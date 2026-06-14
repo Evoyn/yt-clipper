@@ -1,0 +1,18 @@
+# Build
+/target
+
+# Binary sidecars (pinned versions fetched by scripts/fetch-sidecars.ps1)
+/sidecars/
+
+# Model files (whisper GGML, LLM GGUF)
+/models/
+
+# Per-VOD workspace data (audio, segments, exports)
+/workspace/
+
+# Session-bridge artifacts (ephemeral, not project history)
+/handoffs/
+/nextprompt.md
+
+# Claude Code local (machine-specific) settings; shared .claude/ files are committed
+/.claude/settings.local.json

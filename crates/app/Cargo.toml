@@ -1,0 +1,21 @@
+[package]
+name = "yt-clipper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yt-clipper"
+path = "src/main.rs"
+
+[dependencies]
+yc-core.workspace = true
+yc-ingest.workspace = true
+yc-transcribe.workspace = true
+yc-detect.workspace = true
+yc-render.workspace = true
+eframe.workspace = true
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

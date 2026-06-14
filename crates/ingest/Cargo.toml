@@ -1,0 +1,10 @@
+[package]
+name = "yc-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yc-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
