@@ -6,3 +6,8 @@
 //!
 //! The ASS generator is the single home of caption animation logic; Caption
 //! Style presets are data, not code paths.
+
+pub mod ass;
+pub mod export;
+pub use ass::generate_ass;
+pub use export::{build_filtergraph, export_args, run_export};

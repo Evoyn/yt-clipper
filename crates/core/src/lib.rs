@@ -64,6 +64,26 @@ impl TimeRange {
     }
 }
 
+/// One animatable caption unit with timing relative to the start of the
+/// transcribed range (0-based seconds). For EN/ID this is a space-delimited
+/// word; for JA it is a character chunk (M6). Produced by the language-aware
+/// grouping layer in `yc-transcribe`, consumed by the ASS generator in
+/// `yc-render` (ADR 0003/0004).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptionUnit {
+    pub text: String,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+/// The ordered caption units for one transcribed range, tagged with the
+/// language they were grouped for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transcript {
+    pub language: Language,
+    pub units: Vec<CaptionUnit>,
+}
+
 /// Per-signal scores, stored unblended so the ranking formula can be retuned
 /// without re-running analysis (ADR 0002).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
