@@ -115,6 +115,22 @@ pub struct Crop {
     pub h: f32,
 }
 
+impl Crop {
+    /// The largest sub-rectangle of `self` with the given width/height aspect
+    /// ratio, centred inside `self`. Fits a source region to a Panel without
+    /// stretching or letterboxing (CONTEXT.md: Panels fill edge-to-edge). The
+    /// M1 hardcoded Layout uses it; the M5 framing editor reuses it.
+    pub fn fit_to_aspect(&self, target_aspect: f32) -> Crop {
+        if self.w / self.h > target_aspect {
+            let w = self.h * target_aspect; // too wide: keep height, trim width
+            Crop { x: self.x + (self.w - w) / 2.0, y: self.y, w, h: self.h }
+        } else {
+            let h = self.w / target_aspect; // too tall: keep width, trim height
+            Crop { x: self.x, y: self.y + (self.h - h) / 2.0, w: self.w, h }
+        }
+    }
+}
+
 /// The arrangement of a Clip's 1080×1920 canvas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -213,5 +229,27 @@ mod tests {
         let back: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vod.title, "test vod");
         assert_eq!(back.vod.language, Language::Id);
+    }
+
+    #[test]
+    fn fit_to_aspect_trims_width_of_a_wide_region() {
+        // Full 1920x1080 source fit to a tall gameplay Panel (aspect 1080/1190).
+        let full = Crop { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
+        let panel_aspect = 1080.0 / 1190.0;
+        let c = full.fit_to_aspect(panel_aspect);
+        assert!((c.h - 1080.0).abs() < 0.01); // height preserved
+        assert!((c.w / c.h - panel_aspect).abs() < 1e-4); // aspect matched
+        assert!((c.x - (1920.0 - c.w) / 2.0).abs() < 0.01); // centred horizontally
+        assert_eq!(c.y, 0.0);
+    }
+
+    #[test]
+    fn fit_to_aspect_trims_height_of_a_tall_region() {
+        let tall = Crop { x: 10.0, y: 20.0, w: 100.0, h: 400.0 };
+        let c = tall.fit_to_aspect(2.0); // want w/h = 2
+        assert!((c.w - 100.0).abs() < 0.01); // width preserved
+        assert!((c.h - 50.0).abs() < 0.01); // 100 / 2
+        assert_eq!(c.x, 10.0);
+        assert!((c.y - (20.0 + (400.0 - 50.0) / 2.0)).abs() < 0.01); // centred vertically
     }
 }
