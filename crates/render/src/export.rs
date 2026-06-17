@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use yc_core::{Crop, Layout, TimeRange, CANVAS_H, CANVAS_W};
+use yc_core::{Crop, Layout, CANVAS_H, CANVAS_W};
 
 /// `crop=w:h:x:y` in source pixels. Dimensions floored to even numbers >= 2 so
 /// the yuv420p encoder never sees an odd or zero-sized Panel.
@@ -50,23 +50,29 @@ pub fn build_filtergraph(layout: &Layout, ass_name: &str) -> String {
     }
 }
 
-/// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks to the clip
-/// start; `-t` bounds the output to the clip duration (frame-accurate under
+/// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks `seek_s` into
+/// the source; `-t` bounds the output to `duration_s` (frame-accurate under
 /// re-encode). The burned ASS timeline is 0-based, matching the reset output
 /// timeline produced by the seek.
+///
+/// `seek_s` is decoupled from the Clip's VOD range because the two ingest paths
+/// seek different sources: the M1 local file is the whole VOD, so `seek_s` is
+/// the range start; the M2 Segment is a padded slice, so `seek_s` is the
+/// in-segment offset (`range.start - segment_start`; see `yc_ingest`).
 pub fn export_args(
     source: &Path,
-    range: TimeRange,
+    seek_s: f64,
+    duration_s: f64,
     filtergraph: &str,
     out_name: &str,
 ) -> Vec<String> {
     vec![
         "-ss".into(),
-        format!("{:.3}", range.start_s),
+        format!("{seek_s:.3}"),
         "-i".into(),
         source.display().to_string(),
         "-t".into(),
-        format!("{:.3}", range.duration_s()),
+        format!("{duration_s:.3}"),
         "-filter_complex".into(),
         filtergraph.into(),
         "-map".into(),
@@ -130,17 +136,14 @@ mod tests {
 
     #[test]
     fn export_seeks_before_input_and_uses_nvenc() {
-        let args = export_args(
-            Path::new("F:/v.mp4"),
-            TimeRange { start_s: 12.5, end_s: 20.0 },
-            "FG",
-            "export.mp4",
-        );
+        // M2 promote: seek the in-segment offset (2.0s), not the VOD range start.
+        let args = export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4");
         let ss = args.iter().position(|a| a == "-ss").unwrap();
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i for fast seek");
+        assert_eq!(args[ss + 1], "2.000"); // seek = in-segment offset
         assert!(args.contains(&"h264_nvenc".to_string()));
         let t = args.iter().position(|a| a == "-t").unwrap();
-        assert_eq!(args[t + 1], "7.500"); // duration = end - start
+        assert_eq!(args[t + 1], "7.500"); // -t bounds the output to the clip duration
     }
 }

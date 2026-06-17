@@ -1,9 +1,17 @@
-//! The M1 pipeline worker: one background thread (ADR 0005) that runs the full
-//! tracer-bullet chain off the UI thread — ffmpeg audio extract -> whisper over
-//! the picked range -> rolling-pop ASS -> NVENC export — reporting progress
-//! over a channel. The hardcoded Stacked Layout lives here because it is M1
-//! scaffolding, not domain logic; EDIT the source/facecam constants to match
-//! the test VOD.
+//! The M2 pipeline worker: one background thread (ADR 0005) running the
+//! two-phase ingest off the UI thread, reporting progress over a channel.
+//!
+//! - **Import** resolves a VOD (YouTube URL or local file) to its whole-VOD
+//!   analysis audio + raw chat + metadata, and persists `project.json` in the
+//!   per-VOD workspace folder. It leaves a [`Session`] the worker remembers.
+//! - **Promote** turns a picked range into a Clip: fetch the padded Segment
+//!   (YouTube) or use the local file, probe it for the in-segment offset and
+//!   layout dimensions, transcribe the range, generate captions, NVENC export.
+//!
+//! A [`CancelToken`] (shared with the UI) kills the yt-dlp/ffmpeg child tree
+//! mid-download - the M1 "hang" scar. The Stacked Layout is still hardcoded
+//! scaffolding here (the framing editor is M5), but now derives its Crops from
+//! the *probed* source resolution so it works for 360p and 1080p alike.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,140 +20,333 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Crop, Language, Layout, Moment, Signals, TimeRange, CANVAS_H,
-    CANVAS_W,
+    CaptionGenre, CaptionStyle, Clip, Crop, Language, Layout, Moment, Project, Signals, TimeRange,
+    Vod, VodSource, CANVAS_H, CANVAS_W,
 };
+use yc_ingest::{CancelToken, Sidecars};
 
 /// Resolved inputs the worker needs, captured once at spawn.
 #[derive(Clone)]
 pub struct PipelinePaths {
     pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
+    pub ytdlp: PathBuf,
+    pub deno_dir: Option<PathBuf>,
     pub model: PathBuf,
     pub font: PathBuf,
     pub workspace: PathBuf,
 }
 
-/// A unit of work requested by the UI.
+impl PipelinePaths {
+    fn sidecars(&self) -> Sidecars {
+        Sidecars {
+            ytdlp: self.ytdlp.clone(),
+            ffmpeg: self.ffmpeg.clone(),
+            ffprobe: self.ffprobe.clone(),
+            deno_dir: self.deno_dir.clone(),
+        }
+    }
+}
+
+/// Where a VOD is imported from.
+pub enum ImportSource {
+    YouTube(String),
+    Local(PathBuf),
+}
+
+/// A unit of work requested by the UI. Cancel is out-of-band (the worker is
+/// busy inside a job), so it travels via the [`CancelToken`], not this channel.
 pub enum Job {
-    Run { video: PathBuf, range: TimeRange, language: Language },
+    Import { source: ImportSource, language: Language },
+    Promote { range: TimeRange },
 }
 
 /// Progress reported back to the UI thread.
 pub enum Progress {
     Stage(&'static str),
+    /// Import finished; the VOD is ready to promote ranges from.
+    Imported { title: String, duration_s: Option<f64> },
+    /// A Clip rendered to this path.
     Done(PathBuf),
+    Cancelled,
     Failed(String),
 }
 
-/// Spawn the worker thread and return the job sender + progress receiver.
-pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>) {
+/// What an import leaves ready for promotion. The worker holds one between jobs.
+struct Session {
+    vod: Vod,
+    promote: PromoteSource,
+    workdir: PathBuf,
+    analysis_wav: PathBuf,
+}
+
+/// How `Promote` obtains the video to render from, and where it seeks.
+enum PromoteSource {
+    /// Fetch a padded Segment per-promote (web_safari HLS); seek the offset.
+    YouTube(String),
+    /// Use the local file directly as the "Segment"; seek the range start.
+    Local(PathBuf),
+}
+
+/// Spawn the worker thread. Returns the job sender, the progress receiver, and a
+/// [`CancelToken`] the UI flips to kill an in-flight download.
+pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelToken) {
     let (tx_job, rx_job) = mpsc::channel::<Job>();
     let (tx_prog, rx_prog) = mpsc::channel::<Progress>();
+    let cancel = CancelToken::new();
+    let worker_cancel = cancel.clone();
     thread::spawn(move || {
+        let mut session: Option<Session> = None;
         while let Ok(job) = rx_job.recv() {
+            // A cancel of the previous job must not bleed into this one.
+            worker_cancel.reset();
             match job {
-                Job::Run { video, range, language } => {
-                    let result = run_pipeline(&paths, &video, range, language, &tx_prog);
-                    let msg = match result {
-                        Ok(out) => Progress::Done(out),
-                        Err(e) => Progress::Failed(format!("{e:#}")),
-                    };
-                    let _ = tx_prog.send(msg);
+                Job::Import { source, language } => {
+                    match do_import(&paths, source, language, &worker_cancel, &tx_prog) {
+                        Ok(s) => {
+                            let _ = tx_prog.send(Progress::Imported {
+                                title: s.vod.title.clone(),
+                                duration_s: s.vod.duration_s,
+                            });
+                            session = Some(s);
+                        }
+                        Err(e) => {
+                            let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                        }
+                    }
                 }
+                Job::Promote { range } => match &session {
+                    None => {
+                        let _ = tx_prog
+                            .send(Progress::Failed("import a VOD before making a clip".into()));
+                    }
+                    Some(s) => match do_promote(&paths, s, range, &worker_cancel, &tx_prog) {
+                        Ok(out) => {
+                            let _ = tx_prog.send(Progress::Done(out));
+                        }
+                        Err(e) => {
+                            let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                        }
+                    },
+                },
             }
         }
     });
-    (tx_job, rx_prog)
+    (tx_job, rx_prog, cancel)
 }
 
-// --- M1 hardcoded Layout + Caption Style (EDIT to taste / to fit the VOD) ---
+/// A job that ended in error reports as `Cancelled` if the token was flipped
+/// (the child was tree-killed), else as a genuine `Failed`.
+fn fail_or_cancel(e: anyhow::Error, cancel: &CancelToken) -> Progress {
+    if cancel.is_cancelled() {
+        Progress::Cancelled
+    } else {
+        Progress::Failed(format!("{e:#}"))
+    }
+}
 
-/// Assumed source resolution of the test VOD (M1 smoke test pulls 360p).
-const SRC_W: f32 = 640.0;
-const SRC_H: f32 = 360.0;
+// --- import (phase 1) -------------------------------------------------------
+
+fn do_import(
+    paths: &PipelinePaths,
+    source: ImportSource,
+    language: Language,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<Session> {
+    anyhow::ensure!(paths.ffmpeg.is_file(), "ffmpeg sidecar missing - run fetch-sidecars.ps1");
+    match source {
+        ImportSource::YouTube(url) => import_youtube(paths, url, language, cancel, tx),
+        ImportSource::Local(path) => import_local(paths, path, language, tx),
+    }
+}
+
+fn import_youtube(
+    paths: &PipelinePaths,
+    url: String,
+    language: Language,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<Session> {
+    anyhow::ensure!(paths.ytdlp.is_file(), "yt-dlp sidecar missing - run fetch-sidecars.ps1");
+    let sc = paths.sidecars();
+
+    let _ = tx.send(Progress::Stage("Fetching metadata"));
+    let vod = yc_ingest::youtube_metadata(&sc, &url, language, cancel)?;
+    let video_id = match &vod.source {
+        VodSource::YouTube { video_id } => video_id.clone(),
+        // youtube_metadata always builds a YouTube source.
+        VodSource::LocalFile { .. } => anyhow::bail!("expected a YouTube VOD"),
+    };
+
+    // Folder-per-VOD, keyed by video_id (Creator-scoped folders arrive at M5/M6).
+    let workdir = paths.workspace.join(&video_id);
+    fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
+
+    let _ = tx.send(Progress::Stage("Downloading audio"));
+    let analysis_wav = yc_ingest::youtube_fetch_audio(&sc, &url, &workdir, cancel)?;
+
+    let _ = tx.send(Progress::Stage("Fetching chat"));
+    let _chat = yc_ingest::youtube_fetch_chat(&sc, &url, &workdir, cancel)?;
+
+    save_project(&vod, &workdir)?;
+    Ok(Session { vod, promote: PromoteSource::YouTube(url), workdir, analysis_wav })
+}
+
+fn import_local(
+    paths: &PipelinePaths,
+    path: PathBuf,
+    language: Language,
+    tx: &Sender<Progress>,
+) -> Result<Session> {
+    anyhow::ensure!(path.is_file(), "video not found: {}", path.display());
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "clip".into());
+    let workdir = paths.workspace.join(&stem);
+    fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
+
+    let _ = tx.send(Progress::Stage("Extracting audio"));
+    let analysis_wav = workdir.join("analysis.wav");
+    yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav)?;
+
+    let vod = Vod {
+        creator: "local".into(),
+        title: stem,
+        source: VodSource::LocalFile { path: path.clone() },
+        language,
+        duration_s: None,
+    };
+    save_project(&vod, &workdir)?;
+    Ok(Session { vod, promote: PromoteSource::Local(path), workdir, analysis_wav })
+}
+
+fn save_project(vod: &Vod, workdir: &Path) -> Result<()> {
+    Project::new(vod.clone())
+        .save(&workdir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", workdir.display()))
+}
+
+// --- promote (phase 2) ------------------------------------------------------
+
+fn do_promote(
+    paths: &PipelinePaths,
+    session: &Session,
+    range: TimeRange,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<PathBuf> {
+    anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
+    anyhow::ensure!(range.duration_s() > 0.0, "pick a range with end > start");
+    let sc = paths.sidecars();
+
+    // 1. Obtain the render source, the in-segment seek offset, and the source
+    //    resolution (for the Layout) - all from one ffprobe of the media.
+    let (render_src, seek_s, src_w, src_h) = match &session.promote {
+        PromoteSource::Local(path) => {
+            let p = yc_ingest::probe_segment(&paths.ffprobe, path, cancel)?;
+            (path.clone(), range.start_s, p.width as f32, p.height as f32)
+        }
+        PromoteSource::YouTube(url) => {
+            let _ = tx.send(Progress::Stage("Fetching segment"));
+            let padded = yc_ingest::pad_range(range, session.vod.duration_s);
+            let segment = yc_ingest::fetch_segment(&sc, url, padded, &session.workdir, cancel)?;
+            let p = yc_ingest::probe_segment(&paths.ffprobe, &segment, cancel)?;
+            let offset = yc_ingest::in_segment_offset(range.start_s, padded.start_s, &p);
+            (segment, offset, p.width as f32, p.height as f32)
+        }
+    };
+
+    // 2. Transcribe the picked range from the analysis audio (M1 path). Whisper
+    //    captions the loudest voice in the mixed track; mic isolation is future
+    //    work (see ROADMAP M1 known-limitation).
+    let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
+    let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
+    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language)?;
+
+    // 3. Captions: generate the ASS and copy the font beside it (libass finds it
+    //    via fontsdir=., dodging Windows filtergraph path escaping).
+    let _ = tx.send(Progress::Stage("Generating captions"));
+    let style = caption_style();
+    let ass = yc_render::generate_ass(&transcript, &style);
+    fs::write(session.workdir.join("clip.ass"), ass).context("writing clip.ass")?;
+    fs::copy(&paths.font, session.workdir.join("Anton-Regular.ttf"))
+        .with_context(|| format!("copying font from {}", paths.font.display()))?;
+
+    // 4. Record the promoted Clip in the project, then render.
+    let clip = build_clip(range, layout_for(src_w, src_h), &style.name);
+    persist_clip(&session.vod, &clip, &session.workdir)?;
+
+    let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
+    let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
+    let args = yc_render::export_args(&render_src, seek_s, range.duration_s(), &filtergraph, "export.mp4");
+    yc_render::run_export(&paths.ffmpeg, &session.workdir, &args)?;
+
+    Ok(session.workdir.join("export.mp4"))
+}
+
+/// A manually-picked range -> a marked Moment promoted to a Clip (CONTEXT.md).
+fn build_clip(range: TimeRange, layout: Layout, caption_style: &str) -> Clip {
+    Clip {
+        id: 1,
+        moment_id: 1,
+        range,
+        layout,
+        caption_style: caption_style.to_string(),
+        segment_path: None,
+        export_path: None,
+    }
+}
+
+/// Re-save `project.json` with the promoted Moment + Clip recorded.
+fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
+    let mut project = Project::new(vod.clone());
+    project
+        .moments
+        .push(Moment { id: clip.moment_id, range: clip.range, signals: Signals::default(), score: 0.0 });
+    project.clips.push(clip.clone());
+    project
+        .save(&workdir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", workdir.display()))
+}
+
+// --- hardcoded Layout + Caption Style (scaffolding; framing editor is M5) ----
+
 /// Gameplay Panel occupies the top `SEAM` fraction; facecam the rest.
 const SEAM: f32 = 0.62;
-/// Facecam inset rectangle within the source (bottom-right corner of this VOD).
-const FACE_W: f32 = 130.0;
-const FACE_H: f32 = 110.0;
-const FACE_X: f32 = SRC_W - FACE_W;
-const FACE_Y: f32 = SRC_H - FACE_H;
+/// Facecam inset as a fraction of the source frame (bottom-right corner). This
+/// generalizes M1's fixed 130x110-of-640x360 inset to any resolution, so the
+/// same scaffolding frames the 360p test VOD and a 1080p Segment. The operator
+/// will drag the real facecam rectangle in the M5 editor.
+const FACE_W_FRAC: f32 = 0.20;
+const FACE_H_FRAC: f32 = 0.30;
 
-/// The hardcoded stacked Layout: gameplay above facecam (CONTEXT.md), each
-/// Crop aspect-fitted to its Panel so neither stretches (Panel invariant).
-fn m1_layout() -> Layout {
+/// The hardcoded stacked Layout, built from the *probed* source resolution:
+/// gameplay above facecam (CONTEXT.md), each Crop aspect-fitted to its Panel so
+/// neither stretches (Panel invariant).
+fn layout_for(src_w: f32, src_h: f32) -> Layout {
     let gh = (CANVAS_H as f32 * SEAM).round();
     let fh = CANVAS_H as f32 - gh;
-    let gameplay = Crop { x: 0.0, y: 0.0, w: SRC_W, h: SRC_H }.fit_to_aspect(CANVAS_W as f32 / gh);
-    let facecam =
-        Crop { x: FACE_X, y: FACE_Y, w: FACE_W, h: FACE_H }.fit_to_aspect(CANVAS_W as f32 / fh);
+    let gameplay =
+        Crop { x: 0.0, y: 0.0, w: src_w, h: src_h }.fit_to_aspect(CANVAS_W as f32 / gh);
+    let fw = src_w * FACE_W_FRAC;
+    let fhgt = src_h * FACE_H_FRAC;
+    let facecam = Crop { x: src_w - fw, y: src_h - fhgt, w: fw, h: fhgt }
+        .fit_to_aspect(CANVAS_W as f32 / fh);
     Layout::Stacked { seam: SEAM, gameplay, facecam }
 }
 
-/// The single M1 Caption Style preset.
-fn m1_caption_style() -> CaptionStyle {
+/// The default Caption Style preset: one word per caption (huge-word), which
+/// keeps a single word on screen at its own spoken onset — tighter perceived
+/// sync than a multi-word line. The full selectable preset set lands at M6.
+fn caption_style() -> CaptionStyle {
     CaptionStyle {
-        name: "Rolling Pop".into(),
-        genre: CaptionGenre::RollingPop,
+        name: "Huge Word".into(),
+        genre: CaptionGenre::HugeWord,
         font_family: "Anton".into(),
         font_size: 96,
         primary_color: [255, 255, 255, 255],
         accent_color: [255, 209, 0, 255],
     }
-}
-
-fn run_pipeline(
-    paths: &PipelinePaths,
-    video: &Path,
-    range: TimeRange,
-    language: Language,
-    tx: &Sender<Progress>,
-) -> Result<PathBuf> {
-    anyhow::ensure!(video.is_file(), "video not found: {}", video.display());
-    anyhow::ensure!(paths.ffmpeg.is_file(), "ffmpeg sidecar missing — run fetch-sidecars.ps1");
-    anyhow::ensure!(paths.model.is_file(), "whisper model missing — run fetch-models.ps1");
-    anyhow::ensure!(range.duration_s() > 0.0, "pick a range with end > start");
-
-    // Manual pick -> a manually-marked Moment promoted to a Clip (CONTEXT.md).
-    let moment = Moment { id: 1, range, signals: Signals::default(), score: 0.0 };
-    let style = m1_caption_style();
-    let clip = Clip {
-        id: 1,
-        moment_id: moment.id,
-        range: moment.range,
-        layout: m1_layout(),
-        caption_style: style.name.clone(),
-        segment_path: None,
-        export_path: None,
-    };
-
-    let stem = video.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
-    let workdir = paths.workspace.join(&stem);
-    fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
-
-    let _ = tx.send(Progress::Stage("Extracting audio"));
-    let analysis = workdir.join("analysis.wav");
-    yc_ingest::extract_audio(&paths.ffmpeg, video, &analysis)?;
-
-    let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
-    let samples = yc_ingest::read_range_samples(&analysis, clip.range)?;
-    // Language is operator-chosen in the UI (the Creator model will carry it at
-    // M2+). NB: whisper transcribes the loudest speech in the mixed track — it
-    // does not isolate the streamer's mic from in-game voices.
-    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, language)?;
-
-    let _ = tx.send(Progress::Stage("Generating captions"));
-    let ass = yc_render::generate_ass(&transcript, &style);
-    fs::write(workdir.join("clip.ass"), ass).context("writing clip.ass")?;
-    // Copy the font beside the ASS so libass finds it via fontsdir=. (dodges
-    // Windows filtergraph path escaping).
-    fs::copy(&paths.font, workdir.join("Anton-Regular.ttf"))
-        .with_context(|| format!("copying font from {}", paths.font.display()))?;
-
-    let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
-    let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
-    let args = yc_render::export_args(video, clip.range, &filtergraph, "export.mp4");
-    yc_render::run_export(&paths.ffmpeg, &workdir, &args)?;
-
-    Ok(workdir.join("export.mp4"))
 }

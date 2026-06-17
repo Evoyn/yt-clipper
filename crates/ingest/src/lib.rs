@@ -11,6 +11,12 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use yc_core::TimeRange;
 
+pub mod youtube;
+pub use youtube::{
+    fetch_segment, in_segment_offset, pad_range, probe_segment, resolve_deno_dir, youtube_fetch_audio,
+    youtube_fetch_chat, youtube_metadata, CancelToken, SegmentProbe, Sidecars, SEGMENT_PAD_S,
+};
+
 /// Sample rate (mono) whisper.cpp expects.
 pub const WHISPER_SR: u32 = 16_000;
 

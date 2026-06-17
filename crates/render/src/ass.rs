@@ -1,16 +1,18 @@
 //! ASS subtitle generation — the single home of caption animation logic
-//! (ADR 0004). Caption Style presets are data; the animation genre selects
-//! which builder runs. M1 implements one genre: rolling-pop, EN.
+//! (ADR 0004). Caption Style presets are data; the animation `genre` selects
+//! which builder runs (the full preset set is M6).
 //!
-//! Rolling-pop (M1): caption units are grouped into on-screen lines by a
-//! character budget; each line is one Dialogue event in which every unit is
-//! laid out from the first frame but stays invisible until its spoken onset,
-//! when it fades in and scale-"pops". Units therefore reveal in place rather
-//! than reflowing the line. (The line is centred, so a unit's brief pop
-//! overshoot momentarily re-centres it; a measured per-unit `\pos` to kill
-//! that is an M6 refinement, tuned once we eyeball the first real render.)
+//! Two genres so far:
+//! - **Huge-word** (the M2 default): one word per caption — each unit is its own
+//!   Dialogue event, appearing at its own spoken onset and clearing before the
+//!   next word. Sync tracks the spoken word, and there is never more than one
+//!   word on screen. EN/ID; JA character chunking is M6.
+//! - **Rolling-pop** (M1): units grouped into on-screen lines by a character
+//!   budget; each line is one Dialogue event in which every unit is laid out
+//!   from the first frame but stays invisible until its spoken onset, when it
+//!   fades in and scale-"pops". Units reveal in place rather than reflowing.
 
-use yc_core::{CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
+use yc_core::{CaptionGenre, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
 
 /// Keep a completed line on screen this long after its last unit ends.
 const LINE_HOLD_S: f64 = 0.5;
@@ -24,6 +26,11 @@ const MAX_GAP_S: f64 = 1.0;
 /// ends at the Seam, 0.62) — above the facecam face below, and clear of any
 /// burned-in source subtitles that sit near the bottom of the gameplay.
 const CAPTION_Y_FRAC: f64 = 0.46;
+/// Huge-word genre: keep a word on screen at least this long (a fast-spoken word
+/// stays readable) and at most this long after it ends — capped by the next
+/// word's onset, so exactly one word shows and none linger through silence.
+const WORD_MIN_S: f64 = 0.10;
+const WORD_HOLD_S: f64 = 0.30;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
@@ -111,6 +118,44 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     let pos_x = CANVAS_W / 2;
     let pos_y = (CANVAS_H as f64 * CAPTION_Y_FRAC).round() as u32;
 
+    let events = match style.genre {
+        CaptionGenre::HugeWord => huge_word_events(transcript, pos_x, pos_y),
+        CaptionGenre::RollingPop => rolling_pop_events(transcript, pos_x, pos_y),
+        // KaraokeFill lands at M6; fall back to rolling-pop until then.
+        CaptionGenre::KaraokeFill => rolling_pop_events(transcript, pos_x, pos_y),
+    };
+    s.push_str(&events);
+
+    s
+}
+
+/// One word per caption (huge-word): each unit is its own Dialogue event,
+/// appearing at its spoken onset and clearing before the next word (or after a
+/// short hold), so exactly one word is on screen and timing tracks speech.
+fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
+    let mut s = String::new();
+    let units = &transcript.units;
+    for (i, u) in units.iter().enumerate() {
+        let mut end = u.end_s + WORD_HOLD_S;
+        if let Some(next) = units.get(i + 1) {
+            end = end.min(next.start_s); // one word at a time: clear before the next
+        }
+        end = end.max(u.start_s + WORD_MIN_S); // never zero-duration / unreadable
+        let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text);
+        s.push_str(&format!(
+            "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
+            ass_time(u.start_s),
+            ass_time(end),
+            text
+        ));
+    }
+    s
+}
+
+/// Multi-word rolling-pop lines (M1): units grouped into <=MAX_LINE_CHARS lines,
+/// each line one Dialogue event in which every unit pops in at its onset.
+fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
+    let mut s = String::new();
     let lines = group_lines(transcript, MAX_LINE_CHARS);
     for (li, line) in lines.iter().enumerate() {
         let line_start = line.first().map_or(0.0, |u| u.start_s);
@@ -138,7 +183,6 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
             text
         ));
     }
-
     s
 }
 
@@ -227,5 +271,32 @@ mod tests {
         // The first unit of each line pops at relative t=0.
         let ass = generate_ass(&units(&["hello", "world"]), &style());
         assert!(ass.contains("\\t(0,40,\\alpha&H00&)"));
+    }
+
+    #[test]
+    fn huge_word_emits_one_nonzero_event_per_word() {
+        let mut st = style();
+        st.genre = CaptionGenre::HugeWord;
+        let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st);
+        let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
+        assert_eq!(dialogues.len(), 3); // one caption per word
+        // Each event carries exactly its own word, never the next.
+        assert!(dialogues[0].contains("satu") && !dialogues[0].contains("dua"));
+        // No zero-duration captions (the Start,End fields must differ).
+        for d in &dialogues {
+            let fields: Vec<&str> = d.split(',').collect();
+            assert_ne!(fields[1], fields[2], "zero-duration caption: {d}");
+        }
+    }
+
+    #[test]
+    fn huge_word_clears_each_word_before_the_next_starts() {
+        let mut st = style();
+        st.genre = CaptionGenre::HugeWord;
+        // Words at 0.0 and 0.5; the first must end no later than 0.5.
+        let ass = generate_ass(&units(&["a", "b"]), &st);
+        let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
+        let end = first.split(',').nth(2).unwrap();
+        assert_eq!(end, "0:00:00.50"); // capped at the next word's onset
     }
 }

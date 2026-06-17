@@ -11,7 +11,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters,
+};
 use yc_core::{CaptionUnit, Language, Transcript};
 
 fn lang_code(l: Language) -> &'static str {
@@ -62,6 +65,13 @@ where
 pub fn transcribe_range(model: &Path, samples: &[f32], language: Language) -> Result<Transcript> {
     let mut cparams = WhisperContextParameters::default();
     cparams.use_gpu(true);
+    // DTW token-level timestamps with large-v3's alignment heads. The default
+    // heuristic token times drift by a few hundred ms — exactly the word-sync
+    // wobble — so we align each token to the audio via DTW and read `t_dtw`.
+    cparams.dtw_parameters(DtwParameters {
+        mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
+        ..Default::default()
+    });
     let ctx = WhisperContext::new_with_params(model, cparams)
         .with_context(|| format!("loading whisper model {}", model.display()))?;
     let mut state = ctx.create_state().context("creating whisper state")?;
@@ -94,7 +104,17 @@ pub fn transcribe_range(model: &Path, samples: &[f32], language: Language) -> Re
                 continue;
             }
             let data = token.token_data();
-            raw_tokens.push((text, data.t0 as f64 / 100.0, data.t1 as f64 / 100.0));
+            // Prefer the DTW-aligned time; fall back to the heuristic t0/t1 when
+            // DTW produced no value for this token (t_dtw == -1). DTW gives a
+            // single aligned point per token, so a word's span runs from its
+            // first token's time to its last — the caption builders handle the
+            // (zero-width) single-token case.
+            let (t0, t1) = if data.t_dtw >= 0 {
+                (data.t_dtw, data.t_dtw)
+            } else {
+                (data.t0, data.t1)
+            };
+            raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0));
         }
     }
 
