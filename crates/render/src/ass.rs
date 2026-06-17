@@ -16,6 +16,10 @@ use yc_core::{CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
 const LINE_HOLD_S: f64 = 0.5;
 /// Max characters (including inter-unit spaces) on one on-screen line.
 const MAX_LINE_CHARS: usize = 22;
+/// Start a new line when the silence before a unit exceeds this, so words
+/// spoken far apart never share one lingering line (which made captions appear
+/// long before their later words were actually spoken).
+const MAX_GAP_S: f64 = 1.0;
 /// Caption anchor as a fraction of canvas height: mid gameplay Panel (which
 /// ends at the Seam, 0.62) — above the facecam face below, and clear of any
 /// burned-in source subtitles that sit near the bottom of the gameplay.
@@ -50,7 +54,10 @@ fn group_lines<'a>(t: &'a Transcript, max_chars: usize) -> Vec<Vec<&'a CaptionUn
     for u in &t.units {
         let w = u.text.chars().count();
         let add = if cur.is_empty() { w } else { w + 1 };
-        if !cur.is_empty() && len + add > max_chars {
+        let gap = cur.last().map_or(0.0, |p| u.start_s - p.end_s);
+        let over_budget = !cur.is_empty() && len + add > max_chars;
+        let after_silence = !cur.is_empty() && gap > MAX_GAP_S;
+        if over_budget || after_silence {
             lines.push(std::mem::take(&mut cur));
             len = 0;
         }
@@ -104,9 +111,15 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     let pos_x = CANVAS_W / 2;
     let pos_y = (CANVAS_H as f64 * CAPTION_Y_FRAC).round() as u32;
 
-    for line in group_lines(transcript, MAX_LINE_CHARS) {
+    let lines = group_lines(transcript, MAX_LINE_CHARS);
+    for (li, line) in lines.iter().enumerate() {
         let line_start = line.first().map_or(0.0, |u| u.start_s);
-        let line_end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
+        // Hold after the last unit, but never past the next line's start, so
+        // only one line is ever on screen (consecutive lines were overlapping).
+        let mut line_end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
+        if let Some(next_start) = lines.get(li + 1).and_then(|n| n.first()).map(|u| u.start_s) {
+            line_end = line_end.min(next_start);
+        }
 
         let mut text = format!("{{\\an5\\pos({pos_x},{pos_y})}}");
         for (i, u) in line.iter().enumerate() {
@@ -180,6 +193,21 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].len(), 2);
         assert_eq!(lines[1].len(), 2);
+    }
+
+    #[test]
+    fn lines_break_on_long_silence() {
+        // Two short words well within the 22-char budget, but a 3s gap between
+        // them must still split the line (regression: far-apart words lingered).
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "hey".into(), start_s: 0.0, end_s: 0.4 },
+                CaptionUnit { text: "there".into(), start_s: 3.4, end_s: 3.8 },
+            ],
+        };
+        let lines = group_lines(&t, MAX_LINE_CHARS);
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]

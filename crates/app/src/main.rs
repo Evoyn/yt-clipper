@@ -10,7 +10,7 @@ mod pipeline;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use yc_core::TimeRange;
+use yc_core::{Language, TimeRange};
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -34,12 +34,17 @@ fn main() -> eframe::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--headless") {
         let video = PathBuf::from(
-            argv.get(i + 1).expect("--headless needs <video> <start_s> <end_s>"),
+            argv.get(i + 1).expect("--headless needs <video> <start_s> <end_s> [en|id|ja]"),
         );
         let start_s: f64 = argv.get(i + 2).and_then(|s| s.parse().ok()).expect("start_s");
         let end_s: f64 = argv.get(i + 3).and_then(|s| s.parse().ok()).expect("end_s");
+        let language = match argv.get(i + 4).map(|s| s.as_str()) {
+            Some("en") => Language::En,
+            Some("ja") => Language::Ja,
+            _ => Language::Id,
+        };
         to_worker
-            .send(pipeline::Job::Run { video, range: TimeRange { start_s, end_s } })
+            .send(pipeline::Job::Run { video, range: TimeRange { start_s, end_s }, language })
             .expect("send job to worker");
         loop {
             match from_worker.recv() {
@@ -73,6 +78,7 @@ fn main() -> eframe::Result<()> {
                 video_path: String::new(),
                 start_s: 0.0,
                 end_s: 30.0,
+                language: Language::Id,
                 status: Status::Idle,
                 to_worker,
                 from_worker,
@@ -140,6 +146,7 @@ struct App {
     video_path: String,
     start_s: f64,
     end_s: f64,
+    language: Language,
     status: Status,
     to_worker: Sender<pipeline::Job>,
     from_worker: Receiver<pipeline::Progress>,
@@ -188,6 +195,20 @@ impl eframe::App for App {
                 ui.colored_label(egui::Color32::RED, "end < start");
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Spoken language");
+            egui::ComboBox::from_label("(the streamer, not the game)")
+                .selected_text(match self.language {
+                    Language::En => "English",
+                    Language::Id => "Bahasa Indonesia",
+                    Language::Ja => "日本語",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.language, Language::En, "English");
+                    ui.selectable_value(&mut self.language, Language::Id, "Bahasa Indonesia");
+                    ui.selectable_value(&mut self.language, Language::Ja, "日本語");
+                });
+        });
 
         let running = matches!(self.status, Status::Running(_));
         ui.add_enabled_ui(!running, |ui| {
@@ -196,6 +217,7 @@ impl eframe::App for App {
                 let _ = self.to_worker.send(pipeline::Job::Run {
                     video: PathBuf::from(self.video_path.trim()),
                     range,
+                    language: self.language,
                 });
                 self.status = Status::Running("Starting".into());
             }

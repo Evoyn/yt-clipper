@@ -27,7 +27,7 @@ pub struct PipelinePaths {
 
 /// A unit of work requested by the UI.
 pub enum Job {
-    Run { video: PathBuf, range: TimeRange },
+    Run { video: PathBuf, range: TimeRange, language: Language },
 }
 
 /// Progress reported back to the UI thread.
@@ -44,8 +44,8 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>) {
     thread::spawn(move || {
         while let Ok(job) = rx_job.recv() {
             match job {
-                Job::Run { video, range } => {
-                    let result = run_pipeline(&paths, &video, range, &tx_prog);
+                Job::Run { video, range, language } => {
+                    let result = run_pipeline(&paths, &video, range, language, &tx_prog);
                     let msg = match result {
                         Ok(out) => Progress::Done(out),
                         Err(e) => Progress::Failed(format!("{e:#}")),
@@ -98,6 +98,7 @@ fn run_pipeline(
     paths: &PipelinePaths,
     video: &Path,
     range: TimeRange,
+    language: Language,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
     anyhow::ensure!(video.is_file(), "video not found: {}", video.display());
@@ -128,9 +129,10 @@ fn run_pipeline(
 
     let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
     let samples = yc_ingest::read_range_samples(&analysis, clip.range)?;
-    // M1 test VOD is Bahasa Indonesia; language is hardcoded here until the
-    // Creator model carries it (M2+).
-    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, Language::Id)?;
+    // Language is operator-chosen in the UI (the Creator model will carry it at
+    // M2+). NB: whisper transcribes the loudest speech in the mixed track — it
+    // does not isolate the streamer's mic from in-game voices.
+    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, language)?;
 
     let _ = tx.send(Progress::Stage("Generating captions"));
     let ass = yc_render::generate_ass(&transcript, &style);
