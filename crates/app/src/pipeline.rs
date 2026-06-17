@@ -60,14 +60,14 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>) {
 
 // --- M1 hardcoded Layout + Caption Style (EDIT to taste / to fit the VOD) ---
 
-/// Assumed source resolution of the test VOD.
-const SRC_W: f32 = 1920.0;
-const SRC_H: f32 = 1080.0;
+/// Assumed source resolution of the test VOD (M1 smoke test pulls 360p).
+const SRC_W: f32 = 640.0;
+const SRC_H: f32 = 360.0;
 /// Gameplay Panel occupies the top `SEAM` fraction; facecam the rest.
 const SEAM: f32 = 0.62;
-/// Facecam inset rectangle within the source (bottom-right by default).
-const FACE_W: f32 = 480.0;
-const FACE_H: f32 = 270.0;
+/// Facecam inset rectangle within the source (bottom-right corner of this VOD).
+const FACE_W: f32 = 130.0;
+const FACE_H: f32 = 110.0;
 const FACE_X: f32 = SRC_W - FACE_W;
 const FACE_Y: f32 = SRC_H - FACE_H;
 
@@ -128,7 +128,9 @@ fn run_pipeline(
 
     let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
     let samples = yc_ingest::read_range_samples(&analysis, clip.range)?;
-    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, Language::En)?;
+    // M1 test VOD is Bahasa Indonesia; language is hardcoded here until the
+    // Creator model carries it (M2+).
+    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, Language::Id)?;
 
     let _ = tx.send(Progress::Stage("Generating captions"));
     let ass = yc_render::generate_ass(&transcript, &style);

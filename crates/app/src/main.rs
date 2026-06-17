@@ -28,6 +28,35 @@ fn main() -> eframe::Result<()> {
         workspace: paths.workspace.clone(),
     });
 
+    // Headless one-shot for testing / visual iteration (no GUI clicking):
+    //   yt-clipper --headless <video> <start_s> <end_s>
+    // Drives the same worker / Job / Progress path the GUI uses, then exits.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--headless") {
+        let video = PathBuf::from(
+            argv.get(i + 1).expect("--headless needs <video> <start_s> <end_s>"),
+        );
+        let start_s: f64 = argv.get(i + 2).and_then(|s| s.parse().ok()).expect("start_s");
+        let end_s: f64 = argv.get(i + 3).and_then(|s| s.parse().ok()).expect("end_s");
+        to_worker
+            .send(pipeline::Job::Run { video, range: TimeRange { start_s, end_s } })
+            .expect("send job to worker");
+        loop {
+            match from_worker.recv() {
+                Ok(pipeline::Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(pipeline::Progress::Done(p)) => {
+                    println!("{}", p.display());
+                    std::process::exit(0);
+                }
+                Ok(pipeline::Progress::Failed(e)) => {
+                    eprintln!("FAILED: {e}");
+                    std::process::exit(1);
+                }
+                Err(_) => std::process::exit(1),
+            }
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

@@ -16,9 +16,10 @@ use yc_core::{CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
 const LINE_HOLD_S: f64 = 0.5;
 /// Max characters (including inter-unit spaces) on one on-screen line.
 const MAX_LINE_CHARS: usize = 22;
-/// Caption anchor as a fraction of canvas height (lower third of the gameplay
-/// Panel for the hardcoded M1 stacked Layout).
-const CAPTION_Y_FRAC: f64 = 0.70;
+/// Caption anchor as a fraction of canvas height: mid gameplay Panel (which
+/// ends at the Seam, 0.62) — above the facecam face below, and clear of any
+/// burned-in source subtitles that sit near the bottom of the gameplay.
+const CAPTION_Y_FRAC: f64 = 0.46;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
