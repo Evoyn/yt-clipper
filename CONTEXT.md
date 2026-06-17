@@ -20,6 +20,10 @@ _Avoid_: highlight, candidate, event
 A Moment the operator has promoted for production. A Clip gets framing, captions, and an export; a Moment that is never promoted gets nothing.
 _Avoid_: short, video, segment
 
+**Segment**:
+The padded span of full-quality VOD video downloaded for a Clip when it is promoted — bounded by keyframes, so always a little longer than the Clip's range. The frame-accurate export is cut from the Segment; the VOD's video is never downloaded whole (ADR 0001, ADR 0006).
+_Avoid_: clip, chunk, section, source
+
 **Layout**:
 The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single gameplay Panel).
 _Avoid_: composite, template, frame
