@@ -166,6 +166,7 @@ fn main() -> eframe::Result<()> {
                 analysis_wav: None,
                 audio_out: None,
                 sink: None,
+                volume: 1.0,
                 status: Status::Idle,
                 to_worker,
                 from_worker,
@@ -280,6 +281,9 @@ struct App {
     audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     /// The currently-playing sink; taking/replacing it stops playback.
     sink: Option<rodio::Sink>,
+    /// Review playback gain applied to the sink; 1.0 = unmodified, >1.0 boosts
+    /// a quiet streamer in the mixed track (rodio amplifies linearly).
+    volume: f32,
     status: Status,
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
@@ -578,6 +582,7 @@ impl eframe::App for App {
         // --- Selected Moment: transcript + audio playback (ADR 0001) ---
         let mut play: Option<TimeRange> = None;
         let mut stop = false;
+        let mut vol_changed = false;
         if let Some(id) = self.selected {
             if let Some(m) = self.moments.iter().find(|m| m.id == id).cloned() {
                 ui.separator();
@@ -590,6 +595,10 @@ impl eframe::App for App {
                     ));
                     play = ui.button("Play").clicked().then_some(m.range);
                     stop = ui.button("Stop").clicked();
+                    ui.label("Vol");
+                    vol_changed = ui
+                        .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
+                        .changed();
                 });
                 match self.transcripts.get(&id) {
                     Some(t) if !t.trim().is_empty() => {
@@ -614,6 +623,12 @@ impl eframe::App for App {
         }
         if stop {
             self.stop_audio();
+        }
+        // Live volume: nudge the playing sink without restarting it.
+        if vol_changed {
+            if let Some(sink) = &self.sink {
+                sink.set_volume(self.volume);
+            }
         }
 
         // --- Status + Cancel ---
@@ -694,6 +709,7 @@ impl App {
         match rodio::Sink::try_new(&handle) {
             Ok(sink) => {
                 sink.append(rodio::buffer::SamplesBuffer::new(1, yc_ingest::WHISPER_SR, samples));
+                sink.set_volume(self.volume);
                 sink.play();
                 self.sink = Some(sink);
             }
