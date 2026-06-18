@@ -117,6 +117,69 @@ fn main() -> anyhow::Result<()> {
             println!("{left}");
         }
     }
+
+    // --- ADD vs RE-WEIGHT (ADR 0008 discovery question) ---
+    // Build the REAL loudness+chat discovery candidates, then peak-detect the
+    // whole-VOD arousal series the way discovery peak-detects loudness, and count
+    // how many top-N arousal candidates fall OUTSIDE every loudness/chat candidate
+    // range. That off-diagonal count is the add-vs-reweight answer: ~0 => arousal
+    // only re-weights candidates discovery already found (the refine weight
+    // suffices); meaningful => a whole-VOD arousal discovery pass surfaces moments
+    // loudness+chat never nominate.
+    {
+        use yc_detect::{chat, loudness, rank_moments, score, DetectParams};
+        let params = DetectParams::default();
+        let loud_bins = loudness::read_rms_bins(&wav, params.bin_s)?;
+        let chat_path = dir.join("chat.live_chat.json");
+        let chat_counts = if chat_path.exists() {
+            let offs = chat::message_offsets(&chat_path)?;
+            Some(score::bin_counts(&offs, params.bin_s, loud_bins.len()))
+        } else {
+            None
+        };
+        let cands = rank_moments(&loud_bins, chat_counts.as_deref(), &params);
+
+        // Arousal candidates: robust-z the whole-VOD arousal series, peak-detect +
+        // NMS on the arousal grid (hop_s spacing), then lead-window each peak
+        // exactly like discovery (lead_s/dur_s) and take top_n by arousal-z.
+        let az = score::robust_z(&series);
+        let peaks = score::find_peaks(&az, params.min_z);
+        let min_gap = (params.dur_s / hop_s).round().max(1.0) as usize;
+        let kept = score::nms(peaks, &az, min_gap);
+        let arousal_cands: Vec<(f64, f64, f32, f32)> = kept // (start_s, end_s, arousal, loud)
+            .into_iter()
+            .take(params.top_n)
+            .map(|i| {
+                let center = starts[i] as f64 / sr + arousal::WINDOW_S / 2.0;
+                let start = (center - params.lead_s).max(0.0);
+                (start, start + params.dur_s, series[i], loud[i])
+            })
+            .collect();
+
+        let ts = |t: f64| {
+            let s = t.round() as i64;
+            format!("{}:{:02}", s / 60, s % 60)
+        };
+        let overlaps =
+            |a0: f64, a1: f64| cands.iter().any(|c| a0 < c.range.end_s && c.range.start_s < a1);
+        let adds: Vec<_> = arousal_cands.iter().filter(|&&(s0, s1, _, _)| !overlaps(s0, s1)).collect();
+
+        println!("\n--- ADD vs RE-WEIGHT (does whole-VOD arousal surface NEW candidates?) ---");
+        println!("  loudness+chat discovery candidates : {}", cands.len());
+        println!("  top-{} arousal candidates           : {}", params.top_n, arousal_cands.len());
+        println!(
+            "  arousal candidates OUTSIDE every loudness/chat candidate : {} (the 'adds')",
+            adds.len()
+        );
+        if adds.is_empty() {
+            println!("  => arousal RE-WEIGHTS only; no whole-VOD discovery pass needed.");
+        } else {
+            println!("    start     end    arousal   loud");
+            for &&(s0, s1, a, l) in &adds {
+                println!("  {:>6}  {:>6}  {:>7.3}  {:>5.3}", ts(s0), ts(s1), a, l);
+            }
+        }
+    }
     Ok(())
 }
 
