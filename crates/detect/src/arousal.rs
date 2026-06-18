@@ -16,7 +16,7 @@
 //! normalization / pooling / ranking below are pure and always compiled.
 
 use crate::{combined_score, score, Weights};
-use yc_core::{Moment, Signals};
+use yc_core::Moment;
 
 /// Sliding-window width over a candidate's audio, seconds.
 pub const WINDOW_S: f64 = 4.0;
@@ -90,9 +90,15 @@ pub use infer::Ser;
 mod infer {
     use super::{normalize, window_starts};
     use anyhow::{Context, Result};
-    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::session::Session;
     use ort::value::Tensor;
     use std::path::Path;
+
+    /// `ort::Error` holds raw pointers, so it is not `Send + Sync` and cannot be
+    /// converted into `anyhow::Error` by `?`. Stringify it.
+    fn oerr(e: ort::Error) -> anyhow::Error {
+        anyhow::anyhow!("{e}")
+    }
 
     pub struct Ser {
         session: Session,
@@ -104,33 +110,33 @@ mod infer {
     impl Ser {
         /// Load the ONNX SER model on the CPU execution provider (default).
         pub fn load(onnx: &Path) -> Result<Self> {
-            let session = Session::builder()?
-                .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .commit_from_file(onnx)
+            let session = Session::builder()
+                .and_then(|mut b| b.commit_from_file(onnx))
+                .map_err(oerr)
                 .with_context(|| format!("loading SER model {}", onnx.display()))?;
 
             let input_name = session
-                .inputs
+                .inputs()
                 .first()
-                .map(|i| i.name.clone())
+                .map(|i| i.name().to_string())
                 .ok_or_else(|| anyhow::anyhow!("SER model has no inputs"))?;
 
             // audonnx exports `hidden_states` (dim 1024) and `logits` (dim 3 =
             // arousal/dominance/valence). Prefer the name; else the 2nd output
             // (the model card reads predictions at index 1); else the first.
-            let logits_name = session
-                .outputs
+            let outputs_meta = session.outputs();
+            let logits_name = outputs_meta
                 .iter()
-                .find(|o| o.name.to_lowercase().contains("logit"))
-                .or_else(|| session.outputs.get(1))
-                .or_else(|| session.outputs.first())
-                .map(|o| o.name.clone())
+                .find(|o| o.name().to_lowercase().contains("logit"))
+                .or_else(|| outputs_meta.get(1))
+                .or_else(|| outputs_meta.first())
+                .map(|o| o.name().to_string())
                 .ok_or_else(|| anyhow::anyhow!("SER model has no outputs"))?;
 
             tracing::info!(
                 input = %input_name,
                 logits = %logits_name,
-                outputs = ?session.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
+                outputs = ?outputs_meta.iter().map(|o| o.name().to_string()).collect::<Vec<_>>(),
                 "SER model loaded"
             );
             Ok(Self { session, input_name, logits_name })
@@ -140,9 +146,11 @@ mod infer {
         fn arousal_window(&mut self, win: &[f32]) -> Result<f32> {
             let norm = normalize(win);
             let len = norm.len() as i64;
-            let input = Tensor::from_array(([1_i64, len], norm))?;
-            let outputs = self.session.run(ort::inputs![self.input_name.as_str() => input])?;
-            let (_shape, data) = outputs[self.logits_name.as_str()].try_extract_tensor::<f32>()?;
+            let input = Tensor::from_array(([1_i64, len], norm)).map_err(oerr)?;
+            let outputs =
+                self.session.run(ort::inputs![self.input_name.as_str() => input]).map_err(oerr)?;
+            let (_shape, data) =
+                outputs[self.logits_name.as_str()].try_extract_tensor::<f32>().map_err(oerr)?;
             // logits = [arousal, dominance, valence]
             data.first().copied().context("SER logits output was empty")
         }
@@ -165,7 +173,7 @@ mod infer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yc_core::TimeRange;
+    use yc_core::{Signals, TimeRange};
 
     #[test]
     fn normalize_gives_zero_mean_unit_variance() {
