@@ -17,8 +17,12 @@ A scored candidate time range within a VOD, surfaced by analysis (or marked manu
 _Avoid_: highlight, candidate, event
 
 **Signal**:
-One strand of evidence behind a Moment's score — chat-rate, loudness, lexicon, or LLM judgment — kept separate (never blended away) so the ranking can be retuned and the operator can see *why* a Moment surfaced.
+One strand of evidence behind a Moment's score — chat-rate, loudness, lexicon, arousal, or LLM judgment — kept separate (never blended away) so the ranking can be retuned and the operator can see *why* a Moment surfaced.
 _Avoid_: feature, metric, factor
+
+**Arousal**:
+The Signal measuring the emotional *activation* of the streamer's voice — how worked-up they sound — from a speech-emotion model's arousal axis. Deliberately ignores *which* emotion: a laugh, a rage, and a hype-moment all score high (all clip-worthy). Its job is to tell an emotional reaction apart from merely loud audio (a game explosion, music, a cutscene) that loudness alone cannot.
+_Avoid_: sentiment / valence (positive-vs-negative — explicitly not measured), excitement (reserved for the lexicon), emotion (too broad — implies classifying which emotion)
 
 **Clip**:
 A Moment the operator has promoted for production. A Clip gets framing, captions, and an export; a Moment that is never promoted gets nothing.
