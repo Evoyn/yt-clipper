@@ -385,7 +385,19 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| {
                 ui.label("or local file:");
-                ui.add(egui::TextEdit::singleline(&mut self.video_path).desired_width(560.0));
+                ui.add(egui::TextEdit::singleline(&mut self.video_path).desired_width(440.0));
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(
+                            "video / audio",
+                            &["mp4", "mkv", "webm", "mov", "avi", "m4a", "mp3", "wav", "opus"],
+                        )
+                        .pick_file()
+                    {
+                        self.video_path = path.display().to_string();
+                        self.start_import(ImportSource::Local(path));
+                    }
+                }
                 if ui.button("Import file").clicked() && !self.video_path.trim().is_empty() {
                     self.start_import(ImportSource::Local(PathBuf::from(self.video_path.trim())));
                 }
