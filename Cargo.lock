@@ -4442,6 +4442,8 @@ name = "yc-detect"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hound",
+ "serde_json",
  "tracing",
  "yc-core",
 ]
