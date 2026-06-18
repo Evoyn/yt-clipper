@@ -82,6 +82,26 @@ pub fn smooth(series: &[f32], win: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Centered rolling *maximum* over `win` bins. Unlike [`smooth`] (mean), this is
+/// peak-preserving: a brief, sharp spike (a scream, a hype burst) lifts its whole
+/// neighborhood instead of being averaged away — so transient events still
+/// surface, and the Moment window lands on them rather than on a nearby stretch
+/// of merely-sustained loudness. `win <= 1` is a no-op.
+pub fn smooth_max(series: &[f32], win: usize) -> Vec<f32> {
+    if win <= 1 || series.is_empty() {
+        return series.to_vec();
+    }
+    let half = win / 2;
+    let n = series.len();
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(n);
+            series[lo..hi].iter().copied().fold(f32::MIN, f32::max)
+        })
+        .collect()
+}
+
 /// Weighted sum of equal-length signal series, index by index. Series shorter
 /// than the first are treated as zero past their end (defensive; callers align
 /// lengths). Used for the combined rank only - the per-signal values are stored
@@ -171,6 +191,17 @@ mod tests {
         let s = smooth(&[0.0, 0.0, 9.0, 0.0, 0.0], 3);
         assert!((s[2] - 3.0).abs() < 1e-6); // (0+9+0)/3
         assert!((s[1] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smooth_max_preserves_a_spike_across_its_neighbourhood() {
+        // A lone spike lifts the bins within the window to the spike's value,
+        // instead of averaging it down (a 2 s scream vs sustained talk).
+        let s = smooth_max(&[0.0, 0.0, 9.0, 0.0, 0.0], 3);
+        assert_eq!(s[1], 9.0);
+        assert_eq!(s[2], 9.0);
+        assert_eq!(s[3], 9.0);
+        assert_eq!(s[0], 0.0); // outside the window, untouched
     }
 
     #[test]

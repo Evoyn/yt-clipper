@@ -127,9 +127,12 @@ pub fn rank_moments(
     let grid_dur_s = n_bins as f64 * params.bin_s;
     let win = (params.smooth_s / params.bin_s).round() as usize;
 
-    // Normalize each signal over the VOD, then smooth, so a spike is relative
-    // and sustained. Constant game loudness sits near z=0 and won't surface.
-    let loud = score::smooth(&score::robust_z(loud_raw), win);
+    // Normalize each signal over the VOD (a spike is relative; constant game
+    // loudness sits near z=0). Loudness uses a peak-preserving max-pool so a
+    // brief scream/hype spike surfaces and the window lands on it - a clip is
+    // judged by the peak it contains, not its sustained level. Chat uses a mean,
+    // because sustained reaction volume is the signal there.
+    let loud = score::smooth_max(&score::robust_z(loud_raw), win);
     let chat = chat_counts.map(|c| score::smooth(&score::robust_z(c), win));
 
     // Combined series for peak-finding, using renormalized weights over the

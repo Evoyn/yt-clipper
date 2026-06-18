@@ -54,25 +54,30 @@ fn main() -> anyhow::Result<()> {
         println!();
     }
 
-    // --- dump the ranked Moments for a chosen combo ---
+    // --- dump the ranked Moments and flag which window covers a target event
+    //     time (2nd arg, default 39:38 = 2378 s - the operator's jumpscare). The
+    //     dump is loudness-only to match the GUI local-file (no-chat) test. ---
+    let target_s: f64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2378.0);
     let chosen = DetectParams { smooth_s: 10.0, min_z: 1.0, ..Default::default() };
-    let moments = rank_moments(&loud_raw, chat_counts.as_deref(), &chosen);
+    let moments = rank_moments(&loud_raw, None, &chosen);
     println!(
-        "\ntop {} moments at smooth_s={} min_z={}:",
+        "\ntop {} moments (loudness-only) at smooth_s={} min_z={}; '*' covers {}:",
         moments.len(),
         chosen.smooth_s,
         chosen.min_z,
+        mmss(target_s),
     );
-    println!("  #   start    end     score   chat    loud");
+    println!("    #   start    end     score    loud");
     for m in &moments {
+        let covers = if m.range.start_s <= target_s && target_s < m.range.end_s { "*" } else { " " };
         let f = |o: Option<f32>| o.map(|v| format!("{v:6.2}")).unwrap_or_else(|| "     -".into());
         println!(
-            " {:>2}  {:>6}  {:>6}  {:>6.2}  {}  {}",
+            "  {} {:>2}  {:>6}  {:>6}  {:>6.2}  {}",
+            covers,
             m.id,
             mmss(m.range.start_s),
             mmss(m.range.end_s),
             m.score,
-            f(m.signals.chat_rate),
             f(m.signals.loudness),
         );
     }
