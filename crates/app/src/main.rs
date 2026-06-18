@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress};
-use yc_core::{Language, TimeRange};
+use yc_core::{Language, Moment, Signals, TimeRange};
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
@@ -78,6 +78,59 @@ fn main() -> eframe::Result<()> {
                     eprintln!("FAILED: {e}");
                     std::process::exit(1);
                 }
+                Ok(Progress::Detected { .. }) => {} // not reachable in promote-only mode
+                Err(_) => std::process::exit(1),
+            }
+        }
+    }
+
+    // Headless detection for verification (drives the real worker, GPU and all):
+    //   yt-clipper --detect <url-or-file> [en|id|ja]
+    if let Some(i) = argv.iter().position(|a| a == "--detect") {
+        let target = argv.get(i + 1).expect("--detect needs <url-or-file> [en|id|ja]").clone();
+        let language = match argv.get(i + 2).map(|s| s.as_str()) {
+            Some("en") => Language::En,
+            Some("ja") => Language::Ja,
+            _ => Language::Id,
+        };
+        let source = if target.starts_with("http") {
+            ImportSource::YouTube(target)
+        } else {
+            ImportSource::Local(PathBuf::from(target))
+        };
+        to_worker.send(Job::Import { source, language }).expect("send import");
+        loop {
+            match from_worker.recv() {
+                Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(Progress::Imported { title, duration_s }) => {
+                    tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
+                    to_worker.send(Job::Detect).expect("send detect");
+                }
+                Ok(Progress::Detected { moments }) => {
+                    println!("detected {} moments:", moments.len());
+                    for m in &moments {
+                        println!(
+                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {}",
+                            m.id,
+                            fmt_clock(m.range.start_s),
+                            fmt_clock(m.range.end_s),
+                            m.score,
+                            fmt_sig(m.signals.chat_rate),
+                            fmt_sig(m.signals.loudness),
+                            fmt_sig(m.signals.lexicon),
+                        );
+                    }
+                    std::process::exit(0);
+                }
+                Ok(Progress::Cancelled) => {
+                    eprintln!("CANCELLED");
+                    std::process::exit(1);
+                }
+                Ok(Progress::Failed(e)) => {
+                    eprintln!("FAILED: {e}");
+                    std::process::exit(1);
+                }
+                Ok(Progress::Done(_)) => {}
                 Err(_) => std::process::exit(1),
             }
         }
@@ -103,6 +156,8 @@ fn main() -> eframe::Result<()> {
                 end_s: 30.0,
                 language: Language::Id,
                 imported: None,
+                moments: Vec::new(),
+                selected: None,
                 status: Status::Idle,
                 to_worker,
                 from_worker,
@@ -196,6 +251,10 @@ struct App {
     end_s: f64,
     language: Language,
     imported: Option<ImportedInfo>,
+    /// Candidate Moments from detection (and any manually-marked ones), ranked.
+    moments: Vec<Moment>,
+    /// The Moment id currently selected for review, if any.
+    selected: Option<u64>,
     status: Status,
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
@@ -212,6 +271,21 @@ fn fmt_duration(duration_s: Option<f64>) -> String {
     }
 }
 
+/// Compact m:ss (or h:mm:ss past an hour) for a Moment timestamp.
+fn fmt_clock(t_s: f64) -> String {
+    let s = t_s.round().max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// A signal cell: a z-scored value, or a dash when the signal is absent.
+fn fmt_sig(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:5.2}")).unwrap_or_else(|| "    -".into())
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Drain worker messages.
@@ -222,6 +296,11 @@ impl eframe::App for App {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.status = Status::Idle;
                 }
+                Progress::Detected { moments } => {
+                    self.selected = moments.first().map(|m| m.id);
+                    self.moments = moments;
+                    self.status = Status::Idle;
+                }
                 Progress::Done(p) => self.status = Status::Done(p),
                 Progress::Cancelled => self.status = Status::Cancelled,
                 Progress::Failed(e) => self.status = Status::Failed(e),
@@ -229,7 +308,7 @@ impl eframe::App for App {
         }
         let working = matches!(self.status, Status::Working(_));
 
-        ui.heading("yt-clipper - M2 YouTube ingest");
+        ui.heading("yt-clipper - M3 detection");
 
         // Preflight: are the sidecars / model / font present?
         ui.separator();
@@ -294,7 +373,7 @@ impl eframe::App for App {
             });
         });
 
-        // --- Promote (phase 2) ---
+        // --- Detect & review Moments (phase 2) ---
         // Read the imported facts into an owned Option first, so the interactive
         // widgets below can borrow `self` mutably without fighting a borrow of
         // `self.imported` held across the match.
@@ -302,26 +381,82 @@ impl eframe::App for App {
         let imported = self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s));
         match imported {
             None => {
-                ui.label("2. Make a clip - import a VOD first.");
+                ui.label("2. Detect Moments - import a VOD first.");
             }
             Some((title, duration_s)) => {
-                ui.label(format!("2. Make a clip from: {}  ({})", title, fmt_duration(duration_s)));
-                ui.horizontal(|ui| {
-                    ui.label("Start");
-                    ui.add(egui::DragValue::new(&mut self.start_s).speed(0.5).suffix(" s"));
-                    ui.label("End");
-                    ui.add(egui::DragValue::new(&mut self.end_s).speed(0.5).suffix(" s"));
-                    if self.end_s < self.start_s {
-                        ui.colored_label(egui::Color32::RED, "end < start");
-                    }
-                });
+                ui.label(format!("2. Review Moments from: {}  ({})", title, fmt_duration(duration_s)));
                 ui.add_enabled_ui(!working, |ui| {
-                    if ui.button("Make clip").clicked() && self.end_s > self.start_s {
-                        let range = TimeRange { start_s: self.start_s, end_s: self.end_s };
+                    ui.horizontal(|ui| {
+                        if ui.button("Detect Moments").clicked() {
+                            self.moments.clear();
+                            self.selected = None;
+                            let _ = self.to_worker.send(Job::Detect);
+                            self.status = Status::Working("Starting detection".into());
+                        }
+                        ui.separator();
+                        ui.label("Mark manually:  start");
+                        ui.add(egui::DragValue::new(&mut self.start_s).speed(0.5).suffix(" s"));
+                        ui.label("end");
+                        ui.add(egui::DragValue::new(&mut self.end_s).speed(0.5).suffix(" s"));
+                        if ui.button("Add Moment").clicked() && self.end_s > self.start_s {
+                            let id = self.moments.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+                            self.moments.push(Moment {
+                                id,
+                                range: TimeRange { start_s: self.start_s, end_s: self.end_s },
+                                signals: Signals::default(),
+                                score: 0.0,
+                            });
+                            self.selected = Some(id);
+                        }
+                    });
+                });
+
+                // Ranked Moment list with per-signal breakdown; select + promote.
+                // Signals are z-scores (sigmas above the VOD baseline); a dash
+                // means the signal is absent (e.g. no chat, or a manual Moment).
+                if self.moments.is_empty() {
+                    ui.label("No Moments yet - click Detect Moments, or mark one manually.");
+                } else {
+                    let mut to_promote: Option<TimeRange> = None;
+                    let mut to_select: Option<u64> = None;
+                    let selected = self.selected;
+                    let enabled = !working;
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        egui::Grid::new("moments").striped(true).num_columns(7).show(ui, |ui| {
+                            for h in ["#", "range", "score", "chat", "loud", "lex", ""] {
+                                ui.label(h);
+                            }
+                            ui.end_row();
+                            for m in &self.moments {
+                                let sel = selected == Some(m.id);
+                                if ui.add(egui::Button::selectable(sel, m.id.to_string())).clicked() {
+                                    to_select = Some(m.id);
+                                }
+                                ui.label(format!(
+                                    "{}-{}",
+                                    fmt_clock(m.range.start_s),
+                                    fmt_clock(m.range.end_s)
+                                ));
+                                ui.label(format!("{:.2}", m.score));
+                                ui.label(fmt_sig(m.signals.chat_rate));
+                                ui.label(fmt_sig(m.signals.loudness));
+                                ui.label(fmt_sig(m.signals.lexicon));
+                                if ui.add_enabled(enabled, egui::Button::new("Promote")).clicked() {
+                                    to_promote = Some(m.range);
+                                    to_select = Some(m.id);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    if let Some(id) = to_select {
+                        self.selected = Some(id);
+                    }
+                    if let Some(range) = to_promote {
                         let _ = self.to_worker.send(Job::Promote { range });
                         self.status = Status::Working("Starting".into());
                     }
-                });
+                }
             }
         }
 
@@ -360,6 +495,8 @@ impl eframe::App for App {
 impl App {
     fn start_import(&mut self, source: ImportSource) {
         self.imported = None;
+        self.moments.clear();
+        self.selected = None;
         let _ = self.to_worker.send(Job::Import { source, language: self.language });
         self.status = Status::Working("Starting import".into());
     }

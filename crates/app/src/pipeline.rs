@@ -23,6 +23,7 @@ use yc_core::{
     CaptionGenre, CaptionStyle, Clip, Crop, Language, Layout, Moment, Project, Signals, TimeRange,
     Vod, VodSource, CANVAS_H, CANVAS_W,
 };
+use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
 
 /// Resolved inputs the worker needs, captured once at spawn.
@@ -58,14 +59,19 @@ pub enum ImportSource {
 /// busy inside a job), so it travels via the [`CancelToken`], not this channel.
 pub enum Job {
     Import { source: ImportSource, language: Language },
+    /// Run detection over the imported VOD (discover + refine), surfacing
+    /// ranked candidate Moments (ADR 0007). Operates on the current session.
+    Detect,
     Promote { range: TimeRange },
 }
 
 /// Progress reported back to the UI thread.
 pub enum Progress {
     Stage(&'static str),
-    /// Import finished; the VOD is ready to promote ranges from.
+    /// Import finished; the VOD is ready to detect / promote ranges from.
     Imported { title: String, duration_s: Option<f64> },
+    /// Detection finished; ranked candidate Moments for the review UI.
+    Detected { moments: Vec<Moment> },
     /// A Clip rendered to this path.
     Done(PathBuf),
     Cancelled,
@@ -115,6 +121,20 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     }
                 }
+                Job::Detect => match &session {
+                    None => {
+                        let _ = tx_prog
+                            .send(Progress::Failed("import a VOD before detecting".into()));
+                    }
+                    Some(s) => match do_detect(&paths, s, &worker_cancel, &tx_prog) {
+                        Ok(moments) => {
+                            let _ = tx_prog.send(Progress::Detected { moments });
+                        }
+                        Err(e) => {
+                            let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                        }
+                    },
+                },
                 Job::Promote { range } => match &session {
                     None => {
                         let _ = tx_prog
@@ -228,6 +248,69 @@ fn save_project(vod: &Vod, workdir: &Path) -> Result<()> {
         .with_context(|| format!("writing project.json in {}", workdir.display()))
 }
 
+/// Load the VOD's persisted project, or start a fresh one if none exists / it is
+/// unreadable. Lets detect and promote update `project.json` without clobbering
+/// each other's records.
+fn load_or_new_project(vod: &Vod, workdir: &Path) -> Project {
+    Project::load(&workdir.join("project.json")).unwrap_or_else(|_| Project::new(vod.clone()))
+}
+
+// --- detect (M3) ------------------------------------------------------------
+
+/// Detect candidate Moments over the imported VOD (ADR 0007). Discover with the
+/// cheap whole-VOD signals (chat-rate + loudness, no whisper), then refine:
+/// transcribe each candidate once with a *resident* whisper model and score the
+/// excitement lexicon. Returns Moments ranked by final score; persists them to
+/// `project.json`.
+fn do_detect(
+    paths: &PipelinePaths,
+    session: &Session,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<Vec<Moment>> {
+    anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
+    let params = DetectParams::default();
+
+    // Discover: cheap, whole-VOD, no GPU.
+    let _ = tx.send(Progress::Stage("Detecting moments (chat + loudness)"));
+    let chat = session.workdir.join("chat.live_chat.json");
+    let chat_opt = if chat.exists() { Some(chat.as_path()) } else { None };
+    let mut moments = yc_detect::discover(chat_opt, &session.analysis_wav, &params)?;
+    if moments.is_empty() {
+        tracing::info!("no moments discovered");
+        return Ok(moments);
+    }
+
+    // Refine: one model load for the whole candidate batch (the resident
+    // Transcriber), then lexicon-score each transcript.
+    let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
+    let transcriber = yc_transcribe::Transcriber::load(&paths.model)?;
+    let mut densities = Vec::with_capacity(moments.len());
+    for m in &moments {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
+        let transcript = transcriber.transcribe(&samples, session.vod.language)?;
+        densities.push(yc_detect::lexicon::density(&transcript, session.vod.language));
+    }
+    drop(transcriber); // free VRAM before any later GPU stage (M4 LLM)
+    yc_detect::lexicon::apply(&mut moments, &densities, &params.weights);
+
+    // Rank by final score and renumber so ids read as the review rank.
+    moments.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, m) in moments.iter_mut().enumerate() {
+        m.id = (i + 1) as u64;
+    }
+
+    let mut project = load_or_new_project(&session.vod, &session.workdir);
+    project.moments = moments.clone();
+    project
+        .save(&session.workdir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", session.workdir.display()))?;
+    Ok(moments)
+}
+
 // --- promote (phase 2) ------------------------------------------------------
 
 fn do_promote(
@@ -299,12 +382,19 @@ fn build_clip(range: TimeRange, layout: Layout, caption_style: &str) -> Clip {
     }
 }
 
-/// Re-save `project.json` with the promoted Moment + Clip recorded.
+/// Re-save `project.json` with the promoted Clip recorded, preserving any
+/// detected Moments. Records the source Moment only if it isn't already known
+/// (e.g. a directly promoted range that never went through detection).
 fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
-    let mut project = Project::new(vod.clone());
-    project
-        .moments
-        .push(Moment { id: clip.moment_id, range: clip.range, signals: Signals::default(), score: 0.0 });
+    let mut project = load_or_new_project(vod, workdir);
+    if !project.moments.iter().any(|m| m.id == clip.moment_id) {
+        project.moments.push(Moment {
+            id: clip.moment_id,
+            range: clip.range,
+            signals: Signals::default(),
+            score: 0.0,
+        });
+    }
     project.clips.push(clip.clone());
     project
         .save(&workdir.join("project.json"))
