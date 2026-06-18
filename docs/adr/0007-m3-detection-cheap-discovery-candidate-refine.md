@@ -1,0 +1,15 @@
+# M3 detection: cheap-signal discovery, candidate-only transcription
+
+Detection must surface scored Moments without a whole-VOD whisper pass and without first solving vocal separation. We decided M3 runs in two phases: a **discovery** pass over the whole VOD using only the cheap signals that need no transcription — chat-replay message-rate spikes (from the chat JSON) and audio loudness spikes (windowed RMS of the analysis wav) — generates candidate Moments; then a **refine** pass transcribes *only each candidate's range* (reusing the existing range-transcribe from M1) and applies the excitement lexicon to adjust the score. The per-candidate transcripts become the input M4's LLM rerank reads. This extends ADR 0002 (which named the three heuristics + LLM) by pinning down where the transcript comes from and what does not block the milestone.
+
+## Considered options
+
+- **Whole-VOD transcription, lexicon as a discovery signal** — the literal reading of ADR 0002 ("transcript excitement lexicon" + "tolerate minutes-long background analysis"). Rejected for M3: it is a multi-hour whisper pass on the 8 GB card *every* detect run, and per the separation decision below that transcript reads the wrong speaker half the time — a large recurring GPU cost feeding a low-quality signal. The cheap signals discover; whisper is bounded to a handful of short candidate windows instead.
+- **Vocal separation as a detection pre-step** — isolate the streamer's mic before detecting, so loudness and lexicon read the streamer not the game. Rejected as an M3 gate: the signals decompose differently. Chat-rate is immune (it reads chat, not audio). Loudness is arguably *helped* by the mixed track — a clip-worthy gaming moment is loud because of the game event *and* the streamer's reaction together. Only the lexicon is genuinely corrupted, and that is a transcript-quality problem (the same root cause as the caption-quality limitation), not a detection-architecture one. Separation stays a separate, future transcript-quality decision (its own ADR + spike), and M3 consumes whatever transcript quality exists.
+
+## Consequences
+
+- Signals stay exactly the three from ADR 0002 (chat-rate, loudness, transcript-lexicon), stored unblended per Moment; the combined rank is a weighted formula over normalized (robust z-scored) signals, retunable without re-analysis. Chat *content* excitement (emote/laughter/caps mining) is a documented future refinement, not an M3 signal.
+- Discovery quality on a VOD with no chat rests on loudness alone (noisy on mixed gaming audio); manual Moment marking backstops this. Detection is the cheap-and-fast path; the only GPU work in M3 is the bounded candidate-refine batch.
+- The refine pass transcribes ~N candidate ranges per run, so the transcribe stage is deepened to keep the whisper context resident across the batch (load once, transcribe all, unload) rather than M1's load-and-drop-per-call.
+- A Moment becomes the single path to a Clip (CONTEXT.md: a Clip is a promoted Moment): the review UI ranks detected + manually-marked Moments, and promote — unchanged from M2 — turns the selected one into a Clip.

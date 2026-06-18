@@ -16,6 +16,10 @@ _Avoid_: stream, video, source
 A scored candidate time range within a VOD, surfaced by analysis (or marked manually by the operator), awaiting review.
 _Avoid_: highlight, candidate, event
 
+**Signal**:
+One strand of evidence behind a Moment's score — chat-rate, loudness, lexicon, or LLM judgment — kept separate (never blended away) so the ranking can be retuned and the operator can see *why* a Moment surfaced.
+_Avoid_: feature, metric, factor
+
 **Clip**:
 A Moment the operator has promoted for production. A Clip gets framing, captions, and an export; a Moment that is never promoted gets nothing.
 _Avoid_: short, video, segment
