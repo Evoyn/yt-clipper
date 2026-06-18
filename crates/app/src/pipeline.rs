@@ -323,7 +323,10 @@ fn do_detect(
             anyhow::bail!("cancelled");
         }
         let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
-        let transcript = transcriber.transcribe(&samples, session.vod.language)?;
+        let transcript = transcriber.transcribe(&samples, session.vod.language, {
+            let c = cancel.clone();
+            move || c.is_cancelled()
+        })?;
         densities.push(yc_detect::lexicon::density(&transcript, session.vod.language));
         texts.push(
             transcript.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "),
@@ -414,7 +417,10 @@ fn do_promote(
     //    work (see ROADMAP M1 known-limitation).
     let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
     let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
-    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language)?;
+    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language, {
+        let c = cancel.clone();
+        move || c.is_cancelled()
+    })?;
 
     // 3. Captions: generate the ASS and copy the font beside it (libass finds it
     //    via fontsdir=., dodging Windows filtergraph path escaping).

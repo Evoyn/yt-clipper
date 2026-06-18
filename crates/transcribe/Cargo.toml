@@ -8,4 +8,7 @@ license.workspace = true
 yc-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-whisper-rs = { version = "0.16.0", features = ["cuda"] }
+# `tracing_backend` routes whisper.cpp/ggml's own logging through `tracing`, so
+# its verbose per-token DEBUG dump is dropped by the app's `info` filter instead
+# of flooding stderr (install via `install_logging_hooks`).
+whisper-rs = { version = "0.16.0", features = ["cuda", "tracing_backend"] }

@@ -90,6 +90,11 @@ impl Transcriber {
     }
 
     fn load_inner(model: &Path, dtw: bool) -> Result<Self> {
+        // Route whisper.cpp/ggml logging through `tracing` so its verbose
+        // per-token DEBUG dump is dropped by the app's `info` filter rather than
+        // flooding stderr (that flood also slowed transcription badly). Once-
+        // guarded inside whisper-rs, so calling it on every load is free.
+        whisper_rs::install_logging_hooks();
         let mut cparams = WhisperContextParameters::default();
         cparams.use_gpu(true);
         if dtw {
@@ -105,7 +110,16 @@ impl Transcriber {
 
     /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
     /// units, reusing the resident model. Timestamps are 0-based to the range.
-    pub fn transcribe(&self, samples: &[f32], language: Language) -> Result<Transcript> {
+    ///
+    /// `should_abort` is polled by whisper.cpp before each compute step (return
+    /// `true` to stop), so a long transcription can be cancelled mid-call; pass
+    /// `|| false` for an uninterruptible run.
+    pub fn transcribe(
+        &self,
+        samples: &[f32],
+        language: Language,
+        should_abort: impl FnMut() -> bool + 'static,
+    ) -> Result<Transcript> {
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -116,6 +130,9 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_print_special(false);
+        // Abort hook: lets the worker's CancelToken stop a transcription already
+        // in flight (whisper checks this between graph runs); true = abort.
+        params.set_abort_callback_safe(should_abort);
 
         state
             .full(params, samples)
@@ -157,8 +174,13 @@ impl Transcriber {
 /// Load the model, transcribe one range, and drop the model — the one-shot path
 /// for the Promote pipeline (M1/M2). Detection refine loads a [`Transcriber`]
 /// once and reuses it across the candidate batch instead (ADR 0007).
-pub fn transcribe_range(model: &Path, samples: &[f32], language: Language) -> Result<Transcript> {
-    Transcriber::load(model)?.transcribe(samples, language)
+pub fn transcribe_range(
+    model: &Path,
+    samples: &[f32],
+    language: Language,
+    should_abort: impl FnMut() -> bool + 'static,
+) -> Result<Transcript> {
+    Transcriber::load(model)?.transcribe(samples, language, should_abort)
 }
 
 #[cfg(test)]
