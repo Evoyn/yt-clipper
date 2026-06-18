@@ -73,14 +73,31 @@ pub struct Transcriber {
 impl Transcriber {
     /// Load `large-v3` on the GPU with DTW alignment heads (ADR 0003). The
     /// default heuristic token times drift by a few hundred ms — exactly the
-    /// word-sync wobble — so we align each token to the audio via DTW.
+    /// word-sync wobble — so we align each token to the audio via DTW. Use this
+    /// for caption work (the promote path).
     pub fn load(model: &Path) -> Result<Self> {
+        Self::load_inner(model, true)
+    }
+
+    /// Load without DTW alignment — for bulk *text-only* passes (detection
+    /// refine reads the excitement lexicon, not word timing). Besides being
+    /// faster, this avoids whisper's DTW median-filter assertion
+    /// (`filter_width < a->ne[2]`), which aborts the process on a sparse,
+    /// few-token window — common when scanning many arbitrary candidate ranges,
+    /// some of which are music/SFX with almost no speech.
+    pub fn load_text_only(model: &Path) -> Result<Self> {
+        Self::load_inner(model, false)
+    }
+
+    fn load_inner(model: &Path, dtw: bool) -> Result<Self> {
         let mut cparams = WhisperContextParameters::default();
         cparams.use_gpu(true);
-        cparams.dtw_parameters(DtwParameters {
-            mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
-            ..Default::default()
-        });
+        if dtw {
+            cparams.dtw_parameters(DtwParameters {
+                mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
+                ..Default::default()
+            });
+        }
         let ctx = WhisperContext::new_with_params(model, cparams)
             .with_context(|| format!("loading whisper model {}", model.display()))?;
         Ok(Self { ctx })

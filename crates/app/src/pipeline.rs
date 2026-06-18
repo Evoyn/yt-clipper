@@ -308,7 +308,9 @@ fn do_detect(
     // Transcriber), then lexicon-score each transcript. Keep each transcript's
     // text for the review UI (and, later, M4's LLM).
     let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
-    let transcriber = yc_transcribe::Transcriber::load(&paths.model)?;
+    // Text-only (no DTW): the lexicon needs words, not word timing, and DTW
+    // aborts on sparse music/SFX windows (see Transcriber::load_text_only).
+    let transcriber = yc_transcribe::Transcriber::load_text_only(&paths.model)?;
     let mut densities = Vec::with_capacity(moments.len());
     let mut texts = Vec::with_capacity(moments.len());
     for m in &moments {
