@@ -91,6 +91,9 @@ pub struct Signals {
     pub chat_rate: Option<f32>,
     pub loudness: Option<f32>,
     pub lexicon: Option<f32>,
+    /// Emotional activation of the streamer's voice (speech-emotion arousal),
+    /// z-scored across the candidate set during refine (ADR 0008).
+    pub arousal: Option<f32>,
     pub llm: Option<f32>,
 }
 

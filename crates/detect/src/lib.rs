@@ -11,6 +11,7 @@
 //! GPU discipline: the refine/LLM stages must never run while transcription
 //! holds VRAM - staging is strictly sequential on the single 8 GB GPU.
 
+pub mod arousal;
 pub mod chat;
 pub mod lexicon;
 pub mod loudness;
@@ -47,6 +48,7 @@ pub struct Weights {
     pub chat: f32,
     pub loudness: f32,
     pub lexicon: f32,
+    pub arousal: f32,
 }
 
 impl Default for DetectParams {
@@ -61,7 +63,9 @@ impl Default for DetectParams {
             dur_s: 30.0,
             min_z: 1.0,
             top_n: 25,
-            weights: Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2 },
+            // arousal weight is a starting guess pending the mixed-audio gate
+            // (ADR 0008); rebalanced from M3's 0.5/0.3/0.2 to give it a voice.
+            weights: Weights { chat: 0.4, loudness: 0.25, lexicon: 0.15, arousal: 0.2 },
         }
     }
 }
@@ -73,7 +77,12 @@ impl Default for DetectParams {
 pub fn combined_score(s: &Signals, w: &Weights) -> f32 {
     let mut num = 0.0;
     let mut den = 0.0;
-    for (val, weight) in [(s.chat_rate, w.chat), (s.loudness, w.loudness), (s.lexicon, w.lexicon)] {
+    for (val, weight) in [
+        (s.chat_rate, w.chat),
+        (s.loudness, w.loudness),
+        (s.lexicon, w.lexicon),
+        (s.arousal, w.arousal),
+    ] {
         if let Some(v) = val {
             num += weight * v;
             den += weight;
@@ -163,6 +172,7 @@ pub fn rank_moments(
                 chat_rate: chat.as_ref().map(|c| c[bin]),
                 loudness: Some(loud[bin]),
                 lexicon: None,
+                arousal: None,
                 llm: None,
             };
             Moment {
@@ -248,12 +258,14 @@ mod tests {
 
     #[test]
     fn combined_score_renormalizes_over_present_signals() {
-        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2 };
+        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0 };
         // Only loudness present -> score is just the loudness value.
-        let only_loud = Signals { chat_rate: None, loudness: Some(2.0), lexicon: None, llm: None };
+        let only_loud =
+            Signals { chat_rate: None, loudness: Some(2.0), lexicon: None, arousal: None, llm: None };
         assert!((combined_score(&only_loud, &w) - 2.0).abs() < 1e-6);
         // Chat + loud present -> renormalized over 0.5/0.3.
-        let both = Signals { chat_rate: Some(4.0), loudness: Some(2.0), lexicon: None, llm: None };
+        let both =
+            Signals { chat_rate: Some(4.0), loudness: Some(2.0), lexicon: None, arousal: None, llm: None };
         let expect = (0.5 * 4.0 + 0.3 * 2.0) / 0.8;
         assert!((combined_score(&both, &w) - expect).abs() < 1e-6);
     }

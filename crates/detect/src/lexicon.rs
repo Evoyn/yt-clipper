@@ -120,14 +120,15 @@ mod tests {
 
     #[test]
     fn apply_sets_lexicon_and_reranks_by_density() {
-        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2 };
+        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0 };
         let mk = |id, lex_neutral_signals: Signals| Moment {
             id,
             range: TimeRange { start_s: 0.0, end_s: 30.0 },
             signals: lex_neutral_signals,
             score: 0.0,
         };
-        let base = Signals { chat_rate: Some(1.0), loudness: Some(1.0), lexicon: None, llm: None };
+        let base =
+            Signals { chat_rate: Some(1.0), loudness: Some(1.0), lexicon: None, arousal: None, llm: None };
         let mut moments = vec![mk(1, base), mk(2, base)];
         // Moment 2 is lexicon-hot, Moment 1 is not.
         apply(&mut moments, &[0.0, 2.0], &w);

@@ -10,3 +10,11 @@ anyhow.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 hound = "3"
+ort = { version = "2.0.0-rc.12", optional = true }
+
+[features]
+# Speech-emotion (arousal) inference via ONNX Runtime (ADR 0008). Off by
+# default so the fast detection tests need neither the `ort` binary nor the SER
+# model; the app and the `detect_vod` harness enable it. The first build with
+# `--features ser` triggers a one-time ONNX Runtime binary download.
+ser = ["dep:ort"]
