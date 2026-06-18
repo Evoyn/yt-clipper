@@ -18,3 +18,14 @@ Spike/loudness detection finds *loud*, not *emotionally clip-worthy*, moments �
 - Refine-SER **re-ranks** candidates but cannot **surface** a quiet-emotional moment that was neither loud nor chatted. The pre-committed fast-follow is a whole-VOD arousal bin-series fed into discovery's peak-detection (reusing the same primitive). Manual Moment marking backstops in the meantime.
 - **Mixed-audio gate** (the decision the operator asked to make by evidence): dump per-candidate arousal next to loudness on the real VOD `ZSegfmsrYmE` via `crates/detect/examples/detect_vod.rs`. PASS if arousal ranks known emotional reactions **above** known loud-but-flat moments; if it inverts (game/music outscores reactions), vocal separation is promoted ahead of further SER/LLM work.
 - **ROADMAP reorder:** M4 becomes the Arousal Signal; the LLM rerank shifts to M5; Framing/Caption Styles/Hardening shift to M6/M7/M8.
+
+## Outcome (mixed-audio gate, 2026-06-18)
+
+**PASS — arousal works on the mixed track; vocal separation stays deferred.** Validated on `ZSegfmsrYmE` (66 min) with `--features ser` via `detect_vod` (refine re-rank), `arousal_scan` (whole-VOD distribution), and `arousal_probe` (dense local trace):
+
+- Whole-VOD arousal has a wide range (min −0.04, median 0.67, p90 0.91, max 1.10): quiet/flat stretches score ~0, so the game is **not** drowning the streamer (that failure mode would read uniformly high).
+- Densely probed, genuine reactions **peak high**: the 39:38 jumpscare reaches 0.94 (follow-up burst 1.07), the 55:04 moment 1.10, each decaying to ~0 in the surrounding pauses — tight temporal discrimination.
+- Reactions sit at only **moderate loudness** (RMS ~0.37–0.45), so arousal adds signal beyond loudness despite a global `r(arousal, loudness) = 0.79` (the correlation is co-moving speech energy, not redundancy at the peaks).
+- **Max-pool is vindicated**: a candidate's peak 4 s window captures its reaction (~1.0); a loud-but-flat candidate has no such window and pools lower (the 45:23 demotion). The compression seen on loudness-only candidates was because they are all reactive, not a pooling fault.
+- CPU cost: ~0.35–0.46 s per 4 s window (~163 s for the 25-candidate refine batch). Acceptable for a background detect; the CUDA EP remains a drop-in if needed.
+- **Next:** the pre-committed whole-VOD arousal *discovery* pass (peak-detect the `arousal_series` to surface quiet-emotional moments loudness underranks — e.g. 55:04 at RMS 0.37).

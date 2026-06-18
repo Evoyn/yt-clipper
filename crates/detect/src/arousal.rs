@@ -155,17 +155,30 @@ mod infer {
             data.first().copied().context("SER logits output was empty")
         }
 
-        /// Max-pooled arousal over sliding windows across `samples` (ADR 0008:
-        /// peak-preserving). `samples` is 16 kHz mono f32. Empty range -> 0.
-        pub fn arousal_max(&mut self, samples: &[f32], win: usize, hop: usize) -> Result<f32> {
-            let mut peak = 0.0_f32;
-            let mut any = false;
-            for s in window_starts(samples.len(), win, hop) {
+        /// Per-window arousal across `samples` (16 kHz mono f32) — the shared
+        /// primitive (ADR 0008): refine max-pools it per candidate, the
+        /// whole-VOD discovery pass peak-detects it. Window starts come from
+        /// [`window_starts`], so callers can recompute the same grid for times.
+        pub fn arousal_series(
+            &mut self,
+            samples: &[f32],
+            win: usize,
+            hop: usize,
+        ) -> Result<Vec<f32>> {
+            let starts = window_starts(samples.len(), win, hop);
+            let mut out = Vec::with_capacity(starts.len());
+            for s in starts {
                 let end = (s + win).min(samples.len());
-                peak = peak.max(self.arousal_window(&samples[s..end])?);
-                any = true;
+                out.push(self.arousal_window(&samples[s..end])?);
             }
-            Ok(if any { peak } else { 0.0 })
+            Ok(out)
+        }
+
+        /// Max-pooled arousal over sliding windows (ADR 0008: peak-preserving).
+        /// `samples` is 16 kHz mono f32. Empty range -> 0.
+        pub fn arousal_max(&mut self, samples: &[f32], win: usize, hop: usize) -> Result<f32> {
+            // Arousal is >= 0, so fold from 0.0 also yields 0 for an empty range.
+            Ok(self.arousal_series(samples, win, hop)?.into_iter().fold(0.0_f32, f32::max))
         }
     }
 }
