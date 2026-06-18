@@ -12,6 +12,7 @@
 //! holds VRAM - staging is strictly sequential on the single 8 GB GPU.
 
 pub mod chat;
+pub mod lexicon;
 pub mod loudness;
 pub mod score;
 

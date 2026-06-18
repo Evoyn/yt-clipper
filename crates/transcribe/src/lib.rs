@@ -58,67 +58,90 @@ where
     units
 }
 
-/// Load the whisper model on the GPU, transcribe one range's 16 kHz mono f32
-/// samples, and group the tokens into animatable caption units (ADR 0003).
-/// The model is loaded and dropped per call — M1 has one clip; sequential
-/// GPU staging that keeps a context resident is an M3/M4 concern (ADR 0002).
-pub fn transcribe_range(model: &Path, samples: &[f32], language: Language) -> Result<Transcript> {
-    let mut cparams = WhisperContextParameters::default();
-    cparams.use_gpu(true);
-    // DTW token-level timestamps with large-v3's alignment heads. The default
-    // heuristic token times drift by a few hundred ms — exactly the word-sync
-    // wobble — so we align each token to the audio via DTW and read `t_dtw`.
-    cparams.dtw_parameters(DtwParameters {
-        mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
-        ..Default::default()
-    });
-    let ctx = WhisperContext::new_with_params(model, cparams)
-        .with_context(|| format!("loading whisper model {}", model.display()))?;
-    let mut state = ctx.create_state().context("creating whisper state")?;
+/// A whisper model kept resident on the GPU so a *batch* of ranges transcribes
+/// with one model load instead of reloading per range (ADR 0002/0007: detection
+/// refine transcribes ~N candidate Moments). Loading the model is the expensive
+/// step; each [`Transcriber::transcribe`] creates a fresh, cheap state.
+///
+/// GPU discipline: hold one of these only while transcription owns the VRAM -
+/// drop it before the LLM stage loads (M4), since the 8 GB card stages stages
+/// strictly sequentially.
+pub struct Transcriber {
+    ctx: WhisperContext,
+}
 
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some(lang_code(language)));
-    params.set_token_timestamps(true); // populate per-token t0/t1 for word timing
-    params.set_translate(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_print_special(false);
-
-    state
-        .full(params, samples)
-        .context("whisper transcription failed")?;
-
-    // Collect (text, t0_s, t1_s) for every real token, then group into words.
-    let mut raw_tokens: Vec<(String, f64, f64)> = Vec::new();
-    for s in 0..state.full_n_segments() {
-        let segment = state
-            .get_segment(s)
-            .ok_or_else(|| anyhow!("segment {s} out of bounds mid-read"))?;
-        for t in 0..segment.n_tokens() {
-            let Some(token) = segment.get_token(t) else {
-                continue;
-            };
-            let text = token.to_str_lossy().context("reading token text")?.into_owned();
-            if is_special(&text) {
-                continue;
-            }
-            let data = token.token_data();
-            // Prefer the DTW-aligned time; fall back to the heuristic t0/t1 when
-            // DTW produced no value for this token (t_dtw == -1). DTW gives a
-            // single aligned point per token, so a word's span runs from its
-            // first token's time to its last — the caption builders handle the
-            // (zero-width) single-token case.
-            let (t0, t1) = if data.t_dtw >= 0 {
-                (data.t_dtw, data.t_dtw)
-            } else {
-                (data.t0, data.t1)
-            };
-            raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0));
-        }
+impl Transcriber {
+    /// Load `large-v3` on the GPU with DTW alignment heads (ADR 0003). The
+    /// default heuristic token times drift by a few hundred ms — exactly the
+    /// word-sync wobble — so we align each token to the audio via DTW.
+    pub fn load(model: &Path) -> Result<Self> {
+        let mut cparams = WhisperContextParameters::default();
+        cparams.use_gpu(true);
+        cparams.dtw_parameters(DtwParameters {
+            mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
+            ..Default::default()
+        });
+        let ctx = WhisperContext::new_with_params(model, cparams)
+            .with_context(|| format!("loading whisper model {}", model.display()))?;
+        Ok(Self { ctx })
     }
 
-    Ok(Transcript { language, units: group_into_words(raw_tokens) })
+    /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
+    /// units, reusing the resident model. Timestamps are 0-based to the range.
+    pub fn transcribe(&self, samples: &[f32], language: Language) -> Result<Transcript> {
+        let mut state = self.ctx.create_state().context("creating whisper state")?;
+
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some(lang_code(language)));
+        params.set_token_timestamps(true); // populate per-token t0/t1 for word timing
+        params.set_translate(false);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_print_special(false);
+
+        state
+            .full(params, samples)
+            .context("whisper transcription failed")?;
+
+        // Collect (text, t0_s, t1_s) for every real token, then group into words.
+        let mut raw_tokens: Vec<(String, f64, f64)> = Vec::new();
+        for s in 0..state.full_n_segments() {
+            let segment = state
+                .get_segment(s)
+                .ok_or_else(|| anyhow!("segment {s} out of bounds mid-read"))?;
+            for t in 0..segment.n_tokens() {
+                let Some(token) = segment.get_token(t) else {
+                    continue;
+                };
+                let text = token.to_str_lossy().context("reading token text")?.into_owned();
+                if is_special(&text) {
+                    continue;
+                }
+                let data = token.token_data();
+                // Prefer the DTW-aligned time; fall back to the heuristic t0/t1
+                // when DTW produced no value for this token (t_dtw == -1). DTW
+                // gives a single aligned point per token, so a word's span runs
+                // from its first token's time to its last — the caption builders
+                // handle the (zero-width) single-token case.
+                let (t0, t1) = if data.t_dtw >= 0 {
+                    (data.t_dtw, data.t_dtw)
+                } else {
+                    (data.t0, data.t1)
+                };
+                raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0));
+            }
+        }
+
+        Ok(Transcript { language, units: group_into_words(raw_tokens) })
+    }
+}
+
+/// Load the model, transcribe one range, and drop the model — the one-shot path
+/// for the Promote pipeline (M1/M2). Detection refine loads a [`Transcriber`]
+/// once and reuses it across the candidate batch instead (ADR 0007).
+pub fn transcribe_range(model: &Path, samples: &[f32], language: Language) -> Result<Transcript> {
+    Transcriber::load(model)?.transcribe(samples, language)
 }
 
 #[cfg(test)]
