@@ -19,3 +19,5 @@ egui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Audio playback for the Moment review UI (ADR 0001: review by ear, no scrubbing).
+rodio = "0.19"

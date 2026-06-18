@@ -13,6 +13,7 @@
 //! scaffolding here (the framing editor is M5), but now derives its Crops from
 //! the *probed* source resolution so it works for 360p and 1080p alike.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -65,13 +66,24 @@ pub enum Job {
     Promote { range: TimeRange },
 }
 
+/// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
+/// (raw RMS loudness and, when present, viewer-message counts). The UI
+/// normalizes and downsamples to pixel width when painting.
+pub struct Timeline {
+    pub bin_s: f64,
+    pub loudness: Vec<f32>,
+    pub chat: Option<Vec<f32>>,
+}
+
 /// Progress reported back to the UI thread.
 pub enum Progress {
     Stage(&'static str),
     /// Import finished; the VOD is ready to detect / promote ranges from.
-    Imported { title: String, duration_s: Option<f64> },
-    /// Detection finished; ranked candidate Moments for the review UI.
-    Detected { moments: Vec<Moment> },
+    /// `analysis_wav` lets the review UI play a Moment's audio range.
+    Imported { title: String, duration_s: Option<f64>, analysis_wav: PathBuf },
+    /// Detection finished; ranked candidate Moments, each one's transcript text
+    /// (keyed by Moment id), and the whole-VOD signal timeline for the waveform.
+    Detected { moments: Vec<Moment>, transcripts: HashMap<u64, String>, timeline: Timeline },
     /// A Clip rendered to this path.
     Done(PathBuf),
     Cancelled,
@@ -113,6 +125,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             let _ = tx_prog.send(Progress::Imported {
                                 title: s.vod.title.clone(),
                                 duration_s: s.vod.duration_s,
+                                analysis_wav: s.analysis_wav.clone(),
                             });
                             session = Some(s);
                         }
@@ -127,8 +140,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             .send(Progress::Failed("import a VOD before detecting".into()));
                     }
                     Some(s) => match do_detect(&paths, s, &worker_cancel, &tx_prog) {
-                        Ok(moments) => {
-                            let _ = tx_prog.send(Progress::Detected { moments });
+                        Ok((moments, transcripts, timeline)) => {
+                            let _ = tx_prog
+                                .send(Progress::Detected { moments, transcripts, timeline });
                         }
                         Err(e) => {
                             let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
@@ -267,25 +281,36 @@ fn do_detect(
     session: &Session,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<Vec<Moment>> {
+) -> Result<(Vec<Moment>, HashMap<u64, String>, Timeline)> {
     anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
     let params = DetectParams::default();
 
-    // Discover: cheap, whole-VOD, no GPU.
+    // Discover: cheap, whole-VOD, no GPU. Read the bins here (rather than via
+    // yc_detect::discover) so the same series feeds both the ranking and the
+    // review timeline - no second wav read.
     let _ = tx.send(Progress::Stage("Detecting moments (chat + loudness)"));
     let chat = session.workdir.join("chat.live_chat.json");
-    let chat_opt = if chat.exists() { Some(chat.as_path()) } else { None };
-    let mut moments = yc_detect::discover(chat_opt, &session.analysis_wav, &params)?;
+    let loud_bins = yc_detect::loudness::read_rms_bins(&session.analysis_wav, params.bin_s)?;
+    let chat_bins = if chat.exists() {
+        let offsets = yc_detect::chat::message_offsets(&chat)?;
+        Some(yc_detect::score::bin_counts(&offsets, params.bin_s, loud_bins.len()))
+    } else {
+        None
+    };
+    let mut moments = yc_detect::rank_moments(&loud_bins, chat_bins.as_deref(), &params);
+    let timeline = Timeline { bin_s: params.bin_s, loudness: loud_bins, chat: chat_bins };
     if moments.is_empty() {
         tracing::info!("no moments discovered");
-        return Ok(moments);
+        return Ok((moments, HashMap::new(), timeline));
     }
 
     // Refine: one model load for the whole candidate batch (the resident
-    // Transcriber), then lexicon-score each transcript.
+    // Transcriber), then lexicon-score each transcript. Keep each transcript's
+    // text for the review UI (and, later, M4's LLM).
     let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
     let transcriber = yc_transcribe::Transcriber::load(&paths.model)?;
     let mut densities = Vec::with_capacity(moments.len());
+    let mut texts = Vec::with_capacity(moments.len());
     for m in &moments {
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
@@ -293,22 +318,34 @@ fn do_detect(
         let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
         let transcript = transcriber.transcribe(&samples, session.vod.language)?;
         densities.push(yc_detect::lexicon::density(&transcript, session.vod.language));
+        texts.push(
+            transcript.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "),
+        );
     }
     drop(transcriber); // free VRAM before any later GPU stage (M4 LLM)
     yc_detect::lexicon::apply(&mut moments, &densities, &params.weights);
 
-    // Rank by final score and renumber so ids read as the review rank.
-    moments.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    for (i, m) in moments.iter_mut().enumerate() {
-        m.id = (i + 1) as u64;
+    // Rank by final score; carry each Moment's transcript through the reorder,
+    // then renumber so ids read as the review rank.
+    let mut order: Vec<usize> = (0..moments.len()).collect();
+    order.sort_by(|&a, &b| {
+        moments[b].score.partial_cmp(&moments[a].score).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ranked = Vec::with_capacity(moments.len());
+    let mut transcripts = HashMap::with_capacity(moments.len());
+    for (rank, &i) in order.iter().enumerate() {
+        let mut m = moments[i].clone();
+        m.id = (rank + 1) as u64;
+        transcripts.insert(m.id, texts[i].clone());
+        ranked.push(m);
     }
 
     let mut project = load_or_new_project(&session.vod, &session.workdir);
-    project.moments = moments.clone();
+    project.moments = ranked.clone();
     project
         .save(&session.workdir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", session.workdir.display()))?;
-    Ok(moments)
+    Ok((ranked, transcripts, timeline))
 }
 
 // --- promote (phase 2) ------------------------------------------------------
