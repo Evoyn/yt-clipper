@@ -5279,6 +5279,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "yc-core",
+ "yc-ingest",
 ]
 
 [[package]]

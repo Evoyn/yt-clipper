@@ -81,5 +81,52 @@ fn main() -> anyhow::Result<()> {
             f(m.signals.loudness),
         );
     }
+
+    // --- arousal gate (ADR 0008): built with `--features ser`, score each
+    //     candidate's max-pooled arousal and re-rank by it, so we can eyeball
+    //     whether emotional reactions outrank loud-but-flat moments. ---
+    #[cfg(feature = "ser")]
+    {
+        use yc_detect::arousal;
+        let model = PathBuf::from("models/w2v2-emotion/model.onnx");
+        if !model.is_file() {
+            eprintln!("\n[ser] {} not found - skipping arousal gate", model.display());
+        } else {
+            let sr = 16_000.0_f64;
+            let win = (arousal::WINDOW_S * sr) as usize;
+            let hop = (arousal::HOP_S * sr) as usize;
+            let mut ser = arousal::Ser::load(&model)?;
+            let t = std::time::Instant::now();
+            // (start, end, covers_target, arousal, loud)
+            let mut scored: Vec<(f64, f64, bool, f32, f32)> = Vec::new();
+            for m in &moments {
+                let samples = yc_ingest::read_range_samples(&wav, m.range)?;
+                let a = ser.arousal_max(&samples, win, hop)?;
+                let covers = m.range.start_s <= target_s && target_s < m.range.end_s;
+                scored.push((
+                    m.range.start_s,
+                    m.range.end_s,
+                    covers,
+                    a,
+                    m.signals.loudness.unwrap_or(0.0),
+                ));
+            }
+            eprintln!("[ser] scored {} candidates in {:.1}s", scored.len(), t.elapsed().as_secs_f64());
+            scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+            println!("\ncandidates re-ranked by AROUSAL ('*' covers {}):", mmss(target_s));
+            println!("    rank   start     end    arousal    loud");
+            for (rank, (s0, s1, covers, a, loud)) in scored.iter().enumerate() {
+                println!(
+                    "  {} {:>3}  {:>6}  {:>6}  {:>8.3}  {:>6.2}",
+                    if *covers { "*" } else { " " },
+                    rank + 1,
+                    mmss(*s0),
+                    mmss(*s1),
+                    a,
+                    loud,
+                );
+            }
+        }
+    }
     Ok(())
 }

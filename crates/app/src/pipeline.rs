@@ -35,6 +35,11 @@ pub struct PipelinePaths {
     pub ytdlp: PathBuf,
     pub deno_dir: Option<PathBuf>,
     pub model: PathBuf,
+    /// CPU speech-emotion model for the arousal Signal (ADR 0008). May be
+    /// absent: detection runs without it (combined_score renormalizes). Only
+    /// read by the `ser`-gated refine pass.
+    #[cfg_attr(not(feature = "ser"), allow(dead_code))]
+    pub ser_model: PathBuf,
     pub font: PathBuf,
     pub workspace: PathBuf,
 }
@@ -324,8 +329,32 @@ fn do_detect(
             transcript.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "),
         );
     }
-    drop(transcriber); // free VRAM before any later GPU stage (M4 LLM)
+    drop(transcriber); // free VRAM before any later GPU stage (M5 LLM)
     yc_detect::lexicon::apply(&mut moments, &densities, &params.weights);
+
+    // Arousal (ADR 0008): a CPU speech-emotion model scores how emotionally
+    // *activated* the streamer's voice is, demoting loud-but-flat moments
+    // (game explosions, music, cutscenes). Runs after the whisper drop (CPU, no
+    // VRAM). Only when built `--features ser` and the model is present;
+    // combined_score renormalizes when arousal is absent, so detection still
+    // ranks fine without it.
+    #[cfg(feature = "ser")]
+    if paths.ser_model.is_file() {
+        let _ = tx.send(Progress::Stage("Refining moments (arousal, CPU)"));
+        let sr = yc_ingest::WHISPER_SR as f64;
+        let win = (yc_detect::arousal::WINDOW_S * sr) as usize;
+        let hop = (yc_detect::arousal::HOP_S * sr) as usize;
+        let mut ser = yc_detect::arousal::Ser::load(&paths.ser_model)?;
+        let mut arousals = Vec::with_capacity(moments.len());
+        for m in &moments {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
+            arousals.push(ser.arousal_max(&samples, win, hop)?);
+        }
+        yc_detect::arousal::apply(&mut moments, &arousals, &params.weights);
+    }
 
     // Rank by final score; carry each Moment's transcript through the reorder,
     // then renumber so ids read as the review rank.

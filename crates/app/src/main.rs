@@ -32,6 +32,7 @@ fn main() -> eframe::Result<()> {
         ytdlp: paths.ytdlp(),
         deno_dir: deno_dir.clone(),
         model: paths.model(),
+        ser_model: paths.ser_model(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
     });
@@ -111,7 +112,7 @@ fn main() -> eframe::Result<()> {
                     println!("detected {} moments:", moments.len());
                     for m in &moments {
                         println!(
-                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {}",
+                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {} arou {}",
                             m.id,
                             fmt_clock(m.range.start_s),
                             fmt_clock(m.range.end_s),
@@ -119,6 +120,7 @@ fn main() -> eframe::Result<()> {
                             fmt_sig(m.signals.chat_rate),
                             fmt_sig(m.signals.loudness),
                             fmt_sig(m.signals.lexicon),
+                            fmt_sig(m.signals.arousal),
                         );
                     }
                     std::process::exit(0);
@@ -227,6 +229,13 @@ impl AppPaths {
 
     fn model(&self) -> PathBuf {
         self.models.join("ggml-large-v3.bin")
+    }
+
+    /// CPU speech-emotion model for the arousal Signal (ADR 0008). Absent unless
+    /// downloaded; detection runs without it. Operator extracts the audonnx zip
+    /// here, giving `models/w2v2-emotion/model.onnx`.
+    fn ser_model(&self) -> PathBuf {
+        self.models.join("w2v2-emotion").join("model.onnx")
     }
 
     fn font(&self) -> PathBuf {
@@ -527,8 +536,8 @@ impl eframe::App for App {
                     let selected = self.selected;
                     let enabled = !working;
                     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        egui::Grid::new("moments").striped(true).num_columns(7).show(ui, |ui| {
-                            for h in ["#", "range", "score", "chat", "loud", "lex", ""] {
+                        egui::Grid::new("moments").striped(true).num_columns(8).show(ui, |ui| {
+                            for h in ["#", "range", "score", "chat", "loud", "lex", "arou", ""] {
                                 ui.label(h);
                             }
                             ui.end_row();
@@ -546,6 +555,7 @@ impl eframe::App for App {
                                 ui.label(fmt_sig(m.signals.chat_rate));
                                 ui.label(fmt_sig(m.signals.loudness));
                                 ui.label(fmt_sig(m.signals.lexicon));
+                                ui.label(fmt_sig(m.signals.arousal));
                                 if ui.add_enabled(enabled, egui::Button::new("Promote")).clicked() {
                                     to_promote = Some(m.range);
                                     to_select = Some(m.id);
