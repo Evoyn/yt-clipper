@@ -19,3 +19,12 @@ Milestones build tracer-bullet style: M1 threads every subsystem at minimum dept
 - Single 8 GB RTX 3070 Ti: GPU stages strictly sequential, never concurrent.
 - Languages: English, Bahasa Indonesia, Japanese end-to-end (transcription → captions).
 - Persistence: folder-per-VOD with JSON files + global `creators.json`; no database.
+
+## Future directions (beyond v1)
+
+Operator-brainstormed directions, not yet milestones — promote to a numbered milestone + ADR when pursued.
+
+- **Active-speaker / dynamic framing** — extends M6's *static* facecam auto-detect to *moving* subjects (confirmed direction 2026-06-19):
+  - **Multi-person (podcast, 2–3 on screen):** frame/cut to whoever is *talking*. Face detect + track (YuNet/SCRFD + a tracker) + **active-speaker detection** (audio-visual — lip/mouth motion + voice, e.g. TalkNet / Light-ASD via the `ort` runtime) → smoothed pan/zoom of the 9:16 crop onto the active face (cut-vs-pan logic). Pairs with **speaker diarization** (the mixed-audio thread, also future): per-speaker audio + visual ASD = robust "frame the talker," and the two hard problems reinforce each other.
+  - **IRL / vlog** (IShowSpeed-style: handheld camera, public spaces, fast motion): lock onto the streamer (face-ID) + saliency/motion to follow the action in the moving frame.
+  - Broadens scope past the current gaming-VOD domain (gameplay + static facecam) toward talking-head / IRL content — v2-scale; revisit the "Finished VODs only / gaming" framing then.
