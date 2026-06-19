@@ -14,6 +14,7 @@ yc-ingest.workspace = true
 yc-transcribe.workspace = true
 yc-detect.workspace = true
 yc-render.workspace = true
+yc-frame.workspace = true
 eframe.workspace = true
 egui.workspace = true
 anyhow.workspace = true
@@ -31,3 +32,8 @@ rfd = "0.15"
 # yc-detect and reads the SER model. Off by default so the app builds without
 # the ONNX Runtime binary; detection then simply omits arousal.
 ser = ["yc-detect/ser"]
+# Auto-detect framing (M6, ADR 0011): pulls `ort` via yc-frame for Ultraface
+# face detection. Off by default so the app builds without the ONNX Runtime
+# binary; framing then falls back to full-frame gameplay. The pure layout
+# geometry (yc-frame) is always linked regardless of this feature.
+face = ["yc-frame/face"]

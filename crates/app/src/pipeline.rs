@@ -9,9 +9,10 @@
 //!   layout dimensions, transcribe the range, generate captions, NVENC export.
 //!
 //! A [`CancelToken`] (shared with the UI) kills the yt-dlp/ffmpeg child tree
-//! mid-download - the M1 "hang" scar. The Stacked Layout is still hardcoded
-//! scaffolding here (the framing editor is M5), but now derives its Crops from
-//! the *probed* source resolution so it works for 360p and 1080p alike.
+//! mid-download - the M1 "hang" scar. At Promote the Clip's Layout is
+//! auto-detected from the Segment's frames - Ultraface locates the Facecam and
+//! `build_layout` picks stacked / full-cam / full-frame (M6, ADR 0011),
+//! replacing the old hardcoded Stacked scaffolding.
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,8 +22,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Crop, Language, Layout, Moment, Project, Signals, TimeRange,
-    Vod, VodSource, CANVAS_H, CANVAS_W,
+    CaptionGenre, CaptionStyle, Clip, Language, Layout, Moment, Project, Signals, TimeRange, Vod,
+    VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -47,6 +48,11 @@ pub struct PipelinePaths {
     /// The `yc-llm-judge` sidecar binary (it links llama; the app does not).
     /// Absent where it was not built/shipped - detection then omits the llm signal.
     pub llm_judge: PathBuf,
+    /// Ultraface face model for M6 auto-framing (ADR 0011). May be absent:
+    /// framing falls back to full-frame gameplay (combined with a non-`face`
+    /// build). Only read by the `face`-gated auto-frame pass.
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub face_model: PathBuf,
     pub font: PathBuf,
     pub workspace: PathBuf,
 }
@@ -256,6 +262,14 @@ fn import_local(
     language: Language,
     tx: &Sender<Progress>,
 ) -> Result<Session> {
+    // Absolutize: the export runs ffmpeg in the clip folder (so libass resolves
+    // clip.ass + the font by relative name), so a relative source path would
+    // resolve against the wrong cwd there. YouTube Segments are already absolute.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().context("resolving current dir")?.join(path)
+    };
     anyhow::ensure!(path.is_file(), "video not found: {}", path.display());
     let stem = path
         .file_stem()
@@ -561,8 +575,14 @@ fn do_promote(
     fs::copy(&paths.font, session.workdir.join("Anton-Regular.ttf"))
         .with_context(|| format!("copying font from {}", paths.font.display()))?;
 
-    // 4. Record the promoted Clip in the project, then render.
-    let clip = build_clip(range, layout_for(src_w, src_h), &style.name);
+    // 4. Frame the Clip: auto-detect the Facecam from the Segment's frames and
+    //    choose the Layout (M6, ADR 0011). Whisper has dropped by now and
+    //    Ultraface runs on CPU, so there is no GPU contention here. Falls back to
+    //    full-frame gameplay when the `face` feature/model is absent or no static
+    //    face is found. Then record the promoted Clip and render.
+    let _ = tx.send(Progress::Stage("Framing (face detect)"));
+    let layout = build_layout(paths, &render_src, seek_s, src_w, src_h);
+    let clip = build_clip(range, layout, &style.name);
     persist_clip(&session.vod, &clip, &session.workdir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
@@ -605,30 +625,71 @@ fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
         .with_context(|| format!("writing project.json in {}", workdir.display()))
 }
 
-// --- hardcoded Layout + Caption Style (scaffolding; framing editor is M5) ----
+// --- auto-detect framing (M6, ADR 0011) -------------------------------------
 
-/// Gameplay Panel occupies the top `SEAM` fraction; facecam the rest.
-const SEAM: f32 = 0.62;
-/// Facecam inset as a fraction of the source frame (bottom-right corner). This
-/// generalizes M1's fixed 130x110-of-640x360 inset to any resolution, so the
-/// same scaffolding frames the 360p test VOD and a 1080p Segment. The operator
-/// will drag the real facecam rectangle in the M5 editor.
-const FACE_W_FRAC: f32 = 0.20;
-const FACE_H_FRAC: f32 = 0.30;
+/// Choose the Clip's Layout by detecting the Facecam in the Segment's frames.
+/// With the `face` feature and the model present, sample frames, run Ultraface,
+/// cluster the static Facecam, and pick stacked / full-cam / full-frame
+/// gameplay. Otherwise (no feature, missing model, or a detection error) fall
+/// back to full-frame gameplay - a safe default that never misplaces a facecam,
+/// unlike the old hardcoded bottom-right Stacked scaffolding it replaces.
+#[cfg_attr(not(feature = "face"), allow(unused_variables))]
+fn build_layout(
+    paths: &PipelinePaths,
+    render_src: &Path,
+    seek_s: f64,
+    src_w: f32,
+    src_h: f32,
+) -> Layout {
+    #[cfg(feature = "face")]
+    {
+        if paths.face_model.is_file() {
+            match detect_layout(paths, render_src, seek_s, src_w, src_h) {
+                Ok(layout) => return layout,
+                Err(e) => tracing::warn!("auto-frame failed: {e:#}; full-frame fallback"),
+            }
+        } else {
+            tracing::info!("face model absent; full-frame gameplay fallback");
+        }
+    }
+    yc_frame::decide_layout(None, src_w, src_h, yc_frame::SEAM_DEFAULT)
+}
 
-/// The hardcoded stacked Layout, built from the *probed* source resolution:
-/// gameplay above facecam (CONTEXT.md), each Crop aspect-fitted to its Panel so
-/// neither stretches (Panel invariant).
-fn layout_for(src_w: f32, src_h: f32) -> Layout {
-    let gh = (CANVAS_H as f32 * SEAM).round();
-    let fh = CANVAS_H as f32 - gh;
-    let gameplay =
-        Crop { x: 0.0, y: 0.0, w: src_w, h: src_h }.fit_to_aspect(CANVAS_W as f32 / gh);
-    let fw = src_w * FACE_W_FRAC;
-    let fhgt = src_h * FACE_H_FRAC;
-    let facecam = Crop { x: src_w - fw, y: src_h - fhgt, w: fw, h: fhgt }
-        .fit_to_aspect(CANVAS_W as f32 / fh);
-    Layout::Stacked { seam: SEAM, gameplay, facecam }
+/// Sample frames from the Segment, run Ultraface per frame, cluster the static
+/// Facecam, and decide the Layout (ADR 0011). Frames are scaled to the model's
+/// fixed input; its normalized detections map straight to source pixels.
+#[cfg(feature = "face")]
+fn detect_layout(
+    paths: &PipelinePaths,
+    render_src: &Path,
+    seek_s: f64,
+    src_w: f32,
+    src_h: f32,
+) -> Result<Layout> {
+    let frames = yc_ingest::extract_frames_rgb(
+        &paths.ffmpeg,
+        render_src,
+        seek_s,
+        yc_frame::infer::DET_W as u32,
+        yc_frame::infer::DET_H as u32,
+        yc_frame::SAMPLE_FPS,
+        yc_frame::MAX_FRAMES,
+    )?;
+    let mut detector = yc_frame::Detector::load(&paths.face_model)?;
+    let mut per_frame = Vec::with_capacity(frames.len());
+    for f in &frames {
+        per_frame.push(detector.detect(f, src_w, src_h)?);
+    }
+    let faces: usize = per_frame.iter().map(|f| f.len()).sum();
+    let cluster = yc_frame::cluster_static_face(&per_frame, src_w, src_h);
+    tracing::info!(
+        frames = frames.len(),
+        faces,
+        cam = cluster.is_some(),
+        persistence = cluster.map(|c| c.persistence),
+        "auto-frame detection"
+    );
+    Ok(yc_frame::decide_layout(cluster.as_ref(), src_w, src_h, yc_frame::SEAM_DEFAULT))
 }
 
 /// The default Caption Style preset: one word per caption (huge-word), which

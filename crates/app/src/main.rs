@@ -35,6 +35,7 @@ fn main() -> eframe::Result<()> {
         ser_model: paths.ser_model(),
         llm_model: paths.llm_model(),
         llm_judge: paths.llm_judge(),
+        face_model: paths.face_model(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
     });
@@ -260,6 +261,12 @@ impl AppPaths {
     /// llama (the app does not), so the app shells out to it for the llm Signal.
     fn llm_judge(&self) -> PathBuf {
         self.exe_dir.join("yc-llm-judge.exe")
+    }
+
+    /// Ultraface RFB-320 face model for M6 auto-framing (ADR 0011). Absent unless
+    /// downloaded; framing then falls back to full-frame gameplay.
+    fn face_model(&self) -> PathBuf {
+        self.models.join("version-RFB-320.onnx")
     }
 
     fn font(&self) -> PathBuf {

@@ -41,9 +41,9 @@ pub fn build_filtergraph(layout: &Layout, ass_name: &str) -> String {
                 w = CANVAS_W,
             )
         }
-        Layout::FullFrame { gameplay } => format!(
+        Layout::FullFrame { crop } => format!(
             "[0:v]{g},scale={w}:{h},setsar=1[v];[v]subtitles={ass_name}:fontsdir=.[out]",
-            g = fmt_crop(gameplay),
+            g = fmt_crop(crop),
             w = CANVAS_W,
             h = CANVAS_H,
         ),

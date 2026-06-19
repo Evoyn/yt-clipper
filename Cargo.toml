@@ -8,6 +8,7 @@ members = [
     "crates/detect",
     "crates/render",
     "crates/llm-judge",
+    "crates/frame",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ yc-ingest = { path = "crates/ingest" }
 yc-transcribe = { path = "crates/transcribe" }
 yc-detect = { path = "crates/detect" }
 yc-render = { path = "crates/render" }
+yc-frame = { path = "crates/frame" }
 
 [profile.release]
 lto = "thin"

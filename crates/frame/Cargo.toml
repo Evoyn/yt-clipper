@@ -1,0 +1,19 @@
+[package]
+name = "yc-frame"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yc-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+ort = { version = "2.0.0-rc.12", optional = true }
+
+[features]
+# Ultraface face detection via ONNX Runtime (ADR 0011). Off by default so the
+# pure geometry below (clustering + the three-way layout decision + box->Crop
+# expansion) is tested with neither the `ort` binary nor the model present. The
+# app enables it for auto-framing; the first `--features face` build triggers a
+# one-time ONNX Runtime binary download (shared with `yc-detect`'s `ser`).
+face = ["dep:ort"]

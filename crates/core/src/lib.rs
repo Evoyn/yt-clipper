@@ -141,8 +141,10 @@ pub enum Layout {
     /// Gameplay Panel above facecam Panel, divided by the Seam
     /// (a fraction of canvas height).
     Stacked { seam: f32, gameplay: Crop, facecam: Crop },
-    /// A single gameplay Panel filling the canvas (no facecam).
-    FullFrame { gameplay: Crop },
+    /// A single Panel filling the canvas: the gameplay, or the Facecam alone
+    /// during a talking-session Moment (ADR 0011). The field is `crop`, not
+    /// `gameplay`, because full-frame is no longer gameplay-only.
+    FullFrame { crop: Crop },
 }
 
 /// A Moment the operator has promoted for production: it gets framing,

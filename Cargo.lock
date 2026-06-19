@@ -5322,6 +5322,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yc-frame"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ort",
+ "tracing",
+ "yc-core",
+]
+
+[[package]]
 name = "yc-ingest"
 version = "0.1.0"
 dependencies = [
@@ -5402,6 +5412,7 @@ dependencies = [
  "tracing-subscriber",
  "yc-core",
  "yc-detect",
+ "yc-frame",
  "yc-ingest",
  "yc-render",
  "yc-transcribe",

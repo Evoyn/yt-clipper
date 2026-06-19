@@ -37,8 +37,12 @@ The padded span of full-quality VOD video downloaded for a Clip when it is promo
 _Avoid_: clip, chunk, section, source
 
 **Layout**:
-The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single gameplay Panel).
+The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single Panel filling the canvas — the gameplay, or the Facecam alone during a talking-session moment where the streamer's cam is the content).
 _Avoid_: composite, template, frame
+
+**Facecam**:
+The region of the source video showing the streamer's webcam overlay. Its location and size are not fixed across a VOD — a small corner inset during gameplay, but the streamer may switch to a full-screen cam during a talking session — so it is detected per Clip from the promoted Segment's frames, not assumed (M6, ADR 0011). The detected Facecam seeds the facecam Panel's Crop in a stacked Layout, or the whole canvas in a full-frame talking-session Layout.
+_Avoid_: webcam (the hardware), facecam Panel (that is the canvas region it is shown in, not the source region)
 
 **Panel**:
 A region of the canvas that displays exactly one Crop of the VOD, filled edge-to-edge — never letterboxed, never stretched.
