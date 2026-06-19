@@ -4,15 +4,21 @@
 //! - **Import** resolves a VOD (YouTube URL or local file) to its whole-VOD
 //!   analysis audio + raw chat + metadata, and persists `project.json` in the
 //!   per-VOD workspace folder. It leaves a [`Session`] the worker remembers.
-//! - **Promote** turns a picked range into a Clip: fetch the padded Segment
-//!   (YouTube) or use the local file, probe it for the in-segment offset and
-//!   layout dimensions, transcribe the range, generate captions, NVENC export.
+//! - **Prepare** (ADR 0012) fetches the padded Segment, probes it for the
+//!   in-segment offset and layout dimensions, auto-detects the seed Layout
+//!   (Ultraface locates the Facecam; `build_layout` picks stacked / full-cam /
+//!   full-frame, M6/ADR 0011), and extracts a handful of preview frames. It
+//!   leaves a [`PreparedClip`] the worker holds for the matching Render.
+//! - **Render** composites the operator's (possibly nudged in the editor) Layout
+//!   over the prepared Segment: transcribe the range (once, then cached on the
+//!   PreparedClip so re-renders are NVENC-only), generate captions, NVENC export.
+//!
+//! Splitting promote in two is what lets the nudge editor interject between the
+//! auto-detected Layout and the render (ADR 0012); whisper is deferred to Render
+//! so Prepare stays CPU/network and the editor opens fast.
 //!
 //! A [`CancelToken`] (shared with the UI) kills the yt-dlp/ffmpeg child tree
-//! mid-download - the M1 "hang" scar. At Promote the Clip's Layout is
-//! auto-detected from the Segment's frames - Ultraface locates the Facecam and
-//! `build_layout` picks stacked / full-cam / full-frame (M6, ADR 0011),
-//! replacing the old hardcoded Stacked scaffolding.
+//! mid-download - the M1 "hang" scar.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,8 +28,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Language, Layout, Moment, Project, Signals, TimeRange, Vod,
-    VodSource,
+    CaptionGenre, CaptionStyle, Clip, Language, Layout, Moment, Project, Signals, TimeRange,
+    Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -81,7 +87,14 @@ pub enum Job {
     /// Run detection over the imported VOD (discover + refine), surfacing
     /// ranked candidate Moments (ADR 0007). Operates on the current session.
     Detect,
-    Promote { range: TimeRange },
+    /// Phase-2a (ADR 0012): fetch the padded Segment, probe it, auto-detect the
+    /// seed Layout, and extract preview frames for the nudge editor. Leaves a
+    /// [`PreparedClip`] the worker holds for the matching [`Job::Render`].
+    Prepare { range: TimeRange },
+    /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
+    /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
+    /// NVENC export.
+    Render { layout: Layout },
 }
 
 /// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
@@ -109,6 +122,20 @@ pub enum Progress {
         llm_reasons: HashMap<u64, String>,
         timeline: Timeline,
     },
+    /// Prepare finished (ADR 0012): the auto-detected seed Layout, the Segment's
+    /// source dimensions, and a handful of preview frames (raw rgb24, each
+    /// `frame_w` x `frame_h`) sampled across the clip range. The UI uploads the
+    /// frames to textures and opens the nudge editor seeded with `layout`;
+    /// headless echoes `layout` straight back as a `Render` (no nudging).
+    Prepared {
+        layout: Layout,
+        src_w: f32,
+        src_h: f32,
+        frames: Vec<Vec<u8>>,
+        frame_w: u32,
+        frame_h: u32,
+        range: TimeRange,
+    },
     /// A Clip rendered to this path.
     Done(PathBuf),
     Cancelled,
@@ -123,12 +150,27 @@ struct Session {
     analysis_wav: PathBuf,
 }
 
-/// How `Promote` obtains the video to render from, and where it seeks.
+/// How `Prepare` obtains the video to render from, and where it seeks.
 enum PromoteSource {
     /// Fetch a padded Segment per-promote (web_safari HLS); seek the offset.
     YouTube(String),
     /// Use the local file directly as the "Segment"; seek the range start.
     Local(PathBuf),
+}
+
+/// What `Prepare` leaves ready for the nudge editor and the matching `Render`
+/// (ADR 0012): the resolved render source + in-segment seek + source
+/// dimensions, the picked range, the auto-detected seed Layout, and - once the
+/// first Render has run - the cached transcript, so re-renders skip whisper and
+/// are NVENC-only. The worker holds one until the next Prepare or Import.
+struct PreparedClip {
+    render_src: PathBuf,
+    seek_s: f64,
+    src_w: f32,
+    src_h: f32,
+    range: TimeRange,
+    auto_layout: Layout,
+    transcript: Option<Transcript>,
 }
 
 /// Spawn the worker thread. Returns the job sender, the progress receiver, and a
@@ -140,6 +182,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
     let worker_cancel = cancel.clone();
     thread::spawn(move || {
         let mut session: Option<Session> = None;
+        // The clip prepared for the nudge editor, held between Prepare and its
+        // Render(s) (ADR 0012). Invalidated by a new Import or Prepare.
+        let mut prepared: Option<PreparedClip> = None;
         while let Ok(job) = rx_job.recv() {
             // A cancel of the previous job must not bleed into this one.
             worker_cancel.reset();
@@ -153,6 +198,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 analysis_wav: s.analysis_wav.clone(),
                             });
                             session = Some(s);
+                            prepared = None; // a new VOD invalidates any prepared clip
                         }
                         Err(e) => {
                             let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
@@ -178,19 +224,44 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Promote { range } => match &session {
+                Job::Prepare { range } => match &session {
                     None => {
                         let _ = tx_prog
                             .send(Progress::Failed("import a VOD before making a clip".into()));
                     }
-                    Some(s) => match do_promote(&paths, s, range, &worker_cancel, &tx_prog) {
-                        Ok(out) => {
-                            let _ = tx_prog.send(Progress::Done(out));
+                    Some(s) => match do_prepare(&paths, s, range, &worker_cancel, &tx_prog) {
+                        Ok((pc, frames, frame_w, frame_h)) => {
+                            let _ = tx_prog.send(Progress::Prepared {
+                                layout: pc.auto_layout.clone(),
+                                src_w: pc.src_w,
+                                src_h: pc.src_h,
+                                frames,
+                                frame_w,
+                                frame_h,
+                                range: pc.range,
+                            });
+                            prepared = Some(pc);
                         }
                         Err(e) => {
                             let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
                         }
                     },
+                },
+                Job::Render { layout } => match (&session, &mut prepared) {
+                    (Some(s), Some(pc)) => {
+                        match do_render(&paths, s, pc, layout, &worker_cancel, &tx_prog) {
+                            Ok(out) => {
+                                let _ = tx_prog.send(Progress::Done(out));
+                            }
+                            Err(e) => {
+                                let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = tx_prog
+                            .send(Progress::Failed("prepare a clip before rendering".into()));
+                    }
                 },
             }
         }
@@ -520,21 +591,50 @@ fn run_llm_judge(
     serde_json::from_str(&out).context("parsing llm-judge verdicts")
 }
 
-// --- promote (phase 2) ------------------------------------------------------
+// --- prepare + render (phase 2, split for the nudge editor - ADR 0012) ------
 
-fn do_promote(
+/// Number of preview frames sampled across the clip range for the editor's
+/// scrub slider (ADR 0012). A handful is enough to see whether a static crop
+/// holds across a moving face.
+const PREVIEW_FRAMES: usize = 7;
+/// Longest preview-frame edge, in pixels. Crisp enough to place a face without
+/// the texture memory of a full-resolution frame; the editor stores Crops in
+/// source pixels and only normalizes at draw time, so this resolution is purely
+/// preview fidelity.
+const PREVIEW_LONG_EDGE: f32 = 1280.0;
+
+/// Aspect-preserving preview-frame dimensions (even, >= 2) with the longest edge
+/// at most [`PREVIEW_LONG_EDGE`]. Unlike the 320x240 detection pass (ADR 0011,
+/// which tolerates aspect distortion), the editor preview must not distort.
+fn preview_dims(src_w: f32, src_h: f32) -> (u32, u32) {
+    let even = |v: f32| (((v.round().max(2.0)) as u32) / 2) * 2;
+    if src_w >= src_h {
+        let w = src_w.min(PREVIEW_LONG_EDGE);
+        (even(w), even(w * src_h / src_w))
+    } else {
+        let h = src_h.min(PREVIEW_LONG_EDGE);
+        (even(h * src_w / src_h), even(h))
+    }
+}
+
+/// Phase-2a (ADR 0012): resolve the render source (fetch the padded Segment for
+/// YouTube, or use the local file), probe it for the in-segment seek offset and
+/// source resolution, auto-detect the seed Layout (M6/ADR 0011), and sample
+/// preview frames across the clip range. CPU/network only - whisper is deferred
+/// to `do_render` so the editor opens fast. Returns the [`PreparedClip`] plus
+/// the preview frames and their dimensions for the UI to texture.
+fn do_prepare(
     paths: &PipelinePaths,
     session: &Session,
     range: TimeRange,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<PathBuf> {
-    anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
+) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32)> {
     anyhow::ensure!(range.duration_s() > 0.0, "pick a range with end > start");
     let sc = paths.sidecars();
 
-    // 1. Obtain the render source, the in-segment seek offset, and the source
-    //    resolution (for the Layout) - all from one ffprobe of the media.
+    // Obtain the render source, the in-segment seek offset, and the source
+    // resolution (for the Layout) - all from one ffprobe of the media.
     let (render_src, seek_s, src_w, src_h) = match &session.promote {
         PromoteSource::Local(path) => {
             let p = yc_ingest::probe_segment(&paths.ffprobe, path, cancel)?;
@@ -550,44 +650,95 @@ fn do_promote(
         }
     };
 
-    // 2. Transcribe the picked range from the analysis audio (M1 path). Whisper
-    //    captions the loudest voice in the mixed track; mic isolation is future
-    //    work (see ROADMAP M1 known-limitation).
-    let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
-    let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
-    let transcript = yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language, {
-        let c = cancel.clone();
-        move || c.is_cancelled()
-    })?;
+    // Auto-detect the seed Layout: Ultraface locates the Facecam (CPU; no GPU
+    // contention), and build_layout picks stacked / full-cam / full-frame, or
+    // falls back to full-frame gameplay (no `face` feature/model, or no face).
+    // The editor opens seeded with this and the operator nudges from there.
+    let _ = tx.send(Progress::Stage("Framing (face detect)"));
+    let auto_layout = build_layout(paths, &render_src, seek_s, src_w, src_h);
 
-    // Refine caption end-times to the streamer's actual vocalization in the clip
-    // audio: a screamed / drawn-out word holds for its full sound and a normal
-    // word clears when the sound drops, instead of huge-word's fixed hold (too
-    // short for screams, lingering in silence).
-    let transcript = yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR);
+    // Sample preview frames across the clip range for the editor's scrub slider.
+    let _ = tx.send(Progress::Stage("Extracting preview frames"));
+    let (frame_w, frame_h) = preview_dims(src_w, src_h);
+    let fps = (PREVIEW_FRAMES as f64 / range.duration_s()).max(0.1);
+    let frames = yc_ingest::extract_frames_rgb(
+        &paths.ffmpeg,
+        &render_src,
+        seek_s,
+        frame_w,
+        frame_h,
+        fps,
+        PREVIEW_FRAMES,
+    )?;
 
-    // 3. Captions: generate the ASS and copy the font beside it (libass finds it
-    //    via fontsdir=., dodging Windows filtergraph path escaping).
+    let prepared = PreparedClip {
+        render_src,
+        seek_s,
+        src_w,
+        src_h,
+        range,
+        auto_layout,
+        transcript: None,
+    };
+    Ok((prepared, frames, frame_w, frame_h))
+}
+
+/// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
+/// Segment. Transcribes the range once (whisper, GPU) and caches it on the
+/// `PreparedClip`, so a re-render after another nudge is NVENC-only. The
+/// transcript captions the loudest voice in the mixed track; mic isolation is
+/// future work (see ROADMAP M1 known-limitation).
+fn do_render(
+    paths: &PipelinePaths,
+    session: &Session,
+    prepared: &mut PreparedClip,
+    layout: Layout,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<PathBuf> {
+    anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
+    let range = prepared.range;
+
+    // Transcribe once, then reuse: re-rendering a nudged Layout skips whisper.
+    if prepared.transcript.is_none() {
+        let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
+        let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
+        let transcript =
+            yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language, {
+                let c = cancel.clone();
+                move || c.is_cancelled()
+            })?;
+        // Refine caption end-times to the streamer's actual vocalization: a
+        // screamed / drawn-out word holds for its full sound and a normal word
+        // clears when the sound drops, instead of huge-word's fixed hold.
+        let transcript =
+            yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR);
+        prepared.transcript = Some(transcript);
+    }
+    let transcript = prepared.transcript.as_ref().expect("transcript set above");
+
+    // Captions: generate the ASS and copy the font beside it (libass finds it
+    // via fontsdir=., dodging Windows filtergraph path escaping).
     let _ = tx.send(Progress::Stage("Generating captions"));
     let style = caption_style();
-    let ass = yc_render::generate_ass(&transcript, &style);
+    let ass = yc_render::generate_ass(transcript, &style);
     fs::write(session.workdir.join("clip.ass"), ass).context("writing clip.ass")?;
     fs::copy(&paths.font, session.workdir.join("Anton-Regular.ttf"))
         .with_context(|| format!("copying font from {}", paths.font.display()))?;
 
-    // 4. Frame the Clip: auto-detect the Facecam from the Segment's frames and
-    //    choose the Layout (M6, ADR 0011). Whisper has dropped by now and
-    //    Ultraface runs on CPU, so there is no GPU contention here. Falls back to
-    //    full-frame gameplay when the `face` feature/model is absent or no static
-    //    face is found. Then record the promoted Clip and render.
-    let _ = tx.send(Progress::Stage("Framing (face detect)"));
-    let layout = build_layout(paths, &render_src, seek_s, src_w, src_h);
+    // Record the promoted Clip with the operator's Layout, then render it.
     let clip = build_clip(range, layout, &style.name);
     persist_clip(&session.vod, &clip, &session.workdir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
     let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
-    let args = yc_render::export_args(&render_src, seek_s, range.duration_s(), &filtergraph, "export.mp4");
+    let args = yc_render::export_args(
+        &prepared.render_src,
+        prepared.seek_s,
+        range.duration_s(),
+        &filtergraph,
+        "export.mp4",
+    );
     yc_render::run_export(&paths.ffmpeg, &session.workdir, &args)?;
 
     Ok(session.workdir.join("export.mp4"))
@@ -619,6 +770,9 @@ fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
             score: 0.0,
         });
     }
+    // Replace any existing record of this Clip (a re-render after a nudge) so
+    // project.json holds one entry per Clip, not one per render (ADR 0012).
+    project.clips.retain(|c| c.id != clip.id);
     project.clips.push(clip.clone());
     project
         .save(&workdir.join("project.json"))

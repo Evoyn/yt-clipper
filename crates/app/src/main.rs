@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod editor;
 mod pipeline;
 
 use std::collections::HashMap;
@@ -69,7 +70,12 @@ fn main() -> eframe::Result<()> {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
-                    to_worker.send(Job::Promote { range }).expect("send promote");
+                    to_worker.send(Job::Prepare { range }).expect("send prepare");
+                }
+                Ok(Progress::Prepared { layout, .. }) => {
+                    // No GUI to nudge in: render the auto-detected Layout as-is,
+                    // preserving the old one-shot promote behavior (ADR 0012).
+                    to_worker.send(Job::Render { layout }).expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
                     println!("{}", p.display());
@@ -137,6 +143,7 @@ fn main() -> eframe::Result<()> {
                     eprintln!("FAILED: {e}");
                     std::process::exit(1);
                 }
+                Ok(Progress::Prepared { .. }) => {} // not reachable in detect-only mode
                 Ok(Progress::Done(_)) => {}
                 Err(_) => std::process::exit(1),
             }
@@ -173,6 +180,7 @@ fn main() -> eframe::Result<()> {
                 sink: None,
                 volume: 1.0,
                 status: Status::Idle,
+                editor: None,
                 to_worker,
                 from_worker,
                 cancel,
@@ -318,6 +326,9 @@ struct App {
     /// a quiet streamer in the mixed track (rodio amplifies linearly).
     volume: f32,
     status: Status,
+    /// The nudge editor, open from Prepare until the operator dismisses it or a
+    /// new Prepare/import replaces it (ADR 0012); persists across re-renders.
+    editor: Option<editor::EditorState>,
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
     cancel: CancelToken,
@@ -366,6 +377,34 @@ impl eframe::App for App {
                     self.llm_reasons = llm_reasons;
                     self.timeline = Some(timeline);
                     self.status = Status::Idle;
+                }
+                Progress::Prepared { layout, src_w, src_h, frames, frame_w, frame_h, range } => {
+                    // Upload the preview frames to textures and open the nudge
+                    // editor seeded with the auto-detected Layout (ADR 0012).
+                    let ctx = ui.ctx().clone();
+                    let expected = frame_w as usize * frame_h as usize * 3;
+                    let textures: Vec<egui::TextureHandle> = frames
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| b.len() == expected)
+                        .map(|(i, b)| {
+                            let img =
+                                egui::ColorImage::from_rgb([frame_w as usize, frame_h as usize], b);
+                            ctx.load_texture(
+                                format!("preview-{i}"),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            )
+                        })
+                        .collect();
+                    if textures.is_empty() {
+                        self.status = Status::Failed("no preview frames extracted".into());
+                    } else {
+                        self.editor = Some(editor::EditorState::from_seed(
+                            layout, src_w, src_h, range, textures,
+                        ));
+                        self.status = Status::Idle;
+                    }
                 }
                 Progress::Done(p) => self.status = Status::Done(p),
                 Progress::Cancelled => self.status = Status::Cancelled,
@@ -607,8 +646,9 @@ impl eframe::App for App {
                         self.selected = Some(id);
                     }
                     if let Some(range) = to_promote {
-                        let _ = self.to_worker.send(Job::Promote { range });
-                        self.status = Status::Working("Starting".into());
+                        self.editor = None; // a new clip replaces any open editor
+                        let _ = self.to_worker.send(Job::Prepare { range });
+                        self.status = Status::Working("Preparing clip".into());
                     }
                 }
             }
@@ -672,6 +712,34 @@ impl eframe::App for App {
             }
         }
 
+        // --- Nudge editor (ADR 0012): frame the prepared Clip before render ---
+        // A floating, scrollable Window so the tall 9:16 composite and its
+        // Render button stay reachable over the central content (eframe's `ui`
+        // gives a non-scrolling central Ui).
+        let mut editor_action = editor::EditorAction::None;
+        let mut keep_open = true;
+        if let Some(ed) = &mut self.editor {
+            egui::Window::new("Frame the Clip")
+                .open(&mut keep_open)
+                .resizable(true)
+                .vscroll(true)
+                .default_size(egui::vec2(380.0, 720.0))
+                .show(ui.ctx(), |ui| {
+                    editor_action = ed.show(ui, !working);
+                });
+        }
+        if !keep_open {
+            self.editor = None;
+        }
+        match editor_action {
+            editor::EditorAction::Render(layout) => {
+                let _ = self.to_worker.send(Job::Render { layout });
+                self.status = Status::Working("Rendering".into());
+            }
+            editor::EditorAction::Cancel => self.editor = None,
+            editor::EditorAction::None => {}
+        }
+
         // --- Status + Cancel ---
         ui.separator();
         match &self.status {
@@ -716,6 +784,7 @@ impl App {
         self.llm_reasons.clear();
         self.timeline = None;
         self.selected = None;
+        self.editor = None;
         let _ = self.to_worker.send(Job::Import { source, language: self.language });
         self.status = Status::Working("Starting import".into());
     }

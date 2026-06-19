@@ -266,6 +266,123 @@ pub fn decide_layout(face: Option<&FaceCluster>, src_w: f32, src_h: f32, seam: f
     Layout::Stacked { seam, gameplay, facecam }
 }
 
+// ---- editor geometry (M6 nudge editor, ADR 0012) ---------------------------
+//
+// Pure source-pixel operations the egui editor drives: pan/zoom a Crop within
+// the source frame, re-fit a Crop when the Seam moves (panel aspect changes),
+// and seed Crops when the operator overrides the auto-chosen Layout type. All
+// aspect-preserving and clamped to the frame, so the editor never produces a
+// Crop the render filtergraph would reject.
+
+/// Smallest Crop edge, in source pixels: zooming in stops here so a Panel never
+/// samples a sub-pixel region.
+pub const MIN_CROP_EDGE: f32 = 16.0;
+/// Default Facecam seed width as a fraction of source width, when overriding to
+/// Stacked with no detected face (a typical corner-cam footprint).
+pub const DEFAULT_FACECAM_W_FRAC: f32 = 0.30;
+
+/// Translate `crop` by `(dx, dy)` source pixels, clamped so it stays inside the
+/// frame. Size (and therefore aspect) is unchanged — this is a pure pan.
+pub fn pan_crop(crop: Crop, src_w: f32, src_h: f32, dx: f32, dy: f32) -> Crop {
+    Crop {
+        x: (crop.x + dx).clamp(0.0, (src_w - crop.w).max(0.0)),
+        y: (crop.y + dy).clamp(0.0, (src_h - crop.h).max(0.0)),
+        w: crop.w,
+        h: crop.h,
+    }
+}
+
+/// Scale `crop` by `factor` (>1 zooms out / shows more, <1 zooms in) about the
+/// source-pixel anchor `(ax, ay)` — the point under the cursor stays put.
+/// Aspect is preserved (both edges scale together); `factor` is capped so the
+/// result fits the frame and no edge falls below [`MIN_CROP_EDGE`].
+pub fn zoom_crop(crop: Crop, src_w: f32, src_h: f32, factor: f32, ax: f32, ay: f32) -> Crop {
+    // Cap zoom-out at whichever edge reaches the frame first (preserves aspect).
+    let max_factor = (src_w / crop.w).min(src_h / crop.h);
+    // Cap zoom-in so the smaller edge does not drop below MIN_CROP_EDGE.
+    let min_factor = (MIN_CROP_EDGE / crop.w).max(MIN_CROP_EDGE / crop.h);
+    let f = factor.clamp(min_factor, max_factor.max(min_factor));
+    let new_w = crop.w * f;
+    let new_h = crop.h * f;
+    // Keep the anchor's fractional position within the crop fixed.
+    let rel_x = if crop.w > 0.0 { (ax - crop.x) / crop.w } else { 0.5 };
+    let rel_y = if crop.h > 0.0 { (ay - crop.y) / crop.h } else { 0.5 };
+    Crop {
+        x: (ax - rel_x * new_w).clamp(0.0, (src_w - new_w).max(0.0)),
+        y: (ay - rel_y * new_h).clamp(0.0, (src_h - new_h).max(0.0)),
+        w: new_w,
+        h: new_h,
+    }
+}
+
+/// Re-fit `crop` to a new Panel aspect, keeping its center and (where the frame
+/// allows) its height — used when the Seam drag changes a stacked Panel's aspect
+/// and its aspect-locked Crop must follow.
+pub fn reaspect_keep_center(crop: Crop, new_aspect: f32, src_w: f32, src_h: f32) -> Crop {
+    let cx = crop.x + crop.w * 0.5;
+    let cy = crop.y + crop.h * 0.5;
+    let mut h = crop.h;
+    let mut w = h * new_aspect;
+    if w > src_w {
+        w = src_w;
+        h = w / new_aspect;
+    }
+    if h > src_h {
+        h = src_h;
+        w = h * new_aspect;
+    }
+    Crop {
+        x: (cx - w * 0.5).clamp(0.0, (src_w - w).max(0.0)),
+        y: (cy - h * 0.5).clamp(0.0, (src_h - h).max(0.0)),
+        w,
+        h,
+    }
+}
+
+/// The gameplay and facecam Panel aspect ratios (w/h) of a Stacked Layout at
+/// `seam` (fraction of canvas height given to the gameplay Panel).
+pub fn stacked_panel_aspects(seam: f32) -> (f32, f32) {
+    let gh = (CANVAS_H as f32 * seam).round().clamp(2.0, (CANVAS_H - 2) as f32);
+    let fh = CANVAS_H as f32 - gh;
+    (CANVAS_W as f32 / gh, CANVAS_W as f32 / fh)
+}
+
+/// The whole source fit to the 9:16 canvas — the full-frame gameplay Crop and
+/// the safe default when no Facecam is found.
+pub fn fullframe_gameplay_crop(src_w: f32, src_h: f32) -> Crop {
+    Crop { x: 0.0, y: 0.0, w: src_w, h: src_h }.fit_to_aspect(CANVAS_W as f32 / CANVAS_H as f32)
+}
+
+/// A centered full-height (or full-width) 9:16 column — the talking-cam
+/// FullFrame Crop when overriding with no face to center on.
+pub fn centered_fullcam_crop(src_w: f32, src_h: f32) -> Crop {
+    let aspect = CANVAS_W as f32 / CANVAS_H as f32;
+    let w = src_h * aspect;
+    if w <= src_w {
+        Crop { x: (src_w - w) * 0.5, y: 0.0, w, h: src_h }
+    } else {
+        let h = src_w / aspect;
+        Crop { x: 0.0, y: (src_h - h) * 0.5, w: src_w, h }
+    }
+}
+
+/// A default Facecam Crop for `panel_aspect`, parked bottom-right (where gaming
+/// corner-cams usually sit) — the seed when overriding to Stacked with no
+/// detected face. The operator then pans/zooms it onto the real cam.
+pub fn default_facecam_crop(src_w: f32, src_h: f32, panel_aspect: f32) -> Crop {
+    let mut w = src_w * DEFAULT_FACECAM_W_FRAC;
+    let mut h = w / panel_aspect;
+    if h > src_h {
+        h = src_h;
+        w = h * panel_aspect;
+    }
+    if w > src_w {
+        w = src_w;
+        h = w / panel_aspect;
+    }
+    Crop { x: src_w - w, y: src_h - h, w, h }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +496,60 @@ mod tests {
         assert!(c.y <= face.y && c.y + c.h >= face.y + face.h, "contains face vertically");
         // stays inside the frame
         assert!(c.x >= 0.0 && c.y >= 0.0 && c.x + c.w <= 1920.0 && c.y + c.h <= 1080.0);
+    }
+
+    // ---- editor geometry (ADR 0012) ----
+
+    #[test]
+    fn pan_translates_and_clamps_to_the_frame() {
+        let c = Crop { x: 100.0, y: 100.0, w: 200.0, h: 200.0 };
+        let moved = pan_crop(c, 1920.0, 1080.0, 50.0, -30.0);
+        assert_eq!((moved.x, moved.y, moved.w, moved.h), (150.0, 70.0, 200.0, 200.0));
+        // panning past the right/bottom edge clamps so the crop stays inside.
+        let pinned = pan_crop(c, 1920.0, 1080.0, 1e6, 1e6);
+        assert!((pinned.x - (1920.0 - 200.0)).abs() < 1e-3);
+        assert!((pinned.y - (1080.0 - 200.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zoom_preserves_aspect_holds_the_anchor_and_stays_in_bounds() {
+        let c = Crop { x: 400.0, y: 300.0, w: 400.0, h: 300.0 }; // 4:3
+        // zoom in around the crop's own center: aspect held, anchor fixed.
+        let (ax, ay) = (600.0, 450.0);
+        let z = zoom_crop(c, 1920.0, 1080.0, 0.5, ax, ay);
+        assert!((z.w / z.h - 400.0 / 300.0).abs() < 1e-3, "aspect preserved");
+        assert!((z.x + z.w * 0.5 - ax).abs() < 1e-3 && (z.y + z.h * 0.5 - ay).abs() < 1e-3);
+        // zoom-out is capped so the crop can never exceed the frame.
+        let out = zoom_crop(c, 1920.0, 1080.0, 100.0, ax, ay);
+        assert!(out.w <= 1920.0 + 1e-3 && out.h <= 1080.0 + 1e-3);
+        assert!(out.x >= -1e-3 && out.y >= -1e-3);
+        assert!((out.w / out.h - 400.0 / 300.0).abs() < 1e-2, "aspect preserved at the cap");
+    }
+
+    #[test]
+    fn reaspect_adopts_the_new_aspect_keeps_center_and_fits() {
+        let c = Crop { x: 800.0, y: 400.0, w: 300.0, h: 300.0 };
+        let (cx, cy) = (c.x + c.w * 0.5, c.y + c.h * 0.5);
+        let r = reaspect_keep_center(c, 1080.0 / 730.0, 1920.0, 1080.0);
+        assert!((r.w / r.h - 1080.0 / 730.0).abs() < 1e-3, "new aspect");
+        assert!((r.x + r.w * 0.5 - cx).abs() < 1e-3 && (r.y + r.h * 0.5 - cy).abs() < 1e-3);
+        assert!(r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1920.0 && r.y + r.h <= 1080.0);
+    }
+
+    #[test]
+    fn seed_crops_match_their_panel_aspect_and_sit_inside_the_frame() {
+        let (src_w, src_h) = (1920.0, 1080.0);
+        let (ga, fa) = stacked_panel_aspects(SEAM_DEFAULT);
+        let game = fullframe_gameplay_crop(src_w, src_h);
+        assert!((game.w / game.h - CANVAS_W as f32 / CANVAS_H as f32).abs() < 1e-3);
+        let cam = default_facecam_crop(src_w, src_h, fa);
+        assert!((cam.w / cam.h - fa).abs() < 1e-2, "facecam matches its panel aspect");
+        // parked bottom-right, inside the frame.
+        assert!((cam.x + cam.w - src_w).abs() < 1e-3 && (cam.y + cam.h - src_h).abs() < 1e-3);
+        let col = centered_fullcam_crop(src_w, src_h);
+        assert!((col.w / col.h - CANVAS_W as f32 / CANVAS_H as f32).abs() < 1e-3, "9:16 column");
+        assert!((col.x + col.w * 0.5 - src_w * 0.5).abs() < 1e-3, "centered");
+        // gameplay seed is wider/taller than the facecam panel's aspect differs.
+        assert!(ga > 0.0 && fa > 0.0);
     }
 }
