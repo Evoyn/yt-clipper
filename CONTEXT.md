@@ -24,6 +24,10 @@ _Avoid_: feature, metric, factor
 The Signal measuring the emotional *activation* of the streamer's voice — how worked-up they sound — from a speech-emotion model's arousal axis. Deliberately ignores *which* emotion: a laugh, a rage, and a hype-moment all score high (all clip-worthy). Its job is to tell an emotional reaction apart from merely loud audio (a game explosion, music, a cutscene) that loudness alone cannot.
 _Avoid_: sentiment / valence (positive-vs-negative — explicitly not measured), excitement (reserved for the lexicon), emotion (too broad — implies classifying which emotion)
 
+**LLM judgment**:
+The Signal from a local language model reading a Moment's transcript: a judgment of how clip-worthy the *streamer's* speech is, scored per-candidate and kept relative to the others. Unlike the lexicon (which counts excitement words), it weighs meaning in context — and it is explicitly told to discount scripted in-game dialogue and cutscene narration, so a dramatic game line is not clip-worthy unless the streamer reacts to it. Runs locally on the GPU after transcription unloads; no cloud.
+_Avoid_: rerank (it is a Signal in the ensemble, not a post-sort stage), GPT / cloud (it is a local GGUF), sentiment (it judges clip-worthiness, not positive-vs-negative)
+
 **Clip**:
 A Moment the operator has promoted for production. A Clip gets framing, captions, and an export; a Moment that is never promoted gets nothing.
 _Avoid_: short, video, segment

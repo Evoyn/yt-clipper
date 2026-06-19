@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn apply_sets_arousal_and_reranks_by_activation() {
-        let w = Weights { chat: 0.0, loudness: 0.0, lexicon: 0.0, arousal: 1.0 };
+        let w = Weights { chat: 0.0, loudness: 0.0, lexicon: 0.0, arousal: 1.0, llm: 0.0 };
         let mk = |id, signals| Moment {
             id,
             range: TimeRange { start_s: 0.0, end_s: 30.0 },

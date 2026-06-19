@@ -7,6 +7,7 @@ members = [
     "crates/transcribe",
     "crates/detect",
     "crates/render",
+    "crates/llm-judge",
 ]
 
 [workspace.package]

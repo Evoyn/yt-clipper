@@ -8,6 +8,7 @@ license.workspace = true
 yc-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 hound = "3"
 ort = { version = "2.0.0-rc.12", optional = true }

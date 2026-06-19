@@ -1,0 +1,22 @@
+[package]
+name = "yc-llm-judge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yc-llm-judge"
+path = "src/main.rs"
+
+[dependencies]
+# Pure prompt / mitigation / parser / IPC structs shared with the app (no llama).
+yc-core.workspace = true
+yc-detect.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+# llama.cpp (CUDA). This is the ONLY crate in the workspace that links llama; it
+# has no whisper dependency, so its ggml links cleanly. Isolating it here is the
+# fix for the whisper.cpp/llama.cpp duplicate-ggml link collision (ADR 0010).
+llama-cpp-2 = { version = "0.1.150", features = ["cuda"] }

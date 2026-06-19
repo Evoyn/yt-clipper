@@ -33,6 +33,8 @@ fn main() -> eframe::Result<()> {
         deno_dir: deno_dir.clone(),
         model: paths.model(),
         ser_model: paths.ser_model(),
+        llm_model: paths.llm_model(),
+        llm_judge: paths.llm_judge(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
     });
@@ -112,7 +114,7 @@ fn main() -> eframe::Result<()> {
                     println!("detected {} moments:", moments.len());
                     for m in &moments {
                         println!(
-                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {} arou {}",
+                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {} arou {} llm {}",
                             m.id,
                             fmt_clock(m.range.start_s),
                             fmt_clock(m.range.end_s),
@@ -121,6 +123,7 @@ fn main() -> eframe::Result<()> {
                             fmt_sig(m.signals.loudness),
                             fmt_sig(m.signals.lexicon),
                             fmt_sig(m.signals.arousal),
+                            fmt_sig(m.signals.llm),
                         );
                     }
                     std::process::exit(0);
@@ -162,6 +165,7 @@ fn main() -> eframe::Result<()> {
                 moments: Vec::new(),
                 selected: None,
                 transcripts: HashMap::new(),
+                llm_reasons: HashMap::new(),
                 timeline: None,
                 analysis_wav: None,
                 audio_out: None,
@@ -178,6 +182,9 @@ fn main() -> eframe::Result<()> {
 
 /// Resolved locations of everything the app needs on disk.
 struct AppPaths {
+    /// Directory of the running executable; sibling binaries (the yc-llm-judge
+    /// sidecar) live here, even though sidecars/models/assets walk up to the root.
+    exe_dir: PathBuf,
     /// Pinned ffmpeg.exe / ffprobe.exe / yt-dlp.exe / deno.exe (fetch-sidecars.ps1).
     sidecars: PathBuf,
     /// Whisper GGML and LLM GGUF model files (fetch-models.ps1).
@@ -192,17 +199,20 @@ impl AppPaths {
     /// Everything resolves relative to the executable: this is a solo-operator
     /// tool distributed as exe-plus-folders (ADR 0005).
     fn resolve() -> Self {
-        let root = std::env::current_exe()
+        let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("."));
-        // In dev builds the exe sits in target/{debug,release}; walk up to the repo root.
-        let root = if root.ends_with("debug") || root.ends_with("release") {
-            root.ancestors().nth(2).map(PathBuf::from).unwrap_or(root)
+        // In dev builds the exe sits in target/{debug,release}; walk up to the repo
+        // root for sidecars/models/assets/workspace. The yc-llm-judge sidecar binary
+        // stays beside the exe, so it resolves from exe_dir, not the walked-up root.
+        let root = if exe_dir.ends_with("debug") || exe_dir.ends_with("release") {
+            exe_dir.ancestors().nth(2).map(PathBuf::from).unwrap_or_else(|| exe_dir.clone())
         } else {
-            root
+            exe_dir.clone()
         };
         Self {
+            exe_dir,
             sidecars: root.join("sidecars"),
             models: root.join("models"),
             assets: root.join("assets"),
@@ -239,6 +249,19 @@ impl AppPaths {
         self.models.join("w2v2-emotion").join("model.onnx")
     }
 
+    /// LLM judgment GGUF for the `llm` Signal (ADR 0010). Absent unless
+    /// downloaded; detection runs without it. The operator-gated ~5.4 GB
+    /// Qwen2.5-7B-Instruct Q5_K_M default.
+    fn llm_model(&self) -> PathBuf {
+        self.models.join("qwen2.5-7b-instruct-q5_k_m.gguf")
+    }
+
+    /// The `yc-llm-judge` sidecar binary, beside the app exe (ADR 0010): it links
+    /// llama (the app does not), so the app shells out to it for the llm Signal.
+    fn llm_judge(&self) -> PathBuf {
+        self.exe_dir.join("yc-llm-judge.exe")
+    }
+
     fn font(&self) -> PathBuf {
         self.assets.join("fonts").join("Anton-Regular.ttf")
     }
@@ -273,6 +296,9 @@ struct App {
     selected: Option<u64>,
     /// Transcript text per detected Moment id, for the review panel.
     transcripts: HashMap<u64, String>,
+    /// LLM judgment reason per detected Moment id (ADR 0010), for the review
+    /// panel; empty unless built `--features llm` with the GGUF present.
+    llm_reasons: HashMap<u64, String>,
     /// Whole-VOD signal series for the review waveform (set on detect).
     timeline: Option<Timeline>,
     /// Whole-VOD analysis wav (set on import), source for Moment audio playback.
@@ -326,10 +352,11 @@ impl eframe::App for App {
                     self.analysis_wav = Some(analysis_wav);
                     self.status = Status::Idle;
                 }
-                Progress::Detected { moments, transcripts, timeline } => {
+                Progress::Detected { moments, transcripts, llm_reasons, timeline } => {
                     self.selected = moments.first().map(|m| m.id);
                     self.moments = moments;
                     self.transcripts = transcripts;
+                    self.llm_reasons = llm_reasons;
                     self.timeline = Some(timeline);
                     self.status = Status::Idle;
                 }
@@ -540,8 +567,8 @@ impl eframe::App for App {
                     let selected = self.selected;
                     let enabled = !working;
                     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        egui::Grid::new("moments").striped(true).num_columns(8).show(ui, |ui| {
-                            for h in ["#", "range", "score", "chat", "loud", "lex", "arou", ""] {
+                        egui::Grid::new("moments").striped(true).num_columns(9).show(ui, |ui| {
+                            for h in ["#", "range", "score", "chat", "loud", "lex", "arou", "llm", ""] {
                                 ui.label(h);
                             }
                             ui.end_row();
@@ -560,6 +587,7 @@ impl eframe::App for App {
                                 ui.label(fmt_sig(m.signals.loudness));
                                 ui.label(fmt_sig(m.signals.lexicon));
                                 ui.label(fmt_sig(m.signals.arousal));
+                                ui.label(fmt_sig(m.signals.llm));
                                 if ui.add_enabled(enabled, egui::Button::new("Promote")).clicked() {
                                     to_promote = Some(m.range);
                                     to_select = Some(m.id);
@@ -600,6 +628,12 @@ impl eframe::App for App {
                         .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
                         .changed();
                 });
+                if let Some(reason) = self.llm_reasons.get(&id) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("LLM:");
+                        ui.label(reason);
+                    });
+                }
                 match self.transcripts.get(&id) {
                     Some(t) if !t.trim().is_empty() => {
                         egui::ScrollArea::vertical()
@@ -668,6 +702,7 @@ impl App {
         self.imported = None;
         self.moments.clear();
         self.transcripts.clear();
+        self.llm_reasons.clear();
         self.timeline = None;
         self.selected = None;
         let _ = self.to_worker.send(Job::Import { source, language: self.language });

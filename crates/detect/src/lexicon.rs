@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn apply_sets_lexicon_and_reranks_by_density() {
-        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0 };
+        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0, llm: 0.0 };
         let mk = |id, lex_neutral_signals: Signals| Moment {
             id,
             range: TimeRange { start_s: 0.0, end_s: 30.0 },

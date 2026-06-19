@@ -14,6 +14,7 @@
 pub mod arousal;
 pub mod chat;
 pub mod lexicon;
+pub mod llm;
 pub mod loudness;
 pub mod score;
 
@@ -49,6 +50,7 @@ pub struct Weights {
     pub loudness: f32,
     pub lexicon: f32,
     pub arousal: f32,
+    pub llm: f32,
 }
 
 impl Default for DetectParams {
@@ -63,9 +65,11 @@ impl Default for DetectParams {
             dur_s: 30.0,
             min_z: 1.0,
             top_n: 25,
-            // arousal weight is a starting guess pending the mixed-audio gate
-            // (ADR 0008); rebalanced from M3's 0.5/0.3/0.2 to give it a voice.
-            weights: Weights { chat: 0.4, loudness: 0.25, lexicon: 0.15, arousal: 0.2 },
+            // Rebalanced for M5 (ADR 0010): the LLM judgment Signal gets a
+            // strong-but-not-dominant voice (0.25); the lexicon drops to 0.10
+            // since it overlaps the LLM (both read the transcript). Arousal 0.15
+            // is gate-validated (ADR 0008). All retunable per ADR 0002.
+            weights: Weights { chat: 0.30, loudness: 0.20, lexicon: 0.10, arousal: 0.15, llm: 0.25 },
         }
     }
 }
@@ -82,6 +86,7 @@ pub fn combined_score(s: &Signals, w: &Weights) -> f32 {
         (s.loudness, w.loudness),
         (s.lexicon, w.lexicon),
         (s.arousal, w.arousal),
+        (s.llm, w.llm),
     ] {
         if let Some(v) = val {
             num += weight * v;
@@ -258,7 +263,7 @@ mod tests {
 
     #[test]
     fn combined_score_renormalizes_over_present_signals() {
-        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0 };
+        let w = Weights { chat: 0.5, loudness: 0.3, lexicon: 0.2, arousal: 0.0, llm: 0.0 };
         // Only loudness present -> score is just the loudness value.
         let only_loud =
             Signals { chat_rate: None, loudness: Some(2.0), lexicon: None, arousal: None, llm: None };

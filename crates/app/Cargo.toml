@@ -19,6 +19,8 @@ egui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# JSON IPC with the yc-llm-judge sidecar (ADR 0010).
+serde_json.workspace = true
 # Audio playback for the Moment review UI (ADR 0001: review by ear, no scrubbing).
 rodio = "0.19"
 # Native file-open dialog for importing a local VOD.

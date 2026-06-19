@@ -40,6 +40,13 @@ pub struct PipelinePaths {
     /// read by the `ser`-gated refine pass.
     #[cfg_attr(not(feature = "ser"), allow(dead_code))]
     pub ser_model: PathBuf,
+    /// LLM judgment GGUF for the `llm` Signal (ADR 0010). With `llm_judge` present
+    /// the app runs the out-of-process judge over it; if either is missing the
+    /// signal is omitted (combined_score renormalizes), like a missing SER model.
+    pub llm_model: PathBuf,
+    /// The `yc-llm-judge` sidecar binary (it links llama; the app does not).
+    /// Absent where it was not built/shipped - detection then omits the llm signal.
+    pub llm_judge: PathBuf,
     pub font: PathBuf,
     pub workspace: PathBuf,
 }
@@ -87,8 +94,15 @@ pub enum Progress {
     /// `analysis_wav` lets the review UI play a Moment's audio range.
     Imported { title: String, duration_s: Option<f64>, analysis_wav: PathBuf },
     /// Detection finished; ranked candidate Moments, each one's transcript text
-    /// (keyed by Moment id), and the whole-VOD signal timeline for the waveform.
-    Detected { moments: Vec<Moment>, transcripts: HashMap<u64, String>, timeline: Timeline },
+    /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
+    /// id (`llm_reasons`, empty unless built `--features llm` with the GGUF
+    /// present; ADR 0010), and the whole-VOD signal timeline for the waveform.
+    Detected {
+        moments: Vec<Moment>,
+        transcripts: HashMap<u64, String>,
+        llm_reasons: HashMap<u64, String>,
+        timeline: Timeline,
+    },
     /// A Clip rendered to this path.
     Done(PathBuf),
     Cancelled,
@@ -145,9 +159,13 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             .send(Progress::Failed("import a VOD before detecting".into()));
                     }
                     Some(s) => match do_detect(&paths, s, &worker_cancel, &tx_prog) {
-                        Ok((moments, transcripts, timeline)) => {
-                            let _ = tx_prog
-                                .send(Progress::Detected { moments, transcripts, timeline });
+                        Ok((moments, transcripts, llm_reasons, timeline)) => {
+                            let _ = tx_prog.send(Progress::Detected {
+                                moments,
+                                transcripts,
+                                llm_reasons,
+                                timeline,
+                            });
                         }
                         Err(e) => {
                             let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
@@ -286,7 +304,7 @@ fn do_detect(
     session: &Session,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<(Vec<Moment>, HashMap<u64, String>, Timeline)> {
+) -> Result<(Vec<Moment>, HashMap<u64, String>, HashMap<u64, String>, Timeline)> {
     anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
     let params = DetectParams::default();
 
@@ -306,7 +324,7 @@ fn do_detect(
     let timeline = Timeline { bin_s: params.bin_s, loudness: loud_bins, chat: chat_bins };
     if moments.is_empty() {
         tracing::info!("no moments discovered");
-        return Ok((moments, HashMap::new(), timeline));
+        return Ok((moments, HashMap::new(), HashMap::new(), timeline));
     }
 
     // Refine: one model load for the whole candidate batch (the resident
@@ -359,18 +377,70 @@ fn do_detect(
         yc_detect::arousal::apply(&mut moments, &arousals, &params.weights);
     }
 
-    // Rank by final score; carry each Moment's transcript through the reorder,
-    // then renumber so ids read as the review rank.
+    // LLM judgment (ADR 0010): a local GGUF model reads each candidate's
+    // transcript and scores clip-worthiness, instructed to discount scripted
+    // game narration (the load-bearing mitigation - ADR 0009's #11 cutscene at
+    // arousal 1.107, streamer silent). Runs on the GPU after the whisper `drop`
+    // (VRAM free) and after the CPU arousal pass, so the prompt can corroborate
+    // against the z-scored chat/loudness/arousal now on each Moment. Only when
+    // built `--features llm` with the GGUF present; combined_score renormalizes
+    // when the llm signal is absent, so detection still ranks fine without it.
+    // LLM judgment (ADR 0010): runs in the separate `yc-llm-judge` process
+    // (whisper.cpp and llama.cpp can't co-link - duplicate ggml). We hand the
+    // whole candidate batch to it as JSON over stdin and read back one verdict per
+    // candidate. The child loads the GGUF after our whisper `drop` freed VRAM,
+    // scores, and frees that VRAM on exit - sequential GPU staging across the
+    // process boundary. Skipped (signal omitted, combined_score renormalizes) when
+    // the judge binary or the GGUF is absent, exactly like a missing SER model.
+    let mut llm_reasons_vec: Vec<String> = Vec::new();
+    if paths.llm_judge.is_file() && paths.llm_model.is_file() {
+        let _ = tx.send(Progress::Stage("Refining moments (LLM judgment, GPU)"));
+        let request = yc_detect::llm::JudgeRequest {
+            model_path: paths.llm_model.to_string_lossy().into_owned(),
+            language: session.vod.language,
+            candidates: moments
+                .iter()
+                .enumerate()
+                .map(|(i, m)| yc_detect::llm::JudgeCandidate {
+                    transcript: texts[i].clone(),
+                    chat_z: m.signals.chat_rate,
+                    loudness_z: m.signals.loudness,
+                    arousal_z: m.signals.arousal,
+                })
+                .collect(),
+        };
+        match run_llm_judge(&paths.llm_judge, &request, cancel) {
+            Ok(verdicts) if verdicts.len() == moments.len() => {
+                let scores: Vec<f32> = verdicts.iter().map(|v| v.score).collect();
+                llm_reasons_vec = verdicts.into_iter().map(|v| v.reason).collect();
+                yc_detect::llm::apply(&mut moments, &scores, &params.weights);
+            }
+            Ok(v) => tracing::warn!(
+                "llm-judge returned {} verdicts for {} moments; omitting llm signal",
+                v.len(),
+                moments.len()
+            ),
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(e) => tracing::warn!("llm-judge failed: {e:#}; omitting llm signal"),
+        }
+    }
+
+    // Rank by final score; carry each Moment's transcript + LLM reason through
+    // the reorder, then renumber so ids read as the review rank.
     let mut order: Vec<usize> = (0..moments.len()).collect();
     order.sort_by(|&a, &b| {
         moments[b].score.partial_cmp(&moments[a].score).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut ranked = Vec::with_capacity(moments.len());
     let mut transcripts = HashMap::with_capacity(moments.len());
+    let mut llm_reasons = HashMap::new();
     for (rank, &i) in order.iter().enumerate() {
         let mut m = moments[i].clone();
         m.id = (rank + 1) as u64;
         transcripts.insert(m.id, texts[i].clone());
+        if let Some(r) = llm_reasons_vec.get(i).filter(|r| !r.trim().is_empty()) {
+            llm_reasons.insert(m.id, r.clone());
+        }
         ranked.push(m);
     }
 
@@ -379,7 +449,61 @@ fn do_detect(
     project
         .save(&session.workdir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", session.workdir.display()))?;
-    Ok((ranked, transcripts, timeline))
+    Ok((ranked, transcripts, llm_reasons, timeline))
+}
+
+/// Run the out-of-process LLM judge over the whole candidate batch (ADR 0010):
+/// write the [`yc_detect::llm::JudgeRequest`] to its stdin, read the verdicts from
+/// its stdout. stderr is inherited so llama.cpp's load logs reach the operator's
+/// terminal. The child is killed if the detect is cancelled mid-run (releasing its
+/// VRAM). The payload is a few KB (well under the pipe buffer) and the response is
+/// small, so writing the request fully before reading the reply can't deadlock.
+fn run_llm_judge(
+    bin: &Path,
+    request: &yc_detect::llm::JudgeRequest,
+    cancel: &CancelToken,
+) -> Result<Vec<yc_detect::llm::JudgeVerdict>> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let payload = serde_json::to_vec(request).context("serializing llm-judge request")?;
+    let mut child = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+
+    child
+        .stdin
+        .take()
+        .context("llm-judge stdin unavailable")?
+        .write_all(&payload)
+        .context("writing llm-judge request")?;
+
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("cancelled");
+        }
+        match child.try_wait().context("waiting on llm-judge")? {
+            Some(status) => {
+                anyhow::ensure!(status.success(), "llm-judge exited with {status}");
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .context("llm-judge stdout unavailable")?
+        .read_to_string(&mut out)
+        .context("reading llm-judge output")?;
+    serde_json::from_str(&out).context("parsing llm-judge verdicts")
 }
 
 // --- promote (phase 2) ------------------------------------------------------
