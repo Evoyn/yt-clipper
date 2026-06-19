@@ -9,5 +9,5 @@
 
 pub mod ass;
 pub mod export;
-pub use ass::generate_ass;
+pub use ass::{generate_ass, refine_caption_timing};
 pub use export::{build_filtergraph, export_args, run_export};

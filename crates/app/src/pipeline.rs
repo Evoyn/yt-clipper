@@ -546,6 +546,12 @@ fn do_promote(
         move || c.is_cancelled()
     })?;
 
+    // Refine caption end-times to the streamer's actual vocalization in the clip
+    // audio: a screamed / drawn-out word holds for its full sound and a normal
+    // word clears when the sound drops, instead of huge-word's fixed hold (too
+    // short for screams, lingering in silence).
+    let transcript = yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR);
+
     // 3. Captions: generate the ASS and copy the font beside it (libass finds it
     //    via fontsdir=., dodging Windows filtergraph path escaping).
     let _ = tx.send(Progress::Stage("Generating captions"));

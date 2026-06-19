@@ -26,11 +26,23 @@ const MAX_GAP_S: f64 = 1.0;
 /// ends at the Seam, 0.62) — above the facecam face below, and clear of any
 /// burned-in source subtitles that sit near the bottom of the gameplay.
 const CAPTION_Y_FRAC: f64 = 0.46;
-/// Huge-word genre: keep a word on screen at least this long (a fast-spoken word
-/// stays readable) and at most this long after it ends — capped by the next
-/// word's onset, so exactly one word shows and none linger through silence.
+/// Huge-word genre: a word shows from its onset until its `end_s` — which
+/// [`refine_caption_timing`] sets to the streamer's actual vocal end from the
+/// audio — clamped to a readable minimum and to the next word's onset (one word
+/// at a time). Without refinement `end_s` is whisper's (often too-short) word end.
 const WORD_MIN_S: f64 = 0.10;
-const WORD_HOLD_S: f64 = 0.30;
+
+/// Audio-driven caption timing ([`refine_caption_timing`]): RMS envelope at this
+/// hop/window; the streamer's quiet/game floor is the `BASELINE_PCT` percentile of
+/// energy; a word's caption ends once energy stays below
+/// `baseline + VOICE_DROP_FRAC*(peak-baseline)` for `VOICE_SILENCE_S` (the
+/// vocalization stopped), with the vocal peak sought within `PEAK_WINDOW_S` of onset.
+const ENV_HOP_S: f64 = 0.02;
+const ENV_WIN_S: f64 = 0.04;
+const BASELINE_PCT: f64 = 0.25;
+const VOICE_DROP_FRAC: f32 = 0.33;
+const VOICE_SILENCE_S: f64 = 0.12;
+const PEAK_WINDOW_S: f64 = 0.6;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
@@ -136,11 +148,13 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
     let units = &transcript.units;
     for (i, u) in units.iter().enumerate() {
-        let mut end = u.end_s + WORD_HOLD_S;
+        // `end_s` is the word's vocal end (set by refine_caption_timing); show
+        // until then, one word at a time (clear by the next onset), readable min.
+        let mut end = u.end_s;
         if let Some(next) = units.get(i + 1) {
-            end = end.min(next.start_s); // one word at a time: clear before the next
+            end = end.min(next.start_s);
         }
-        end = end.max(u.start_s + WORD_MIN_S); // never zero-duration / unreadable
+        let end = end.max(u.start_s + WORD_MIN_S); // never zero-duration / unreadable
         let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text);
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
@@ -150,6 +164,75 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
         ));
     }
     s
+}
+
+/// Refine each caption unit's end to the streamer's actual vocal end, read from
+/// the clip's RMS energy envelope (called on the promote path before
+/// `generate_ass`). whisper marks a word's end where the phoneme is recognized -
+/// far short of a drawn-out scream - so a fixed hold either cuts screams or
+/// lingers in silence. Here a word's caption ends once energy falls back toward
+/// the clip's quiet/game baseline (the vocalization stopped), bounded by the next
+/// word's onset: a screamed word holds for its whole sound, a normal word clears
+/// as it drops, and nothing hangs in silence. `samples` is the clip's 16 kHz mono
+/// audio, aligned to the transcript's 0-based times.
+pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u32) -> Transcript {
+    let n = samples.len();
+    if n == 0 || sr == 0 || transcript.units.is_empty() {
+        return transcript;
+    }
+    let hop = ((sr as f64) * ENV_HOP_S).max(1.0) as usize;
+    let win = ((sr as f64) * ENV_WIN_S).max(1.0) as usize;
+    // RMS energy envelope over the clip.
+    let mut env: Vec<f32> = Vec::with_capacity(n / hop + 1);
+    let mut i = 0;
+    while i < n {
+        let e = (i + win).min(n);
+        let w = &samples[i..e];
+        env.push((w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt());
+        i += hop;
+    }
+    let n_env = env.len();
+    if n_env == 0 {
+        return transcript;
+    }
+    let t_of = |k: usize| (k * hop) as f64 / sr as f64;
+    let k_of = |t: f64| (((t * sr as f64) / hop as f64).round() as usize).min(n_env - 1);
+    // Quiet/game floor = a low percentile of the envelope.
+    let mut sorted = env.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let baseline = sorted[((n_env as f64 * BASELINE_PCT) as usize).min(n_env - 1)];
+    let silence_hops = ((VOICE_SILENCE_S / ENV_HOP_S).round() as usize).max(1);
+
+    let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
+    for idx in 0..starts.len() {
+        let start = starts[idx];
+        let next = starts.get(idx + 1).copied().unwrap_or_else(|| t_of(n_env));
+        let k0 = k_of(start);
+        let k_next = k_of(next).max(k0 + 1).min(n_env);
+        // The word's vocal peak near its onset.
+        let k_peak_end = k_of(start + PEAK_WINDOW_S).max(k0 + 1).min(k_next);
+        let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
+        let thresh = baseline + VOICE_DROP_FRAC * (peak - baseline);
+        // Walk forward tracking the last loud frame; stop once silence is sustained.
+        let mut last_loud = k0;
+        let mut below = 0usize;
+        let mut k = k0;
+        while k < k_next {
+            if env[k] >= thresh {
+                last_loud = k;
+                below = 0;
+            } else {
+                below += 1;
+                if below >= silence_hops {
+                    break;
+                }
+            }
+            k += 1;
+        }
+        let end = (t_of(last_loud) + ENV_WIN_S).clamp(start + WORD_MIN_S, next);
+        transcript.units[idx].end_s = end;
+    }
+    transcript
 }
 
 /// Multi-word rolling-pop lines (M1): units grouped into <=MAX_LINE_CHARS lines,
@@ -297,6 +380,31 @@ mod tests {
         let ass = generate_ass(&units(&["a", "b"]), &st);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
-        assert_eq!(end, "0:00:00.50"); // capped at the next word's onset
+        assert_eq!(end, "0:00:00.40"); // shows for the word's own end, clearing before next
+    }
+
+    #[test]
+    fn refine_extends_a_held_word_and_clears_at_silence() {
+        let sr = 16_000u32;
+        // 2 s: a held "hold" loud 0.0-1.2, then silence; a quiet "next" blip at 1.6.
+        let mut samples = vec![0.0f32; 2 * sr as usize];
+        for s in samples.iter_mut().take((1.2 * sr as f64) as usize) {
+            *s = 0.5;
+        }
+        for s in samples.iter_mut().skip((1.6 * sr as f64) as usize).take((0.1 * sr as f64) as usize)
+        {
+            *s = 0.4;
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                // whisper marked "hold" ending at 0.2 - far short of the scream.
+                CaptionUnit { text: "hold".into(), start_s: 0.0, end_s: 0.2 },
+                CaptionUnit { text: "next".into(), start_s: 1.6, end_s: 1.7 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        // "hold" extends to ~1.2 (the scream's end) - not 0.2, and not 1.6 (the next).
+        assert!(r.units[0].end_s > 1.0 && r.units[0].end_s < 1.45, "end = {}", r.units[0].end_s);
     }
 }
