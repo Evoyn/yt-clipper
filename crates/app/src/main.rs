@@ -691,8 +691,12 @@ impl eframe::App for App {
             }
         }
 
+        // While a GPU job runs, repaint at ~10 fps instead of unbounded: the
+        // continuous wgpu render loop otherwise competes with whisper for the
+        // single 8 GB card and starves it (the detect-hang scar). 10 fps still
+        // drains worker progress and animates the spinner smoothly.
         if working {
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }
