@@ -111,9 +111,10 @@ impl Transcriber {
     /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
     /// units, reusing the resident model. Timestamps are 0-based to the range.
     ///
-    /// `should_abort` is polled by whisper.cpp before each compute step (return
-    /// `true` to stop), so a long transcription can be cancelled mid-call; pass
-    /// `|| false` for an uninterruptible run.
+    /// `should_abort` is currently **inert**: whisper's abort hook collapses GPU
+    /// throughput (see the note in the body), so it is not installed. It is kept
+    /// in the signature so a graph-safe cancel can be re-wired without touching
+    /// callers; for now cancellation happens between candidates in the detect loop.
     pub fn transcribe(
         &self,
         samples: &[f32],
@@ -130,9 +131,17 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_print_special(false);
-        // Abort hook: lets the worker's CancelToken stop a transcription already
-        // in flight (whisper checks this between graph runs); true = abort.
-        params.set_abort_callback_safe(should_abort);
+        // NOTE: we deliberately do NOT install whisper's abort callback here.
+        // Installing it collapsed whisper's GPU throughput to a crawl (a
+        // hung-looking ~5% util detect) under concurrent desktop GPU load -
+        // almost certainly because the abort hook forces per-op synchronization /
+        // disables ggml-cuda graph batching. The LLM judge (no abort hook, keeps
+        // CUDA graphs) stays fast under the same load, which isolates the hook as
+        // the cause. Cancellation therefore falls back to the detect loop's
+        // per-candidate `cancel.is_cancelled()` check (between candidates, not
+        // mid-transcription). `should_abort` stays in the signature so a
+        // graph-safe abort can be re-wired later without touching callers.
+        let _ = should_abort;
 
         state
             .full(params, samples)
