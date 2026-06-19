@@ -58,6 +58,41 @@ where
     units
 }
 
+/// Per-language fix-ups for words whisper reliably mishears on the mixed game+mic
+/// track (e.g. Indonesian streamer slang). A cheap, deterministic patch over the
+/// transcription ceiling - the real fix is vocal separation. Expand against real
+/// VODs, like the excitement lexicon. (wrong, right), lowercase.
+fn corrections(language: Language) -> &'static [(&'static str, &'static str)] {
+    match language {
+        Language::Id => &[("bocal", "bocil")],
+        Language::En => &[],
+        Language::Ja => &[],
+    }
+}
+
+/// Replace whole words whisper commonly mishears (case-insensitive, surrounding
+/// punctuation preserved). Applied to every transcript so both captions and the
+/// detection lexicon read the corrected text.
+fn correct_known_mishears(units: &mut [CaptionUnit], language: Language) {
+    let map = corrections(language);
+    if map.is_empty() {
+        return;
+    }
+    for u in units.iter_mut() {
+        let core: String = u.text.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+        if core.is_empty() {
+            continue;
+        }
+        let lower = core.to_lowercase();
+        for &(wrong, right) in map {
+            if wrong == lower.as_str() {
+                u.text = u.text.replacen(&core, right, 1);
+                break;
+            }
+        }
+    }
+}
+
 /// A whisper model kept resident on the GPU so a *batch* of ranges transcribes
 /// with one model load instead of reloading per range (ADR 0002/0007: detection
 /// refine transcribes ~N candidate Moments). Loading the model is the expensive
@@ -176,7 +211,9 @@ impl Transcriber {
             }
         }
 
-        Ok(Transcript { language, units: group_into_words(raw_tokens) })
+        let mut units = group_into_words(raw_tokens);
+        correct_known_mishears(&mut units, language);
+        Ok(Transcript { language, units })
     }
 }
 
@@ -227,5 +264,19 @@ mod tests {
         assert!(is_special("[_BEG_]"));
         assert!(is_special("<|endoftext|>"));
         assert!(!is_special(" hello"));
+    }
+
+    #[test]
+    fn corrects_known_mishears_whole_word_case_insensitively() {
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        let mut units = vec![mk("Bocal"), mk("bocal,"), mk("lokal")];
+        correct_known_mishears(&mut units, Language::Id);
+        assert_eq!(units[0].text, "bocil"); // case-insensitive match
+        assert_eq!(units[1].text, "bocil,"); // trailing punctuation preserved
+        assert_eq!(units[2].text, "lokal"); // not a key - untouched
+        // Other languages have no ID corrections.
+        let mut en = vec![mk("bocal")];
+        correct_known_mishears(&mut en, Language::En);
+        assert_eq!(en[0].text, "bocal");
     }
 }

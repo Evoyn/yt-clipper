@@ -639,7 +639,9 @@ fn caption_style() -> CaptionStyle {
         name: "Huge Word".into(),
         genre: CaptionGenre::HugeWord,
         font_family: "Anton".into(),
-        font_size: 96,
+        // Large: one word at a time, meant to read on a phone. ~15 Anton chars fit
+        // the 1080-wide canvas at this size; longer words are rare (tune freely).
+        font_size: 150,
         primary_color: [255, 255, 255, 255],
         accent_color: [255, 209, 0, 255],
     }

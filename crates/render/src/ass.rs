@@ -34,15 +34,18 @@ const WORD_MIN_S: f64 = 0.10;
 
 /// Audio-driven caption timing ([`refine_caption_timing`]): RMS envelope at this
 /// hop/window; the streamer's quiet/game floor is the `BASELINE_PCT` percentile of
-/// energy; a word's caption ends once energy stays below
+/// energy. A word's caption ends once energy stays below
 /// `baseline + VOICE_DROP_FRAC*(peak-baseline)` for `VOICE_SILENCE_S` (the
-/// vocalization stopped), with the vocal peak sought within `PEAK_WINDOW_S` of onset.
+/// vocalization stopped), with the vocal peak sought within `PEAK_WINDOW_S` of
+/// onset; and a word whose onset peak never rises `VOICE_PRESENT_FRAC` of the way
+/// from the floor to the loud (p95) level is dropped as a silence/game hallucination.
 const ENV_HOP_S: f64 = 0.02;
 const ENV_WIN_S: f64 = 0.04;
 const BASELINE_PCT: f64 = 0.25;
 const VOICE_DROP_FRAC: f32 = 0.33;
 const VOICE_SILENCE_S: f64 = 0.12;
 const PEAK_WINDOW_S: f64 = 0.6;
+const VOICE_PRESENT_FRAC: f32 = 0.15;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
@@ -155,7 +158,8 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
             end = end.min(next.start_s);
         }
         let end = end.max(u.start_s + WORD_MIN_S); // never zero-duration / unreadable
-        let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text);
+        let text =
+            format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text.to_uppercase());
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
             ass_time(u.start_s),
@@ -173,8 +177,10 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
 /// lingers in silence. Here a word's caption ends once energy falls back toward
 /// the clip's quiet/game baseline (the vocalization stopped), bounded by the next
 /// word's onset: a screamed word holds for its whole sound, a normal word clears
-/// as it drops, and nothing hangs in silence. `samples` is the clip's 16 kHz mono
-/// audio, aligned to the transcript's 0-based times.
+/// as it drops, and nothing hangs in silence. It also **drops** a word whose onset
+/// falls in a near-silent stretch (whisper's spurious tokens on the streamer's
+/// pauses / on game-only audio). `samples` is the clip's 16 kHz mono audio,
+/// aligned to the transcript's 0-based times.
 pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u32) -> Transcript {
     let n = samples.len();
     if n == 0 || sr == 0 || transcript.units.is_empty() {
@@ -202,8 +208,14 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let baseline = sorted[((n_env as f64 * BASELINE_PCT) as usize).min(n_env - 1)];
     let silence_hops = ((VOICE_SILENCE_S / ENV_HOP_S).round() as usize).max(1);
+    // "Real voice" level: a word whose onset energy never rises this far above the
+    // floor is dropped as a likely whisper hallucination (it places spurious tokens
+    // on the streamer's pauses / on game-only audio). p95 anchors the loud end.
+    let loud_ref = sorted[((n_env as f64 * 0.95) as usize).min(n_env - 1)];
+    let voice_present = baseline + VOICE_PRESENT_FRAC * (loud_ref - baseline);
 
     let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
+    let mut kept: Vec<CaptionUnit> = Vec::with_capacity(starts.len());
     for idx in 0..starts.len() {
         let start = starts[idx];
         let next = starts.get(idx + 1).copied().unwrap_or_else(|| t_of(n_env));
@@ -212,6 +224,12 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
         // The word's vocal peak near its onset.
         let k_peak_end = k_of(start + PEAK_WINDOW_S).max(k0 + 1).min(k_next);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
+        // Drop words that begin in a near-silent stretch (no streamer voice above
+        // the quiet/game floor) - whisper hallucinates tokens on the streamer's
+        // pauses. Real speech always lifts energy above the floor, so it survives.
+        if peak < voice_present {
+            continue;
+        }
         let thresh = baseline + VOICE_DROP_FRAC * (peak - baseline);
         // Walk forward tracking the last loud frame; stop once silence is sustained.
         let mut last_loud = k0;
@@ -229,9 +247,15 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
             }
             k += 1;
         }
-        let end = (t_of(last_loud) + ENV_WIN_S).clamp(start + WORD_MIN_S, next);
-        transcript.units[idx].end_s = end;
+        // Bound to [start+MIN, next] with max/min (NOT clamp): when the next onset
+        // is barely a frame after `start`, float wobble can push `start+WORD_MIN_S`
+        // just past `next`, and f64::clamp panics when min > max.
+        let end = (t_of(last_loud) + ENV_WIN_S).max(start + WORD_MIN_S).min(next);
+        let mut u = transcript.units[idx].clone();
+        u.end_s = end;
+        kept.push(u);
     }
+    transcript.units = kept;
     transcript
 }
 
@@ -253,7 +277,7 @@ fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String
         for (i, u) in line.iter().enumerate() {
             let on_ms = ((u.start_s - line_start) * 1000.0).round() as i64;
             text.push_str(&rolling_pop_tags(on_ms));
-            text.push_str(&u.text);
+            text.push_str(&u.text.to_uppercase());
             if i + 1 < line.len() {
                 text.push(' ');
             }
@@ -363,8 +387,8 @@ mod tests {
         let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st);
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 3); // one caption per word
-        // Each event carries exactly its own word, never the next.
-        assert!(dialogues[0].contains("satu") && !dialogues[0].contains("dua"));
+        // Each event carries exactly its own word (uppercased), never the next.
+        assert!(dialogues[0].contains("SATU") && !dialogues[0].contains("DUA"));
         // No zero-duration captions (the Start,End fields must differ).
         for d in &dialogues {
             let fields: Vec<&str> = d.split(',').collect();
@@ -406,5 +430,59 @@ mod tests {
         let r = refine_caption_timing(t, &samples, sr);
         // "hold" extends to ~1.2 (the scream's end) - not 0.2, and not 1.6 (the next).
         assert!(r.units[0].end_s > 1.0 && r.units[0].end_s < 1.45, "end = {}", r.units[0].end_s);
+    }
+
+    #[test]
+    fn refine_does_not_panic_when_words_are_a_frame_apart() {
+        // Float wobble: 28.1 + WORD_MIN_S (0.10) == 28.200000000000003 > 28.2, which
+        // made the end clamp panic (min > max). Must bound without panicking.
+        // Audio spans past the word times (steady tone, so nothing drops as silence).
+        let sr = 16_000u32;
+        let samples = vec![0.3f32; (28.4 * sr as f64) as usize];
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 28.1, end_s: 28.15 },
+                CaptionUnit { text: "b".into(), start_s: 28.2, end_s: 28.25 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr); // must not panic
+        assert_eq!(r.units.len(), 2);
+        assert!(r.units[0].end_s.is_finite() && r.units[0].end_s <= 28.2001);
+    }
+
+    #[test]
+    fn refine_drops_a_word_that_starts_in_silence() {
+        let sr = 16_000u32;
+        // loud "a" 0.0-0.5, silence, loud "c" 2.0-2.5; "b" is a spurious token at
+        // 1.0 in the silence (a whisper hallucination on the pause) -> dropped.
+        let mut samples = vec![0.0f32; 3 * sr as usize];
+        for s in samples.iter_mut().take((0.5 * sr as f64) as usize) {
+            *s = 0.5;
+        }
+        for s in samples.iter_mut().skip((2.0 * sr as f64) as usize).take((0.5 * sr as f64) as usize)
+        {
+            *s = 0.5;
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 0.4 },
+                CaptionUnit { text: "b".into(), start_s: 1.0, end_s: 1.1 },
+                CaptionUnit { text: "c".into(), start_s: 2.0, end_s: 2.4 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        let texts: Vec<&str> = r.units.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "c"]); // the silent "b" is dropped
+    }
+
+    #[test]
+    fn captions_are_uppercased() {
+        let mut st = style();
+        st.genre = CaptionGenre::HugeWord;
+        let ass = generate_ass(&units(&["bocil", "gila"]), &st);
+        assert!(ass.contains("BOCIL") && ass.contains("GILA"));
+        assert!(!ass.contains("bocil"));
     }
 }
