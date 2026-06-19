@@ -97,7 +97,12 @@ linking whisper.cpp's and llama.cpp's ggml into one exe failed with LNK1169
 moved to a standalone `yc-llm-judge` binary (llama only), invoked by the app over
 stdio. The app and default tests no longer link llama at all; only the judge does.
 
-_Still pending: the GPU verify that the `llm` column populates and reranks
-sensibly on `ZSegfmsrYmE` (the #11 cutscene must not float to the top), and that
-the judge process loads then frees its VRAM cleanly (whisper dropped first;
-sequential staging holds even across the process boundary)._
+**Verified (2026-06-19):** the standalone judge smoke-test scored a streamer
+reaction 8, a hype/win 10, the scripted-cutscene line **0 despite arousal 1.1
+(the #11 antidote)**, and menu-reading 0 — reproducible (greedy/temp-0). A full
+headless `--detect` ran end-to-end (whisper refine → app spawns the judge → the
+`llm` column populates and reranks), and a real 25-candidate
+`--detect --features ser` on a second VOD demoted loud intro chatter (llm −1.12)
+while lifting a reaction (+1.12). VRAM staging is clean headless — whisper drops,
+then the judge owns the card; the judge cannot co-reside with the GUI's wgpu on
+the 8 GB card, so detection runs headless. **M5 done.**
