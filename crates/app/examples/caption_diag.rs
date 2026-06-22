@@ -1,0 +1,135 @@
+//! Caption-timing inspector (ADR 0013). Replays the REAL caption path over a wav
+//! range - whisper large-v3 + DTW (`transcribe_range`, exactly as `do_render`),
+//! then the real `refine_caption_timing` - and reports raw whisper units (flagging
+//! non-monotonic DTW onsets), the RMS envelope distribution, and a per-word verdict
+//! (dropped vs kept, each kept word's on-screen duration + what bounded it). The
+//! feedback loop ADR 0013's gap-fill decision was made and verified against; kept
+//! for future caption-timing work.
+//!
+//!   scripts\cargo-cuda.bat run -p yt-clipper --example caption_diag -- workspace\9-X80Ozwo1I\analysis.wav 2049.5 2079.5 id
+//!
+//! Everything comes from the real functions - the only mirrored numbers are the
+//! MIN_READ/MAX_HOLD labels used to *describe* each kept word's limiter (not to
+//! recompute anything), so they cannot silently change the verdict.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use yc_core::Language;
+use yc_ingest::{read_range_samples, WHISPER_SR};
+
+// Labels only (mirror ass.rs for the limiter column; not load-bearing).
+const MIN_READ_S: f64 = 0.40;
+const MAX_HOLD_S: f64 = 1.2;
+const ENV_HOP_S: f64 = 0.02;
+const ENV_WIN_S: f64 = 0.04;
+
+fn ts(t: f64) -> String {
+    format!("{:6.2}", t)
+}
+
+fn main() -> anyhow::Result<()> {
+    let mut a = std::env::args().skip(1);
+    let wav = PathBuf::from(a.next().expect("usage: caption_diag <wav> <start_s> <end_s> [lang]"));
+    let start_s: f64 = a.next().expect("start_s").parse()?;
+    let end_s: f64 = a.next().expect("end_s").parse()?;
+    let lang = match a.next().as_deref() {
+        Some("en") => Language::En,
+        Some("ja") => Language::Ja,
+        _ => Language::Id,
+    };
+    let model = PathBuf::from("models/ggml-large-v3.bin");
+    anyhow::ensure!(model.is_file(), "whisper model missing: {}", model.display());
+
+    let samples = read_range_samples(&wav, yc_core::TimeRange { start_s, end_s })?;
+    let sr = WHISPER_SR;
+    println!(
+        "=== caption_diag: {} [{:.1}-{:.1}s] {:?}  ({} samples, {:.1}s) ===",
+        wav.display(), start_s, end_s, lang, samples.len(), samples.len() as f64 / sr as f64
+    );
+
+    // 1) RAW whisper (WITH DTW - exactly the render path: transcribe_range).
+    eprintln!("[caption_diag] loading whisper + transcribing (GPU)...");
+    let raw = yc_transcribe::transcribe_range(&model, &samples, lang, || false)?;
+    println!("\n--- RAW whisper units ({}) - '!' = DTW start < previous (non-monotonic) ---", raw.units.len());
+    let mut prev = -1.0_f64;
+    let mut nonmono = 0;
+    for (i, u) in raw.units.iter().enumerate() {
+        let bang = if u.start_s < prev { nonmono += 1; "!" } else { " " };
+        println!("{bang}{:>3} [{}-{}] dur {:>5.2}  {}", i, ts(u.start_s), ts(u.end_s), u.end_s - u.start_s, u.text);
+        prev = u.start_s;
+    }
+    println!("(non-monotonic starts: {nonmono})");
+
+    // 2) RMS envelope distribution (context for the silence-drop).
+    let hop = ((sr as f64) * ENV_HOP_S) as usize;
+    let win = ((sr as f64) * ENV_WIN_S) as usize;
+    let mut env = Vec::new();
+    let mut i = 0;
+    while i < samples.len() {
+        let e = (i + win).min(samples.len());
+        let w = &samples[i..e];
+        env.push((w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt());
+        i += hop;
+    }
+    env.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| env[((env.len() as f64 * p) as usize).min(env.len() - 1)];
+    println!("\n--- RMS envelope ({} frames) ---", env.len());
+    println!(
+        "p10 {:.4}  p25 {:.4}  p50 {:.4}  p75 {:.4}  p90 {:.4}  p95(loud_ref) {:.4}  max {:.4}",
+        pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90), pct(0.95), pct(1.0)
+    );
+
+    // 3) Per-word verdict from the REAL refine (dropped = raw word absent from the
+    // refined set; kept word's duration + limiter derived from refined ends).
+    let refined = yc_render::refine_caption_timing(raw.clone(), &samples, sr);
+    let ends: HashMap<u64, f64> = refined
+        .units
+        .iter()
+        .map(|u| ((u.start_s * 1000.0).round() as u64, u.end_s))
+        .collect();
+    let clip_end = samples.len() as f64 / sr as f64;
+    println!("\n--- refine verdict (real refine_caption_timing) ---");
+    let (mut kept, mut dropped, mut flash_with_room, mut held) = (0, 0, 0, 0);
+    let mut max_dur = 0.0_f64;
+    for (idx, u) in raw.units.iter().enumerate() {
+        let key = (u.start_s * 1000.0).round() as u64;
+        let next = raw.units.get(idx + 1).map(|n| n.start_s).unwrap_or(clip_end);
+        let room = next - u.start_s;
+        match ends.get(&key) {
+            None => {
+                dropped += 1;
+                println!(" DROP {:>3} [{}]  {}", idx, ts(u.start_s), u.text);
+            }
+            Some(&end) => {
+                kept += 1;
+                let dur = end - u.start_s;
+                max_dur = max_dur.max(dur);
+                let limiter = if (end - next).abs() < 1e-3 {
+                    "next"
+                } else if (dur - MAX_HOLD_S).abs() < 1e-3 {
+                    held += 1;
+                    "MAX_HOLD"
+                } else {
+                    "min/other"
+                };
+                // A flash (<MIN_READ) is only a bug when there was room to show longer.
+                if dur + 1e-3 < MIN_READ_S && room + 1e-3 >= MIN_READ_S {
+                    flash_with_room += 1;
+                }
+                println!(
+                    " keep {:>3} [{}-{}] dur {:>5.2} room {:>5.2} via {:<9} {}",
+                    idx, ts(u.start_s), ts(end), dur, room, limiter, u.text
+                );
+            }
+        }
+    }
+
+    println!("\n--- summary ---");
+    println!("raw units:                 {}", raw.units.len());
+    println!("kept / dropped:            {} / {}", kept, dropped);
+    println!("flashes WITH room (<MIN_READ but room to show longer - should be 0): {}", flash_with_room);
+    println!("held at MAX_HOLD:          {}", held);
+    println!("longest on-screen (s):     {:.2}", max_dur);
+    println!("non-monotonic DTW starts:  {}", nonmono);
+    Ok(())
+}

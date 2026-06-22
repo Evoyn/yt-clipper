@@ -26,26 +26,28 @@ const MAX_GAP_S: f64 = 1.0;
 /// ends at the Seam, 0.62) — above the facecam face below, and clear of any
 /// burned-in source subtitles that sit near the bottom of the gameplay.
 const CAPTION_Y_FRAC: f64 = 0.46;
-/// Huge-word genre: a word shows from its onset until its `end_s` — which
-/// [`refine_caption_timing`] sets to the streamer's actual vocal end from the
-/// audio — clamped to a readable minimum and to the next word's onset (one word
-/// at a time). Without refinement `end_s` is whisper's (often too-short) word end.
+/// Gap-fill caption timing (ADR 0013). whisper's DTW gives a precise word *onset*
+/// but a zero-width *end*, so [`refine_caption_timing`] synthesises each word's
+/// on-screen end by filling the gap to the next word's onset: capped at
+/// `MAX_HOLD_S` (a word never lingers into a real pause — the "too slow" fix) and
+/// floored at `MIN_READ_S` where there is room (nothing flashes sub-readably — the
+/// "too fast" fix), one word at a time (the end never crosses the next onset).
+/// `WORD_MIN_S` is the huge-word zero-duration guard.
 const WORD_MIN_S: f64 = 0.10;
+const MIN_READ_S: f64 = 0.40;
+const MAX_HOLD_S: f64 = 1.2;
 
-/// Audio-driven caption timing ([`refine_caption_timing`]): RMS envelope at this
-/// hop/window; the streamer's quiet/game floor is the `BASELINE_PCT` percentile of
-/// energy. A word's caption ends once energy stays below
-/// `baseline + VOICE_DROP_FRAC*(peak-baseline)` for `VOICE_SILENCE_S` (the
-/// vocalization stopped), with the vocal peak sought within `PEAK_WINDOW_S` of
-/// onset; and a word whose onset peak never rises `VOICE_PRESENT_FRAC` of the way
-/// from the floor to the loud (p95) level is dropped as a silence/game hallucination.
+/// The RMS envelope's one remaining job (ADR 0013): drop a word whose onset window
+/// is in near-silence — whisper hallucinates tokens on silent / pure-music windows
+/// (ADR 0007). Envelope at this hop/window; `loud_ref` is the p95 of the clip
+/// envelope and a word is dropped when its onset-window peak (sought within
+/// `PEAK_WINDOW_S` of onset) stays below `SILENCE_DROP_FRAC * loud_ref`. Anchoring
+/// on the loud reference (not a baseline) keeps quiet-but-present speech and stays
+/// sane when a clip is mostly silence (a baseline would collapse to ~0 there).
 const ENV_HOP_S: f64 = 0.02;
 const ENV_WIN_S: f64 = 0.04;
-const BASELINE_PCT: f64 = 0.25;
-const VOICE_DROP_FRAC: f32 = 0.33;
-const VOICE_SILENCE_S: f64 = 0.12;
 const PEAK_WINDOW_S: f64 = 0.6;
-const VOICE_PRESENT_FRAC: f32 = 0.15;
+const SILENCE_DROP_FRAC: f32 = 0.10;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
@@ -151,13 +153,14 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
     let units = &transcript.units;
     for (i, u) in units.iter().enumerate() {
-        // `end_s` is the word's vocal end (set by refine_caption_timing); show
-        // until then, one word at a time (clear by the next onset), readable min.
-        let mut end = u.end_s;
+        // `end_s` is the word's gap-filled end (set by refine_caption_timing, ADR
+        // 0013); show until then, one word at a time. Floor first as a zero-duration
+        // guard, then clamp to the next onset LAST — so the floor can never push the
+        // end past the next word's start (the brief overlap fixed in ADR 0013).
+        let mut end = u.end_s.max(u.start_s + WORD_MIN_S);
         if let Some(next) = units.get(i + 1) {
             end = end.min(next.start_s);
         }
-        let end = end.max(u.start_s + WORD_MIN_S); // never zero-duration / unreadable
         let text =
             format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text.to_uppercase());
         s.push_str(&format!(
@@ -170,17 +173,20 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
     s
 }
 
-/// Refine each caption unit's end to the streamer's actual vocal end, read from
-/// the clip's RMS energy envelope (called on the promote path before
-/// `generate_ass`). whisper marks a word's end where the phoneme is recognized -
-/// far short of a drawn-out scream - so a fixed hold either cuts screams or
-/// lingers in silence. Here a word's caption ends once energy falls back toward
-/// the clip's quiet/game baseline (the vocalization stopped), bounded by the next
-/// word's onset: a screamed word holds for its whole sound, a normal word clears
-/// as it drops, and nothing hangs in silence. It also **drops** a word whose onset
-/// falls in a near-silent stretch (whisper's spurious tokens on the streamer's
-/// pauses / on game-only audio). `samples` is the clip's 16 kHz mono audio,
-/// aligned to the transcript's 0-based times.
+/// Synthesise each caption unit's on-screen end (ADR 0013), called on the render
+/// path before `generate_ass`. whisper's DTW gives a precise word *onset* but a
+/// zero-width *end*, so we **gap-fill**: a word shows from its onset until the next
+/// word's onset, capped at `MAX_HOLD_S` (never linger into a real pause) and
+/// floored at `MIN_READ_S` where there is room (never a sub-readable flash), one
+/// word at a time (the end never crosses the next onset). The earlier approach -
+/// ending a word when the *mixed* RMS envelope fell toward a per-clip baseline -
+/// set its threshold from the word's onset peak, which loud game SFX/music inflate,
+/// so words rode background transients and cleared too fast (or held too slow): see
+/// ADR 0013's diagnosis. The envelope now does one job only: **drop** a word whose
+/// onset window is in near-silence (whisper's spurious tokens on silent / pure-music
+/// windows, ADR 0007) - relative to the loud (p95) reference, so quiet real speech
+/// survives. `samples` is the clip's 16 kHz mono audio, aligned to the transcript's
+/// 0-based times.
 pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u32) -> Transcript {
     let n = samples.len();
     if n == 0 || sr == 0 || transcript.units.is_empty() {
@@ -188,7 +194,7 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     }
     let hop = ((sr as f64) * ENV_HOP_S).max(1.0) as usize;
     let win = ((sr as f64) * ENV_WIN_S).max(1.0) as usize;
-    // RMS energy envelope over the clip.
+    // RMS energy envelope over the clip - used only to drop near-silent words now.
     let mut env: Vec<f32> = Vec::with_capacity(n / hop + 1);
     let mut i = 0;
     while i < n {
@@ -203,54 +209,35 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     }
     let t_of = |k: usize| (k * hop) as f64 / sr as f64;
     let k_of = |t: f64| (((t * sr as f64) / hop as f64).round() as usize).min(n_env - 1);
-    // Quiet/game floor = a low percentile of the envelope.
+    // Loud reference (p95): the silence-drop is relative to this, not a baseline,
+    // so quiet-but-present speech survives and a mostly-silent clip (baseline ~ 0)
+    // still has a sane floor.
     let mut sorted = env.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let baseline = sorted[((n_env as f64 * BASELINE_PCT) as usize).min(n_env - 1)];
-    let silence_hops = ((VOICE_SILENCE_S / ENV_HOP_S).round() as usize).max(1);
-    // "Real voice" level: a word whose onset energy never rises this far above the
-    // floor is dropped as a likely whisper hallucination (it places spurious tokens
-    // on the streamer's pauses / on game-only audio). p95 anchors the loud end.
     let loud_ref = sorted[((n_env as f64 * 0.95) as usize).min(n_env - 1)];
-    let voice_present = baseline + VOICE_PRESENT_FRAC * (loud_ref - baseline);
+    let silence_drop = SILENCE_DROP_FRAC * loud_ref;
 
+    let clip_end = t_of(n_env);
     let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
     let mut kept: Vec<CaptionUnit> = Vec::with_capacity(starts.len());
     for idx in 0..starts.len() {
         let start = starts[idx];
-        let next = starts.get(idx + 1).copied().unwrap_or_else(|| t_of(n_env));
+        // The next word's onset bounds this one - one word on screen at a time.
+        // `.max(start)` guards a non-monotonic DTW onset (rare; absent on the repro).
+        let next = starts.get(idx + 1).copied().unwrap_or(clip_end).max(start);
+        // Drop a word whose onset window is in near-silence: whisper hallucinates
+        // tokens on silent / pure-music windows (ADR 0007). Quiet real speech sits
+        // well above SILENCE_DROP_FRAC*loud_ref and survives.
         let k0 = k_of(start);
-        let k_next = k_of(next).max(k0 + 1).min(n_env);
-        // The word's vocal peak near its onset.
-        let k_peak_end = k_of(start + PEAK_WINDOW_S).max(k0 + 1).min(k_next);
+        let k_peak_end = k_of(start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
-        // Drop words that begin in a near-silent stretch (no streamer voice above
-        // the quiet/game floor) - whisper hallucinates tokens on the streamer's
-        // pauses. Real speech always lifts energy above the floor, so it survives.
-        if peak < voice_present {
+        if peak < silence_drop {
             continue;
         }
-        let thresh = baseline + VOICE_DROP_FRAC * (peak - baseline);
-        // Walk forward tracking the last loud frame; stop once silence is sustained.
-        let mut last_loud = k0;
-        let mut below = 0usize;
-        let mut k = k0;
-        while k < k_next {
-            if env[k] >= thresh {
-                last_loud = k;
-                below = 0;
-            } else {
-                below += 1;
-                if below >= silence_hops {
-                    break;
-                }
-            }
-            k += 1;
-        }
-        // Bound to [start+MIN, next] with max/min (NOT clamp): when the next onset
-        // is barely a frame after `start`, float wobble can push `start+WORD_MIN_S`
-        // just past `next`, and f64::clamp panics when min > max.
-        let end = (t_of(last_loud) + ENV_WIN_S).max(start + WORD_MIN_S).min(next);
+        // Gap-fill the end to the next onset, capped at MAX_HOLD and floored at
+        // MIN_READ where there is room; clamp to `next` LAST so neither the cap nor
+        // the floor can produce an overlap (one word at a time - ADR 0013).
+        let end = (start + MAX_HOLD_S).min(next).max(start + MIN_READ_S).min(next);
         let mut u = transcript.units[idx].clone();
         u.end_s = end;
         kept.push(u);
@@ -408,47 +395,115 @@ mod tests {
     }
 
     #[test]
-    fn refine_extends_a_held_word_and_clears_at_silence() {
+    fn huge_word_floor_never_overlaps_the_next_onset() {
+        // ADR 0013 overlap bug: a word whose end sits at the next onset (0.50) but
+        // whose start (0.46) is < WORD_MIN_S before it. The floor must not push the
+        // end past the next word's start - the next-onset clamp is applied LAST.
+        let mut st = style();
+        st.genre = CaptionGenre::HugeWord;
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.46, end_s: 0.50 },
+                CaptionUnit { text: "b".into(), start_s: 0.50, end_s: 0.90 },
+            ],
+        };
+        let ass = generate_ass(&t, &st);
+        let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
+        let end = first.split(',').nth(2).unwrap();
+        assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.56
+    }
+
+    #[test]
+    fn refine_fills_gap_to_next_onset_not_a_flash() {
+        // ADR 0013 "too fast" regression: "a" has a loud onset transient then goes
+        // quiet long before "b" at 0.5 s. The old envelope timing cleared it the
+        // instant energy dropped (~0.1 s flash); gap-fill shows it for the whole gap.
         let sr = 16_000u32;
-        // 2 s: a held "hold" loud 0.0-1.2, then silence; a quiet "next" blip at 1.6.
-        let mut samples = vec![0.0f32; 2 * sr as usize];
-        for s in samples.iter_mut().take((1.2 * sr as f64) as usize) {
-            *s = 0.5;
-        }
-        for s in samples.iter_mut().skip((1.6 * sr as f64) as usize).take((0.1 * sr as f64) as usize)
-        {
-            *s = 0.4;
+        let mut samples = vec![0.1f32; sr as usize]; // 1 s, moderate floor (kept)
+        for s in samples.iter_mut().take((0.1 * sr as f64) as usize) {
+            *s = 0.5; // onset transient only
         }
         let t = Transcript {
             language: Language::En,
             units: vec![
-                // whisper marked "hold" ending at 0.2 - far short of the scream.
-                CaptionUnit { text: "hold".into(), start_s: 0.0, end_s: 0.2 },
-                CaptionUnit { text: "next".into(), start_s: 1.6, end_s: 1.7 },
+                CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 0.0 }, // zero-width DTW
+                CaptionUnit { text: "b".into(), start_s: 0.5, end_s: 0.5 },
             ],
         };
         let r = refine_caption_timing(t, &samples, sr);
-        // "hold" extends to ~1.2 (the scream's end) - not 0.2, and not 1.6 (the next).
-        assert!(r.units[0].end_s > 1.0 && r.units[0].end_s < 1.45, "end = {}", r.units[0].end_s);
+        assert_eq!(r.units.len(), 2);
+        // "a" fills to "b"'s onset (gap 0.5 s, between MIN_READ and MAX_HOLD), not a flash.
+        assert!((r.units[0].end_s - 0.5).abs() < 1e-6, "end = {}", r.units[0].end_s);
+        assert!(r.units[0].end_s >= MIN_READ_S);
     }
 
     #[test]
-    fn refine_does_not_panic_when_words_are_a_frame_apart() {
-        // Float wobble: 28.1 + WORD_MIN_S (0.10) == 28.200000000000003 > 28.2, which
-        // made the end clamp panic (min > max). Must bound without panicking.
-        // Audio spans past the word times (steady tone, so nothing drops as silence).
+    fn refine_caps_a_word_before_a_pause_at_max_hold() {
+        // ADR 0013 "too slow" regression: "a" then a 5 s pause before "b". The word
+        // must not linger the whole pause - it caps at MAX_HOLD and clears.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 6 * sr as usize];
+        for s in samples.iter_mut().take((0.2 * sr as f64) as usize) {
+            *s = 0.5; // "a" onset
+        }
+        for s in samples.iter_mut().skip((5.0 * sr as f64) as usize).take((0.2 * sr as f64) as usize)
+        {
+            *s = 0.5; // "b" onset, after a long real pause
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 0.0 },
+                CaptionUnit { text: "b".into(), start_s: 5.0, end_s: 5.0 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        assert!((r.units[0].end_s - MAX_HOLD_S).abs() < 1e-6, "end = {}", r.units[0].end_s);
+    }
+
+    #[test]
+    fn refine_does_not_overlap_when_onsets_are_a_frame_apart() {
+        // Onsets ~0.1 s apart (faster than MIN_READ): the first word clips to the
+        // next onset, never past it (no overlap), and nothing panics. Steady tone so
+        // nothing drops as silence.
         let sr = 16_000u32;
         let samples = vec![0.3f32; (28.4 * sr as f64) as usize];
         let t = Transcript {
             language: Language::En,
             units: vec![
-                CaptionUnit { text: "a".into(), start_s: 28.1, end_s: 28.15 },
-                CaptionUnit { text: "b".into(), start_s: 28.2, end_s: 28.25 },
+                CaptionUnit { text: "a".into(), start_s: 28.1, end_s: 28.1 },
+                CaptionUnit { text: "b".into(), start_s: 28.2, end_s: 28.2 },
             ],
         };
         let r = refine_caption_timing(t, &samples, sr); // must not panic
         assert_eq!(r.units.len(), 2);
         assert!(r.units[0].end_s.is_finite() && r.units[0].end_s <= 28.2001);
+    }
+
+    #[test]
+    fn refine_keeps_a_quiet_but_present_word() {
+        // ADR 0013: the old drop threshold (baseline + 0.15*(loud_ref-baseline))
+        // killed quiet real speech ("apa sih" on the repro). Anchored on loud_ref
+        // alone, a word well above SILENCE_DROP_FRAC*loud_ref survives.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 2 * sr as usize];
+        for s in samples.iter_mut().take((0.5 * sr as f64) as usize) {
+            *s = 1.0; // a loud reaction sets loud_ref ~ 1.0
+        }
+        for s in samples.iter_mut().skip(sr as usize).take((0.5 * sr as f64) as usize) {
+            *s = 0.2; // quiet aside at 1.0 s: 0.2 > 0.10*loud_ref, must be kept
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "loud".into(), start_s: 0.0, end_s: 0.0 },
+                CaptionUnit { text: "quiet".into(), start_s: 1.0, end_s: 1.0 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        let texts: Vec<&str> = r.units.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, vec!["loud", "quiet"]);
     }
 
     #[test]
