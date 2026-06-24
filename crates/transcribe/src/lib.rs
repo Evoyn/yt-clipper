@@ -107,6 +107,12 @@ pub struct DialectLexicon {
     /// fills itself instead of the operator hunting garbles. Set false to freeze.
     #[serde(default = "default_true")]
     pub harvest: bool,
+    /// Language codes whose bundled wordlists (`<code>.words.txt`) feed the
+    /// auto-harvest filter — e.g. `["id","en"]` for a streamer who code-switches
+    /// to English, so their English words aren't flagged as garbles. Empty = just
+    /// this store's own language.
+    #[serde(default)]
+    pub dictionaries: Vec<String>,
     /// Domain words to bias whisper toward when `prime` is on (game terms, names,
     /// catchphrases). Joined into the `initial_prompt`.
     #[serde(default)]
@@ -116,11 +122,12 @@ pub struct DialectLexicon {
     /// later review without changing any output.
     #[serde(default)]
     pub corrections: Vec<Correction>,
-    /// Real-word dictionary for the auto-harvest filter, loaded from
-    /// `<dir>/<lang>.words.txt` (not part of the JSON). A flagged word that IS a
-    /// real word is skipped, so only out-of-dictionary tokens — the garbles,
-    /// slang, and names worth recording — reach the review queue. Empty when the
-    /// wordlist is absent (harvest then falls back to confidence alone).
+    /// Real-word set for the auto-harvest filter, merged at load from the
+    /// `dictionaries` wordlists (`<code>.words.txt`) plus the `names.json` roster
+    /// (not part of this JSON). A flagged word that IS a real word / known name is
+    /// skipped, so only out-of-dictionary tokens — the garbles, slang, and unknown
+    /// names worth recording — reach the review queue. Empty when no wordlist is
+    /// present (harvest then falls back to confidence alone).
     #[serde(skip)]
     pub dictionary: HashSet<String>,
 }
@@ -146,6 +153,17 @@ pub struct Correction {
     pub status: String,
 }
 
+/// `names.json` — the roster of viewer names the streamer reads aloud, loaded
+/// alongside the store (language-agnostic, per-Creator's community). A correctly
+/// transcribed name is a real word, not a garble, so its parts join the harvest
+/// dictionary; a *garbled* name still harvests and maps to the right name via a
+/// `corrections` entry.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct NamesFile {
+    #[serde(default)]
+    names: Vec<String>,
+}
+
 impl DialectLexicon {
     /// Load `<dir>/<lang>.json`, falling back to an empty lexicon when the file
     /// is absent or unparseable (so transcription never fails on a bad store).
@@ -161,24 +179,51 @@ impl DialectLexicon {
             },
             Err(_) => DialectLexicon::default(),
         };
-        // Attach the real-word dictionary for the harvest filter (optional).
-        // Read as bytes + lossy UTF-8: community wordlists carry the odd non-UTF-8
-        // byte, which `read_to_string` would reject wholesale — the valid (ASCII)
-        // words are what matter, so a lossy decode keeps them all.
-        let words_path = dir.join(format!("{}.words.txt", lang_code(language)));
-        if let Ok(bytes) = std::fs::read(&words_path) {
-            lex.dictionary = String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(|l| l.trim().to_lowercase())
-                .filter(|w| !w.is_empty())
-                .collect();
+        // Harvest dictionary: merge the bundled wordlist(s) for every language in
+        // `dictionaries` (default: this store's own language), so a code-switching
+        // streamer's other-language words aren't flagged as garbles. Read as bytes
+        // + lossy UTF-8 — community wordlists carry the odd non-UTF-8 byte that
+        // `read_to_string` would reject wholesale; the valid (ASCII) words matter.
+        let codes: Vec<String> = if lex.dictionaries.is_empty() {
+            vec![lang_code(language).to_string()]
+        } else {
+            lex.dictionaries.clone()
+        };
+        for code in &codes {
+            if let Ok(bytes) = std::fs::read(dir.join(format!("{code}.words.txt"))) {
+                for line in String::from_utf8_lossy(&bytes).lines() {
+                    let w = line.trim().to_lowercase();
+                    if !w.is_empty() {
+                        lex.dictionary.insert(w);
+                    }
+                }
+            }
+        }
+        // Viewer names (`names.json`, language-agnostic): a correctly-read name is
+        // a real word, not a garble. Split multi-word names so the whole-word
+        // harvest skips each part.
+        let mut n_names = 0;
+        if let Ok(text) = std::fs::read_to_string(dir.join("names.json")) {
+            if let Ok(nf) = serde_json::from_str::<NamesFile>(&text) {
+                for name in &nf.names {
+                    for word in name.split_whitespace() {
+                        let w = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                        if !w.is_empty() {
+                            lex.dictionary.insert(w);
+                        }
+                    }
+                }
+                n_names = nf.names.len();
+            }
         }
         tracing::info!(
-            "dialect: {} ({} corrections, {} vocab, {} dict words)",
+            "dialect: {} ({} corrections, {} vocab, {} dict words [{}], {} names)",
             if lex.creator.is_empty() { "lexicon" } else { lex.creator.as_str() },
             lex.corrections.iter().filter(|c| !c.right.is_empty()).count(),
             lex.vocabulary.len(),
             lex.dictionary.len(),
+            codes.join("+"),
+            n_names,
         );
         lex
     }

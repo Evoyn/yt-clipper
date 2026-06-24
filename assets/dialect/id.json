@@ -4,6 +4,7 @@
   "note": "",
   "prime": false,
   "harvest": true,
+  "dictionaries": ["id", "en"],
   "vocabulary": [],
   "corrections": []
 }
