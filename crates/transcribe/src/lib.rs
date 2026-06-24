@@ -10,6 +10,7 @@
 //! bundled bindings are Linux-only).
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use std::path::Path;
 use whisper_rs::{
     DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
@@ -32,16 +33,20 @@ fn is_special(text: &str) -> bool {
 }
 
 /// Group raw whisper tokens — each carrying whisper's leading-space word
-/// marking and start/end seconds — into caption units. A unit begins at every
-/// whitespace-led token (a word for EN/ID); a token with no leading space
-/// (subword piece or trailing punctuation) extends the current unit. Pure, so
-/// it is unit-tested without a model. JA character chunking arrives at M6.
-fn group_into_words<I>(tokens: I) -> Vec<CaptionUnit>
+/// marking, start/end seconds, and decode probability — into caption units. A
+/// unit begins at every whitespace-led token (a word for EN/ID); a token with no
+/// leading space (subword piece or trailing punctuation) extends the current
+/// unit. Returns the units plus a parallel per-unit **confidence** (the minimum
+/// token probability over the unit's tokens), the signal the auto-harvest uses
+/// to flag words whisper was unsure about. Pure, so it is unit-tested without a
+/// model. JA character chunking arrives at M6.
+fn group_into_words<I>(tokens: I) -> (Vec<CaptionUnit>, Vec<f32>)
 where
-    I: IntoIterator<Item = (String, f64, f64)>,
+    I: IntoIterator<Item = (String, f64, f64, f32)>,
 {
     let mut units: Vec<CaptionUnit> = Vec::new();
-    for (raw, t0, t1) in tokens {
+    let mut conf: Vec<f32> = Vec::new();
+    for (raw, t0, t1, p) in tokens {
         let clean = raw.trim_start();
         if clean.trim().is_empty() {
             continue;
@@ -49,32 +54,239 @@ where
         let starts_word = raw.starts_with(' ') || raw.starts_with('\u{2581}'); // ' ' or ▁
         if starts_word || units.is_empty() {
             units.push(CaptionUnit { text: clean.to_string(), start_s: t0, end_s: t1 });
+            conf.push(p);
         } else {
             let last = units.last_mut().expect("non-empty by branch");
             last.text.push_str(clean);
             last.end_s = t1;
+            let c = conf.last_mut().expect("non-empty by branch");
+            *c = c.min(p); // a word is only as confident as its least-sure token
         }
     }
-    units
+    (units, conf)
 }
 
-/// Per-language fix-ups for words whisper reliably mishears on the mixed game+mic
-/// track (e.g. Indonesian streamer slang). A cheap, deterministic patch over the
-/// transcription ceiling - the real fix is vocal separation. Expand against real
-/// VODs, like the excitement lexicon. (wrong, right), lowercase.
-fn corrections(language: Language) -> &'static [(&'static str, &'static str)] {
-    match language {
-        Language::Id => &[("bocal", "bocil")],
-        Language::En => &[],
-        Language::Ja => &[],
+/// A curatable per-language (later per-Creator) store of dialect / slang
+/// mishears and domain vocabulary, loaded from `<dir>/<lang>.json`. It drives
+/// two cheap caption fixes that lift the transcription ceiling without a heavier
+/// model, because the real caption pain here is *linguistic* (a streamer's
+/// accent / local slang / viewer names), not acoustic:
+///
+///   1. **Priming** — the vocabulary seeds whisper's `initial_prompt`, so the
+///      decoder mishears the streamer's real words *less at the source*.
+///   2. **Correction** — confirmed `wrong -> right` pairs patch whole-word
+///      mishears *after* transcription (captions and the detection lexicon both
+///      read the corrected text).
+///
+/// The operator curates the JSON over time — filling blank `right`s, adding
+/// entries — so detection of that Creator's dialect keeps improving. A missing
+/// or unparseable file yields an empty lexicon (both fixes no-op), so a Creator
+/// without a store still transcribes, just without the fix-ups.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct DialectLexicon {
+    /// Who this store is for (free text, e.g. the Creator name). Informational.
+    #[serde(default)]
+    pub creator: String,
+    /// Language code this store is for ("id"/"en"/"ja"); preserved on round-trip.
+    #[serde(default)]
+    pub language: String,
+    /// Operator documentation only (e.g. "Streamer logat Medan, main game"). It
+    /// is NEVER fed to whisper — a descriptive sentence in the prompt makes the
+    /// decoder hallucinate boilerplate (see `initial_prompt`).
+    #[serde(default)]
+    pub note: String,
+    /// Opt-in whisper priming (#1). Off by default because `initial_prompt`
+    /// biases the *whole* transcription, not just the target words — measured to
+    /// drift / shorten an otherwise-complete transcript (min3: 108 -> 77 units).
+    /// The correction dict (#2) is always applied and is risk-free; set this true
+    /// per-Creator only to experiment with source-level priming.
+    #[serde(default)]
+    pub prime: bool,
+    /// Auto-harvest (default on): append words whisper was unsure about to this
+    /// store as `unverified` to-dos on each caption run, so the review queue
+    /// fills itself instead of the operator hunting garbles. Set false to freeze.
+    #[serde(default = "default_true")]
+    pub harvest: bool,
+    /// Domain words to bias whisper toward when `prime` is on (game terms, names,
+    /// catchphrases). Joined into the `initial_prompt`.
+    #[serde(default)]
+    pub vocabulary: Vec<String>,
+    /// Known mishears. Only entries with a non-empty `right` are applied; a
+    /// blank `right` is an operator to-do that records the unsolved garble for
+    /// later review without changing any output.
+    #[serde(default)]
+    pub corrections: Vec<Correction>,
+    /// Real-word dictionary for the auto-harvest filter, loaded from
+    /// `<dir>/<lang>.words.txt` (not part of the JSON). A flagged word that IS a
+    /// real word is skipped, so only out-of-dictionary tokens — the garbles,
+    /// slang, and names worth recording — reach the review queue. Empty when the
+    /// wordlist is absent (harvest then falls back to confidence alone).
+    #[serde(skip)]
+    pub dictionary: HashSet<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One mishear record in a [`DialectLexicon`].
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct Correction {
+    /// The garbled text whisper produces (matched whole-word, case-insensitive).
+    pub wrong: String,
+    /// What it should be. Blank = unverified, awaiting operator review.
+    #[serde(default)]
+    pub right: String,
+    /// Free-text operator note (meaning, source clip, "viewer name?", ...).
+    #[serde(default)]
+    pub note: String,
+    /// "confirmed" | "unverified" | whatever the operator writes. Informational —
+    /// application keys off whether `right` is filled, not this.
+    #[serde(default)]
+    pub status: String,
+}
+
+impl DialectLexicon {
+    /// Load `<dir>/<lang>.json`, falling back to an empty lexicon when the file
+    /// is absent or unparseable (so transcription never fails on a bad store).
+    pub fn load(dir: &Path, language: Language) -> Self {
+        let path = dir.join(format!("{}.json", lang_code(language)));
+        let mut lex: DialectLexicon = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!("dialect: ignoring {} ({e})", path.display());
+                    DialectLexicon::default()
+                }
+            },
+            Err(_) => DialectLexicon::default(),
+        };
+        // Attach the real-word dictionary for the harvest filter (optional).
+        // Read as bytes + lossy UTF-8: community wordlists carry the odd non-UTF-8
+        // byte, which `read_to_string` would reject wholesale — the valid (ASCII)
+        // words are what matter, so a lossy decode keeps them all.
+        let words_path = dir.join(format!("{}.words.txt", lang_code(language)));
+        if let Ok(bytes) = std::fs::read(&words_path) {
+            lex.dictionary = String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(|l| l.trim().to_lowercase())
+                .filter(|w| !w.is_empty())
+                .collect();
+        }
+        tracing::info!(
+            "dialect: {} ({} corrections, {} vocab, {} dict words)",
+            if lex.creator.is_empty() { "lexicon" } else { lex.creator.as_str() },
+            lex.corrections.iter().filter(|c| !c.right.is_empty()).count(),
+            lex.vocabulary.len(),
+            lex.dictionary.len(),
+        );
+        lex
+    }
+
+    /// whisper `initial_prompt` (#1): a **bare comma-separated term list** — the
+    /// vocabulary plus every confirmed correct word (deduped, order-preserving).
+    ///
+    /// Deliberately NOT a sentence. A natural-language primer that *describes the
+    /// content* ("Streamer Indonesia main game live...") makes whisper-large-v3
+    /// abandon the audio and hallucinate YouTube boilerplate ("Jangan lupa like,
+    /// share, dan subscribe") on repeat — measured on min3, 108 real units ->
+    /// 14 hallucinated. A bare word list biases spelling toward the streamer's
+    /// vocabulary without that collapse. The `note` field stays documentation
+    /// only; it is never primed. Empty when the store has no vocabulary.
+    pub fn initial_prompt(&self) -> String {
+        let mut seen = HashSet::new();
+        let mut list: Vec<&str> = Vec::new();
+        for v in &self.vocabulary {
+            if !v.is_empty() && seen.insert(v.to_lowercase()) {
+                list.push(v.as_str());
+            }
+        }
+        for c in &self.corrections {
+            if !c.right.is_empty() && seen.insert(c.right.to_lowercase()) {
+                list.push(c.right.as_str());
+            }
+        }
+        list.join(", ")
+    }
+
+    /// Confirmed `(wrong_lowercased, right)` pairs for the post-transcription
+    /// whole-word fix-up. Blank-`right` entries (operator to-dos) are skipped.
+    fn pairs(&self) -> Vec<(String, &str)> {
+        self.corrections
+            .iter()
+            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty())
+            .map(|c| (c.wrong.to_lowercase(), c.right.as_str()))
+            .collect()
+    }
+
+    /// Append `candidates` to `<dir>/<lang>.json` as `unverified` to-dos, skipping
+    /// any the store already knows (wrong / right / vocabulary). Re-reads the file
+    /// first so concurrent operator edits to the `right` fields are preserved, and
+    /// writes back pretty-printed. Returns how many new entries were added. Best-
+    /// effort: a read/parse/write failure logs and adds nothing (never fails a
+    /// render). The caption path calls this so the review queue self-populates.
+    pub fn harvest_to_store(
+        dir: &Path,
+        language: Language,
+        candidates: &[(String, f32)],
+    ) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let path = dir.join(format!("{}.json", lang_code(language)));
+        // Re-read (not the in-memory copy) so any hand-edits since load survive.
+        let mut lex: DialectLexicon = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if lex.language.is_empty() {
+            lex.language = lang_code(language).to_string();
+        }
+        let mut known: HashSet<String> = HashSet::new();
+        for c in &lex.corrections {
+            known.insert(c.wrong.to_lowercase());
+            if !c.right.is_empty() {
+                known.insert(c.right.to_lowercase());
+            }
+        }
+        for v in &lex.vocabulary {
+            known.insert(v.to_lowercase());
+        }
+        let mut added = 0;
+        for (cand, conf) in candidates {
+            if known.insert(cand.to_lowercase()) {
+                lex.corrections.push(Correction {
+                    wrong: cand.clone(),
+                    right: String::new(),
+                    note: format!("auto-harvested (whisper confidence {conf:.2}) - operator verify"),
+                    status: "unverified".into(),
+                });
+                added += 1;
+            }
+        }
+        if added > 0 {
+            match serde_json::to_string_pretty(&lex) {
+                Ok(s) => {
+                    if let Err(e) = std::fs::write(&path, s + "\n") {
+                        tracing::warn!("dialect: harvest write to {} failed ({e})", path.display());
+                        return 0;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("dialect: harvest serialize failed ({e})");
+                    return 0;
+                }
+            }
+        }
+        added
     }
 }
 
-/// Replace whole words whisper commonly mishears (case-insensitive, surrounding
+/// Replace whole words the lexicon maps (case-insensitive, surrounding
 /// punctuation preserved). Applied to every transcript so both captions and the
 /// detection lexicon read the corrected text.
-fn correct_known_mishears(units: &mut [CaptionUnit], language: Language) {
-    let map = corrections(language);
+fn correct_known_mishears(units: &mut [CaptionUnit], lexicon: &DialectLexicon) {
+    let map = lexicon.pairs();
     if map.is_empty() {
         return;
     }
@@ -84,13 +296,72 @@ fn correct_known_mishears(units: &mut [CaptionUnit], language: Language) {
             continue;
         }
         let lower = core.to_lowercase();
-        for &(wrong, right) in map {
-            if wrong == lower.as_str() {
+        for (wrong, right) in &map {
+            if wrong == &lower {
                 u.text = u.text.replacen(&core, right, 1);
                 break;
             }
         }
     }
+}
+
+/// A word whose least-sure token fell below this probability is *eligible* for
+/// the review queue. Whisper is uncertain about many genuinely-correct words on
+/// accented audio, so this alone is noisy — [`HARVEST_MAX_PER_CLIP`] then keeps
+/// only the least-confident few. Tune-from-use. (A dictionary filter would cut
+/// the noise further; deferred.)
+const HARVEST_MAX_P: f32 = 0.50;
+/// Don't harvest fragments shorter than this (punctuation, "ya", "ke") — too
+/// noisy and rarely the dialect/name garbles worth recording.
+const HARVEST_MIN_LEN: usize = 4;
+/// Cap on words harvested per clip — only the N least-confident survive, so the
+/// operator's review queue stays small even when whisper is broadly unsure.
+const HARVEST_MAX_PER_CLIP: usize = 8;
+
+/// Words whisper was least sure about (confidence below [`HARVEST_MAX_P`]) that
+/// the store doesn't already know — the review queue the auto-harvest appends,
+/// each paired with its confidence so the operator can prioritise. Skips short /
+/// non-alphabetic tokens and anything already a `wrong`, `right`, or vocabulary
+/// entry (including the word a correction just fixed). Deduped; returned
+/// least-confident first and capped at [`HARVEST_MAX_PER_CLIP`]. Pure (testable
+/// without a model).
+fn harvest_candidates(
+    units: &[CaptionUnit],
+    conf: &[f32],
+    lexicon: &DialectLexicon,
+) -> Vec<(String, f32)> {
+    let mut known: HashSet<String> = HashSet::new();
+    for c in &lexicon.corrections {
+        known.insert(c.wrong.to_lowercase());
+        if !c.right.is_empty() {
+            known.insert(c.right.to_lowercase());
+        }
+    }
+    for v in &lexicon.vocabulary {
+        known.insert(v.to_lowercase());
+    }
+    let mut out: Vec<(String, f32)> = Vec::new();
+    let mut seen = HashSet::new();
+    for (u, &c) in units.iter().zip(conf.iter()) {
+        if c >= HARVEST_MAX_P {
+            continue;
+        }
+        let core: String = u.text.trim_matches(|ch: char| !ch.is_alphanumeric()).to_string();
+        if core.chars().count() < HARVEST_MIN_LEN || !core.chars().any(|ch| ch.is_alphabetic()) {
+            continue;
+        }
+        let lc = core.to_lowercase();
+        // A real Indonesian word whisper was merely unsure of - not a garble.
+        if lexicon.dictionary.contains(&lc) {
+            continue;
+        }
+        if !known.contains(&lc) && seen.insert(lc) {
+            out.push((core, c));
+        }
+    }
+    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(HARVEST_MAX_PER_CLIP);
+    out
 }
 
 /// A whisper model kept resident on the GPU so a *batch* of ranges transcribes
@@ -154,12 +425,48 @@ impl Transcriber {
         &self,
         samples: &[f32],
         language: Language,
+        lexicon: &DialectLexicon,
         should_abort: impl FnMut() -> bool + 'static,
     ) -> Result<Transcript> {
+        Ok(self.run(samples, language, lexicon, should_abort)?.0)
+    }
+
+    /// Like [`Self::transcribe`], but also returns the **auto-harvest candidates**
+    /// — words whisper was unsure about that the store doesn't yet know. The
+    /// caption path appends these to the dialect store for the operator to review
+    /// (so the dict keeps improving without manual garble-hunting).
+    pub fn transcribe_with_harvest(
+        &self,
+        samples: &[f32],
+        language: Language,
+        lexicon: &DialectLexicon,
+        should_abort: impl FnMut() -> bool + 'static,
+    ) -> Result<(Transcript, Vec<(String, f32)>)> {
+        let (transcript, conf) = self.run(samples, language, lexicon, should_abort)?;
+        let harvest = harvest_candidates(&transcript.units, &conf, lexicon);
+        Ok((transcript, harvest))
+    }
+
+    fn run(
+        &self,
+        samples: &[f32],
+        language: Language,
+        lexicon: &DialectLexicon,
+        should_abort: impl FnMut() -> bool + 'static,
+    ) -> Result<(Transcript, Vec<f32>)> {
         let mut state = self.ctx.create_state().context("creating whisper state")?;
+
+        // Opt-in decoder priming (#1): only when the store sets `prime`, since
+        // it biases the whole transcription (drift risk). The dict (#2, applied
+        // after grouping) is the always-on, risk-free fix. Declared before
+        // `params` so the prompt outlives the borrow.
+        let prompt = if lexicon.prime { lexicon.initial_prompt() } else { String::new() };
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some(lang_code(language)));
+        if !prompt.is_empty() {
+            params.set_initial_prompt(&prompt);
+        }
         params.set_token_timestamps(true); // populate per-token t0/t1 for word timing
         params.set_translate(false);
         params.set_print_progress(false);
@@ -182,8 +489,8 @@ impl Transcriber {
             .full(params, samples)
             .context("whisper transcription failed")?;
 
-        // Collect (text, t0_s, t1_s) for every real token, then group into words.
-        let mut raw_tokens: Vec<(String, f64, f64)> = Vec::new();
+        // Collect (text, t0_s, t1_s, prob) for every real token, then group.
+        let mut raw_tokens: Vec<(String, f64, f64, f32)> = Vec::new();
         for s in 0..state.full_n_segments() {
             let segment = state
                 .get_segment(s)
@@ -207,13 +514,13 @@ impl Transcriber {
                 } else {
                     (data.t0, data.t1)
                 };
-                raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0));
+                raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0, data.p));
             }
         }
 
-        let mut units = group_into_words(raw_tokens);
-        correct_known_mishears(&mut units, language);
-        Ok(Transcript { language, units })
+        let (mut units, conf) = group_into_words(raw_tokens);
+        correct_known_mishears(&mut units, lexicon);
+        Ok((Transcript { language, units }, conf))
     }
 }
 
@@ -224,9 +531,22 @@ pub fn transcribe_range(
     model: &Path,
     samples: &[f32],
     language: Language,
+    lexicon: &DialectLexicon,
     should_abort: impl FnMut() -> bool + 'static,
 ) -> Result<Transcript> {
-    Transcriber::load(model)?.transcribe(samples, language, should_abort)
+    Transcriber::load(model)?.transcribe(samples, language, lexicon, should_abort)
+}
+
+/// Like [`transcribe_range`], but also returns the auto-harvest candidates so the
+/// caption path can self-populate the dialect store's review queue.
+pub fn transcribe_range_harvesting(
+    model: &Path,
+    samples: &[f32],
+    language: Language,
+    lexicon: &DialectLexicon,
+    should_abort: impl FnMut() -> bool + 'static,
+) -> Result<(Transcript, Vec<(String, f32)>)> {
+    Transcriber::load(model)?.transcribe_with_harvest(samples, language, lexicon, should_abort)
 }
 
 #[cfg(test)]
@@ -234,29 +554,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn groups_leading_space_tokens_into_words() {
+    fn groups_leading_space_tokens_into_words_with_min_confidence() {
         let toks = vec![
-            (" Hello".to_string(), 0.0, 0.4),
-            (" world".to_string(), 0.4, 0.8),
-            ("!".to_string(), 0.8, 0.9), // punctuation extends "world"
-            (" GG".to_string(), 1.0, 1.2),
+            (" Hello".to_string(), 0.0, 0.4, 0.95),
+            (" world".to_string(), 0.4, 0.8, 0.90),
+            ("!".to_string(), 0.8, 0.9, 0.30), // extends "world", drags conf to the min
+            (" GG".to_string(), 1.0, 1.2, 0.80),
         ];
-        let units = group_into_words(toks);
+        let (units, conf) = group_into_words(toks);
         assert_eq!(units.len(), 3);
         assert_eq!(units[0].text, "Hello");
         assert_eq!(units[1].text, "world!");
         assert_eq!(units[2].text, "GG");
         assert_eq!(units[0].start_s, 0.0);
         assert_eq!(units[1].end_s, 0.9); // end advanced by the "!" token
+        // a unit's confidence is its least-sure token: min(0.90, 0.30)
+        assert_eq!(conf.len(), 3);
+        assert!((conf[1] - 0.30).abs() < 1e-6);
     }
 
     #[test]
     fn first_token_without_leading_space_still_starts_a_word() {
-        let toks = vec![("Yo".to_string(), 0.0, 0.3), ("urs".to_string(), 0.3, 0.5)];
-        let units = group_into_words(toks);
+        let toks =
+            vec![("Yo".to_string(), 0.0, 0.3, 0.9), ("urs".to_string(), 0.3, 0.5, 0.8)];
+        let (units, conf) = group_into_words(toks);
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].text, "Yours");
         assert_eq!(units[0].end_s, 0.5);
+        assert_eq!(conf, vec![0.8]); // min(0.9, 0.8)
+    }
+
+    #[test]
+    fn harvest_flags_only_unsure_unknown_real_words() {
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        let units = vec![
+            mk("mendoakan"),   // low conf but in vocabulary -> skip
+            mk("lenjakgawa"),  // low conf, unknown, long -> HARVEST
+            mk("ya"),          // low conf but too short -> skip
+            mk("profesi"),     // a known `right` (and confident) -> skip
+            mk("kusursekali"), // low conf, unknown -> HARVEST
+            mk("jelas"),       // unknown but confident -> skip
+        ];
+        let conf = vec![0.20, 0.10, 0.05, 0.95, 0.30, 0.99];
+        let lex = DialectLexicon {
+            vocabulary: vec!["mendoakan".into()],
+            corrections: vec![Correction {
+                wrong: "protesi".into(),
+                right: "profesi".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let got = harvest_candidates(&units, &conf, &lex);
+        let words: Vec<&str> = got.iter().map(|(w, _)| w.as_str()).collect();
+        // least-confident first: lenjakgawa(0.10) before kusursekali(0.30)
+        assert_eq!(words, vec!["lenjakgawa", "kusursekali"]);
+    }
+
+    #[test]
+    fn harvest_skips_real_dictionary_words() {
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        let units = vec![mk("berapa"), mk("sempurxyz")]; // both flagged unsure
+        let conf = vec![0.10, 0.10];
+        let mut dictionary = HashSet::new();
+        dictionary.insert("berapa".to_string()); // a real word whisper merely doubted
+        let lex = DialectLexicon { dictionary, ..Default::default() };
+        let got = harvest_candidates(&units, &conf, &lex);
+        let words: Vec<&str> = got.iter().map(|(w, _)| w.as_str()).collect();
+        assert_eq!(words, vec!["sempurxyz"]); // only the out-of-dictionary garble survives
     }
 
     #[test]
@@ -269,14 +634,54 @@ mod tests {
     #[test]
     fn corrects_known_mishears_whole_word_case_insensitively() {
         let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
-        let mut units = vec![mk("Bocal"), mk("bocal,"), mk("lokal")];
-        correct_known_mishears(&mut units, Language::Id);
+        let lex = DialectLexicon {
+            corrections: vec![
+                Correction { wrong: "bocal".into(), right: "bocil".into(), ..Default::default() },
+                // blank `right` = unverified operator to-do: must be skipped, not
+                // used to blank the word.
+                Correction { wrong: "lenjak".into(), right: String::new(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut units = vec![mk("Bocal"), mk("bocal,"), mk("lokal"), mk("lenjak")];
+        correct_known_mishears(&mut units, &lex);
         assert_eq!(units[0].text, "bocil"); // case-insensitive match
         assert_eq!(units[1].text, "bocil,"); // trailing punctuation preserved
         assert_eq!(units[2].text, "lokal"); // not a key - untouched
-        // Other languages have no ID corrections.
-        let mut en = vec![mk("bocal")];
-        correct_known_mishears(&mut en, Language::En);
-        assert_eq!(en[0].text, "bocal");
+        assert_eq!(units[3].text, "lenjak"); // unverified (blank right) - untouched
+
+        // An empty lexicon is a no-op (the pre-store behavior).
+        let mut u2 = vec![mk("bocal")];
+        correct_known_mishears(&mut u2, &DialectLexicon::default());
+        assert_eq!(u2[0].text, "bocal");
+    }
+
+    #[test]
+    fn initial_prompt_is_a_bare_deduped_term_list_never_the_note() {
+        let lex = DialectLexicon {
+            // The note must NEVER reach the prompt: a descriptive sentence makes
+            // whisper hallucinate YouTube boilerplate (measured on min3).
+            note: "Streamer logat Medan main game live".into(),
+            vocabulary: vec!["mendoakan".into(), "profesi".into()],
+            corrections: vec![
+                // confirmed right already in vocab -> deduped, primed once
+                Correction { wrong: "mendokong".into(), right: "mendoakan".into(), ..Default::default() },
+                Correction { wrong: "bocal".into(), right: "bocil".into(), ..Default::default() },
+                // blank right -> not primed
+                Correction { wrong: "wasi".into(), right: String::new(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let p = lex.initial_prompt();
+        assert!(!p.to_lowercase().contains("streamer") && !p.contains("game")); // note not primed
+        assert!(p.starts_with("mendoakan")); // first vocabulary term, no lead sentence
+        assert!(p.contains("profesi") && p.contains("bocil"));
+        assert!(!p.contains("wasi")); // blank-right entry is not primed
+        assert_eq!(p.matches("mendoakan").count(), 1); // vocab + correction => once
+    }
+
+    #[test]
+    fn empty_lexicon_has_no_prompt() {
+        assert!(DialectLexicon::default().initial_prompt().is_empty());
     }
 }

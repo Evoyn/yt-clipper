@@ -36,6 +36,14 @@ _Avoid_: short, video, segment
 The padded span of full-quality VOD video downloaded for a Clip when it is promoted — bounded by keyframes, so always a little longer than the Clip's range. The frame-accurate export is cut from the Segment; the VOD's video is never downloaded whole (ADR 0001, ADR 0006).
 _Avoid_: clip, chunk, section, source
 
+**Vocal stem**:
+The streamer's voice track separated from a Segment's audio — music and game SFX stripped out by a source-separation model. It isolates *voice from music/SFX*, **not one speaker from another**: an in-game NPC or cutscene voice survives it (telling those apart is a separate, future concern). Produced per-Clip behind the `sep` feature. **Rejected for captions (ADR 0014)**: htdemucs is a music separator and drops real spoken speech, so the export captions the mixed audio; the validated runtime is kept off-by-default for a possible future arousal-discovery use.
+_Avoid_: mic track / mic (it is not literally the streamer's microphone feed — any voice in the mix survives), denoised audio (it removes music/SFX, not just background noise)
+
+**Dialect store**:
+A curatable per-language file (`assets/dialect/<lang>.json`, the `DialectLexicon`) that lifts the caption-transcription ceiling for a Creator's accent / slang / viewer names — the *linguistic* error that no audio processing fixes (ADR 0014). It drives a deterministic `wrong → right` correction dict (always on), opt-in whisper priming (`prime`, off — it drifts), and **auto-harvest**: words whisper was unsure of that aren't in the bundled real-word dictionary are appended as `unverified` to-dos each caption run, so the operator's review queue self-populates and the dict improves over time.
+_Avoid_: lexicon (overloaded — that is the excitement-word list for detection scoring), dictionary (that is the bundled real-word wordlist the harvest filters against, not the corrections)
+
 **Layout**:
 The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single Panel filling the canvas — the gameplay, or the Facecam alone during a talking-session moment where the streamer's cam is the content).
 _Avoid_: composite, template, frame

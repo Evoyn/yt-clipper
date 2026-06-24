@@ -37,3 +37,8 @@ ser = ["yc-detect/ser"]
 # binary; framing then falls back to full-frame gameplay. The pure layout
 # geometry (yc-frame) is always linked regardless of this feature.
 face = ["yc-frame/face"]
+# Vocal-stem captions: pulls `ort` via yc-detect and the htdemucs model, so the
+# export transcribes the streamer's voice split from music/SFX instead of the
+# mixed analysis audio. Off by default; the export then captions the mix as
+# before. Only the caption source changes — the rendered clip's audio is the mix.
+sep = ["yc-detect/sep"]

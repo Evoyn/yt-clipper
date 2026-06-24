@@ -8,6 +8,9 @@ license.workspace = true
 yc-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# The curatable dialect/slang correction store (per-language JSON).
+serde.workspace = true
+serde_json.workspace = true
 # `tracing_backend` routes whisper.cpp/ggml's own logging through `tracing`, so
 # its verbose per-token DEBUG dump is dropped by the app's `info` filter instead
 # of flooding stderr (install via `install_logging_hooks`).

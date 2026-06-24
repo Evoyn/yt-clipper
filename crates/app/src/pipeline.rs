@@ -59,6 +59,15 @@ pub struct PipelinePaths {
     /// build). Only read by the `face`-gated auto-frame pass.
     #[cfg_attr(not(feature = "face"), allow(dead_code))]
     pub face_model: PathBuf,
+    /// htdemucs vocals model for the Vocal-stem captions (`sep`). May be absent:
+    /// the export then captions the mixed analysis audio. Only read by the
+    /// `sep`-gated caption pass.
+    #[cfg_attr(not(feature = "sep"), allow(dead_code))]
+    pub sep_model: PathBuf,
+    /// Directory of per-language dialect/slang correction stores (`<lang>.json`,
+    /// see `yc_transcribe::DialectLexicon`). Primes whisper + patches known
+    /// mishears; a missing file just disables the fix-ups for that language.
+    pub dialect_dir: PathBuf,
     pub font: PathBuf,
     pub workspace: PathBuf,
 }
@@ -418,6 +427,7 @@ fn do_detect(
     let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
     // Text-only (no DTW): the lexicon needs words, not word timing, and DTW
     // aborts on sparse music/SFX windows (see Transcriber::load_text_only).
+    let lexicon = yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
     let transcriber = yc_transcribe::Transcriber::load_text_only(&paths.model)?;
     let mut densities = Vec::with_capacity(moments.len());
     let mut texts = Vec::with_capacity(moments.len());
@@ -426,7 +436,7 @@ fn do_detect(
             anyhow::bail!("cancelled");
         }
         let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
-        let transcript = transcriber.transcribe(&samples, session.vod.language, {
+        let transcript = transcriber.transcribe(&samples, session.vod.language, &lexicon, {
             let c = cancel.clone();
             move || c.is_cancelled()
         })?;
@@ -683,11 +693,114 @@ fn do_prepare(
     Ok((prepared, frames, frame_w, frame_h))
 }
 
+/// The 16 kHz-mono samples whisper captions from. With the `sep` feature and the
+/// htdemucs model present, this is the **Vocal stem** of the Segment's range —
+/// the streamer's voice split from music/SFX (CONTEXT.md), so whisper reads the
+/// voice rather than the loudest sound in the mix. Otherwise it is the mixed
+/// analysis-wav range (the historical path). Either way the rendered clip's
+/// audible audio stays the mix — only what whisper *hears* changes.
+#[cfg_attr(not(feature = "sep"), allow(unused_variables))]
+fn caption_samples(
+    paths: &PipelinePaths,
+    session: &Session,
+    prepared: &PreparedClip,
+    range: TimeRange,
+    tx: &Sender<Progress>,
+) -> Result<Vec<f32>> {
+    #[cfg(feature = "sep")]
+    {
+        if paths.sep_model.is_file() {
+            let _ = tx.send(Progress::Stage("Separating vocal stem"));
+            let wd = &session.workdir;
+            let in44 = wd.join("_sep_in44k.wav");
+            let voc44 = wd.join("_sep_voc44k.wav");
+            let voc16 = wd.join("_sep_voc16k.wav");
+            // 44.1 kHz stereo for the clip range, from the render source at its
+            // in-segment offset — the same window the mix would caption.
+            ffmpeg_extract_stereo_44k(
+                &paths.ffmpeg,
+                &prepared.render_src,
+                prepared.seek_s,
+                range.duration_s(),
+                &in44,
+            )?;
+            yc_detect::sep::separate_vocals_wav(&paths.sep_model, &in44, &voc44)?;
+            // Back to whisper's 16 kHz mono; the temp file spans exactly the range.
+            ffmpeg_resample_16k_mono(&paths.ffmpeg, &voc44, &voc16)?;
+            return yc_ingest::read_range_samples(
+                &voc16,
+                TimeRange { start_s: 0.0, end_s: range.duration_s() + 1.0 },
+            );
+        }
+    }
+    yc_ingest::read_range_samples(&session.analysis_wav, range)
+}
+
+/// Extract `dur_s` of `src` from `seek_s` as a 44.1 kHz **stereo** PCM wav — the
+/// htdemucs vocal-sep input. `-ss` before `-i` fast-seeks (the render source is
+/// the padded Segment, or the whole local file).
+#[cfg(feature = "sep")]
+fn ffmpeg_extract_stereo_44k(
+    ffmpeg: &Path,
+    src: &Path,
+    seek_s: f64,
+    dur_s: f64,
+    out: &Path,
+) -> Result<()> {
+    let args: Vec<String> = vec![
+        "-ss".into(),
+        format!("{seek_s:.3}"),
+        "-t".into(),
+        format!("{dur_s:.3}"),
+        "-i".into(),
+        src.display().to_string(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-ac".into(),
+        "2".into(),
+        "-ar".into(),
+        "44100".into(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-y".into(),
+        out.display().to_string(),
+    ];
+    let status = std::process::Command::new(ffmpeg)
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    anyhow::ensure!(status.success(), "ffmpeg vocal-sep extract failed ({status})");
+    Ok(())
+}
+
+/// Resample a wav to whisper's 16 kHz mono PCM (the vocal stem -> caption input).
+#[cfg(feature = "sep")]
+fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()> {
+    let args: Vec<String> = vec![
+        "-i".into(),
+        src.display().to_string(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        yc_ingest::WHISPER_SR.to_string(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-y".into(),
+        out.display().to_string(),
+    ];
+    let status = std::process::Command::new(ffmpeg)
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    anyhow::ensure!(status.success(), "ffmpeg vocal-sep resample failed ({status})");
+    Ok(())
+}
+
 /// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
 /// Segment. Transcribes the range once (whisper, GPU) and caches it on the
 /// `PreparedClip`, so a re-render after another nudge is NVENC-only. The
-/// transcript captions the loudest voice in the mixed track; mic isolation is
-/// future work (see ROADMAP M1 known-limitation).
+/// transcript captions the Vocal stem when `sep` is built, else the mixed track
+/// (the loudest voice in it); see `caption_samples`.
 fn do_render(
     paths: &PipelinePaths,
     session: &Session,
@@ -701,13 +814,35 @@ fn do_render(
 
     // Transcribe once, then reuse: re-rendering a nudged Layout skips whisper.
     if prepared.transcript.is_none() {
+        // Captions read the Vocal stem when `sep` is built (music/SFX split off
+        // the streamer's voice); otherwise the mixed analysis audio, as before.
+        let samples = caption_samples(paths, session, prepared, range, tx)?;
         let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
-        let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
-        let transcript =
-            yc_transcribe::transcribe_range(&paths.model, &samples, session.vod.language, {
+        let lexicon =
+            yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
+        let (transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
+            &paths.model,
+            &samples,
+            session.vod.language,
+            &lexicon,
+            {
                 let c = cancel.clone();
                 move || c.is_cancelled()
-            })?;
+            },
+        )?;
+        // Self-populate the store's review queue with words whisper was unsure
+        // about (auto-harvest), unless the store froze it. Best-effort: a write
+        // failure logs and never sinks the render.
+        if lexicon.harvest {
+            let n = yc_transcribe::DialectLexicon::harvest_to_store(
+                &paths.dialect_dir,
+                session.vod.language,
+                &harvest,
+            );
+            if n > 0 {
+                tracing::info!("dialect: harvested {n} low-confidence word(s) to review");
+            }
+        }
         // Refine caption end-times to the streamer's actual vocalization: a
         // screamed / drawn-out word holds for its full sound and a normal word
         // clears when the sound drops, instead of huge-word's fixed hold.

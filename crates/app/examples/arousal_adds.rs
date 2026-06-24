@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     for start in starts {
         let range = TimeRange { start_s: start, end_s: start + dur_s };
         let samples = yc_ingest::read_range_samples(&wav, range)?;
-        let t = transcriber.transcribe(&samples, lang, || false)?;
+        let t = transcriber.transcribe(&samples, lang, &yc_transcribe::DialectLexicon::default(), || false)?;
         let density = yc_detect::lexicon::density(&t, lang);
         let text = t.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" ");
         println!("{:>6} [{:.3}]  {}", mmss(start), density, text.trim());

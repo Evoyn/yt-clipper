@@ -17,6 +17,10 @@ pub mod lexicon;
 pub mod llm;
 pub mod loudness;
 pub mod score;
+/// Vocal-stem separation (htdemucs vocals ONNX). Behind `sep` so the default
+/// detection build needs neither the `ort` binary nor the htdemucs model.
+#[cfg(feature = "sep")]
+pub mod sep;
 
 use anyhow::Result;
 use std::path::Path;

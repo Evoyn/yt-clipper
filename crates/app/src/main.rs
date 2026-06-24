@@ -37,6 +37,8 @@ fn main() -> eframe::Result<()> {
         llm_model: paths.llm_model(),
         llm_judge: paths.llm_judge(),
         face_model: paths.face_model(),
+        sep_model: paths.sep_model(),
+        dialect_dir: paths.dialect_dir(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
     });
@@ -275,6 +277,17 @@ impl AppPaths {
     /// downloaded; framing then falls back to full-frame gameplay.
     fn face_model(&self) -> PathBuf {
         self.models.join("version-RFB-320.onnx")
+    }
+
+    /// htdemucs vocals model for the Vocal-stem captions (`sep`). Absent unless
+    /// downloaded; the export then captions the mixed analysis audio.
+    fn sep_model(&self) -> PathBuf {
+        self.models.join("htdemucs_ft_vocals.onnx")
+    }
+
+    /// Directory of per-language dialect/slang stores (`assets/dialect/<lang>.json`).
+    fn dialect_dir(&self) -> PathBuf {
+        self.assets.join("dialect")
     }
 
     fn font(&self) -> PathBuf {

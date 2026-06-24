@@ -47,9 +47,36 @@ fn main() -> anyhow::Result<()> {
         wav.display(), start_s, end_s, lang, samples.len(), samples.len() as f64 / sr as f64
     );
 
+    // Dialect store (priming + post-correction) - the same path do_render takes.
+    let lexicon = yc_transcribe::DialectLexicon::load(&PathBuf::from("assets/dialect"), lang);
+    let prompt = lexicon.initial_prompt();
+    let n_corr = lexicon.corrections.iter().filter(|c| !c.right.is_empty()).count();
+    println!(
+        "\ndialect: {} confirmed corrections | {} dict words | prime: {}",
+        n_corr,
+        lexicon.dictionary.len(),
+        if !lexicon.prime {
+            "(off)".to_string()
+        } else if prompt.is_empty() {
+            "(on, no vocab)".to_string()
+        } else {
+            format!("on \"{prompt}\"")
+        }
+    );
+
     // 1) RAW whisper (WITH DTW - exactly the render path: transcribe_range).
     eprintln!("[caption_diag] loading whisper + transcribing (GPU)...");
-    let raw = yc_transcribe::transcribe_range(&model, &samples, lang, || false)?;
+    let (raw, harvest) =
+        yc_transcribe::transcribe_range_harvesting(&model, &samples, lang, &lexicon, || false)?;
+    println!(
+        "auto-harvest candidates ({}): {}",
+        harvest.len(),
+        if harvest.is_empty() {
+            "(none)".to_string()
+        } else {
+            harvest.iter().map(|(w, c)| format!("{w}({c:.2})")).collect::<Vec<_>>().join(", ")
+        }
+    );
     println!("\n--- RAW whisper units ({}) - '!' = DTW start < previous (non-monotonic) ---", raw.units.len());
     let mut prev = -1.0_f64;
     let mut nonmono = 0;

@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     for (i, m) in moments.iter().enumerate() {
         eprintln!("transcribing {}/{} ({})", i + 1, moments.len(), mmss(m.range.start_s));
         let samples = yc_ingest::read_range_samples(&wav, m.range)?;
-        let t = transcriber.transcribe(&samples, lang, || false)?;
+        let t = transcriber.transcribe(&samples, lang, &yc_transcribe::DialectLexicon::default(), || false)?;
         densities.push(lexicon::density(&t, lang));
         texts.push(t.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "));
     }
