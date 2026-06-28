@@ -9,6 +9,12 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **Karaoke captions snap per word** — the karaoke style used a smooth
+  left-to-right fill that looked like "a loading bar filling." Now each word
+  **snaps** to the accent colour as a whole the moment it's spoken (and stays
+  lit), instead of sweeping. Same timing, punchier read. Live-verified: a frame
+  strip over "DAN LAGI, TIDAK ADA" shows whole words turning gold one-by-one,
+  none ever half-filled. (ADR 0018)
 - **Layout is now selectable** — your preferred stacked framing (gameplay on top,
   facecam below) stopped appearing because M6 auto-detect falls back to full-frame
   whenever it can't confidently find a corner cam (and `--batch` never opens the
