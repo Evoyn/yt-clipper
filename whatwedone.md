@@ -9,6 +9,13 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **Loud clips start earlier, for the build-up** — a jumpscare or loud donation
+  clip used to begin a fixed 5s before the loud peak. Now the pre-roll scales with
+  how loud the peak is — up to ~10s for a loud-driven Moment, so the lead-up is
+  captured — while a chat-driven Moment keeps the ~5s (chat lags the event). Window
+  spacing was widened so the longer leads never make two candidate clips overlap.
+  Measured on a real 105-min VOD: all 25 detected Moments are loud-driven and now
+  open with the full 10s pre-roll. (ADR 0020)
 - **Captions no longer jump ahead of the audio** — sometimes a word appeared a
   beat before it was spoken. whisper's word-onset timing occasionally runs early;
   now each caption's start is nudged **forward** to where the audio actually rises
