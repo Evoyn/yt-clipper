@@ -965,6 +965,20 @@ fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()>
     Ok(())
 }
 
+/// Peak sample magnitude (|s|, 0..1) below which a promoted clip is treated as
+/// having no speech, so transcription is skipped (M8): a near-silent window trips
+/// whisper.cpp's DTW assertion and aborts the process. Real speech peaks far above
+/// this; only a genuinely silent range (an accidental promote of a quiet gap)
+/// falls below. Tune-from-use.
+const SILENT_CLIP_PEAK: f32 = 0.01;
+
+/// Whether a clip's caption samples carry effectively no audio (peak below
+/// [`SILENT_CLIP_PEAK`]) — the no-speech guard for the whisper DTW abort (M8).
+/// Pure, so the threshold is unit-tested without a model.
+fn is_silent_clip(samples: &[f32]) -> bool {
+    samples.iter().fold(0.0f32, |m, &s| m.max(s.abs())) < SILENT_CLIP_PEAK
+}
+
 /// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
 /// Segment. Transcribes the range once (whisper, GPU) and caches it on the
 /// `PreparedClip`, so a re-render after another nudge is NVENC-only. The
@@ -987,37 +1001,52 @@ fn do_render(
         // Captions read the Vocal stem when `sep` is built (music/SFX split off
         // the streamer's voice); otherwise the mixed analysis audio, as before.
         let samples = caption_samples(paths, session, prepared, range, tx)?;
-        let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
-        let lexicon =
-            yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
-        let (transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
-            &paths.model,
-            &samples,
-            session.vod.language,
-            &lexicon,
-            {
-                let c = cancel.clone();
-                move || c.is_cancelled()
-            },
-        )?;
-        // Self-populate the store's review queue with words whisper was unsure
-        // about (auto-harvest), unless the store froze it. Best-effort: a write
-        // failure logs and never sinks the render.
-        if lexicon.harvest {
-            let n = yc_transcribe::DialectLexicon::harvest_to_store(
-                &paths.dialect_dir,
-                session.vod.language,
-                &harvest,
+        // Guard whisper's DTW process-abort on a token-starved window (M8): a
+        // (near-)silent promote feeds whisper almost no speech and trips the
+        // whisper.cpp DTW assertion (filter_width < ne[2]), which *aborts the
+        // whole process* (uncatchable from Rust; detection dodges it with the
+        // no-DTW `load_text_only`, ADR 0007). If the clip has effectively no
+        // audio, skip transcription -> empty captions and still render the video.
+        // Real speech peaks far above this floor. (The harder music-but-no-speech
+        // case wants whisper out-of-process, like the judge; noted, deferred.)
+        let transcript = if is_silent_clip(&samples) {
+            tracing::warn!(
+                "caption: clip below silence floor {SILENT_CLIP_PEAK}; \
+                 skipping transcription (no speech)"
             );
-            if n > 0 {
-                tracing::info!("dialect: harvested {n} low-confidence word(s) to review");
+            Transcript { language: session.vod.language, units: Vec::new() }
+        } else {
+            let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
+            let lexicon =
+                yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
+            let (transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
+                &paths.model,
+                &samples,
+                session.vod.language,
+                &lexicon,
+                {
+                    let c = cancel.clone();
+                    move || c.is_cancelled()
+                },
+            )?;
+            // Self-populate the store's review queue with words whisper was unsure
+            // about (auto-harvest), unless the store froze it. Best-effort: a write
+            // failure logs and never sinks the render.
+            if lexicon.harvest {
+                let n = yc_transcribe::DialectLexicon::harvest_to_store(
+                    &paths.dialect_dir,
+                    session.vod.language,
+                    &harvest,
+                );
+                if n > 0 {
+                    tracing::info!("dialect: harvested {n} low-confidence word(s) to review");
+                }
             }
-        }
-        // Refine caption end-times to the streamer's actual vocalization: a
-        // screamed / drawn-out word holds for its full sound and a normal word
-        // clears when the sound drops, instead of huge-word's fixed hold.
-        let transcript =
-            yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR);
+            // Refine caption end-times to the streamer's actual vocalization: a
+            // screamed / drawn-out word holds for its full sound and a normal word
+            // clears when the sound drops, instead of huge-word's fixed hold.
+            yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR)
+        };
         prepared.transcript = Some(transcript);
     }
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
@@ -1309,6 +1338,17 @@ mod tests {
         assert_eq!(unique_path(&dir, "My Clip", "mp4"), dir.join("My Clip (3).mp4"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_silent_clip_flags_only_near_silence() {
+        // Pure silence and a tiny-noise floor read as silent (would crash whisper's
+        // DTW); a clip with any real speech-level energy does not.
+        assert!(is_silent_clip(&[0.0; 16_000]));
+        assert!(is_silent_clip(&[0.001, -0.002, 0.003])); // dither / noise floor
+        assert!(!is_silent_clip(&[0.0, 0.0, 0.2, 0.0])); // one speech-level peak is enough
+        assert!(!is_silent_clip(&[0.5; 100])); // loud
+        assert!(is_silent_clip(&[])); // empty -> nothing to transcribe, treat as silent
     }
 
     #[test]
