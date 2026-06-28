@@ -492,6 +492,16 @@ fn fmt_sig(v: Option<f32>) -> String {
     v.map(|x| format!("{x:5.2}")).unwrap_or_else(|| "    -".into())
 }
 
+/// Truncate `s` to at most `max` characters, appending an ellipsis when cut — for
+/// the compact Moment-list labels in the rail (W4).
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
 /// Parse the headless caption-genre arg (M7): `rolling` / `karaoke`, else the
 /// huge-word default.
 fn parse_genre(arg: Option<&str>) -> CaptionGenre {
@@ -641,7 +651,7 @@ impl eframe::App for App {
         // always-visible status, instead of a heading buried in the scroll and a
         // status pinned to the very bottom. A proper app bar — the first step of the
         // SaaS shell; the moments-rail / detail-pane split is the next slice.
-        egui::TopBottomPanel::top("brandbar").show_inside(ui, |ui| {
+        egui::Panel::top("brandbar").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD));
@@ -654,409 +664,25 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        // Preflight: are the sidecars / model / font present?
-        ui.separator();
-        let file_row = |ui: &mut egui::Ui, name: &str, path: &PathBuf| {
-            let ok = path.exists();
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if ok { theme::OK } else { theme::ERR },
-                    if ok { "ok" } else { "MISSING" },
-                );
-                ui.label(format!("{name}: {}", path.display()));
+        // --- W4: two-pane clip workspace — a Moments rail (left) + a detail /
+        // preview pane (right), on the ADR 0024 theme. Each section is its own
+        // method so the panel structure stays legible. ---
+        egui::Panel::left("rail")
+            .resizable(true)
+            .default_size(380.0)
+            .min_size(300.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("rail").show(ui, |ui| {
+                    self.ui_preflight(ui);
+                    self.ui_import(ui, working);
+                    self.ui_moments(ui, working);
+                });
             });
-        };
-        file_row(ui, "ffmpeg", &self.paths.ffmpeg());
-        file_row(ui, "ffprobe", &self.paths.ffprobe());
-        file_row(ui, "yt-dlp", &self.paths.ytdlp());
-        ui.horizontal(|ui| {
-            let ok = self.deno_dir.is_some();
-            ui.colored_label(
-                if ok { egui::Color32::GREEN } else { egui::Color32::RED },
-                if ok { "ok" } else { "MISSING" },
-            );
-            match &self.deno_dir {
-                Some(d) => ui.label(format!("deno: {}", d.display())),
-                None => ui.label("deno: not found (run fetch-sidecars.ps1 or install via winget)"),
-            };
-        });
-        file_row(ui, "whisper model", &self.paths.model());
-        file_row(ui, "caption font", &self.paths.font());
-
-        // --- Import (phase 1) ---
-        ui.separator();
-        ui.label("1. Import a VOD");
-        ui.horizontal(|ui| {
-            ui.label("Spoken language");
-            egui::ComboBox::from_label("(the streamer, not the game)")
-                .selected_text(match self.language {
-                    Language::En => "English",
-                    Language::Id => "Bahasa Indonesia",
-                    Language::Ja => "Nihongo",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.language, Language::En, "English");
-                    ui.selectable_value(&mut self.language, Language::Id, "Bahasa Indonesia");
-                    ui.selectable_value(&mut self.language, Language::Ja, "Nihongo");
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Caption style");
-            egui::ComboBox::from_label("(applied on render)")
-                .selected_text(match self.caption_genre {
-                    CaptionGenre::HugeWord => "Huge Word",
-                    CaptionGenre::RollingPop => "Rolling Pop",
-                    CaptionGenre::KaraokeFill => "Karaoke Fill",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::HugeWord, "Huge Word");
-                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
-                    ui.selectable_value(
-                        &mut self.caption_genre,
-                        CaptionGenre::KaraokeFill,
-                        "Karaoke Fill",
-                    );
-                });
-        });
-        // Layout preference (ADR 0017): the operator's explicit framing for the
-        // next clip. Auto = M6 auto-detect; the others force it (so the preferred
-        // stacked / game-on-top, cam-below framing is one click away, and works in
-        // batch where the nudge editor never opens).
-        ui.horizontal(|ui| {
-            ui.label("Layout");
-            egui::ComboBox::from_label("(framing for the next clip)")
-                .selected_text(match self.layout_pref {
-                    LayoutPref::Auto => "Auto-detect",
-                    LayoutPref::Stacked => "Stacked (game + cam)",
-                    LayoutPref::FullCam => "Full cam",
-                    LayoutPref::FullGameplay => "Full gameplay",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Auto, "Auto-detect");
-                    ui.selectable_value(
-                        &mut self.layout_pref,
-                        LayoutPref::Stacked,
-                        "Stacked (game + cam)",
-                    );
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullCam, "Full cam");
-                    ui.selectable_value(
-                        &mut self.layout_pref,
-                        LayoutPref::FullGameplay,
-                        "Full gameplay",
-                    );
-                });
-        });
-        ui.add_enabled_ui(!working, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("YouTube URL:");
-                ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(560.0));
-                if ui.button("Import URL").clicked() && !self.url.trim().is_empty() {
-                    self.start_import(ImportSource::YouTube(self.url.trim().to_string()));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("or local file:");
-                ui.add(egui::TextEdit::singleline(&mut self.video_path).desired_width(440.0));
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "video / audio",
-                            &["mp4", "mkv", "webm", "mov", "avi", "m4a", "mp3", "wav", "opus"],
-                        )
-                        .pick_file()
-                    {
-                        self.video_path = path.display().to_string();
-                        self.start_import(ImportSource::Local(path));
-                    }
-                }
-                if ui.button("Import file").clicked() && !self.video_path.trim().is_empty() {
-                    self.start_import(ImportSource::Local(PathBuf::from(self.video_path.trim())));
-                }
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
+                self.ui_detail(ui, working);
             });
         });
-
-        // --- Detect & review Moments (phase 2) ---
-        // Read the imported facts into an owned Option first, so the interactive
-        // widgets below can borrow `self` mutably without fighting a borrow of
-        // `self.imported` held across the match.
-        ui.separator();
-        let imported = self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s));
-        match imported {
-            None => {
-                ui.label("2. Detect Moments - import a VOD first.");
-            }
-            Some((title, duration_s)) => {
-                ui.label(format!("2. Review Moments from: {}  ({})", title, fmt_duration(duration_s)));
-                ui.add_enabled_ui(!working, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Detect Moments").clicked() {
-                            self.moments.clear();
-                            self.selected = None;
-                            let _ = self.to_worker.send(Job::Detect);
-                            self.status = Status::Working("Starting detection".into());
-                        }
-                        ui.separator();
-                        ui.label("Mark manually:  start");
-                        ui.add(egui::DragValue::new(&mut self.start_s).speed(0.5).suffix(" s"));
-                        ui.label("end");
-                        ui.add(egui::DragValue::new(&mut self.end_s).speed(0.5).suffix(" s"));
-                        if ui.button("Add Moment").clicked() && self.end_s > self.start_s {
-                            let id = self.moments.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-                            self.moments.push(Moment {
-                                id,
-                                range: TimeRange { start_s: self.start_s, end_s: self.end_s },
-                                signals: Signals::default(),
-                                score: 0.0,
-                                title: None, // manual Moment: render names the Short by timestamp
-                            });
-                            self.selected = Some(id);
-                        }
-                    });
-                });
-
-                // VOD overview: loudness waveform + chat-rate overlay + Moment
-                // markers (ADR 0001: review by waveform, not video scrubbing).
-                // Click a marker to select that Moment.
-                let mut tl_select: Option<u64> = None;
-                if let Some(tl) = &self.timeline {
-                    let total_s = tl.loudness.len() as f64 * tl.bin_s;
-                    if total_s > 0.0 {
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 70.0),
-                            egui::Sense::click(),
-                        );
-                        let p = ui.painter_at(rect);
-                        p.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_gray(18));
-                        let n = tl.loudness.len();
-                        let cols = rect.width().max(1.0) as usize;
-                        let lmax = tl.loudness.iter().copied().fold(1e-6_f32, f32::max);
-                        for c in 0..cols {
-                            let i0 = c * n / cols;
-                            let i1 = ((c + 1) * n / cols).clamp(i0 + 1, n);
-                            let peak = tl.loudness[i0..i1].iter().copied().fold(0.0, f32::max) / lmax;
-                            let x = rect.left() + c as f32;
-                            p.line_segment(
-                                [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - peak * rect.height())],
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(85)),
-                            );
-                        }
-                        if let Some(chat) = &tl.chat {
-                            let cmax = chat.iter().copied().fold(1e-6_f32, f32::max);
-                            let mut prev: Option<egui::Pos2> = None;
-                            for c in 0..cols {
-                                let i0 = c * n / cols;
-                                let i1 = ((c + 1) * n / cols).clamp(i0 + 1, n);
-                                let avg = chat[i0..i1].iter().copied().sum::<f32>() / (i1 - i0) as f32 / cmax;
-                                let pt = egui::pos2(rect.left() + c as f32, rect.bottom() - avg * rect.height());
-                                if let Some(pp) = prev {
-                                    p.line_segment([pp, pt], egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 170, 255)));
-                                }
-                                prev = Some(pt);
-                            }
-                        }
-                        let t_to_x = |t: f64| rect.left() + (t / total_s) as f32 * rect.width();
-                        for m in &self.moments {
-                            let x0 = t_to_x(m.range.start_s);
-                            let x1 = t_to_x(m.range.end_s).max(x0 + 1.0);
-                            let col = if self.selected == Some(m.id) {
-                                egui::Color32::from_rgba_unmultiplied(255, 209, 0, 110)
-                            } else {
-                                egui::Color32::from_rgba_unmultiplied(255, 80, 80, 70)
-                            };
-                            p.rect_filled(
-                                egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
-                                egui::CornerRadius::ZERO,
-                                col,
-                            );
-                        }
-                        if resp.clicked() {
-                            if let Some(pos) = resp.interact_pointer_pos() {
-                                let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * total_s;
-                                let mid = |m: &Moment| (m.range.start_s + m.range.end_s) / 2.0;
-                                tl_select = self
-                                    .moments
-                                    .iter()
-                                    .min_by(|a, b| {
-                                        (mid(a) - t).abs().partial_cmp(&(mid(b) - t).abs()).unwrap_or(std::cmp::Ordering::Equal)
-                                    })
-                                    .map(|m| m.id);
-                            }
-                        }
-                    }
-                }
-                if let Some(id) = tl_select {
-                    self.selected = Some(id);
-                }
-
-                // Ranked Moment list with per-signal breakdown; select + promote.
-                // Signals are z-scores (sigmas above the VOD baseline); a dash
-                // means the signal is absent (e.g. no chat, or a manual Moment).
-                if self.moments.is_empty() {
-                    ui.label("No Moments yet - click Detect Moments, or mark one manually.");
-                } else {
-                    // The promoted range plus that Moment's generated title (ADR
-                    // 0015), threaded to Prepare so the render names the Short.
-                    let mut to_promote: Option<(TimeRange, Option<String>)> = None;
-                    let mut to_select: Option<u64> = None;
-                    // Batch-select checkbox toggles (M8): (Moment id, new checked).
-                    let mut batch_toggles: Vec<(u64, bool)> = Vec::new();
-                    let selected = self.selected;
-                    let enabled = !working;
-                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        egui::Grid::new("moments").striped(true).num_columns(10).show(ui, |ui| {
-                            for h in ["", "#", "range", "score", "chat", "loud", "lex", "arou", "llm", ""] {
-                                ui.label(h);
-                            }
-                            ui.end_row();
-                            for m in &self.moments {
-                                // Batch-render select (M8): render these together.
-                                let mut checked = self.batch_selected.contains(&m.id);
-                                if ui.add_enabled(enabled, egui::Checkbox::new(&mut checked, "")).changed() {
-                                    batch_toggles.push((m.id, checked));
-                                }
-                                let sel = selected == Some(m.id);
-                                if ui.add(egui::Button::selectable(sel, m.id.to_string())).clicked() {
-                                    to_select = Some(m.id);
-                                }
-                                ui.label(format!(
-                                    "{}-{}",
-                                    fmt_clock(m.range.start_s),
-                                    fmt_clock(m.range.end_s)
-                                ));
-                                ui.label(format!("{:.2}", m.score));
-                                ui.label(fmt_sig(m.signals.chat_rate));
-                                ui.label(fmt_sig(m.signals.loudness));
-                                ui.label(fmt_sig(m.signals.lexicon));
-                                ui.label(fmt_sig(m.signals.arousal));
-                                ui.label(fmt_sig(m.signals.llm));
-                                if ui.add_enabled(enabled, egui::Button::new("Promote")).clicked() {
-                                    to_promote = Some((m.range, m.title.clone()));
-                                    to_select = Some(m.id);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    });
-                    for (id, on) in batch_toggles {
-                        if on {
-                            self.batch_selected.insert(id);
-                        } else {
-                            self.batch_selected.remove(&id);
-                        }
-                    }
-                    if let Some(id) = to_select {
-                        self.selected = Some(id);
-                    }
-                    if let Some((range, title)) = to_promote {
-                        self.editor = None; // a new clip replaces any open editor
-                        let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
-                        self.status = Status::Working("Preparing clip".into());
-                    }
-
-                    // Batch render (M8 job-queue): render every checked Moment
-                    // sequentially, each auto-framed (no editor), in rank order. The
-                    // Prepared/Done worker-drain handlers above drive the queue.
-                    let n_sel = self.batch_selected.len();
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                enabled && n_sel > 0,
-                                egui::Button::new(format!("Render {n_sel} selected (auto-framed)")),
-                            )
-                            .clicked()
-                        {
-                            let queue: Vec<(TimeRange, Option<String>)> = self
-                                .moments
-                                .iter()
-                                .filter(|m| self.batch_selected.contains(&m.id))
-                                .map(|m| (m.range, m.title.clone()))
-                                .collect();
-                            if let Some((range, title)) = queue.first().cloned() {
-                                self.editor = None;
-                                self.render_queue = queue;
-                                self.queue_idx = 0;
-                                let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
-                                self.status = Status::Working(format!(
-                                    "Rendering 1/{}",
-                                    self.render_queue.len()
-                                ));
-                            }
-                        }
-                        if n_sel > 0
-                            && ui.add_enabled(enabled, egui::Button::new("Clear")).clicked()
-                        {
-                            self.batch_selected.clear();
-                        }
-                    });
-                }
-            }
-        }
-
-        // --- Selected Moment: transcript + audio playback (ADR 0001) ---
-        let mut play: Option<TimeRange> = None;
-        let mut stop = false;
-        let mut vol_changed = false;
-        if let Some(id) = self.selected {
-            if let Some(m) = self.moments.iter().find(|m| m.id == id).cloned() {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Moment #{}   {} - {}",
-                        id,
-                        fmt_clock(m.range.start_s),
-                        fmt_clock(m.range.end_s)
-                    ));
-                    play = ui.button("Play").clicked().then_some(m.range);
-                    stop = ui.button("Stop").clicked();
-                    ui.label("Vol");
-                    vol_changed = ui
-                        .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
-                        .changed();
-                });
-                // The LLM-generated Shorts title (ADR 0015) — this is what the
-                // rendered Short will be named, so the operator sees it pre-promote.
-                if let Some(title) = m.title.as_deref().filter(|t| !t.is_empty()) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong("Title:");
-                        ui.label(title);
-                    });
-                }
-                if let Some(reason) = self.llm_reasons.get(&id) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong("LLM:");
-                        ui.label(reason);
-                    });
-                }
-                match self.transcripts.get(&id) {
-                    Some(t) if !t.trim().is_empty() => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("transcript")
-                            .max_height(120.0)
-                            .show(ui, |ui| {
-                                ui.label(t);
-                            });
-                    }
-                    Some(_) => {
-                        ui.weak("(no speech transcribed for this Moment)");
-                    }
-                    None => {
-                        ui.weak("(manual Moment - run Detect to transcribe)");
-                    }
-                }
-            }
-        }
-        if let Some(range) = play {
-            self.play_range(range);
-        }
-        if stop {
-            self.stop_audio();
-        }
-        // Live volume: nudge the playing sink without restarting it.
-        if vol_changed {
-            if let Some(sink) = &self.sink {
-                sink.set_volume(self.volume);
-            }
-        }
 
         // --- Nudge editor (ADR 0012): frame the prepared Clip before render ---
         // A floating, scrollable Window so the tall 9:16 composite and its
@@ -1131,6 +757,413 @@ impl App {
             }
             Status::Failed(err) => {
                 ui.colored_label(theme::ERR, "Failed").on_hover_text(err.clone());
+            }
+        }
+    }
+
+    /// Left-rail section: the preflight tool/model check, collapsed once every
+    /// sidecar + model is present (auto-expanded when something is missing).
+    fn ui_preflight(&mut self, ui: &mut egui::Ui) {
+        let row = |ui: &mut egui::Ui, ok: bool, text: String| {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    if ok { theme::OK } else { theme::ERR },
+                    if ok { "ok" } else { "MISSING" },
+                );
+                ui.label(text);
+            });
+        };
+        let files = [
+            ("ffmpeg", self.paths.ffmpeg()),
+            ("ffprobe", self.paths.ffprobe()),
+            ("yt-dlp", self.paths.ytdlp()),
+            ("whisper model", self.paths.model()),
+            ("caption font", self.paths.font()),
+        ];
+        let all_ok = self.deno_dir.is_some() && files.iter().all(|(_, p)| p.exists());
+        let header = if all_ok {
+            "Diagnostics — all tools ready"
+        } else {
+            "Diagnostics — something is missing"
+        };
+        egui::CollapsingHeader::new(header).default_open(!all_ok).show(ui, |ui| {
+            for (name, p) in &files {
+                row(ui, p.exists(), format!("{name}: {}", p.display()));
+            }
+            match &self.deno_dir {
+                Some(d) => row(ui, true, format!("deno: {}", d.display())),
+                None => row(ui, false, "deno: not found (run fetch-sidecars.ps1 / winget)".into()),
+            }
+        });
+    }
+
+    /// Left-rail section: import a VOD — the per-clip defaults (language / caption /
+    /// layout) and the URL / local-file pickers.
+    fn ui_import(&mut self, ui: &mut egui::Ui, working: bool) {
+        ui.separator();
+        ui.strong("1 · Import a VOD");
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("Language");
+            egui::ComboBox::from_id_salt("lang")
+                .selected_text(match self.language {
+                    Language::En => "English",
+                    Language::Id => "Bahasa Indonesia",
+                    Language::Ja => "Nihongo",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.language, Language::En, "English");
+                    ui.selectable_value(&mut self.language, Language::Id, "Bahasa Indonesia");
+                    ui.selectable_value(&mut self.language, Language::Ja, "Nihongo");
+                });
+            ui.weak("(streamer, not the game)");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Caption");
+            egui::ComboBox::from_id_salt("caption")
+                .selected_text(match self.caption_genre {
+                    CaptionGenre::HugeWord => "Huge Word",
+                    CaptionGenre::RollingPop => "Rolling Pop",
+                    CaptionGenre::KaraokeFill => "Karaoke",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::HugeWord, "Huge Word");
+                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
+                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::KaraokeFill, "Karaoke");
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Layout");
+            egui::ComboBox::from_id_salt("layout")
+                .selected_text(match self.layout_pref {
+                    LayoutPref::Auto => "Auto-detect",
+                    LayoutPref::Stacked => "Stacked",
+                    LayoutPref::FullCam => "Full cam",
+                    LayoutPref::FullGameplay => "Full gameplay",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Auto, "Auto-detect");
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Stacked, "Stacked (game + cam)");
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullCam, "Full cam");
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullGameplay, "Full gameplay");
+                });
+        });
+        ui.add_space(6.0);
+        ui.add_enabled_ui(!working, |ui| {
+            ui.label("YouTube URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.url)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("https://youtu.be/…"),
+            );
+            if ui.button("Import URL").clicked() && !self.url.trim().is_empty() {
+                self.start_import(ImportSource::YouTube(self.url.trim().to_string()));
+            }
+            ui.add_space(6.0);
+            ui.label("or a local file");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.video_path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("path to a video / audio file"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Browse…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter(
+                            "video / audio",
+                            &["mp4", "mkv", "webm", "mov", "avi", "m4a", "mp3", "wav", "opus"],
+                        )
+                        .pick_file()
+                    {
+                        self.video_path = path.display().to_string();
+                        self.start_import(ImportSource::Local(path));
+                    }
+                }
+                if ui.button("Import file").clicked() && !self.video_path.trim().is_empty() {
+                    self.start_import(ImportSource::Local(PathBuf::from(self.video_path.trim())));
+                }
+            });
+        });
+    }
+
+    /// Left-rail section: detect / mark Moments + the ranked, selectable Moment
+    /// list (pick one to see its detail on the right; check boxes for a batch
+    /// render). The wide per-signal breakdown moved to the detail pane.
+    fn ui_moments(&mut self, ui: &mut egui::Ui, working: bool) {
+        ui.separator();
+        let enabled = !working;
+        let Some((title, duration_s)) =
+            self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s))
+        else {
+            ui.strong("2 · Moments");
+            ui.weak("Import a VOD to detect Moments.");
+            return;
+        };
+        ui.strong("2 · Moments");
+        ui.weak(format!("{title}  ({})", fmt_duration(duration_s)));
+        ui.add_enabled_ui(enabled, |ui| {
+            if ui.button("Detect Moments").clicked() {
+                self.moments.clear();
+                self.selected = None;
+                let _ = self.to_worker.send(Job::Detect);
+                self.status = Status::Working("Starting detection".into());
+            }
+            ui.horizontal(|ui| {
+                ui.label("Manual:");
+                ui.add(egui::DragValue::new(&mut self.start_s).speed(0.5).suffix("s"));
+                ui.label("→");
+                ui.add(egui::DragValue::new(&mut self.end_s).speed(0.5).suffix("s"));
+                if ui.button("Add").clicked() && self.end_s > self.start_s {
+                    let id = self.moments.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+                    self.moments.push(Moment {
+                        id,
+                        range: TimeRange { start_s: self.start_s, end_s: self.end_s },
+                        signals: Signals::default(),
+                        score: 0.0,
+                        title: None,
+                    });
+                    self.selected = Some(id);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if self.moments.is_empty() {
+            ui.weak("No Moments yet — Detect, or add one manually.");
+            return;
+        }
+        let selected = self.selected;
+        let mut to_select: Option<u64> = None;
+        let mut batch_toggles: Vec<(u64, bool)> = Vec::new();
+        egui::ScrollArea::vertical().id_salt("moments").max_height(360.0).show(ui, |ui| {
+            for m in &self.moments {
+                ui.horizontal(|ui| {
+                    let mut checked = self.batch_selected.contains(&m.id);
+                    if ui.add_enabled(enabled, egui::Checkbox::new(&mut checked, "")).changed() {
+                        batch_toggles.push((m.id, checked));
+                    }
+                    let label = match m.title.as_deref().filter(|t| !t.is_empty()) {
+                        Some(t) => format!("#{}  {}", m.id, ellipsize(t, 30)),
+                        None => format!(
+                            "#{}  {}–{}",
+                            m.id,
+                            fmt_clock(m.range.start_s),
+                            fmt_clock(m.range.end_s)
+                        ),
+                    };
+                    if ui.selectable_label(selected == Some(m.id), label).clicked() {
+                        to_select = Some(m.id);
+                    }
+                    if m.score > 0.0 {
+                        ui.weak(format!("{:.1}", m.score));
+                    }
+                });
+            }
+        });
+        for (id, on) in batch_toggles {
+            if on {
+                self.batch_selected.insert(id);
+            } else {
+                self.batch_selected.remove(&id);
+            }
+        }
+        if let Some(id) = to_select {
+            self.selected = Some(id);
+        }
+        let n_sel = self.batch_selected.len();
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    enabled && n_sel > 0,
+                    egui::Button::new(format!("Render {n_sel} selected")),
+                )
+                .clicked()
+            {
+                let queue: Vec<(TimeRange, Option<String>)> = self
+                    .moments
+                    .iter()
+                    .filter(|m| self.batch_selected.contains(&m.id))
+                    .map(|m| (m.range, m.title.clone()))
+                    .collect();
+                if let Some((range, title)) = queue.first().cloned() {
+                    self.editor = None;
+                    self.render_queue = queue;
+                    self.queue_idx = 0;
+                    let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
+                    self.status =
+                        Status::Working(format!("Rendering 1/{}", self.render_queue.len()));
+                }
+            }
+            if n_sel > 0 && ui.add_enabled(enabled, egui::Button::new("Clear")).clicked() {
+                self.batch_selected.clear();
+            }
+        });
+    }
+
+    /// Right pane: the VOD overview waveform (click a marker to select) + the
+    /// selected Moment's detail — signals, title, LLM reason, transcript, audio
+    /// scrub, and the Promote action. An empty state when nothing is selected.
+    fn ui_detail(&mut self, ui: &mut egui::Ui, working: bool) {
+        let mut tl_select: Option<u64> = None;
+        if let Some(tl) = &self.timeline {
+            let total_s = tl.loudness.len() as f64 * tl.bin_s;
+            if total_s > 0.0 {
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 64.0),
+                    egui::Sense::click(),
+                );
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, egui::CornerRadius::same(4), egui::Color32::from_gray(18));
+                let n = tl.loudness.len();
+                let cols = rect.width().max(1.0) as usize;
+                let lmax = tl.loudness.iter().copied().fold(1e-6_f32, f32::max);
+                for c in 0..cols {
+                    let i0 = c * n / cols;
+                    let i1 = ((c + 1) * n / cols).clamp(i0 + 1, n);
+                    let peak = tl.loudness[i0..i1].iter().copied().fold(0.0, f32::max) / lmax;
+                    let x = rect.left() + c as f32;
+                    p.line_segment(
+                        [egui::pos2(x, rect.bottom()), egui::pos2(x, rect.bottom() - peak * rect.height())],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                    );
+                }
+                if let Some(chat) = &tl.chat {
+                    let cmax = chat.iter().copied().fold(1e-6_f32, f32::max);
+                    let mut prev: Option<egui::Pos2> = None;
+                    for c in 0..cols {
+                        let i0 = c * n / cols;
+                        let i1 = ((c + 1) * n / cols).clamp(i0 + 1, n);
+                        let avg = chat[i0..i1].iter().copied().sum::<f32>() / (i1 - i0) as f32 / cmax;
+                        let pt = egui::pos2(rect.left() + c as f32, rect.bottom() - avg * rect.height());
+                        if let Some(pp) = prev {
+                            p.line_segment([pp, pt], egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 170, 255)));
+                        }
+                        prev = Some(pt);
+                    }
+                }
+                let t_to_x = |t: f64| rect.left() + (t / total_s) as f32 * rect.width();
+                for m in &self.moments {
+                    let x0 = t_to_x(m.range.start_s);
+                    let x1 = t_to_x(m.range.end_s).max(x0 + 1.0);
+                    let col = if self.selected == Some(m.id) {
+                        egui::Color32::from_rgba_unmultiplied(255, 209, 0, 120)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(255, 80, 80, 70)
+                    };
+                    p.rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+                        egui::CornerRadius::ZERO,
+                        col,
+                    );
+                }
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * total_s;
+                        let mid = |m: &Moment| (m.range.start_s + m.range.end_s) / 2.0;
+                        tl_select = self
+                            .moments
+                            .iter()
+                            .min_by(|a, b| {
+                                (mid(a) - t).abs().partial_cmp(&(mid(b) - t).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|m| m.id);
+                    }
+                }
+                ui.add_space(8.0);
+            }
+        }
+        if let Some(id) = tl_select {
+            self.selected = Some(id);
+        }
+
+        let Some(id) = self.selected else {
+            ui.add_space(48.0);
+            ui.vertical_centered(|ui| {
+                ui.weak("Select a Moment from the list to see its detail,");
+                ui.weak("or Detect Moments to begin.");
+            });
+            return;
+        };
+        let Some(m) = self.moments.iter().find(|m| m.id == id).cloned() else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.heading(format!("Moment #{id}"));
+            ui.add_space(6.0);
+            ui.label(format!("{} – {}", fmt_clock(m.range.start_s), fmt_clock(m.range.end_s)));
+        });
+        if let Some(t) = m.title.as_deref().filter(|t| !t.is_empty()) {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Title:");
+                ui.label(egui::RichText::new(t).color(theme::GOLD));
+            });
+        }
+        // Per-signal breakdown (z-scores; a dash means the signal is absent).
+        ui.horizontal_wrapped(|ui| {
+            let sig = |ui: &mut egui::Ui, name: &str, v: Option<f32>| {
+                ui.label(format!(
+                    "{name} {}",
+                    v.map(|x| format!("{x:+.1}")).unwrap_or_else(|| "—".into())
+                ));
+            };
+            ui.weak(format!("score {:.2}  ·", m.score));
+            sig(ui, "chat", m.signals.chat_rate);
+            sig(ui, "loud", m.signals.loudness);
+            sig(ui, "lex", m.signals.lexicon);
+            sig(ui, "arou", m.signals.arousal);
+            sig(ui, "llm", m.signals.llm);
+        });
+        if let Some(reason) = self.llm_reasons.get(&id) {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("LLM:");
+                ui.label(reason);
+            });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("▶ Play").clicked() {
+                self.play_range(m.range);
+            }
+            if ui.button("■ Stop").clicked() {
+                self.stop_audio();
+            }
+            ui.label("Vol");
+            if ui
+                .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
+                .changed()
+            {
+                if let Some(sink) = &self.sink {
+                    sink.set_volume(self.volume);
+                }
+            }
+            ui.add_space(10.0);
+            if ui
+                .add_enabled(!working, egui::Button::new("Promote → Frame & Render"))
+                .clicked()
+            {
+                self.editor = None;
+                let _ = self.to_worker.send(Job::Prepare {
+                    range: m.range,
+                    title: m.title.clone(),
+                    layout_pref: self.layout_pref,
+                });
+                self.status = Status::Working("Preparing clip".into());
+            }
+        });
+        ui.add_space(6.0);
+        match self.transcripts.get(&id) {
+            Some(t) if !t.trim().is_empty() => {
+                ui.strong("Transcript");
+                egui::ScrollArea::vertical().id_salt("transcript").max_height(240.0).show(ui, |ui| {
+                    ui.label(t);
+                });
+            }
+            Some(_) => {
+                ui.weak("(no speech transcribed for this Moment)");
+            }
+            None => {
+                ui.weak("(manual Moment — run Detect to transcribe)");
             }
         }
     }
