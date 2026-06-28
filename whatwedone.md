@@ -10,6 +10,12 @@ A second operator-feedback batch — running W1→W4 (hide consoles → two-pers
 facecam → caption accuracy → SaaS GUI) as an autonomous loop, same ritual. Newest
 first.
 
+- **Two-person cams frame both people now** — on a co-stream cam (e.g. "Horror
+  Tanpa Ekspresi bersama @guntur69"), auto-framing used to zoom into one of the two
+  people, tight enough to look soft. It now detects **everyone** on the cam and
+  frames their **union** in the stacked facecam panel, so both are in shot (and the
+  wider crop is sharper). A solo cam is unchanged. Verified on your actual VOD: both
+  streamers framed side-by-side. (ADR 0026)
 - **No more console windows flashing during a render** — the GUI spawns ffmpeg /
   yt-dlp / the judge as helpers, and on Windows each was popping its own console
   window mid-render. They now run hidden. Verified on a real release render: zero
