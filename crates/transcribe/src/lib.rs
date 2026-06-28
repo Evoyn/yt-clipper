@@ -401,9 +401,11 @@ impl DialectLexicon {
     }
 }
 
-/// Replace whole words the lexicon maps (case-insensitive, surrounding
-/// punctuation preserved). Applied to every transcript so both captions and the
-/// detection lexicon read the corrected text.
+/// Replace whole **single** words the lexicon maps (case-insensitive, surrounding
+/// punctuation preserved). A multi-word `wrong` never matches here (a unit is one
+/// word, so its core has no space) — [`apply_multiword_corrections`] handles those
+/// first. Applied to every transcript so both captions and the detection lexicon
+/// read the corrected text.
 fn correct_known_mishears(units: &mut [CaptionUnit], lexicon: &DialectLexicon) {
     let map = lexicon.pairs();
     if map.is_empty() {
@@ -419,6 +421,62 @@ fn correct_known_mishears(units: &mut [CaptionUnit], lexicon: &DialectLexicon) {
             if wrong == &lower {
                 u.text = u.text.replacen(&core, right, 1);
                 break;
+            }
+        }
+    }
+}
+
+/// Apply **multi-word** `wrong -> right` corrections (ADR 0014): a streamer's
+/// two-plus-word catchphrase or a multi-word viewer handle that mis-transcribes
+/// across several caption units (e.g. `"point blank" -> "Point Blank"`). The
+/// single-word [`correct_known_mishears`] can't reach these because each unit is
+/// one word. For each multi-word correction, slide a K-unit window over the units;
+/// where K consecutive units' cores (case-insensitive, punctuation-trimmed) equal
+/// the `wrong` words in order, **collapse** them into one unit holding `right`
+/// (spanning the first unit's start to the last unit's end, with the last unit's
+/// trailing punctuation kept), and shrink `conf` in lockstep (the collapsed unit
+/// keeps the least-sure confidence). Runs **before** the single-word pass so a
+/// phrase wins over a word, and so the collapsed unit (whose core now contains a
+/// space) is untouched by it. Pure, so it is unit-tested without a model.
+fn apply_multiword_corrections(
+    units: &mut Vec<CaptionUnit>,
+    conf: &mut Vec<f32>,
+    lexicon: &DialectLexicon,
+) {
+    for c in &lexicon.corrections {
+        if c.wrong.is_empty() || c.right.is_empty() {
+            continue;
+        }
+        let words: Vec<String> =
+            c.wrong.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
+        if words.len() < 2 {
+            continue; // single-word corrections are handled by correct_known_mishears
+        }
+        let k = words.len();
+        let mut i = 0;
+        while i + k <= units.len() {
+            let matches = (0..k).all(|j| {
+                let core =
+                    units[i + j].text.trim_matches(|ch: char| !ch.is_alphanumeric()).to_lowercase();
+                core == words[j]
+            });
+            if matches {
+                let start = units[i].start_s;
+                let end = units[i + k - 1].end_s;
+                // Keep the last unit's trailing punctuation (e.g. "blank!" -> right + "!").
+                let last = &units[i + k - 1].text;
+                let trail = last[last.trim_end_matches(|ch: char| !ch.is_alphanumeric()).len()..]
+                    .to_string();
+                let new_conf =
+                    (i..i + k).map(|j| conf[j]).fold(f32::INFINITY, f32::min);
+                units[i] =
+                    CaptionUnit { text: format!("{}{}", c.right, trail), start_s: start, end_s: end };
+                conf[i] = new_conf;
+                units.drain(i + 1..i + k);
+                conf.drain(i + 1..i + k);
+                i += 1; // past the collapsed unit
+            } else {
+                i += 1;
             }
         }
     }
@@ -637,7 +695,10 @@ impl Transcriber {
             }
         }
 
-        let (mut units, conf) = group_tokens(raw_tokens, language);
+        let (mut units, mut conf) = group_tokens(raw_tokens, language);
+        // Multi-word phrase corrections first (they collapse units + shrink conf in
+        // lockstep), then the single-word fix-ups over the result (ADR 0014).
+        apply_multiword_corrections(&mut units, &mut conf, lexicon);
         correct_known_mishears(&mut units, lexicon);
         Ok((Transcript { language, units }, conf))
     }
@@ -841,6 +902,79 @@ mod tests {
         let mut u2 = vec![mk("bocal")];
         correct_known_mishears(&mut u2, &DialectLexicon::default());
         assert_eq!(u2[0].text, "bocal");
+    }
+
+    // --- multi-word phrase corrections (ADR 0014) ---------------------------
+
+    fn phrase_lex() -> DialectLexicon {
+        DialectLexicon {
+            corrections: vec![Correction {
+                wrong: "point blank".into(),
+                right: "Point Blank".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn multiword_correction_collapses_units_and_keeps_timing_and_conf() {
+        let mk = |t: &str, s: f64, e: f64| CaptionUnit { text: t.into(), start_s: s, end_s: e };
+        // "main point blank!" -> "main" then the collapsed "Point Blank!".
+        let mut units =
+            vec![mk("main", 0.0, 0.3), mk("point", 0.3, 0.6), mk("blank!", 0.6, 1.0)];
+        let mut conf = vec![0.9, 0.4, 0.2];
+        apply_multiword_corrections(&mut units, &mut conf, &phrase_lex());
+        assert_eq!(
+            units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(),
+            vec!["main", "Point Blank!"] // collapsed, last unit's "!" kept
+        );
+        assert_eq!(units.len(), 2);
+        // The collapsed unit spans the first matched start to the last matched end.
+        assert!((units[1].start_s - 0.3).abs() < 1e-9);
+        assert!((units[1].end_s - 1.0).abs() < 1e-9);
+        // conf shrinks in lockstep; the collapsed unit keeps the least-sure (0.2).
+        assert_eq!(conf.len(), 2);
+        assert!((conf[1] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn multiword_correction_is_case_insensitive_and_skips_non_matches() {
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        // Case-insensitive whole-phrase match.
+        let mut hit = vec![mk("POINT"), mk("Blank")];
+        let mut hc = vec![0.5, 0.5];
+        apply_multiword_corrections(&mut hit, &mut hc, &phrase_lex());
+        assert_eq!(hit.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), vec!["Point Blank"]);
+        // A partial / wrong phrase is left untouched (no collapse).
+        let mut miss = vec![mk("point"), mk("guard")];
+        let mut mc = vec![0.5, 0.5];
+        apply_multiword_corrections(&mut miss, &mut mc, &phrase_lex());
+        assert_eq!(miss.len(), 2);
+        assert_eq!(miss[0].text, "point");
+    }
+
+    #[test]
+    fn multiword_then_singleword_corrections_compose() {
+        // The phrase pass runs first, then the single-word pass over the result —
+        // both fire, and the collapsed phrase isn't re-touched by the word pass.
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        let lex = DialectLexicon {
+            corrections: vec![
+                Correction { wrong: "point blank".into(), right: "Point Blank".into(), ..Default::default() },
+                Correction { wrong: "bocal".into(), right: "bocil".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut units = vec![mk("bocal"), mk("point"), mk("blank")];
+        let mut conf = vec![0.9, 0.5, 0.5];
+        apply_multiword_corrections(&mut units, &mut conf, &lex);
+        correct_known_mishears(&mut units, &lex);
+        assert_eq!(
+            units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(),
+            vec!["bocil", "Point Blank"]
+        );
+        assert_eq!(conf.len(), 2); // bocal(kept) + collapsed phrase
     }
 
     #[test]

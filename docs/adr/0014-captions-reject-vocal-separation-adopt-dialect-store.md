@@ -92,7 +92,9 @@ tune-from-use, like the M6 editor and caption-timing constants.
   the file.
 - Deferred, in rough priority: an LLM post-correction pass for the long tail;
   remembering operator *deletions* so a rejected harvest word is not re-flagged;
-  multi-word phrase corrections (the dict matches whole single words).
+  ~~multi-word phrase corrections~~ — **done 2026-06-28** (`apply_multiword_corrections`
+  collapses a K-unit window matching a spaced `wrong` into the `right`, conf in
+  lockstep; verified live: `"cepat kayak" -> "SUPERCEPAT"` through a real render).
 
 ## Outcome (2026-06-24)
 
