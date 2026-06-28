@@ -517,6 +517,11 @@ const HARVEST_MIN_LEN: usize = 4;
 /// operator's review queue stays small even when whisper is broadly unsure.
 const HARVEST_MAX_PER_CLIP: usize = 8;
 
+/// Beam width for the caption path's beam-search decode (ADR 0027). whisper.cpp's
+/// quality decoder; 5 is its conventional default. Slower than greedy, but the
+/// render is not time-bound and accuracy is the goal. Tune-from-use.
+const BEAM_SIZE: i32 = 5;
+
 /// Words whisper was least sure about (confidence below [`HARVEST_MAX_P`]) that
 /// the store doesn't already know — the review queue the auto-harvest appends,
 /// each paired with its confidence so the operator can prioritise. Skips short /
@@ -615,6 +620,9 @@ fn harvest_candidates(
 /// strictly sequentially.
 pub struct Transcriber {
     ctx: WhisperContext,
+    /// Beam-search decoding (ADR 0027) for accuracy on the caption path; greedy
+    /// for the bulk text-only detect refine (speed). Tied to the DTW load.
+    beam: bool,
 }
 
 impl Transcriber {
@@ -652,7 +660,9 @@ impl Transcriber {
         }
         let ctx = WhisperContext::new_with_params(model, cparams)
             .with_context(|| format!("loading whisper model {}", model.display()))?;
-        Ok(Self { ctx })
+        // The DTW (caption) load decodes with beam search for accuracy; the
+        // text-only detect load stays greedy for speed (ADR 0027).
+        Ok(Self { ctx, beam: dtw })
     }
 
     /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
@@ -703,7 +713,16 @@ impl Transcriber {
         // `params` so the prompt outlives the borrow.
         let prompt = if lexicon.prime { lexicon.initial_prompt() } else { String::new() };
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Caption path: beam search (whisper.cpp's quality decoder) — render time is
+        // no object and accuracy is the goal (ADR 0027). Detect refine: greedy, to
+        // keep the many-candidate scan fast (it reads the excitement lexicon, not
+        // exact words).
+        let strategy = if self.beam {
+            SamplingStrategy::BeamSearch { beam_size: BEAM_SIZE, patience: -1.0 }
+        } else {
+            SamplingStrategy::Greedy { best_of: 1 }
+        };
+        let mut params = FullParams::new(strategy);
         params.set_language(Some(lang_code(language)));
         if !prompt.is_empty() {
             params.set_initial_prompt(&prompt);
