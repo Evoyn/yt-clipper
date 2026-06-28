@@ -10,11 +10,13 @@ A second operator-feedback batch — running W1→W4 (hide consoles → two-pers
 facecam → caption accuracy → SaaS GUI) as an autonomous loop, same ritual. Newest
 first.
 
-- **A proper top app bar** (GUI redesign, part 1) — the brand + a live status now
-  sit in a top bar (gold "yt-clipper" left, spinner/Done/Failed right), instead of a
-  heading lost in the scroll and a status pinned to the bottom. First slice of the
-  two-pane SaaS shell; the Moments-rail / detail-pane split is the next slice.
-  (ADR 0024)
+- **The GUI is a two-pane "clip workspace" now** (SaaS redesign, done) — the old
+  single scrolling column became a proper app: a **top bar** (gold "yt-clipper"
+  brand + a live status — spinner/Done/Failed), a **left rail** (diagnostics that
+  collapse when all's well, Import, and a compact selectable Moments list), and a
+  **detail/preview pane** on the right (the VOD waveform + the selected Moment's
+  signals, title, transcript, audio, and a "Promote → Frame & Render" button). On
+  the dark "midnight studio" theme. (ADR 0024)
 - **Captions decode with beam search now** (caption-accuracy, part 1) — the render
   path was using whisper's *fastest, lowest-quality* decoder; since you said render
   time is no object, it now uses **beam search** (whisper's quality decoder) for the
