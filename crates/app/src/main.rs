@@ -404,7 +404,7 @@ impl eframe::App for App {
         while let Ok(msg) = self.from_worker.try_recv() {
             match msg {
                 Progress::Stage(s) => self.status = Status::Working(s.to_string()),
-                Progress::Imported { title, duration_s, analysis_wav, caption_genre } => {
+                Progress::Imported { title, duration_s, analysis_wav, caption_genre, moments } => {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.analysis_wav = Some(analysis_wav);
                     // Seed the caption-style picker to this Creator's remembered
@@ -412,6 +412,13 @@ impl eframe::App for App {
                     if let Some(genre) = caption_genre {
                         self.caption_genre = genre;
                     }
+                    // Restore a prior session's detected Moments (M8) so a re-import
+                    // shows the review list (playable + promotable) without
+                    // re-detecting. Transcripts/waveform aren't persisted — a Detect
+                    // refills them; until then the transcript panel shows its empty
+                    // state. A fresh Detect replaces these.
+                    self.selected = moments.first().map(|m| m.id);
+                    self.moments = moments;
                     self.status = Status::Idle;
                 }
                 Progress::Detected { moments, transcripts, llm_reasons, timeline } => {

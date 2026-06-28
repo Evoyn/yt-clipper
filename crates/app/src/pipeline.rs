@@ -125,12 +125,15 @@ pub enum Progress {
     /// `analysis_wav` lets the review UI play a Moment's audio range.
     /// `caption_genre` is this Creator's remembered Caption Style (ADR 0016), if
     /// known, so the UI seeds its caption-style picker to the operator's usual
-    /// choice for this streamer; `None` for an unknown/new Creator.
+    /// choice for this streamer; `None` for an unknown/new Creator. `moments` are
+    /// the Moments persisted from a prior session (M8), so a re-import restores the
+    /// review list without re-detecting (empty for a never-detected VOD).
     Imported {
         title: String,
         duration_s: Option<f64>,
         analysis_wav: PathBuf,
         caption_genre: Option<CaptionGenre>,
+        moments: Vec<Moment>,
     },
     /// Detection finished; ranked candidate Moments, each one's transcript text
     /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
@@ -177,6 +180,10 @@ struct Session {
     /// `<stream_dir>/data/` — analysis audio, segments, project.json, captions.
     data_dir: PathBuf,
     analysis_wav: PathBuf,
+    /// Moments persisted from a prior session (M8), surfaced to the review UI on
+    /// import so a re-import doesn't lose detection work. Empty for a never-detected
+    /// VOD. Read once (for `Progress::Imported`); a later Detect supersedes them.
+    moments: Vec<Moment>,
 }
 
 /// How `Prepare` obtains the video to render from, and where it seeks.
@@ -230,6 +237,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 duration_s: s.vod.duration_s,
                                 analysis_wav: s.analysis_wav.clone(),
                                 caption_genre: remembered_caption_genre(&paths.workspace, &s.vod),
+                                moments: s.moments.clone(),
                             });
                             session = Some(s);
                             prepared = None; // a new VOD invalidates any prepared clip
@@ -360,8 +368,15 @@ fn import_youtube(
     let _ = tx.send(Progress::Stage("Fetching chat"));
     let _chat = yc_ingest::youtube_fetch_chat(&sc, &url, &data_dir, cancel)?;
 
-    save_project(&vod, &data_dir)?;
-    Ok(Session { vod, promote: PromoteSource::YouTube(url), stream_dir, data_dir, analysis_wav })
+    let project = save_project(&vod, &data_dir)?;
+    Ok(Session {
+        vod,
+        promote: PromoteSource::YouTube(url),
+        stream_dir,
+        data_dir,
+        analysis_wav,
+        moments: project.moments,
+    })
 }
 
 fn import_local(
@@ -399,8 +414,15 @@ fn import_local(
     let analysis_wav = data_dir.join("analysis.wav");
     yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav)?;
 
-    save_project(&vod, &data_dir)?;
-    Ok(Session { vod, promote: PromoteSource::Local(path), stream_dir, data_dir, analysis_wav })
+    let project = save_project(&vod, &data_dir)?;
+    Ok(Session {
+        vod,
+        promote: PromoteSource::Local(path),
+        stream_dir,
+        data_dir,
+        analysis_wav,
+        moments: project.moments,
+    })
 }
 
 /// Max chars for a sanitized folder segment (`<creator>` / `<stream-title>`).
@@ -423,10 +445,17 @@ fn stream_dirs(workspace: &Path, vod: &Vod) -> (PathBuf, PathBuf) {
     (stream_dir, data_dir)
 }
 
-fn save_project(vod: &Vod, data_dir: &Path) -> Result<()> {
-    Project::new(vod.clone())
+/// Persist `project.json` at import, **preserving** any Moments/Clips a prior
+/// session detected/promoted (M8): a re-import must not wipe detection work. Only
+/// the Vod metadata is refreshed. Returns the (possibly pre-existing) Project so
+/// the worker can surface its Moments back to the review UI.
+fn save_project(vod: &Vod, data_dir: &Path) -> Result<Project> {
+    let mut project = load_or_new_project(vod, data_dir);
+    project.vod = vod.clone();
+    project
         .save(&data_dir.join("project.json"))
-        .with_context(|| format!("writing project.json in {}", data_dir.display()))
+        .with_context(|| format!("writing project.json in {}", data_dir.display()))?;
+    Ok(project)
 }
 
 /// `workspace/creators.json` — the global per-Creator defaults store (ADR 0016).
@@ -1232,6 +1261,37 @@ mod tests {
         assert_eq!(p2, dir.join("My Clip (2).mp4"));
         fs::write(&p2, b"x").unwrap();
         assert_eq!(unique_path(&dir, "My Clip", "mp4"), dir.join("My Clip (3).mp4"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_project_preserves_prior_moments_on_reimport() {
+        // M8: a re-import must not wipe a prior session's detected Moments.
+        let dir = std::env::temp_dir().join("yc_save_project_preserve");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let v = vod("local", "stream");
+
+        // Seed project.json as if a prior Detect had run.
+        let mut prior = Project::new(v.clone());
+        prior.moments.push(Moment {
+            id: 3,
+            range: TimeRange { start_s: 10.0, end_s: 40.0 },
+            signals: Signals::default(),
+            score: 1.5,
+            title: Some("Big play".into()),
+        });
+        prior.save(&dir.join("project.json")).unwrap();
+
+        // save_project (the import-time persist) must keep the Moment and return it.
+        let returned = save_project(&v, &dir).unwrap();
+        assert_eq!(returned.moments.len(), 1, "returned the preserved Moment");
+        assert_eq!(returned.moments[0].id, 3);
+        // And it's still on disk (not clobbered to an empty Project).
+        let reloaded = Project::load(&dir.join("project.json")).unwrap();
+        assert_eq!(reloaded.moments.len(), 1);
+        assert_eq!(reloaded.moments[0].title.as_deref(), Some("Big play"));
 
         let _ = fs::remove_dir_all(&dir);
     }
