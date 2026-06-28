@@ -141,8 +141,24 @@ pub fn nms(mut peaks: Vec<usize>, scores: &[f32], min_gap: usize) -> Vec<usize> 
     kept
 }
 
+/// Per-peak pre-roll lead (ADR 0020): a loud-driven peak (a jumpscare, a loud
+/// mediashare donation) needs more build-up captured *before* the peak than a
+/// chat-driven one. Linear from `base_lead_s` at loudness z `lo_z` up to
+/// `loud_lead_s` at `hi_z`, clamped outside `[lo_z, hi_z]`. A chat-driven peak
+/// (low loudness z) keeps the base chat-lag lead; the louder the peak, the longer
+/// the pre-roll. Pure, so the ramp is unit-tested.
+pub fn peak_lead_s(loud_z: f32, lo_z: f32, hi_z: f32, base_lead_s: f64, loud_lead_s: f64) -> f64 {
+    let t = if hi_z > lo_z {
+        ((loud_z - lo_z) / (hi_z - lo_z)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    base_lead_s + (loud_lead_s - base_lead_s) * t as f64
+}
+
 /// A peak bin -> a fixed-duration Moment range that *leads* the peak (chat lags
-/// the on-screen event), clamped to `[0, vod_dur_s]`.
+/// the on-screen event), clamped to `[0, vod_dur_s]`. `lead_s` is the per-peak
+/// pre-roll ([`peak_lead_s`]); a longer lead just shifts the window earlier.
 pub fn peak_to_range(peak_bin: usize, bin_s: f64, lead_s: f64, dur_s: f64, vod_dur_s: f64) -> TimeRange {
     let peak_t = peak_bin as f64 * bin_s + bin_s / 2.0;
     let start_s = (peak_t - lead_s).max(0.0);
@@ -213,6 +229,18 @@ mod tests {
         // min_gap 3: bin 4 is within 3 of the stronger bin 2, so it is dropped.
         let kept = nms(peaks, &series, 3);
         assert_eq!(kept, vec![8, 2]); // sorted by descending score
+    }
+
+    #[test]
+    fn peak_lead_scales_with_loudness_between_the_anchors() {
+        // base 5 s at lo_z 1.0, max 10 s at hi_z 3.0.
+        assert!((peak_lead_s(1.0, 1.0, 3.0, 5.0, 10.0) - 5.0).abs() < 1e-6); // at lo -> base
+        assert!((peak_lead_s(3.0, 1.0, 3.0, 5.0, 10.0) - 10.0).abs() < 1e-6); // at hi -> max
+        assert!((peak_lead_s(2.0, 1.0, 3.0, 5.0, 10.0) - 7.5).abs() < 1e-6); // midpoint
+        // A chat-driven peak (loudness z below lo) keeps the base lead.
+        assert!((peak_lead_s(-0.5, 1.0, 3.0, 5.0, 10.0) - 5.0).abs() < 1e-6);
+        // A very loud peak (above hi) is capped at the max lead.
+        assert!((peak_lead_s(9.0, 1.0, 3.0, 5.0, 10.0) - 10.0).abs() < 1e-6);
     }
 
     #[test]
