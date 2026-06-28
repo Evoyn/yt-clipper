@@ -134,9 +134,9 @@ impl TimeRange {
 
 /// One animatable caption unit with timing relative to the start of the
 /// transcribed range (0-based seconds). For EN/ID this is a space-delimited
-/// word; for JA it is a character chunk (M6). Produced by the language-aware
-/// grouping layer in `yc-transcribe`, consumed by the ASS generator in
-/// `yc-render` (ADR 0003/0004).
+/// word; for JA it is a fixed-size character chunk (whisper emits JA without
+/// inter-word spaces). Produced by the language-aware grouping layer in
+/// `yc-transcribe`, consumed by the ASS generator in `yc-render` (ADR 0003/0004).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptionUnit {
     pub text: String,

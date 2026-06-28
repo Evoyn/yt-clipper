@@ -2,7 +2,8 @@
 //! (ADR 0003; M1 uses the f16 weights, the ADR's quantized ship-default is
 //! revisited at M6). Whisper emits token-level timestamps; the language-aware
 //! grouping layer in this crate converts tokens into animatable caption
-//! units — space-delimited words for EN/ID, character chunks for JA (M6).
+//! units — space-delimited words for EN/ID, fixed-size character chunks for JA
+//! (which whisper emits without inter-word spaces).
 //!
 //! M1 transcribes only the manually-picked range's samples (transcribe-range-
 //! only), so timestamps are already 0-based to the clip and line up with the
@@ -32,14 +33,30 @@ fn is_special(text: &str) -> bool {
     text.starts_with("[_") || text.starts_with("<|")
 }
 
+/// Group raw whisper tokens into animatable caption units for the given
+/// `language` — the language-aware layer (ADR 0003). EN/ID group into
+/// space-delimited words ([`group_into_words`]); JA, which whisper emits without
+/// leading spaces, groups into small character chunks ([`group_into_chars`]).
+/// Returns the units plus a parallel per-unit confidence (min token probability)
+/// for the auto-harvest. Pure, so it is unit-tested without a model.
+fn group_tokens<I>(tokens: I, language: Language) -> (Vec<CaptionUnit>, Vec<f32>)
+where
+    I: IntoIterator<Item = (String, f64, f64, f32)>,
+{
+    match language {
+        Language::Ja => group_into_chars(tokens),
+        Language::En | Language::Id => group_into_words(tokens),
+    }
+}
+
 /// Group raw whisper tokens — each carrying whisper's leading-space word
-/// marking, start/end seconds, and decode probability — into caption units. A
-/// unit begins at every whitespace-led token (a word for EN/ID); a token with no
+/// marking, start/end seconds, and decode probability — into **word** caption
+/// units (EN/ID). A unit begins at every whitespace-led token; a token with no
 /// leading space (subword piece or trailing punctuation) extends the current
 /// unit. Returns the units plus a parallel per-unit **confidence** (the minimum
 /// token probability over the unit's tokens), the signal the auto-harvest uses
 /// to flag words whisper was unsure about. Pure, so it is unit-tested without a
-/// model. JA character chunking arrives at M6.
+/// model.
 fn group_into_words<I>(tokens: I) -> (Vec<CaptionUnit>, Vec<f32>)
 where
     I: IntoIterator<Item = (String, f64, f64, f32)>,
@@ -62,6 +79,63 @@ where
             let c = conf.last_mut().expect("non-empty by branch");
             *c = c.min(p); // a word is only as confident as its least-sure token
         }
+    }
+    (units, conf)
+}
+
+/// Characters per JA caption chunk (tune-from-use, like the caption-timing
+/// constants). Japanese has no inter-word spaces, so whisper emits JA tokens with
+/// no leading-space marking — [`group_into_words`] would collapse a whole segment
+/// into one unit. JA instead chunks into small fixed-size character runs (ADR
+/// 0003: "character chunks at kanji/kana boundaries"), each an animatable unit.
+/// ~4 reads cleanly one-chunk-at-a-time on a phone without flashing single glyphs.
+const JA_CHUNK_CHARS: usize = 4;
+
+/// Sentence-ending punctuation that closes a JA chunk early (so a chunk never
+/// straddles a sentence boundary), full- and half-width.
+fn is_ja_break_punct(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '．' | '…' | '!' | '?')
+}
+
+/// Group raw whisper tokens into **JA character chunks**. Whole tokens are
+/// accumulated into a chunk until adding the next would exceed [`JA_CHUNK_CHARS`]
+/// (a token is never split — it carries a single DTW time span), and a token
+/// ending in sentence punctuation closes the chunk. Each chunk's span runs from
+/// its first token's start to its last token's end; the per-chunk confidence is
+/// the minimum token probability, exactly as for words. Pure, so it is unit-tested
+/// without a model.
+fn group_into_chars<I>(tokens: I) -> (Vec<CaptionUnit>, Vec<f32>)
+where
+    I: IntoIterator<Item = (String, f64, f64, f32)>,
+{
+    let mut units: Vec<CaptionUnit> = Vec::new();
+    let mut conf: Vec<f32> = Vec::new();
+    let mut open = false; // is the last chunk still accepting tokens?
+    for (raw, t0, t1, p) in tokens {
+        let clean = raw.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let n = clean.chars().count();
+        let cur_n = if open {
+            units.last().map_or(0, |u| u.text.chars().count())
+        } else {
+            0
+        };
+        if !open || cur_n + n > JA_CHUNK_CHARS {
+            units.push(CaptionUnit { text: clean.to_string(), start_s: t0, end_s: t1 });
+            conf.push(p);
+        } else {
+            let last = units.last_mut().expect("non-empty by branch");
+            last.text.push_str(clean);
+            last.end_s = t1;
+            let c = conf.last_mut().expect("non-empty by branch");
+            *c = c.min(p);
+        }
+        // The chunk stays open only while under budget and not sentence-ended.
+        let chunk_chars = units.last().expect("just pushed/extended").text.chars().count();
+        let ends_sentence = clean.chars().next_back().is_some_and(is_ja_break_punct);
+        open = chunk_chars < JA_CHUNK_CHARS && !ends_sentence;
     }
     (units, conf)
 }
@@ -563,7 +637,7 @@ impl Transcriber {
             }
         }
 
-        let (mut units, conf) = group_into_words(raw_tokens);
+        let (mut units, conf) = group_tokens(raw_tokens, language);
         correct_known_mishears(&mut units, lexicon);
         Ok((Transcript { language, units }, conf))
     }
@@ -627,6 +701,74 @@ mod tests {
         assert_eq!(units[0].text, "Yours");
         assert_eq!(units[0].end_s, 0.5);
         assert_eq!(conf, vec![0.8]); // min(0.9, 0.8)
+    }
+
+    // --- JA character chunking (ADR 0003) -----------------------------------
+
+    /// One JA token (no leading space), `chars` long, spanning [t0,t1] at prob p.
+    fn jtok(text: &str, t0: f64, t1: f64, p: f32) -> (String, f64, f64, f32) {
+        (text.to_string(), t0, t1, p)
+    }
+
+    #[test]
+    fn ja_chunks_at_the_char_budget_with_min_confidence() {
+        // Five single-char JA tokens, no leading spaces -> chunks of <=4 chars.
+        // Word grouping would collapse all five into one unit; chunking splits them.
+        let toks = vec![
+            jtok("こ", 0.0, 0.1, 0.9),
+            jtok("ん", 0.1, 0.2, 0.8),
+            jtok("に", 0.2, 0.3, 0.95),
+            jtok("ち", 0.3, 0.4, 0.7),
+            jtok("は", 0.4, 0.5, 0.6),
+        ];
+        let (units, conf) = group_into_chars(toks);
+        assert_eq!(units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), vec!["こんにち", "は"]);
+        // First chunk spans its first..last token; conf is its least-sure token.
+        assert_eq!(units[0].start_s, 0.0);
+        assert!((units[0].end_s - 0.4).abs() < 1e-9);
+        assert!((conf[0] - 0.7).abs() < 1e-6); // min(0.9,0.8,0.95,0.7)
+        assert!((conf[1] - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ja_sentence_punctuation_closes_a_chunk() {
+        // A token ending in sentence punctuation keeps the punctuation with the
+        // preceding text but closes the chunk, so the next chars start fresh.
+        let toks = vec![
+            jtok("あ", 0.0, 0.1, 0.9),
+            jtok("い", 0.1, 0.2, 0.9),
+            jtok("。", 0.2, 0.3, 0.9),
+            jtok("う", 0.3, 0.4, 0.9),
+            jtok("え", 0.4, 0.5, 0.9),
+        ];
+        let units = group_into_chars(toks).0;
+        assert_eq!(units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), vec!["あい。", "うえ"]);
+    }
+
+    #[test]
+    fn ja_never_splits_a_multi_char_token() {
+        // A 3-char token then a 2-char token: 3+2 > 4, so they land in separate
+        // chunks rather than the token being cut to fill the budget exactly.
+        let toks = vec![jtok("あいう", 0.0, 0.3, 0.9), jtok("えお", 0.3, 0.5, 0.8)];
+        let units = group_into_chars(toks).0;
+        assert_eq!(units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), vec!["あいう", "えお"]);
+        // An oversized single token is its own chunk, never dropped.
+        let big = group_into_chars(vec![jtok("あいうえお", 0.0, 0.5, 0.9)]).0;
+        assert_eq!(big.len(), 1);
+        assert_eq!(big[0].text, "あいうえお");
+    }
+
+    #[test]
+    fn group_tokens_dispatches_by_language() {
+        // JA -> character chunks (one segment, no spaces, splits).
+        let ja = vec![jtok("か", 0.0, 0.1, 0.9), jtok("き", 0.1, 0.2, 0.9), jtok("く", 0.2, 0.3, 0.9),
+                      jtok("け", 0.3, 0.4, 0.9), jtok("こ", 0.4, 0.5, 0.9)];
+        let (ja_units, _) = group_tokens(ja, Language::Ja);
+        assert_eq!(ja_units.len(), 2); // "かきくけ" (4) + "こ" (1), not one blob
+        // EN -> word grouping (leading-space tokens start words), unchanged.
+        let en = vec![jtok(" hello", 0.0, 0.4, 0.9), jtok(" world", 0.4, 0.8, 0.9)];
+        let (en_units, _) = group_tokens(en, Language::En);
+        assert_eq!(en_units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(), vec!["hello", "world"]);
     }
 
     #[test]
