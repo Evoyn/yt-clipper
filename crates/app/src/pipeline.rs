@@ -1037,10 +1037,15 @@ fn do_render(
             // about (auto-harvest), unless the store froze it. Best-effort: a write
             // failure logs and never sinks the render.
             if lexicon.harvest {
+                // Record each harvested word's source (ADR 0022): the generated
+                // Short title + the absolute VOD timestamp (clip start + the word's
+                // clip-relative onset), so the operator can find and curate it.
                 let n = yc_transcribe::DialectLexicon::harvest_to_store(
                     &paths.dialect_dir,
                     session.vod.language,
                     &harvest,
+                    range.start_s,
+                    prepared.title.as_deref(),
                 );
                 if n > 0 {
                     tracing::info!("dialect: harvested {n} low-confidence word(s) to review");

@@ -77,7 +77,11 @@ fn main() -> anyhow::Result<()> {
         if harvest.is_empty() {
             "(none)".to_string()
         } else {
-            harvest.iter().map(|(w, c)| format!("{w}({c:.2})")).collect::<Vec<_>>().join(", ")
+            harvest
+                .iter()
+                .map(|c| format!("{}({:.2}@{:.1}s)", c.word, c.confidence, c.start_s))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     println!("\n--- RAW whisper units ({}) - '!' = DTW start < previous (non-monotonic) ---", raw.units.len());

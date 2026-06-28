@@ -344,10 +344,18 @@ impl DialectLexicon {
     /// writes back pretty-printed. Returns how many new entries were added. Best-
     /// effort: a read/parse/write failure logs and adds nothing (never fails a
     /// render). The caption path calls this so the review queue self-populates.
+    ///
+    /// Each new entry's note records **where the word came from** (ADR 0022) so the
+    /// operator can curate it: the generated Short `title` (if any) and the
+    /// **absolute VOD timestamp** `clip_start_s + candidate.start_s` (the clip's VOD
+    /// start plus the word's clip-relative onset), as `from "Title" at h:mm:ss`. A
+    /// word is recorded once (first clip it is flagged in); a later clip skips it.
     pub fn harvest_to_store(
         dir: &Path,
         language: Language,
-        candidates: &[(String, f32)],
+        candidates: &[HarvestCandidate],
+        clip_start_s: f64,
+        title: Option<&str>,
     ) -> usize {
         if candidates.is_empty() {
             return 0;
@@ -372,12 +380,25 @@ impl DialectLexicon {
             known.insert(v.to_lowercase());
         }
         let mut added = 0;
-        for (cand, conf) in candidates {
-            if known.insert(cand.to_lowercase()) {
+        for cand in candidates {
+            if known.insert(cand.word.to_lowercase()) {
+                // VOD-absolute source location (ADR 0022): the clip's VOD start plus
+                // the word's clip-relative onset, so the operator can jump to it.
+                let at = vod_clock(clip_start_s + cand.start_s);
+                let note = match title {
+                    Some(t) if !t.is_empty() => format!(
+                        "auto-harvested (conf {:.2}) from \"{t}\" at {at} - operator verify",
+                        cand.confidence
+                    ),
+                    _ => format!(
+                        "auto-harvested (conf {:.2}) at {at} - operator verify",
+                        cand.confidence
+                    ),
+                };
                 lex.corrections.push(Correction {
-                    wrong: cand.clone(),
+                    wrong: cand.word.clone(),
                     right: String::new(),
-                    note: format!("auto-harvested (whisper confidence {conf:.2}) - operator verify"),
+                    note,
                     status: "unverified".into(),
                 });
                 added += 1;
@@ -502,11 +523,35 @@ const HARVEST_MAX_PER_CLIP: usize = 8;
 /// entry (including the word a correction just fixed). Deduped; returned
 /// least-confident first and capped at [`HARVEST_MAX_PER_CLIP`]. Pure (testable
 /// without a model).
+/// `h:mm:ss` (or `m:ss` under an hour) for a VOD-absolute timestamp — the source
+/// location written into a harvested word's review note (ADR 0022). Filesystem
+/// concerns don't apply (it goes in a note, not a filename), so the natural `:` is
+/// used. Pure, so the format is unit-tested.
+fn vod_clock(t_s: f64) -> String {
+    let s = t_s.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// A word the harvest flags for review: the garbled text, the whisper confidence
+/// that flagged it, and its **clip-relative onset**. The onset lets the render
+/// record an absolute VOD timestamp (clip start + this) in the review note, so the
+/// operator can jump to the source and check the word (ADR 0022).
+#[derive(Debug, Clone)]
+pub struct HarvestCandidate {
+    pub word: String,
+    pub confidence: f32,
+    pub start_s: f64,
+}
+
 fn harvest_candidates(
     units: &[CaptionUnit],
     conf: &[f32],
     lexicon: &DialectLexicon,
-) -> Vec<(String, f32)> {
+) -> Vec<HarvestCandidate> {
     let mut known: HashSet<String> = HashSet::new();
     for c in &lexicon.corrections {
         known.insert(c.wrong.to_lowercase());
@@ -517,7 +562,7 @@ fn harvest_candidates(
     for v in &lexicon.vocabulary {
         known.insert(v.to_lowercase());
     }
-    let mut out: Vec<(String, f32)> = Vec::new();
+    let mut out: Vec<HarvestCandidate> = Vec::new();
     let mut seen = HashSet::new();
     for (u, &c) in units.iter().zip(conf.iter()) {
         if c >= HARVEST_MAX_P {
@@ -533,10 +578,10 @@ fn harvest_candidates(
             continue;
         }
         if !known.contains(&lc) && seen.insert(lc) {
-            out.push((core, c));
+            out.push(HarvestCandidate { word: core, confidence: c, start_s: u.start_s });
         }
     }
-    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(HARVEST_MAX_PER_CLIP);
     out
 }
@@ -618,7 +663,7 @@ impl Transcriber {
         language: Language,
         lexicon: &DialectLexicon,
         should_abort: impl FnMut() -> bool + 'static,
-    ) -> Result<(Transcript, Vec<(String, f32)>)> {
+    ) -> Result<(Transcript, Vec<HarvestCandidate>)> {
         let (transcript, conf) = self.run(samples, language, lexicon, should_abort)?;
         let harvest = harvest_candidates(&transcript.units, &conf, lexicon);
         Ok((transcript, harvest))
@@ -725,7 +770,7 @@ pub fn transcribe_range_harvesting(
     language: Language,
     lexicon: &DialectLexicon,
     should_abort: impl FnMut() -> bool + 'static,
-) -> Result<(Transcript, Vec<(String, f32)>)> {
+) -> Result<(Transcript, Vec<HarvestCandidate>)> {
     Transcriber::load(model)?.transcribe_with_harvest(samples, language, lexicon, should_abort)
 }
 
@@ -854,7 +899,7 @@ mod tests {
             ..Default::default()
         };
         let got = harvest_candidates(&units, &conf, &lex);
-        let words: Vec<&str> = got.iter().map(|(w, _)| w.as_str()).collect();
+        let words: Vec<&str> = got.iter().map(|c| c.word.as_str()).collect();
         // least-confident first: lenjakgawa(0.10) before kusursekali(0.30)
         assert_eq!(words, vec!["lenjakgawa", "kusursekali"]);
     }
@@ -868,8 +913,57 @@ mod tests {
         dictionary.insert("berapa".to_string()); // a real word whisper merely doubted
         let lex = DialectLexicon { dictionary, ..Default::default() };
         let got = harvest_candidates(&units, &conf, &lex);
-        let words: Vec<&str> = got.iter().map(|(w, _)| w.as_str()).collect();
+        let words: Vec<&str> = got.iter().map(|c| c.word.as_str()).collect();
         assert_eq!(words, vec!["sempurxyz"]); // only the out-of-dictionary garble survives
+    }
+
+    #[test]
+    fn harvest_candidates_carry_their_clip_relative_onset() {
+        // ADR 0022: each candidate keeps its unit's onset so the render can record
+        // an absolute VOD timestamp.
+        let units = vec![
+            CaptionUnit { text: "garblexyz".into(), start_s: 12.5, end_s: 13.0 },
+        ];
+        let got = harvest_candidates(&units, &[0.10], &DialectLexicon::default());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].word, "garblexyz");
+        assert!((got[0].start_s - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vod_clock_formats_minutes_and_hours() {
+        assert_eq!(vod_clock(0.0), "0:00");
+        assert_eq!(vod_clock(83.0), "1:23");
+        assert_eq!(vod_clock(3723.0), "1:02:03"); // past an hour -> h:mm:ss
+    }
+
+    #[test]
+    fn harvest_to_store_writes_title_and_absolute_timestamp_in_the_note() {
+        // ADR 0022: the note records the Short title + the VOD-absolute time
+        // (clip_start_s + the word's clip-relative onset), so id.json is curatable.
+        let dir = std::env::temp_dir().join("yc_harvest_note_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cands =
+            vec![HarvestCandidate { word: "garblexyz".into(), confidence: 0.42, start_s: 12.0 }];
+        // Clip starts at 1:00:00 in the VOD; the word at +12 s -> 1:00:12.
+        let n = DialectLexicon::harvest_to_store(
+            &dir,
+            Language::Id,
+            &cands,
+            3600.0,
+            Some("He LOST it on the boss"),
+        );
+        assert_eq!(n, 1);
+        let saved = std::fs::read_to_string(dir.join("id.json")).unwrap();
+        let lex: DialectLexicon = serde_json::from_str(&saved).unwrap();
+        let note = &lex.corrections[0].note;
+        assert!(note.contains("He LOST it on the boss"), "title in note: {note}");
+        assert!(note.contains("1:00:12"), "absolute timestamp in note: {note}");
+        assert!(note.contains("0.42"), "confidence in note: {note}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
