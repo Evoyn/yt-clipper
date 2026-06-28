@@ -164,6 +164,80 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Headless batch render (M8 — the job-queue core): import -> detect -> render
+    // the top-k Moments sequentially, each auto-framed (no editor) with the chosen
+    // Caption Style and named by its LLM title.
+    //   yt-clipper --batch <url-or-file> [en|id|ja] [huge|rolling|karaoke] [k]
+    // Drives the same worker the GUI does; one clip renders at a time, so the GPU
+    // stages stay strictly sequential (a Prepare/Render pair per Moment, in turn).
+    if let Some(i) = argv.iter().position(|a| a == "--batch") {
+        let target =
+            argv.get(i + 1).expect("--batch needs <url-or-file> [en|id|ja] [genre] [k]").clone();
+        let language = match argv.get(i + 2).map(|s| s.as_str()) {
+            Some("en") => Language::En,
+            Some("ja") => Language::Ja,
+            _ => Language::Id,
+        };
+        let caption_genre = parse_genre(argv.get(i + 3).map(|s| s.as_str()));
+        let k: usize = argv.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let source = if target.starts_with("http") {
+            ImportSource::YouTube(target)
+        } else {
+            ImportSource::Local(PathBuf::from(target))
+        };
+        to_worker.send(Job::Import { source, language }).expect("send import");
+        // The Moments to render (range + title) and how many have finished.
+        let mut queue: Vec<(TimeRange, Option<String>)> = Vec::new();
+        let mut rendered = 0usize;
+        loop {
+            match from_worker.recv() {
+                Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(Progress::Imported { title, duration_s, .. }) => {
+                    tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
+                    to_worker.send(Job::Detect).expect("send detect");
+                }
+                Ok(Progress::Detected { moments, .. }) => {
+                    queue = moments.iter().take(k).map(|m| (m.range, m.title.clone())).collect();
+                    tracing::info!("batch: rendering {} of {} moments", queue.len(), moments.len());
+                    match queue.first().cloned() {
+                        Some((range, title)) => {
+                            to_worker.send(Job::Prepare { range, title }).expect("send prepare");
+                        }
+                        None => {
+                            eprintln!("no moments to render");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                Ok(Progress::Prepared { layout, .. }) => {
+                    to_worker.send(Job::Render { layout, caption_genre }).expect("send render");
+                }
+                Ok(Progress::Done(p)) => {
+                    println!("{}", p.display()); // one Short path per rendered Moment
+                    rendered += 1;
+                    match queue.get(rendered).cloned() {
+                        Some((range, title)) => {
+                            to_worker.send(Job::Prepare { range, title }).expect("send prepare");
+                        }
+                        None => {
+                            tracing::info!("batch: rendered {rendered} clip(s)");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                Ok(Progress::Cancelled) => {
+                    eprintln!("CANCELLED");
+                    std::process::exit(1);
+                }
+                Ok(Progress::Failed(e)) => {
+                    eprintln!("FAILED: {e}");
+                    std::process::exit(1);
+                }
+                Err(_) => std::process::exit(1),
+            }
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
