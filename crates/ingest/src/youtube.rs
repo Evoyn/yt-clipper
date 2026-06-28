@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use yc_core::{Language, TimeRange, Vod, VodSource};
+use yc_core::{Language, NoConsole, TimeRange, Vod, VodSource};
 
 /// Pinned sidecar locations + the resolved deno directory, captured once.
 #[derive(Clone)]
@@ -102,6 +102,7 @@ impl CancelToken {
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
     let _ = Command::new("taskkill")
+        .no_console()
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -138,6 +139,7 @@ fn run(program: &Path, args: &[String], deno_dir: Option<&Path>, cancel: &Cancel
     let mut cmd = Command::new(program);
     cmd.args(args);
     with_deno_path(&mut cmd, deno_dir);
+    cmd.no_console();
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", program.display()))?;
@@ -171,6 +173,7 @@ fn run_capture(
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::inherit());
     with_deno_path(&mut cmd, deno_dir);
+    cmd.no_console();
     let child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", program.display()))?;

@@ -277,6 +277,32 @@ pub enum LayoutPref {
     FullGameplay,
 }
 
+/// Spawn child processes without flashing a console window on Windows
+/// (`CREATE_NO_WINDOW`). The release GUI is a `windows_subsystem = "windows"`
+/// binary with no console of its own, so every ffmpeg / ffprobe / yt-dlp / deno /
+/// sidecar child would otherwise pop *its own* console window mid-render — a jarring
+/// flicker the operator flagged. Call `.no_console()` on a `Command` before
+/// spawning. A no-op off Windows (and harmless in the debug console build, where
+/// the child simply runs without a console; its inherited stdio still reaches the
+/// terminal).
+pub trait NoConsole {
+    fn no_console(&mut self) -> &mut Self;
+}
+
+impl NoConsole for std::process::Command {
+    #[cfg(windows)]
+    fn no_console(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (winbase.h): the child runs with no console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+    #[cfg(not(windows))]
+    fn no_console(&mut self) -> &mut Self {
+        self
+    }
+}
+
 /// A Moment the operator has promoted for production: it gets framing,
 /// captions, and an export.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +376,14 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_console_is_chainable_and_builds() {
+        // The shim must stay chainable on a Command without spawning (cross-platform:
+        // a no-op off Windows, the CREATE_NO_WINDOW flag on it).
+        let mut cmd = std::process::Command::new("yc-does-not-run");
+        let _ = cmd.no_console().arg("x");
+    }
 
     #[test]
     fn project_roundtrips_through_json() {

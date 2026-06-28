@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use yc_core::TimeRange;
+use yc_core::{NoConsole, TimeRange};
 
 pub mod youtube;
 pub use youtube::{
@@ -96,6 +96,7 @@ pub fn extract_audio_args(video: &Path, out_wav: &Path) -> Vec<String> {
 pub fn extract_audio(ffmpeg: &Path, video: &Path, out_wav: &Path) -> Result<()> {
     let args = extract_audio_args(video, out_wav);
     let status = std::process::Command::new(ffmpeg)
+        .no_console()
         .args(&args)
         .status()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
@@ -149,6 +150,7 @@ pub fn extract_frames_rgb(
 ) -> Result<Vec<Vec<u8>>> {
     let args = extract_frames_args(video, seek_s, w, h, fps, max_frames);
     let child = std::process::Command::new(ffmpeg)
+        .no_console()
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())

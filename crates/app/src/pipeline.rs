@@ -29,7 +29,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use yc_core::{
     CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, LayoutPref, Moment,
-    Project, ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
+    NoConsole, Project, ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -732,6 +732,7 @@ fn run_llm_judge(
 
     let payload = serde_json::to_vec(request).context("serializing llm-judge request")?;
     let mut child = Command::new(bin)
+        .no_console()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -939,6 +940,7 @@ fn ffmpeg_extract_stereo_44k(
         out.display().to_string(),
     ];
     let status = std::process::Command::new(ffmpeg)
+        .no_console()
         .args(&args)
         .status()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
@@ -962,6 +964,7 @@ fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()>
         out.display().to_string(),
     ];
     let status = std::process::Command::new(ffmpeg)
+        .no_console()
         .args(&args)
         .status()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;

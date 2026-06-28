@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use yc_core::{Crop, Layout, CANVAS_H, CANVAS_W};
+use yc_core::{Crop, Layout, NoConsole, CANVAS_H, CANVAS_W};
 
 /// `crop=w:h:x:y` in source pixels. Dimensions floored to even numbers >= 2 so
 /// the yuv420p encoder never sees an odd or zero-sized Panel.
@@ -110,6 +110,7 @@ pub fn export_args(
 /// `fontsdir=.` resolve (and Windows filtergraph path-escaping is avoided).
 pub fn run_export(ffmpeg: &Path, workdir: &Path, args: &[String]) -> Result<()> {
     let status = std::process::Command::new(ffmpeg)
+        .no_console()
         .current_dir(workdir)
         .args(args)
         .status()
