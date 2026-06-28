@@ -10,7 +10,7 @@
 mod editor;
 mod pipeline;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -270,6 +270,9 @@ fn main() -> eframe::Result<()> {
                 volume: 1.0,
                 status: Status::Idle,
                 editor: None,
+                batch_selected: HashSet::new(),
+                render_queue: Vec::new(),
+                queue_idx: 0,
                 to_worker,
                 from_worker,
                 cancel,
@@ -432,6 +435,14 @@ struct App {
     /// The nudge editor, open from Prepare until the operator dismisses it or a
     /// new Prepare/import replaces it (ADR 0012); persists across re-renders.
     editor: Option<editor::EditorState>,
+    /// Moment ids checked for a batch render (M8 job-queue): "Render selected"
+    /// renders them sequentially, each auto-framed (no editor).
+    batch_selected: HashSet<u64>,
+    /// The active batch queue (range + title per Moment) and the index of the
+    /// clip currently rendering; empty when no batch runs. The worker drain
+    /// auto-renders each (Prepared -> Render) and advances on Done.
+    render_queue: Vec<(TimeRange, Option<String>)>,
+    queue_idx: usize,
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
     cancel: CancelToken,
@@ -514,8 +525,17 @@ impl eframe::App for App {
                     self.status = Status::Idle;
                 }
                 Progress::Prepared { layout, src_w, src_h, frames, frame_w, frame_h, range } => {
-                    // Upload the preview frames to textures and open the nudge
-                    // editor seeded with the auto-detected Layout (ADR 0012).
+                    // Batch render (M8): auto-render this clip with its auto-detected
+                    // Layout (no editor); the Done handler advances the queue.
+                    // `continue` skips the editor setup and drains the next message.
+                    if !self.render_queue.is_empty() {
+                        let _ = self
+                            .to_worker
+                            .send(Job::Render { layout, caption_genre: self.caption_genre });
+                        continue;
+                    }
+                    // Single clip: upload the preview frames to textures and open the
+                    // nudge editor seeded with the auto-detected Layout (ADR 0012).
                     let ctx = ui.ctx().clone();
                     let expected = frame_w as usize * frame_h as usize * 3;
                     let textures: Vec<egui::TextureHandle> = frames
@@ -546,9 +566,40 @@ impl eframe::App for App {
                         self.status = Status::Idle;
                     }
                 }
-                Progress::Done(p) => self.status = Status::Done(p),
-                Progress::Cancelled => self.status = Status::Cancelled,
-                Progress::Failed(e) => self.status = Status::Failed(e),
+                Progress::Done(p) => {
+                    if self.render_queue.is_empty() {
+                        self.status = Status::Done(p);
+                    } else {
+                        // Batch (M8): advance to the next queued Moment, or finish.
+                        self.queue_idx += 1;
+                        match self.render_queue.get(self.queue_idx).cloned() {
+                            Some((range, title)) => {
+                                let n = self.render_queue.len();
+                                let _ = self.to_worker.send(Job::Prepare { range, title });
+                                self.status =
+                                    Status::Working(format!("Rendering {}/{n}", self.queue_idx + 1));
+                            }
+                            None => {
+                                let n = self.render_queue.len();
+                                self.render_queue.clear();
+                                self.queue_idx = 0;
+                                tracing::info!("batch: rendered {n} clip(s)");
+                                self.status = Status::Done(p); // last Short; all N in the folder
+                            }
+                        }
+                    }
+                }
+                Progress::Cancelled => {
+                    // A cancel stops the whole batch, not just the in-flight clip.
+                    self.render_queue.clear();
+                    self.queue_idx = 0;
+                    self.status = Status::Cancelled;
+                }
+                Progress::Failed(e) => {
+                    self.render_queue.clear();
+                    self.queue_idx = 0;
+                    self.status = Status::Failed(e);
+                }
             }
         }
         let working = matches!(self.status, Status::Working(_));
@@ -771,15 +822,22 @@ impl eframe::App for App {
                     // 0015), threaded to Prepare so the render names the Short.
                     let mut to_promote: Option<(TimeRange, Option<String>)> = None;
                     let mut to_select: Option<u64> = None;
+                    // Batch-select checkbox toggles (M8): (Moment id, new checked).
+                    let mut batch_toggles: Vec<(u64, bool)> = Vec::new();
                     let selected = self.selected;
                     let enabled = !working;
                     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        egui::Grid::new("moments").striped(true).num_columns(9).show(ui, |ui| {
-                            for h in ["#", "range", "score", "chat", "loud", "lex", "arou", "llm", ""] {
+                        egui::Grid::new("moments").striped(true).num_columns(10).show(ui, |ui| {
+                            for h in ["", "#", "range", "score", "chat", "loud", "lex", "arou", "llm", ""] {
                                 ui.label(h);
                             }
                             ui.end_row();
                             for m in &self.moments {
+                                // Batch-render select (M8): render these together.
+                                let mut checked = self.batch_selected.contains(&m.id);
+                                if ui.add_enabled(enabled, egui::Checkbox::new(&mut checked, "")).changed() {
+                                    batch_toggles.push((m.id, checked));
+                                }
                                 let sel = selected == Some(m.id);
                                 if ui.add(egui::Button::selectable(sel, m.id.to_string())).clicked() {
                                     to_select = Some(m.id);
@@ -803,6 +861,13 @@ impl eframe::App for App {
                             }
                         });
                     });
+                    for (id, on) in batch_toggles {
+                        if on {
+                            self.batch_selected.insert(id);
+                        } else {
+                            self.batch_selected.remove(&id);
+                        }
+                    }
                     if let Some(id) = to_select {
                         self.selected = Some(id);
                     }
@@ -811,6 +876,42 @@ impl eframe::App for App {
                         let _ = self.to_worker.send(Job::Prepare { range, title });
                         self.status = Status::Working("Preparing clip".into());
                     }
+
+                    // Batch render (M8 job-queue): render every checked Moment
+                    // sequentially, each auto-framed (no editor), in rank order. The
+                    // Prepared/Done worker-drain handlers above drive the queue.
+                    let n_sel = self.batch_selected.len();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                enabled && n_sel > 0,
+                                egui::Button::new(format!("Render {n_sel} selected (auto-framed)")),
+                            )
+                            .clicked()
+                        {
+                            let queue: Vec<(TimeRange, Option<String>)> = self
+                                .moments
+                                .iter()
+                                .filter(|m| self.batch_selected.contains(&m.id))
+                                .map(|m| (m.range, m.title.clone()))
+                                .collect();
+                            if let Some((range, title)) = queue.first().cloned() {
+                                self.editor = None;
+                                self.render_queue = queue;
+                                self.queue_idx = 0;
+                                let _ = self.to_worker.send(Job::Prepare { range, title });
+                                self.status = Status::Working(format!(
+                                    "Rendering 1/{}",
+                                    self.render_queue.len()
+                                ));
+                            }
+                        }
+                        if n_sel > 0
+                            && ui.add_enabled(enabled, egui::Button::new("Clear")).clicked()
+                        {
+                            self.batch_selected.clear();
+                        }
+                    });
                 }
             }
         }
