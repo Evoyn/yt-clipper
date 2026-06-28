@@ -264,15 +264,15 @@ impl DialectLexicon {
             lex.dictionaries.clone()
         };
         for code in &codes {
-            if let Ok(bytes) = std::fs::read(dir.join(format!("{code}.words.txt"))) {
-                for line in String::from_utf8_lossy(&bytes).lines() {
-                    let w = line.trim().to_lowercase();
-                    if !w.is_empty() {
-                        lex.dictionary.insert(w);
-                    }
-                }
-            }
+            load_wordlist(&dir.join(format!("{code}.words.txt")), &mut lex.dictionary);
         }
+        // Common given names (`names.words.txt`, ADR 0023): always loaded, like
+        // `names.json` - a correctly-read common name (Budi, Siti, John, ...) is a
+        // real word, not a garble, so it must not flag the harvest. Language-
+        // agnostic (a streamer reads viewer names from anywhere), so it loads
+        // regardless of `dictionaries`. An *unusual* handle is absent here and still
+        // harvests (the one to curate, now with the title+timestamp of ADR 0022).
+        let n_name_words = load_wordlist(&dir.join("names.words.txt"), &mut lex.dictionary);
         // Viewer names (`names.json`, language-agnostic): a correctly-read name is
         // a real word, not a garble. Split multi-word names so the whole-word
         // harvest skips each part.
@@ -291,12 +291,13 @@ impl DialectLexicon {
             }
         }
         tracing::info!(
-            "dialect: {} ({} corrections, {} vocab, {} dict words [{}], {} names)",
+            "dialect: {} ({} corrections, {} vocab, {} dict words [{}], {} name words, {} roster names)",
             if lex.creator.is_empty() { "lexicon" } else { lex.creator.as_str() },
             lex.corrections.iter().filter(|c| !c.right.is_empty()).count(),
             lex.vocabulary.len(),
             lex.dictionary.len(),
             codes.join("+"),
+            n_name_words,
             n_names,
         );
         lex
@@ -523,6 +524,24 @@ const HARVEST_MAX_PER_CLIP: usize = 8;
 /// entry (including the word a correction just fixed). Deduped; returned
 /// least-confident first and capped at [`HARVEST_MAX_PER_CLIP`]. Pure (testable
 /// without a model).
+/// Merge a newline-delimited wordlist into `dict` (trimmed, lowercased), skipping
+/// blank and `#`-comment lines. Read as bytes + lossy UTF-8 — community wordlists
+/// carry the odd non-UTF-8 byte that `read_to_string` would reject wholesale; the
+/// valid (ASCII) words matter. Returns how many new words it added. Shared by the
+/// `dictionaries` codes and the always-loaded `names.words.txt` (ADR 0023).
+fn load_wordlist(path: &Path, dict: &mut HashSet<String>) -> usize {
+    let mut added = 0;
+    if let Ok(bytes) = std::fs::read(path) {
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let w = line.trim().to_lowercase();
+            if !w.is_empty() && !w.starts_with('#') && dict.insert(w) {
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
 /// `h:mm:ss` (or `m:ss` under an hour) for a VOD-absolute timestamp — the source
 /// location written into a harvested word's review note (ADR 0022). Filesystem
 /// concerns don't apply (it goes in a note, not a filename), so the natural `:` is
@@ -928,6 +947,29 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].word, "garblexyz");
         assert!((got[0].start_s - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn names_words_filters_common_names_but_not_unusual_handles() {
+        // ADR 0023: a bundled common given name is loaded into the harvest
+        // dictionary (always, skipping `#` comments), so a correctly-read name is
+        // not flagged; an unusual viewer handle is absent and still harvests.
+        let dir = std::env::temp_dir().join("yc_names_words_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("names.words.txt"), "# a comment\nbudi\nsiti\njohn\n").unwrap();
+
+        let lex = DialectLexicon::load(&dir, Language::Id);
+        assert!(lex.dictionary.contains("budi"), "name loaded into the dictionary");
+        assert!(!lex.dictionary.contains("# a comment"), "comment line skipped");
+
+        let mk = |t: &str| CaptionUnit { text: t.into(), start_s: 0.0, end_s: 0.4 };
+        let units = vec![mk("Budi"), mk("zxqwerty")]; // common name + unusual handle
+        let got = harvest_candidates(&units, &[0.10, 0.10], &lex);
+        let words: Vec<&str> = got.iter().map(|c| c.word.as_str()).collect();
+        assert_eq!(words, vec!["zxqwerty"], "common name filtered, unusual handle harvested");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
