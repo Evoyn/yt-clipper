@@ -9,6 +9,12 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **The app has a real look now** — replaced egui's default gray with a "midnight
+  studio" dark theme: a cool-slate palette with the **caption gold (#FFD100)** as
+  the one accent, and the **yt-clipper heading in gold Anton** (the same font the
+  captions burn) as the signature. Roomier spacing, a clear type scale, cleaned-up
+  copy. Live-verified by launching the GUI and screenshotting it. Layout and every
+  control are unchanged — just the skin. (ADR 0024)
 - **Common viewer names stop cluttering the review queue** — a correctly-read name
   (Budi, Siti, Wahyuni, John, Kayla) used to get flagged as a "garble" because it
   isn't in the Indonesian/English word lists. Bundled a common-given-names list
