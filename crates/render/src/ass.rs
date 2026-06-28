@@ -11,12 +11,14 @@
 //!   budget; each line is one Dialogue event in which every unit is laid out
 //!   from the first frame but stays invisible until its spoken onset, when it
 //!   fades in and scale-"pops". Units reveal in place rather than reflowing.
-//! - **Karaoke-fill** (M7): the same character-budget lines as rolling-pop, but
-//!   every word is visible from the first frame in the *unsung* colour and
-//!   **fills** word-by-word to the *sung* colour as it is spoken, via ASS `\kf`
-//!   karaoke timing synced to the DTW word onsets (ADR 0013). The sung colour
-//!   persists, so a line is fully highlighted by its end. JA character-chunk
-//!   karaoke rides on the deferred JA-chunking work.
+//! - **Karaoke-fill** (M7; per-word *snap* since ADR 0018): the same
+//!   character-budget lines as rolling-pop, but every word is visible from the
+//!   first frame in the *unsung* colour and **snaps** as a whole to the *sung*
+//!   colour at its spoken onset, via ASS `\k` karaoke timing synced to the DTW
+//!   word onsets (ADR 0013) — an instant per-word highlight, not a
+//!   left-to-right sweep. The sung colour persists (cumulative), so a line is
+//!   fully highlighted by its end. JA character-chunk karaoke rides on the
+//!   deferred JA-chunking work.
 
 use yc_core::{CaptionGenre, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
 
@@ -295,18 +297,21 @@ fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String
     s
 }
 
-/// Karaoke-fill lines (M7): the same character-budget lines as rolling-pop, but
-/// each line is one Dialogue in which every word is visible from the first frame
-/// in the *unsung* colour and **fills** to the *sung* colour as it is spoken, via
-/// ASS `\kf` karaoke timing. `\kf<cs>` sweeps its word's text from SecondaryColour
-/// to PrimaryColour over `<cs>` centiseconds, the cursor advancing by each `\kf`
-/// in turn; so word i's fill runs from its onset to the next word's onset (the
-/// last word over its own gap-filled span — ADR 0013), keeping the sweep on the
-/// speech. The colours are set inline (`\1c` = post-fill = accent, the sung
-/// highlight; `\2c` = pre-fill = primary, the base text) so the effect is
-/// independent of the shared Style line's primary/secondary ordering. Because the
-/// fills sum to at most the line's span, the line is fully highlighted by its end
-/// and then holds briefly (`LINE_HOLD_S`, clamped to the next line's start).
+/// Karaoke-fill lines (M7; per-word snap since ADR 0018): the same
+/// character-budget lines as rolling-pop, but each line is one Dialogue in which
+/// every word is visible from the first frame in the *unsung* colour and
+/// **snaps** as a whole to the *sung* colour at its spoken onset, via ASS `\k`
+/// karaoke timing. `\k<cs>` switches its word's text from SecondaryColour to
+/// PrimaryColour **instantly** when the karaoke cursor reaches it (not the
+/// left-to-right sweep `\kf` paints), the cursor advancing by each `\k`'s `<cs>`
+/// in turn; so word i snaps at its onset and `<cs>` is just the dwell until the
+/// next word snaps (the last word over its own gap-filled span — ADR 0013). The
+/// colours are set inline (`\1c` = sung = accent, the highlight; `\2c` = unsung =
+/// primary, the base text) so the effect is independent of the shared Style
+/// line's primary/secondary ordering. The sung colour persists (cumulative), so
+/// the line is fully highlighted by its end and then holds briefly (`LINE_HOLD_S`,
+/// clamped to the next line's start). The function keeps its `_fill` name for
+/// `CaptionGenre::KaraokeFill` enum/serde stability.
 fn karaoke_fill_events(
     transcript: &Transcript,
     style: &CaptionStyle,
@@ -328,12 +333,13 @@ fn karaoke_fill_events(
 
         let mut text = format!("{{\\an5\\pos({pos_x},{pos_y})\\1c{sung}\\2c{unsung}}}");
         for (i, u) in line.iter().enumerate() {
-            // Fill span (centiseconds): to the next word's onset, or — for the last
-            // word — over its own gap-filled duration. Floored at 1 cs so a zero-gap
-            // word still advances the karaoke cursor (and `\kf0` never stalls).
+            // Karaoke dwell (centiseconds) before the next word snaps: to the next
+            // word's onset, or — for the last word — its own gap-filled duration.
+            // Floored at 1 cs so a zero-gap word still advances the cursor (and
+            // `\k0` never stalls).
             let next_on = line.get(i + 1).map_or(u.end_s, |n| n.start_s);
             let dur_cs = (((next_on - u.start_s) * 100.0).round() as i64).max(1);
-            text.push_str(&format!("{{\\kf{dur_cs}}}"));
+            text.push_str(&format!("{{\\k{dur_cs}}}"));
             text.push_str(&u.text.to_uppercase());
             if i + 1 < line.len() {
                 text.push(' ');
@@ -627,13 +633,14 @@ mod tests {
     }
 
     #[test]
-    fn karaoke_fill_emits_kf_per_word_with_inline_sweep_colours() {
-        // "a b c" = 5 chars -> one line, one Dialogue, three \kf chunks.
+    fn karaoke_snap_emits_k_per_word_with_inline_colours() {
+        // "a b c" = 5 chars -> one line, one Dialogue, three \k snap chunks.
         let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 1);
         let d = dialogues[0];
-        assert_eq!(d.matches("\\kf").count(), 3); // one karaoke chunk per word
+        assert_eq!(d.matches("{\\k").count(), 3); // one karaoke snap chunk per word
+        assert!(!d.contains("\\kf"), "instant \\k snap, not the \\kf sweep: {d}");
         // Inline colours: \1c = sung = accent (gold), \2c = unsung = primary (white).
         assert!(d.contains("\\1c&H00D7FF&"), "sung colour: {d}");
         assert!(d.contains("\\2c&HFFFFFF&"), "unsung colour: {d}");
@@ -641,13 +648,14 @@ mod tests {
     }
 
     #[test]
-    fn karaoke_fill_durations_track_word_onsets() {
-        // Onsets 0.0 / 0.5 / 1.0 -> each non-last word fills over the 0.5 s gap
-        // (\kf50); the last fills over its own gap-filled span (1.0->1.4 = \kf40).
+    fn karaoke_snap_durations_track_word_onsets() {
+        // Onsets 0.0 / 0.5 / 1.0 -> each non-last word dwells the 0.5 s gap before
+        // the next snaps (\k50); the last over its own gap-filled span (1.0->1.4 =
+        // \k40). Same cursor maths as the old \kf sweep — only the visual changed.
         let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
         let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
-        assert_eq!(d.matches("\\kf50").count(), 2); // a and b: onset-to-onset gaps
-        assert!(d.contains("\\kf40")); // c: its own duration 0.4 s
+        assert_eq!(d.matches("\\k50").count(), 2); // a and b: onset-to-onset gaps
+        assert!(d.contains("\\k40")); // c: its own duration 0.4 s
     }
 
     #[test]

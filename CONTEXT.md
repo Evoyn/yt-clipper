@@ -81,7 +81,7 @@ The rectangle of source-video pixels a Panel displays. Aspect-locked to its Pane
 _Avoid_: selection, region, window
 
 **Caption Style**:
-A named preset describing how captions look and animate (font, colors, outline, animation genre — rolling-pop, huge-word, karaoke fill). Saved per Creator, overridable per Clip.
+A named preset describing how captions look and animate (font, colors, outline, animation genre — rolling-pop, huge-word, karaoke). Saved per Creator, overridable per Clip. The karaoke genre (enum `KaraokeFill`) highlights **per word as a whole, snapping** to the accent colour at each word's spoken onset (ASS `\k`, cumulative — ADR 0018), not a left-to-right fill.
 _Avoid_: theme, template, skin
 
 **Offline**:
