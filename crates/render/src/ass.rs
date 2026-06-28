@@ -61,15 +61,25 @@ const ONSET_MAX_LEAD_S: f64 = 0.20;
 
 /// The RMS envelope's one remaining job (ADR 0013): drop a word whose onset window
 /// is in near-silence — whisper hallucinates tokens on silent / pure-music windows
-/// (ADR 0007). Envelope at this hop/window; `loud_ref` is the p95 of the clip
-/// envelope and a word is dropped when its onset-window peak (sought within
-/// `PEAK_WINDOW_S` of onset) stays below `SILENCE_DROP_FRAC * loud_ref`. Anchoring
-/// on the loud reference (not a baseline) keeps quiet-but-present speech and stays
-/// sane when a clip is mostly silence (a baseline would collapse to ~0 there).
+/// (ADR 0007). Envelope at this hop/window; a word is dropped when its onset-window
+/// peak (sought within `PEAK_WINDOW_S` of onset) stays below the drop threshold,
+/// which is the **lower** of a relative bar `SILENCE_DROP_FRAC * loud_ref`
+/// (`loud_ref` = p95 of the clip envelope) and an absolute floor `SILENCE_DROP_ABS`
+/// (ADR 0021). The relative bar adapts to mic gain, but on a clip with loud
+/// reactions it sits *above* quiet asides — a whispered viewer name — and wrongly
+/// dropped them; the absolute floor, set between true silence and quiet speech,
+/// keeps that real speech. Taking the `min` lets the (lower) relative bar still
+/// govern a uniformly-quiet clip, so the floor never over-drops there.
 const ENV_HOP_S: f64 = 0.02;
 const ENV_WIN_S: f64 = 0.04;
 const PEAK_WINDOW_S: f64 = 0.6;
 const SILENCE_DROP_FRAC: f32 = 0.10;
+/// Absolute RMS floor (ADR 0021): a word whose onset-window peak is at least this
+/// is kept even when it is below the relative bar — quiet-but-present speech amid
+/// loud moments. Set between true silence/hallucination level (clip p25 ~0.002 on
+/// the repro) and quiet speech (a dropped-but-real "Terus" measured 0.0091).
+/// Tune-from-use; `caption_diag` prints each dropped word's peak to recalibrate.
+const SILENCE_DROP_ABS: f32 = 0.006;
 
 /// RGBA (alpha = opacity) -> ASS `&HAABBGGRR`: bytes are ordered BGR and ASS
 /// alpha is *transparency*, so 0x00 is opaque. This is the one place the
@@ -246,7 +256,10 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     let mut sorted = env.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let loud_ref = sorted[((n_env as f64 * 0.95) as usize).min(n_env - 1)];
-    let silence_drop = SILENCE_DROP_FRAC * loud_ref;
+    // The lower of the relative bar and the absolute floor (ADR 0021): on a loud
+    // clip the abs floor caps the bar so quiet asides survive; on a quiet clip the
+    // (lower) relative bar governs so the floor never over-drops.
+    let silence_drop = (SILENCE_DROP_FRAC * loud_ref).min(SILENCE_DROP_ABS);
 
     let clip_end = t_of(n_env);
     let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
@@ -258,7 +271,8 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
         let next = starts.get(idx + 1).copied().unwrap_or(clip_end).max(dtw_start);
         // Drop a word whose onset window is in near-silence: whisper hallucinates
         // tokens on silent / pure-music windows (ADR 0007). Quiet real speech sits
-        // well above SILENCE_DROP_FRAC*loud_ref and survives.
+        // above the absolute floor and survives even when it is below the relative
+        // bar (a whispered name amid loud reactions - ADR 0021).
         let k0 = k_of(dtw_start);
         let k_peak_end = k_of(dtw_start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
@@ -688,6 +702,35 @@ mod tests {
         assert_eq!(r.units.len(), 1, "kept (peak window reaches the 0.60 s speech)");
         let start = r.units[0].start_s;
         assert!((0.28..=0.32).contains(&start), "capped at +0.20, got {start}");
+    }
+
+    #[test]
+    fn refine_keeps_a_quiet_aside_amid_loud_moments_via_the_abs_floor() {
+        // ADR 0021: a loud reaction (loud_ref ~ 0.5, relative bar ~ 0.05) plus a
+        // quiet aside whose onset peak (0.04) is below that bar but above the
+        // absolute floor (0.006). The relative bar alone dropped it (the operator's
+        // "quiet speech / viewer name not captioned" - the real "Terus" measured
+        // 0.0091); the abs floor keeps it. A truly-silent token is still dropped.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; (35 * sr as usize) / 10]; // 3.5 s
+        for s in samples.iter_mut().take(sr as usize) {
+            *s = 0.5; // loud reaction 0..1 s
+        }
+        let (q0, q1) = ((25 * sr as usize) / 10, (29 * sr as usize) / 10); // 2.5..2.9 s
+        for s in samples.iter_mut().take(q1).skip(q0) {
+            *s = 0.04; // a quiet aside: RMS 0.04 < ~0.05 bar, > 0.006 floor
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "loud".into(), start_s: 0.0, end_s: 0.0 },
+                CaptionUnit { text: "ghost".into(), start_s: 1.5, end_s: 1.5 }, // in silence
+                CaptionUnit { text: "quiet".into(), start_s: 2.5, end_s: 2.5 },
+            ],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        let texts: Vec<&str> = r.units.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, vec!["loud", "quiet"], "abs floor keeps the quiet aside; silence dropped");
     }
 
     #[test]

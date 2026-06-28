@@ -16,11 +16,15 @@ use std::path::PathBuf;
 use yc_core::Language;
 use yc_ingest::{read_range_samples, WHISPER_SR};
 
-// Labels only (mirror ass.rs for the limiter column; not load-bearing).
+// Labels only (mirror ass.rs for the limiter / silence-drop columns; not
+// load-bearing - they describe each verdict, they don't recompute it).
 const MIN_READ_S: f64 = 0.40;
 const MAX_HOLD_S: f64 = 1.2;
 const ENV_HOP_S: f64 = 0.02;
 const ENV_WIN_S: f64 = 0.04;
+const SILENCE_DROP_FRAC: f32 = 0.10;
+const SILENCE_DROP_ABS: f32 = 0.006; // ADR 0021 absolute floor
+const PEAK_WINDOW_S: f64 = 0.6;
 
 fn ts(t: f64) -> String {
     format!("{:6.2}", t)
@@ -97,13 +101,32 @@ fn main() -> anyhow::Result<()> {
         env.push((w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt());
         i += hop;
     }
-    env.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pct = |p: f64| env[((env.len() as f64 * p) as usize).min(env.len() - 1)];
-    println!("\n--- RMS envelope ({} frames) ---", env.len());
+    // Keep `env` time-indexed for the per-word onset peak below; sort a clone for
+    // the percentile summary only.
+    let mut sorted = env.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)];
+    let loud_ref = pct(0.95);
+    // Mirrors ass.rs (label only): relative bar SILENCE_DROP_FRAC*loud_ref, plus
+    // the ADR 0021 absolute floor SILENCE_DROP_ABS - the effective drop is the min.
+    let rel_drop = SILENCE_DROP_FRAC * loud_ref;
+    let eff_drop = rel_drop.min(SILENCE_DROP_ABS);
+    println!("\n--- RMS envelope ({} frames) ---", sorted.len());
     println!(
         "p10 {:.4}  p25 {:.4}  p50 {:.4}  p75 {:.4}  p90 {:.4}  p95(loud_ref) {:.4}  max {:.4}",
-        pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90), pct(0.95), pct(1.0)
+        pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90), loud_ref, pct(1.0)
     );
+    println!(
+        "silence-drop: relative {:.4} (={:.2}*loud_ref), abs floor {:.4} -> effective {:.4}",
+        rel_drop, SILENCE_DROP_FRAC, SILENCE_DROP_ABS, eff_drop
+    );
+    let onset_peak = |start: f64| -> f32 {
+        let k0 = ((start * sr as f64 / hop as f64).round() as usize).min(env.len().saturating_sub(1));
+        let k1 = (((start + PEAK_WINDOW_S) * sr as f64 / hop as f64).round() as usize)
+            .max(k0 + 1)
+            .min(env.len());
+        env[k0..k1].iter().copied().fold(0.0_f32, f32::max)
+    };
 
     // 3) Per-word verdict from the REAL refine. refined is the kept subsequence of
     // raw (silence-drops removed) with each kept word's start possibly clamped
@@ -125,7 +148,18 @@ fn main() -> anyhow::Result<()> {
         match matched {
             None => {
                 dropped += 1;
-                println!(" DROP {:>3} [{}]  {}", idx, ts(u.start_s), u.text);
+                let pk = onset_peak(u.start_s);
+                // Flag a word the relative bar drops but the abs floor would keep -
+                // i.e. quiet-but-present speech wrongly dropped on a loud clip.
+                let rescue = if pk >= SILENCE_DROP_ABS && pk < rel_drop {
+                    "  <- abs floor KEEPS (quiet speech)"
+                } else {
+                    ""
+                };
+                println!(
+                    " DROP {:>3} [{}] peak {:.4} (rel bar {:.4}){}  {}",
+                    idx, ts(u.start_s), pk, rel_drop, rescue, u.text
+                );
             }
             Some(r) => {
                 j += 1;
