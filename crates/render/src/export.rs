@@ -24,7 +24,11 @@ fn fmt_crop(c: &Crop) -> String {
 /// Build the `-filter_complex` graph compositing the Layout and burning
 /// `ass_name`. `ass_name` is relative to ffmpeg's working dir: we run ffmpeg in
 /// the clip folder so the `subtitles` filter never has to escape a Windows
-/// drive colon or backslash.
+/// drive colon or backslash. `fontsdir=fonts` points libass at a **fonts-only**
+/// subdirectory (the caller copies the caption font there) so it never tries to
+/// open the sibling intermediates (`analysis.wav`, `clip.ass`, `project.json`)
+/// as fonts — the noisy `Error opening memory font` lines a flat `fontsdir=.`
+/// produced. Relative, so it stays clear of the Windows drive-colon escaping too.
 pub fn build_filtergraph(layout: &Layout, ass_name: &str) -> String {
     match layout {
         Layout::Stacked { seam, gameplay, facecam } => {
@@ -35,14 +39,14 @@ pub fn build_filtergraph(layout: &Layout, ass_name: &str) -> String {
                 "[0:v]{g},scale={w}:{gh},setsar=1[g];\
                  [0:v]{f},scale={w}:{fh},setsar=1[f];\
                  [g][f]vstack=inputs=2[v];\
-                 [v]subtitles={ass_name}:fontsdir=.[out]",
+                 [v]subtitles={ass_name}:fontsdir=fonts[out]",
                 g = fmt_crop(gameplay),
                 f = fmt_crop(facecam),
                 w = CANVAS_W,
             )
         }
         Layout::FullFrame { crop } => format!(
-            "[0:v]{g},scale={w}:{h},setsar=1[v];[v]subtitles={ass_name}:fontsdir=.[out]",
+            "[0:v]{g},scale={w}:{h},setsar=1[v];[v]subtitles={ass_name}:fontsdir=fonts[out]",
             g = fmt_crop(crop),
             w = CANVAS_W,
             h = CANVAS_H,
@@ -128,7 +132,7 @@ mod tests {
         let g = build_filtergraph(&layout, "clip.ass");
         assert_eq!(g.matches("crop=").count(), 2);
         assert!(g.contains("vstack=inputs=2"));
-        assert!(g.contains("subtitles=clip.ass:fontsdir=."));
+        assert!(g.contains("subtitles=clip.ass:fontsdir=fonts"));
         // gameplay panel = round(1920*0.62)=1190; facecam = 1920-1190 = 730.
         assert!(g.contains("scale=1080:1190"), "graph: {g}");
         assert!(g.contains("scale=1080:730"), "graph: {g}");

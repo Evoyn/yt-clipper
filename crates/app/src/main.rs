@@ -445,7 +445,12 @@ impl eframe::App for App {
                         self.status = Status::Failed("no preview frames extracted".into());
                     } else {
                         self.editor = Some(editor::EditorState::from_seed(
-                            layout, src_w, src_h, range, textures,
+                            layout,
+                            src_w,
+                            src_h,
+                            range,
+                            textures,
+                            self.caption_genre,
                         ));
                         self.status = Status::Idle;
                     }
@@ -805,10 +810,11 @@ impl eframe::App for App {
             self.editor = None;
         }
         match editor_action {
-            editor::EditorAction::Render(layout) => {
-                let _ = self
-                    .to_worker
-                    .send(Job::Render { layout, caption_genre: self.caption_genre });
+            editor::EditorAction::Render(layout, caption_genre) => {
+                // The editor's per-Clip pick wins; mirror it back to the app's
+                // selection so it stays the default for the next clip.
+                self.caption_genre = caption_genre;
+                let _ = self.to_worker.send(Job::Render { layout, caption_genre });
                 self.status = Status::Working("Rendering".into());
             }
             editor::EditorAction::Cancel => self.editor = None,

@@ -947,14 +947,19 @@ fn do_render(
     }
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
 
-    // Captions: generate the ASS and copy the font into the data folder (libass
-    // finds them via the relative name + fontsdir=. when ffmpeg runs there,
-    // dodging Windows filtergraph path escaping).
+    // Captions: write the ASS into the data folder and the font into a fonts-only
+    // `data/fonts/` subdir. ffmpeg runs in the data folder, so the relative
+    // `subtitles=clip.ass:fontsdir=fonts` resolves both (dodging Windows
+    // filtergraph path escaping) while libass scans only fonts — not the sibling
+    // analysis.wav / project.json a flat fontsdir tried (and failed) to open.
     let _ = tx.send(Progress::Stage("Generating captions"));
     let style = caption_style(caption_genre);
     let ass = yc_render::generate_ass(transcript, &style);
     fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
-    fs::copy(&paths.font, session.data_dir.join("Anton-Regular.ttf"))
+    let fonts_dir = session.data_dir.join("fonts");
+    fs::create_dir_all(&fonts_dir)
+        .with_context(|| format!("creating {}", fonts_dir.display()))?;
+    fs::copy(&paths.font, fonts_dir.join("Anton-Regular.ttf"))
         .with_context(|| format!("copying font from {}", paths.font.display()))?;
 
     // Name the Short from the LLM-generated title (ADR 0015), de-collided so a

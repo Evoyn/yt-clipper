@@ -11,7 +11,7 @@
 //! the egui surface and the per-kind Crop bookkeeping.
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind};
-use yc_core::{Crop, Layout, TimeRange, CANVAS_H, CANVAS_W};
+use yc_core::{CaptionGenre, Crop, Layout, TimeRange, CANVAS_H, CANVAS_W};
 
 /// Which of the three Layouts the operator has selected. `Layout::FullFrame`
 /// collapses the talking-cam and gameplay cases into one variant, so the
@@ -28,8 +28,9 @@ enum LayoutKind {
 pub enum EditorAction {
     /// Nothing to do this frame.
     None,
-    /// The operator hit Render: composite this (nudged) Layout.
-    Render(Layout),
+    /// The operator hit Render: composite this (nudged) Layout with this
+    /// per-Clip Caption Style genre (M7 — the editor overrides the global pick).
+    Render(Layout, CaptionGenre),
     /// The operator dismissed the editor without rendering.
     Cancel,
 }
@@ -53,6 +54,9 @@ pub struct EditorState {
     facecam: Crop,
     fullcam: Crop,
     fullgameplay: Crop,
+    /// Per-Clip Caption Style genre (M7). Seeded from the app's current selection
+    /// (which is the Creator-remembered default, ADR 0016) and overridable here.
+    caption_genre: CaptionGenre,
 }
 
 impl EditorState {
@@ -65,6 +69,7 @@ impl EditorState {
         src_h: f32,
         range: TimeRange,
         frames: Vec<egui::TextureHandle>,
+        caption_genre: CaptionGenre,
     ) -> Self {
         let frame_idx = frames.len() / 2; // a representative middle frame
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
@@ -82,6 +87,7 @@ impl EditorState {
             facecam,
             fullcam,
             fullgameplay,
+            caption_genre,
         }
     }
 
@@ -135,6 +141,23 @@ impl EditorState {
                     .clicked()
                 {
                     self.kind = LayoutKind::FullGameplay;
+                }
+            });
+        });
+
+        // Per-Clip Caption Style override (M7): the animation genre for this Clip,
+        // seeded from the app's (Creator-remembered) pick and overridable here.
+        ui.horizontal(|ui| {
+            ui.label("Caption:");
+            ui.add_enabled_ui(enabled, |ui| {
+                for (genre, label) in [
+                    (CaptionGenre::HugeWord, "Huge word"),
+                    (CaptionGenre::RollingPop, "Rolling pop"),
+                    (CaptionGenre::KaraokeFill, "Karaoke fill"),
+                ] {
+                    if ui.selectable_label(self.caption_genre == genre, label).clicked() {
+                        self.caption_genre = genre;
+                    }
                 }
             });
         });
@@ -208,7 +231,7 @@ impl EditorState {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(enabled, |ui| {
                 if ui.button("Render").clicked() {
-                    action = EditorAction::Render(self.current_layout());
+                    action = EditorAction::Render(self.current_layout(), self.caption_genre);
                 }
                 if ui.button("Cancel").clicked() {
                     action = EditorAction::Cancel;
