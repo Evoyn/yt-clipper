@@ -9,6 +9,13 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **Quiet speech and viewer names get captioned now** — on a clip with loud
+  reactions, a quietly-spoken word (a whispered name) was being dropped because the
+  "is this silence?" bar was set relative to the loudest moment, so quiet-but-real
+  speech fell under it (and the dropped word left a gap that wobbled the timing).
+  Added an absolute floor below the relative bar: real quiet speech survives, true
+  silence still drops. Measured on a real clip: the word "Terus" (dropped at peak
+  0.0091, just under the bar) is now kept, with no timing gap. (ADR 0021)
 - **Loud clips start earlier, for the build-up** — a jumpscare or loud donation
   clip used to begin a fixed 5s before the loud peak. Now the pre-roll scales with
   how loud the peak is — up to ~10s for a loud-driven Moment, so the lead-up is
