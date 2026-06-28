@@ -10,6 +10,14 @@ A second operator-feedback batch — running W1→W4 (hide consoles → two-pers
 facecam → caption accuracy → SaaS GUI) as an autonomous loop, same ritual. Newest
 first.
 
+- **Captions decode with beam search now** (caption-accuracy, part 1) — the render
+  path was using whisper's *fastest, lowest-quality* decoder; since you said render
+  time is no object, it now uses **beam search** (whisper's quality decoder) for the
+  captions, while detection stays fast. Diagnosing first showed whisper is already
+  accurate on clear clips — the wrong captions are mostly from **game noise** on
+  gameplay clips, so the bigger fix is **voice isolation** (cleaning the audio before
+  whisper); that + an optional LLM auto-correct are queued for your steer with a real
+  bad-caption clip. (ADR 0027)
 - **Two-person cams frame both people now** — on a co-stream cam (e.g. "Horror
   Tanpa Ekspresi bersama @guntur69"), auto-framing used to zoom into one of the two
   people, tight enough to look soft. It now detects **everyone** on the cam and
