@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress, Timeline};
-use yc_core::{Language, Moment, Signals, TimeRange};
+use yc_core::{CaptionGenre, Language, Moment, Signals, TimeRange};
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
@@ -44,9 +44,10 @@ fn main() -> eframe::Result<()> {
     });
 
     // Headless one-shot for testing / visual iteration (no GUI clicking):
-    //   yt-clipper --headless <url-or-file> <start_s> <end_s> [en|id|ja]
+    //   yt-clipper --headless <url-or-file> <start_s> <end_s> [en|id|ja] [huge|rolling|karaoke]
     // An http(s) target is imported as a YouTube URL, anything else as a local
-    // file. Drives the same Import -> Promote worker path the GUI uses.
+    // file. The optional last arg picks the caption animation (M7). Drives the
+    // same Import -> Promote worker path the GUI uses.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--headless") {
         let target = argv
@@ -60,6 +61,9 @@ fn main() -> eframe::Result<()> {
             Some("ja") => Language::Ja,
             _ => Language::Id,
         };
+        // Optional 6th arg picks the caption animation (M7): huge | rolling |
+        // karaoke. Defaults to huge-word (the historical headless default).
+        let caption_genre = parse_genre(argv.get(i + 5).map(|s| s.as_str()));
         let source = if target.starts_with("http") {
             ImportSource::YouTube(target)
         } else {
@@ -79,7 +83,9 @@ fn main() -> eframe::Result<()> {
                 Ok(Progress::Prepared { layout, .. }) => {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
                     // preserving the old one-shot promote behavior (ADR 0012).
-                    to_worker.send(Job::Render { layout }).expect("send render");
+                    to_worker
+                        .send(Job::Render { layout, caption_genre })
+                        .expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
                     println!("{}", p.display());
@@ -177,6 +183,7 @@ fn main() -> eframe::Result<()> {
                 start_s: 0.0,
                 end_s: 30.0,
                 language: Language::Id,
+                caption_genre: CaptionGenre::HugeWord,
                 imported: None,
                 moments: Vec::new(),
                 selected: None,
@@ -323,6 +330,9 @@ struct App {
     start_s: f64,
     end_s: f64,
     language: Language,
+    /// Caption animation for the next render (M7): huge-word / rolling-pop /
+    /// karaoke-fill. A global selection for now; per-Clip override is later M7.
+    caption_genre: CaptionGenre,
     imported: Option<ImportedInfo>,
     /// Candidate Moments from detection (and any manually-marked ones), ranked.
     moments: Vec<Moment>,
@@ -376,6 +386,16 @@ fn fmt_clock(t_s: f64) -> String {
 /// A signal cell: a z-scored value, or a dash when the signal is absent.
 fn fmt_sig(v: Option<f32>) -> String {
     v.map(|x| format!("{x:5.2}")).unwrap_or_else(|| "    -".into())
+}
+
+/// Parse the headless caption-genre arg (M7): `rolling` / `karaoke`, else the
+/// huge-word default.
+fn parse_genre(arg: Option<&str>) -> CaptionGenre {
+    match arg {
+        Some("rolling") | Some("rolling-pop") => CaptionGenre::RollingPop,
+        Some("karaoke") | Some("karaoke-fill") => CaptionGenre::KaraokeFill,
+        _ => CaptionGenre::HugeWord,
+    }
 }
 
 impl eframe::App for App {
@@ -478,6 +498,24 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.language, Language::En, "English");
                     ui.selectable_value(&mut self.language, Language::Id, "Bahasa Indonesia");
                     ui.selectable_value(&mut self.language, Language::Ja, "Nihongo");
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Caption style");
+            egui::ComboBox::from_label("(applied on render)")
+                .selected_text(match self.caption_genre {
+                    CaptionGenre::HugeWord => "Huge Word",
+                    CaptionGenre::RollingPop => "Rolling Pop",
+                    CaptionGenre::KaraokeFill => "Karaoke Fill",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::HugeWord, "Huge Word");
+                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
+                    ui.selectable_value(
+                        &mut self.caption_genre,
+                        CaptionGenre::KaraokeFill,
+                        "Karaoke Fill",
+                    );
                 });
         });
         ui.add_enabled_ui(!working, |ui| {
@@ -763,7 +801,9 @@ impl eframe::App for App {
         }
         match editor_action {
             editor::EditorAction::Render(layout) => {
-                let _ = self.to_worker.send(Job::Render { layout });
+                let _ = self
+                    .to_worker
+                    .send(Job::Render { layout, caption_genre: self.caption_genre });
                 self.status = Status::Working("Rendering".into());
             }
             editor::EditorAction::Cancel => self.editor = None,

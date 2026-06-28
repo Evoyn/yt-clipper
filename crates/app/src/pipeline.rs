@@ -104,8 +104,9 @@ pub enum Job {
     Prepare { range: TimeRange, title: Option<String> },
     /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
-    /// NVENC export.
-    Render { layout: Layout },
+    /// NVENC export. `caption_genre` selects the Caption Style animation (M7):
+    /// huge-word / rolling-pop / karaoke-fill; the rest of the style is data.
+    Render { layout: Layout, caption_genre: CaptionGenre },
 }
 
 /// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
@@ -271,9 +272,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Render { layout } => match (&session, &mut prepared) {
+                Job::Render { layout, caption_genre } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, caption_genre, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -856,6 +857,7 @@ fn do_render(
     session: &Session,
     prepared: &mut PreparedClip,
     layout: Layout,
+    caption_genre: CaptionGenre,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
@@ -906,7 +908,7 @@ fn do_render(
     // finds them via the relative name + fontsdir=. when ffmpeg runs there,
     // dodging Windows filtergraph path escaping).
     let _ = tx.send(Progress::Stage("Generating captions"));
-    let style = caption_style();
+    let style = caption_style(caption_genre);
     let ass = yc_render::generate_ass(transcript, &style);
     fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
     fs::copy(&paths.font, session.data_dir.join("Anton-Regular.ttf"))
@@ -1089,15 +1091,25 @@ fn detect_layout(
 
 /// The default Caption Style preset: one word per caption (huge-word), which
 /// keeps a single word on screen at its own spoken onset — tighter perceived
-/// sync than a multi-word line. The full selectable preset set lands at M6.
-fn caption_style() -> CaptionStyle {
-    CaptionStyle {
-        name: "Huge Word".into(),
-        genre: CaptionGenre::HugeWord,
-        font_family: "Anton".into(),
+/// The Caption Style for a chosen animation `genre` (M7). The genre is the only
+/// thing that varies the build; the rest is data (ADR 0004) — Anton, white text +
+/// gold accent. Font size is the one size-sensitive datum: huge-word is one big
+/// word filling the width, the multi-word genres (rolling-pop / karaoke-fill) need
+/// a smaller size so a ~22-char line fits the 1080-wide canvas. The full per-Clip
+/// preset editor + per-Creator defaults are the rest of M7.
+fn caption_style(genre: CaptionGenre) -> CaptionStyle {
+    let (name, font_size) = match genre {
         // Large: one word at a time, meant to read on a phone. ~15 Anton chars fit
-        // the 1080-wide canvas at this size; longer words are rare (tune freely).
-        font_size: 150,
+        // the 1080-wide canvas at 150; longer words are rare (tune freely).
+        CaptionGenre::HugeWord => ("Huge Word", 150),
+        CaptionGenre::RollingPop => ("Rolling Pop", 96),
+        CaptionGenre::KaraokeFill => ("Karaoke Fill", 96),
+    };
+    CaptionStyle {
+        name: name.into(),
+        genre,
+        font_family: "Anton".into(),
+        font_size,
         primary_color: [255, 255, 255, 255],
         accent_color: [255, 209, 0, 255],
     }

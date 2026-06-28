@@ -1,16 +1,22 @@
 //! ASS subtitle generation — the single home of caption animation logic
 //! (ADR 0004). Caption Style presets are data; the animation `genre` selects
-//! which builder runs (the full preset set is M6).
+//! which builder runs.
 //!
-//! Two genres so far:
+//! Three genres:
 //! - **Huge-word** (the M2 default): one word per caption — each unit is its own
 //!   Dialogue event, appearing at its own spoken onset and clearing before the
 //!   next word. Sync tracks the spoken word, and there is never more than one
-//!   word on screen. EN/ID; JA character chunking is M6.
+//!   word on screen. EN/ID; JA character chunking is later.
 //! - **Rolling-pop** (M1): units grouped into on-screen lines by a character
 //!   budget; each line is one Dialogue event in which every unit is laid out
 //!   from the first frame but stays invisible until its spoken onset, when it
 //!   fades in and scale-"pops". Units reveal in place rather than reflowing.
+//! - **Karaoke-fill** (M7): the same character-budget lines as rolling-pop, but
+//!   every word is visible from the first frame in the *unsung* colour and
+//!   **fills** word-by-word to the *sung* colour as it is spoken, via ASS `\kf`
+//!   karaoke timing synced to the DTW word onsets (ADR 0013). The sung colour
+//!   persists, so a line is fully highlighted by its end. JA character-chunk
+//!   karaoke rides on the deferred JA-chunking work.
 
 use yc_core::{CaptionGenre, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
 
@@ -55,6 +61,15 @@ const SILENCE_DROP_FRAC: f32 = 0.10;
 fn ass_color(rgba: [u8; 4]) -> String {
     let [r, g, b, a] = rgba;
     format!("&H{:02X}{:02X}{:02X}{:02X}", 255 - a, b, g, r)
+}
+
+/// RGBA -> ASS inline colour-override `&HBBGGRR&` (colour only, no alpha — alpha
+/// is the separate `\Na` tag). For the `\1c`/`\2c` override tags the karaoke-fill
+/// genre uses, which take six BGR hex digits, unlike the Style line's colour
+/// fields (which carry alpha, see [`ass_color`]). Alpha is dropped.
+fn ass_color_tag(rgba: [u8; 4]) -> String {
+    let [r, g, b, _a] = rgba;
+    format!("&H{:02X}{:02X}{:02X}&", b, g, r)
 }
 
 /// Seconds -> ASS `H:MM:SS.cc` (centisecond precision).
@@ -107,8 +122,9 @@ fn rolling_pop_tags(on_ms: i64) -> String {
     )
 }
 
-/// Generate a complete ASS document for a transcript under a Caption Style.
-/// M1: assumes `style.genre == RollingPop`; the genre match arrives at M6.
+/// Generate a complete ASS document for a transcript under a Caption Style. The
+/// `genre` selects the animation builder; everything else about the style is data
+/// (ADR 0004), so colours/font/size flow into the shared Style line.
 pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     let mut s = String::new();
 
@@ -138,8 +154,7 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     let events = match style.genre {
         CaptionGenre::HugeWord => huge_word_events(transcript, pos_x, pos_y),
         CaptionGenre::RollingPop => rolling_pop_events(transcript, pos_x, pos_y),
-        // KaraokeFill lands at M6; fall back to rolling-pop until then.
-        CaptionGenre::KaraokeFill => rolling_pop_events(transcript, pos_x, pos_y),
+        CaptionGenre::KaraokeFill => karaoke_fill_events(transcript, style, pos_x, pos_y),
     };
     s.push_str(&events);
 
@@ -264,6 +279,61 @@ fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String
         for (i, u) in line.iter().enumerate() {
             let on_ms = ((u.start_s - line_start) * 1000.0).round() as i64;
             text.push_str(&rolling_pop_tags(on_ms));
+            text.push_str(&u.text.to_uppercase());
+            if i + 1 < line.len() {
+                text.push(' ');
+            }
+        }
+
+        s.push_str(&format!(
+            "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
+            ass_time(line_start),
+            ass_time(line_end),
+            text
+        ));
+    }
+    s
+}
+
+/// Karaoke-fill lines (M7): the same character-budget lines as rolling-pop, but
+/// each line is one Dialogue in which every word is visible from the first frame
+/// in the *unsung* colour and **fills** to the *sung* colour as it is spoken, via
+/// ASS `\kf` karaoke timing. `\kf<cs>` sweeps its word's text from SecondaryColour
+/// to PrimaryColour over `<cs>` centiseconds, the cursor advancing by each `\kf`
+/// in turn; so word i's fill runs from its onset to the next word's onset (the
+/// last word over its own gap-filled span — ADR 0013), keeping the sweep on the
+/// speech. The colours are set inline (`\1c` = post-fill = accent, the sung
+/// highlight; `\2c` = pre-fill = primary, the base text) so the effect is
+/// independent of the shared Style line's primary/secondary ordering. Because the
+/// fills sum to at most the line's span, the line is fully highlighted by its end
+/// and then holds briefly (`LINE_HOLD_S`, clamped to the next line's start).
+fn karaoke_fill_events(
+    transcript: &Transcript,
+    style: &CaptionStyle,
+    pos_x: u32,
+    pos_y: u32,
+) -> String {
+    let mut s = String::new();
+    let lines = group_lines(transcript, MAX_LINE_CHARS);
+    let sung = ass_color_tag(style.accent_color); // \1c: filled / "sung" colour
+    let unsung = ass_color_tag(style.primary_color); // \2c: unfilled / base colour
+    for (li, line) in lines.iter().enumerate() {
+        let line_start = line.first().map_or(0.0, |u| u.start_s);
+        // Hold after the last unit, but never past the next line's start, so only
+        // one line is on screen — and the hold leaves the line fully highlighted.
+        let mut line_end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
+        if let Some(next_start) = lines.get(li + 1).and_then(|n| n.first()).map(|u| u.start_s) {
+            line_end = line_end.min(next_start);
+        }
+
+        let mut text = format!("{{\\an5\\pos({pos_x},{pos_y})\\1c{sung}\\2c{unsung}}}");
+        for (i, u) in line.iter().enumerate() {
+            // Fill span (centiseconds): to the next word's onset, or — for the last
+            // word — over its own gap-filled duration. Floored at 1 cs so a zero-gap
+            // word still advances the karaoke cursor (and `\kf0` never stalls).
+            let next_on = line.get(i + 1).map_or(u.end_s, |n| n.start_s);
+            let dur_cs = (((next_on - u.start_s) * 100.0).round() as i64).max(1);
+            text.push_str(&format!("{{\\kf{dur_cs}}}"));
             text.push_str(&u.text.to_uppercase());
             if i + 1 < line.len() {
                 text.push(' ');
@@ -537,6 +607,63 @@ mod tests {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
         let ass = generate_ass(&units(&["bocil", "gila"]), &st);
+        assert!(ass.contains("BOCIL") && ass.contains("GILA"));
+        assert!(!ass.contains("bocil"));
+    }
+
+    #[test]
+    fn color_tag_is_bgr_without_alpha() {
+        // The \1c/\2c override form is six BGR digits wrapped in &H..&, no alpha.
+        assert_eq!(ass_color_tag([255, 0, 0, 255]), "&H0000FF&"); // red
+        assert_eq!(ass_color_tag([255, 215, 0, 255]), "&H00D7FF&"); // gold
+        // Alpha is dropped (unlike ass_color, which encodes it).
+        assert_eq!(ass_color_tag([255, 255, 255, 0]), "&HFFFFFF&");
+    }
+
+    fn karaoke_style() -> CaptionStyle {
+        let mut st = style();
+        st.genre = CaptionGenre::KaraokeFill;
+        st // primary white [255,255,255,255], accent gold [255,215,0,255]
+    }
+
+    #[test]
+    fn karaoke_fill_emits_kf_per_word_with_inline_sweep_colours() {
+        // "a b c" = 5 chars -> one line, one Dialogue, three \kf chunks.
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
+        let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
+        assert_eq!(dialogues.len(), 1);
+        let d = dialogues[0];
+        assert_eq!(d.matches("\\kf").count(), 3); // one karaoke chunk per word
+        // Inline colours: \1c = sung = accent (gold), \2c = unsung = primary (white).
+        assert!(d.contains("\\1c&H00D7FF&"), "sung colour: {d}");
+        assert!(d.contains("\\2c&HFFFFFF&"), "unsung colour: {d}");
+        assert!(d.contains('A') && d.contains('B') && d.contains('C'));
+    }
+
+    #[test]
+    fn karaoke_fill_durations_track_word_onsets() {
+        // Onsets 0.0 / 0.5 / 1.0 -> each non-last word fills over the 0.5 s gap
+        // (\kf50); the last fills over its own gap-filled span (1.0->1.4 = \kf40).
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
+        let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
+        assert_eq!(d.matches("\\kf50").count(), 2); // a and b: onset-to-onset gaps
+        assert!(d.contains("\\kf40")); // c: its own duration 0.4 s
+    }
+
+    #[test]
+    fn karaoke_fill_groups_into_lines_like_rolling_pop() {
+        // Same character budget as rolling-pop: a long run splits into >1 line,
+        // each its own Dialogue, and the count matches group_lines.
+        let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
+        let ass = generate_ass(&t, &karaoke_style());
+        let dialogues = ass.lines().filter(|l| l.starts_with("Dialogue:")).count();
+        assert_eq!(dialogues, group_lines(&t, MAX_LINE_CHARS).len());
+        assert!(dialogues >= 2);
+    }
+
+    #[test]
+    fn karaoke_fill_is_uppercased() {
+        let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style());
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
     }
