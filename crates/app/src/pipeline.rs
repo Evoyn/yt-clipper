@@ -28,8 +28,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, Moment, Project,
-    ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
+    CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, LayoutPref, Moment,
+    Project, ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -96,12 +96,14 @@ pub enum Job {
     /// Run detection over the imported VOD (discover + refine), surfacing
     /// ranked candidate Moments (ADR 0007). Operates on the current session.
     Detect,
-    /// Phase-2a (ADR 0012): fetch the padded Segment, probe it, auto-detect the
-    /// seed Layout, and extract preview frames for the nudge editor. Leaves a
+    /// Phase-2a (ADR 0012): fetch the padded Segment, probe it, choose the seed
+    /// Layout, and extract preview frames for the nudge editor. Leaves a
     /// [`PreparedClip`] the worker holds for the matching [`Job::Render`]. `title`
     /// is the promoted Moment's LLM-generated title (ADR 0015), carried to the
     /// render to name the Short; `None` for a manually-marked / headless clip.
-    Prepare { range: TimeRange, title: Option<String> },
+    /// `layout_pref` is the operator's explicit framing choice (ADR 0017): `Auto`
+    /// runs M6 auto-detect, the others force a Layout.
+    Prepare { range: TimeRange, title: Option<String>, layout_pref: LayoutPref },
     /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
     /// NVENC export. `caption_genre` selects the Caption Style animation (M7):
@@ -272,12 +274,12 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Prepare { range, title } => match &session {
+                Job::Prepare { range, title, layout_pref } => match &session {
                     None => {
                         let _ = tx_prog
                             .send(Progress::Failed("import a VOD before making a clip".into()));
                     }
-                    Some(s) => match do_prepare(&paths, s, range, title, &worker_cancel, &tx_prog) {
+                    Some(s) => match do_prepare(&paths, s, range, title, layout_pref, &worker_cancel, &tx_prog) {
                         Ok((pc, frames, frame_w, frame_h)) => {
                             let _ = tx_prog.send(Progress::Prepared {
                                 layout: pc.auto_layout.clone(),
@@ -805,6 +807,7 @@ fn do_prepare(
     session: &Session,
     range: TimeRange,
     title: Option<String>,
+    layout_pref: LayoutPref,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32)> {
@@ -828,12 +831,13 @@ fn do_prepare(
         }
     };
 
-    // Auto-detect the seed Layout: Ultraface locates the Facecam (CPU; no GPU
-    // contention), and build_layout picks stacked / full-cam / full-frame, or
-    // falls back to full-frame gameplay (no `face` feature/model, or no face).
+    // Choose the seed Layout: Ultraface locates the Facecam (CPU; no GPU
+    // contention), then build_layout applies the operator's Layout preference
+    // (ADR 0017) - Auto runs M6's stacked / full-cam / full-frame decision, a
+    // forced kind overrides it (still using the detected Facecam when found).
     // The editor opens seeded with this and the operator nudges from there.
     let _ = tx.send(Progress::Stage("Framing (face detect)"));
-    let auto_layout = build_layout(paths, &render_src, seek_s, src_w, src_h);
+    let auto_layout = build_layout(paths, &render_src, seek_s, src_w, src_h, layout_pref);
 
     // Sample preview frames across the clip range for the editor's scrub slider.
     let _ = tx.send(Progress::Stage("Extracting preview frames"));
@@ -1179,45 +1183,73 @@ fn persist_clip(vod: &Vod, clip: &Clip, data_dir: &Path) -> Result<()> {
 
 // --- auto-detect framing (M6, ADR 0011) -------------------------------------
 
-/// Choose the Clip's Layout by detecting the Facecam in the Segment's frames.
-/// With the `face` feature and the model present, sample frames, run Ultraface,
-/// cluster the static Facecam, and pick stacked / full-cam / full-frame
-/// gameplay. Otherwise (no feature, missing model, or a detection error) fall
-/// back to full-frame gameplay - a safe default that never misplaces a facecam,
-/// unlike the old hardcoded bottom-right Stacked scaffolding it replaces.
-#[cfg_attr(not(feature = "face"), allow(unused_variables))]
+/// Choose the Clip's Layout (ADR 0017): detect the Facecam in the Segment's
+/// frames (M6/ADR 0011), then apply the operator's `pref`. `Auto` runs the
+/// three-way auto-decision (stacked / full-cam / full-frame gameplay); a forced
+/// kind overrides it, still using the detected Facecam Crop when one was found.
+/// Detection is best-effort - with no `face` feature, a missing model, or a
+/// detection error the Facecam is `None`, and the forced seeds (or Auto's
+/// full-frame fallback) apply.
 fn build_layout(
     paths: &PipelinePaths,
     render_src: &Path,
     seek_s: f64,
     src_w: f32,
     src_h: f32,
+    pref: LayoutPref,
 ) -> Layout {
-    #[cfg(feature = "face")]
-    {
-        if paths.face_model.is_file() {
-            match detect_layout(paths, render_src, seek_s, src_w, src_h) {
-                Ok(layout) => return layout,
-                Err(e) => tracing::warn!("auto-frame failed: {e:#}; full-frame fallback"),
-            }
-        } else {
-            tracing::info!("face model absent; full-frame gameplay fallback");
-        }
-    }
-    yc_frame::decide_layout(None, src_w, src_h, yc_frame::SEAM_DEFAULT)
+    let face = detect_facecam(paths, render_src, seek_s, src_w, src_h);
+    yc_frame::decide_layout_with_pref(pref, face.as_ref(), src_w, src_h, yc_frame::SEAM_DEFAULT)
 }
 
-/// Sample frames from the Segment, run Ultraface per frame, cluster the static
-/// Facecam, and decide the Layout (ADR 0011). Frames are scaled to the model's
-/// fixed input; its normalized detections map straight to source pixels.
+/// Detect the static Facecam in the Segment (ADR 0011), or `None` when the
+/// `face` feature / model is absent, detection errors, or no face persists.
 #[cfg(feature = "face")]
-fn detect_layout(
+fn detect_facecam(
     paths: &PipelinePaths,
     render_src: &Path,
     seek_s: f64,
     src_w: f32,
     src_h: f32,
-) -> Result<Layout> {
+) -> Option<yc_frame::FaceCluster> {
+    if !paths.face_model.is_file() {
+        tracing::info!("face model absent; no Facecam (Layout uses pref seeds / fallback)");
+        return None;
+    }
+    match detect_facecam_inner(paths, render_src, seek_s, src_w, src_h) {
+        Ok(cluster) => cluster,
+        Err(e) => {
+            tracing::warn!("auto-frame failed: {e:#}; no Facecam (pref seeds / fallback)");
+            None
+        }
+    }
+}
+
+/// Without the `face` feature there is no detector: the Facecam is always `None`
+/// and the Layout comes entirely from the operator's preference seeds (ADR 0017)
+/// or Auto's full-frame fallback.
+#[cfg(not(feature = "face"))]
+fn detect_facecam(
+    _paths: &PipelinePaths,
+    _render_src: &Path,
+    _seek_s: f64,
+    _src_w: f32,
+    _src_h: f32,
+) -> Option<yc_frame::FaceCluster> {
+    None
+}
+
+/// Sample frames from the Segment, run Ultraface per frame, and cluster the
+/// static Facecam (ADR 0011). Frames are scaled to the model's fixed input; its
+/// normalized detections map straight to source pixels.
+#[cfg(feature = "face")]
+fn detect_facecam_inner(
+    paths: &PipelinePaths,
+    render_src: &Path,
+    seek_s: f64,
+    src_w: f32,
+    src_h: f32,
+) -> Result<Option<yc_frame::FaceCluster>> {
     let frames = yc_ingest::extract_frames_rgb(
         &paths.ffmpeg,
         render_src,
@@ -1241,7 +1273,7 @@ fn detect_layout(
         persistence = cluster.map(|c| c.persistence),
         "auto-frame detection"
     );
-    Ok(yc_frame::decide_layout(cluster.as_ref(), src_w, src_h, yc_frame::SEAM_DEFAULT))
+    Ok(cluster)
 }
 
 /// The default Caption Style preset: one word per caption (huge-word), which

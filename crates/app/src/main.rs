@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress, Timeline};
-use yc_core::{CaptionGenre, Language, Moment, Signals, TimeRange};
+use yc_core::{CaptionGenre, Language, LayoutPref, Moment, Signals, TimeRange};
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
@@ -44,7 +44,7 @@ fn main() -> eframe::Result<()> {
     });
 
     // Headless one-shot for testing / visual iteration (no GUI clicking):
-    //   yt-clipper --headless <url-or-file> <start_s> <end_s> [en|id|ja] [huge|rolling|karaoke]
+    //   yt-clipper --headless <url-or-file> <start_s> <end_s> [en|id|ja] [huge|rolling|karaoke] [auto|stacked|cam|gameplay]
     // An http(s) target is imported as a YouTube URL, anything else as a local
     // file. The optional last arg picks the caption animation (M7). Drives the
     // same Import -> Promote worker path the GUI uses.
@@ -64,6 +64,9 @@ fn main() -> eframe::Result<()> {
         // Optional 6th arg picks the caption animation (M7): huge | rolling |
         // karaoke. Defaults to huge-word (the historical headless default).
         let caption_genre = parse_genre(argv.get(i + 5).map(|s| s.as_str()));
+        // Optional 7th arg picks the Layout (ADR 0017): auto | stacked | cam |
+        // gameplay. Defaults to auto (M6 auto-detect).
+        let layout_pref = parse_layout_pref(argv.get(i + 6).map(|s| s.as_str()));
         let source = if target.starts_with("http") {
             ImportSource::YouTube(target)
         } else {
@@ -78,7 +81,9 @@ fn main() -> eframe::Result<()> {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
                     // No detection in --headless, so no generated title; the
                     // render names the Short by timestamp (ADR 0015).
-                    to_worker.send(Job::Prepare { range, title: None }).expect("send prepare");
+                    to_worker
+                        .send(Job::Prepare { range, title: None, layout_pref })
+                        .expect("send prepare");
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
@@ -167,7 +172,7 @@ fn main() -> eframe::Result<()> {
     // Headless batch render (M8 — the job-queue core): import -> detect -> render
     // the top-k Moments sequentially, each auto-framed (no editor) with the chosen
     // Caption Style and named by its LLM title.
-    //   yt-clipper --batch <url-or-file> [en|id|ja] [huge|rolling|karaoke] [k]
+    //   yt-clipper --batch <url-or-file> [en|id|ja] [huge|rolling|karaoke] [k] [auto|stacked|cam|gameplay]
     // Drives the same worker the GUI does; one clip renders at a time, so the GPU
     // stages stay strictly sequential (a Prepare/Render pair per Moment, in turn).
     if let Some(i) = argv.iter().position(|a| a == "--batch") {
@@ -180,6 +185,9 @@ fn main() -> eframe::Result<()> {
         };
         let caption_genre = parse_genre(argv.get(i + 3).map(|s| s.as_str()));
         let k: usize = argv.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(3);
+        // Optional 6th arg picks the Layout for every clip (ADR 0017): auto |
+        // stacked | cam | gameplay. Defaults to auto (M6 auto-detect).
+        let layout_pref = parse_layout_pref(argv.get(i + 5).map(|s| s.as_str()));
         let source = if target.starts_with("http") {
             ImportSource::YouTube(target)
         } else {
@@ -201,7 +209,9 @@ fn main() -> eframe::Result<()> {
                     tracing::info!("batch: rendering {} of {} moments", queue.len(), moments.len());
                     match queue.first().cloned() {
                         Some((range, title)) => {
-                            to_worker.send(Job::Prepare { range, title }).expect("send prepare");
+                            to_worker
+                                .send(Job::Prepare { range, title, layout_pref })
+                                .expect("send prepare");
                         }
                         None => {
                             eprintln!("no moments to render");
@@ -217,7 +227,9 @@ fn main() -> eframe::Result<()> {
                     rendered += 1;
                     match queue.get(rendered).cloned() {
                         Some((range, title)) => {
-                            to_worker.send(Job::Prepare { range, title }).expect("send prepare");
+                            to_worker
+                                .send(Job::Prepare { range, title, layout_pref })
+                                .expect("send prepare");
                         }
                         None => {
                             tracing::info!("batch: rendered {rendered} clip(s)");
@@ -258,6 +270,7 @@ fn main() -> eframe::Result<()> {
                 end_s: 30.0,
                 language: Language::Id,
                 caption_genre: CaptionGenre::HugeWord,
+                layout_pref: LayoutPref::default(),
                 imported: None,
                 moments: Vec::new(),
                 selected: None,
@@ -410,6 +423,10 @@ struct App {
     /// Caption animation for the next render (M7): huge-word / rolling-pop /
     /// karaoke-fill. A global selection for now; per-Clip override is later M7.
     caption_genre: CaptionGenre,
+    /// Explicit Layout preference for the next clip (ADR 0017): Auto runs M6
+    /// auto-detect, the others force stacked / full-cam / full-gameplay. A global
+    /// session selection (the nudge editor can still override per-Clip).
+    layout_pref: LayoutPref,
     imported: Option<ImportedInfo>,
     /// Candidate Moments from detection (and any manually-marked ones), ranked.
     moments: Vec<Moment>,
@@ -480,6 +497,20 @@ fn parse_genre(arg: Option<&str>) -> CaptionGenre {
         Some("rolling") | Some("rolling-pop") => CaptionGenre::RollingPop,
         Some("karaoke") | Some("karaoke-fill") => CaptionGenre::KaraokeFill,
         _ => CaptionGenre::HugeWord,
+    }
+}
+
+/// Parse the headless / batch Layout-preference arg (ADR 0017): `stacked` /
+/// `cam` / `gameplay`, else the `auto` (M6 auto-detect) default. Accepts a few
+/// spellings so the operator needn't remember the exact token.
+fn parse_layout_pref(arg: Option<&str>) -> LayoutPref {
+    match arg {
+        Some("stacked") | Some("stack") => LayoutPref::Stacked,
+        Some("cam") | Some("fullcam") | Some("full-cam") => LayoutPref::FullCam,
+        Some("gameplay") | Some("fullgameplay") | Some("full-gameplay") => {
+            LayoutPref::FullGameplay
+        }
+        _ => LayoutPref::Auto,
     }
 }
 
@@ -575,7 +606,7 @@ impl eframe::App for App {
                         match self.render_queue.get(self.queue_idx).cloned() {
                             Some((range, title)) => {
                                 let n = self.render_queue.len();
-                                let _ = self.to_worker.send(Job::Prepare { range, title });
+                                let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
                                 self.status =
                                     Status::Working(format!("Rendering {}/{n}", self.queue_idx + 1));
                             }
@@ -667,6 +698,34 @@ impl eframe::App for App {
                         &mut self.caption_genre,
                         CaptionGenre::KaraokeFill,
                         "Karaoke Fill",
+                    );
+                });
+        });
+        // Layout preference (ADR 0017): the operator's explicit framing for the
+        // next clip. Auto = M6 auto-detect; the others force it (so the preferred
+        // stacked / game-on-top, cam-below framing is one click away, and works in
+        // batch where the nudge editor never opens).
+        ui.horizontal(|ui| {
+            ui.label("Layout");
+            egui::ComboBox::from_label("(framing for the next clip)")
+                .selected_text(match self.layout_pref {
+                    LayoutPref::Auto => "Auto-detect",
+                    LayoutPref::Stacked => "Stacked (game + cam)",
+                    LayoutPref::FullCam => "Full cam",
+                    LayoutPref::FullGameplay => "Full gameplay",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Auto, "Auto-detect");
+                    ui.selectable_value(
+                        &mut self.layout_pref,
+                        LayoutPref::Stacked,
+                        "Stacked (game + cam)",
+                    );
+                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullCam, "Full cam");
+                    ui.selectable_value(
+                        &mut self.layout_pref,
+                        LayoutPref::FullGameplay,
+                        "Full gameplay",
                     );
                 });
         });
@@ -873,7 +932,7 @@ impl eframe::App for App {
                     }
                     if let Some((range, title)) = to_promote {
                         self.editor = None; // a new clip replaces any open editor
-                        let _ = self.to_worker.send(Job::Prepare { range, title });
+                        let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
                         self.status = Status::Working("Preparing clip".into());
                     }
 
@@ -899,7 +958,7 @@ impl eframe::App for App {
                                 self.editor = None;
                                 self.render_queue = queue;
                                 self.queue_idx = 0;
-                                let _ = self.to_worker.send(Job::Prepare { range, title });
+                                let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
                                 self.status = Status::Working(format!(
                                     "Rendering 1/{}",
                                     self.render_queue.len()

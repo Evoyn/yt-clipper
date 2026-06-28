@@ -57,8 +57,12 @@ A curatable per-language file (`assets/dialect/<lang>.json`, the `DialectLexicon
 _Avoid_: lexicon (overloaded — that is the excitement-word list for detection scoring), dictionary (that is the bundled real-word wordlist the harvest filters against, not the corrections)
 
 **Layout**:
-The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single Panel filling the canvas — the gameplay, or the Facecam alone during a talking-session moment where the streamer's cam is the content).
+The arrangement of a Clip's 1080×1920 canvas. Two variants: stacked (gameplay Panel above facecam Panel, divided by the Seam) and full-frame (a single Panel filling the canvas — the gameplay, or the Facecam alone during a talking-session moment where the streamer's cam is the content). Chosen per Clip by M6 auto-detect (ADR 0011) unless the operator's **Layout preference** forces a specific one.
 _Avoid_: composite, template, frame
+
+**Layout preference**:
+The operator's explicit choice of which Layout to frame a Clip with (ADR 0017), overriding M6 auto-detect: _auto_ (the ADR 0011 three-way decision), or a forced _stacked_ / _full cam_ / _full gameplay_. A forced choice still uses the detected Facecam Crop when one is found, else a sensible seed. A global session/per-invocation setting (GUI top-bar menu + a `--batch`/`--headless` CLI token), defaulting to _auto_; persisting it per-Creator is a later Creator-aware-framing slice (ADR 0016). It exists because the operator's preferred stacked framing must be selectable in `--batch`, which never opens the nudge editor.
+_Avoid_: layout (that is the realized arrangement; this is the operator's pick of it), template
 
 **Facecam**:
 The region of the source video showing the streamer's webcam overlay. Its location and size are not fixed across a VOD — a small corner inset during gameplay, but the streamer may switch to a full-screen cam during a talking session — so it is detected per Clip from the promoted Segment's frames, not assumed (M6, ADR 0011). The detected Facecam seeds the facecam Panel's Crop in a stacked Layout, or the whole canvas in a full-frame talking-session Layout.

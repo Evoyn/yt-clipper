@@ -18,7 +18,7 @@
 //! per-frame [`FaceBox`]es lives in [`infer`], behind the `face` cargo feature
 //! (mirrors `yc-detect`'s arousal split).
 
-use yc_core::{Crop, Layout, CANVAS_H, CANVAS_W};
+use yc_core::{Crop, Layout, LayoutPref, CANVAS_H, CANVAS_W};
 
 #[cfg(feature = "face")]
 pub mod infer;
@@ -242,11 +242,8 @@ fn fullcam_crop(face: &FaceBox, src_w: f32, src_h: f32) -> Crop {
 /// three-way decision). `None` (no persistent face) -> full-frame gameplay.
 /// `seam` is the stacked Seam position (use [`SEAM_DEFAULT`]).
 pub fn decide_layout(face: Option<&FaceCluster>, src_w: f32, src_h: f32, seam: f32) -> Layout {
-    let canvas_aspect = CANVAS_W as f32 / CANVAS_H as f32;
-    let full = Crop { x: 0.0, y: 0.0, w: src_w, h: src_h };
-
     let Some(face) = face else {
-        return Layout::FullFrame { crop: full.fit_to_aspect(canvas_aspect) };
+        return Layout::FullFrame { crop: fullframe_gameplay_crop(src_w, src_h) };
     };
 
     let w_frac = face.bbox.w / src_w;
@@ -255,15 +252,62 @@ pub fn decide_layout(face: Option<&FaceCluster>, src_w: f32, src_h: f32, seam: f
 
     if w_frac >= FULLCAM_FACE_W_FRAC && centered {
         // Talking session: the streamer is the content.
-        return Layout::FullFrame { crop: fullcam_crop(&face.bbox, src_w, src_h) };
+        fullcam_layout(Some(&face.bbox), src_w, src_h)
+    } else {
+        // Gameplay with a corner cam: gameplay Panel above the detected facecam.
+        stacked_layout(Some(&face.bbox), src_w, src_h, seam)
     }
+}
 
-    // Gameplay with a corner cam: gameplay Panel above the detected facecam.
+/// Apply the operator's explicit [`LayoutPref`] (ADR 0017), overriding the M6
+/// auto-detect. `Auto` defers to [`decide_layout`] (the unchanged ADR 0011
+/// decision); a forced kind builds that Layout from the detected Facecam when
+/// `face` is `Some`, else from a sensible seed — so forced Stacked / FullCam
+/// still work with no `face` feature and no detected cam. Pure and unit-tested.
+pub fn decide_layout_with_pref(
+    pref: LayoutPref,
+    face: Option<&FaceCluster>,
+    src_w: f32,
+    src_h: f32,
+    seam: f32,
+) -> Layout {
+    let bbox = face.map(|f| &f.bbox);
+    match pref {
+        LayoutPref::Auto => decide_layout(face, src_w, src_h, seam),
+        LayoutPref::Stacked => stacked_layout(bbox, src_w, src_h, seam),
+        LayoutPref::FullCam => fullcam_layout(bbox, src_w, src_h),
+        LayoutPref::FullGameplay => {
+            Layout::FullFrame { crop: fullframe_gameplay_crop(src_w, src_h) }
+        }
+    }
+}
+
+/// A stacked Layout at `seam`: gameplay Panel above facecam Panel. The facecam
+/// Crop covers the detected Facecam when `face` is `Some`, else the bottom-right
+/// [`default_facecam_crop`] seed (forced Stacked with no detected cam). Shared by
+/// the Auto corner-cam branch and the forced-Stacked preference.
+fn stacked_layout(face: Option<&FaceBox>, src_w: f32, src_h: f32, seam: f32) -> Layout {
+    let full = Crop { x: 0.0, y: 0.0, w: src_w, h: src_h };
     let gh = (CANVAS_H as f32 * seam).round();
     let fh = CANVAS_H as f32 - gh;
+    let cam_aspect = CANVAS_W as f32 / fh;
     let gameplay = full.fit_to_aspect(CANVAS_W as f32 / gh);
-    let facecam = expand_facecam(&face.bbox, src_w, src_h).fit_to_aspect(CANVAS_W as f32 / fh);
+    let facecam = match face {
+        Some(f) => expand_facecam(f, src_w, src_h).fit_to_aspect(cam_aspect),
+        None => default_facecam_crop(src_w, src_h, cam_aspect),
+    };
     Layout::Stacked { seam, gameplay, facecam }
+}
+
+/// A full-frame talking-cam Layout: `FullFrame` centered on the detected face
+/// when `face` is `Some`, else a centered 9:16 column. Shared by the Auto
+/// talking-session branch and the forced-FullCam preference.
+fn fullcam_layout(face: Option<&FaceBox>, src_w: f32, src_h: f32) -> Layout {
+    let crop = match face {
+        Some(f) => fullcam_crop(f, src_w, src_h),
+        None => centered_fullcam_crop(src_w, src_h),
+    };
+    Layout::FullFrame { crop }
 }
 
 // ---- editor geometry (M6 nudge editor, ADR 0012) ---------------------------
@@ -496,6 +540,72 @@ mod tests {
         assert!(c.y <= face.y && c.y + c.h >= face.y + face.h, "contains face vertically");
         // stays inside the frame
         assert!(c.x >= 0.0 && c.y >= 0.0 && c.x + c.w <= 1920.0 && c.y + c.h <= 1080.0);
+    }
+
+    // ---- explicit Layout preference (ADR 0017) ----
+
+    #[test]
+    fn pref_auto_matches_decide_layout_with_and_without_a_face() {
+        // Auto must be byte-for-byte the ADR 0011 decision (no regression).
+        let face = FaceCluster { bbox: fb(1600.0, 820.0, 200.0, 200.0), persistence: 1.0 };
+        for f in [None, Some(&face)] {
+            let auto = decide_layout_with_pref(LayoutPref::Auto, f, 1920.0, 1080.0, SEAM_DEFAULT);
+            let base = decide_layout(f, 1920.0, 1080.0, SEAM_DEFAULT);
+            assert_eq!(auto, base);
+        }
+    }
+
+    #[test]
+    fn pref_stacked_forces_stacked_even_for_a_large_centered_face() {
+        // A big centered face Auto would frame as full-cam; the preference must
+        // still produce Stacked, with the facecam Panel over the detected face.
+        let face = FaceCluster { bbox: fb(660.0, 200.0, 600.0, 600.0), persistence: 1.0 };
+        assert!(matches!(
+            decide_layout(Some(&face), 1920.0, 1080.0, SEAM_DEFAULT),
+            Layout::FullFrame { .. }
+        ));
+        match decide_layout_with_pref(LayoutPref::Stacked, Some(&face), 1920.0, 1080.0, SEAM_DEFAULT) {
+            Layout::Stacked { seam, facecam, .. } => {
+                assert!((seam - SEAM_DEFAULT).abs() < 1e-6);
+                let (fcx, fcy) = (face.bbox.cx(), face.bbox.cy());
+                assert!(facecam.x <= fcx && fcx <= facecam.x + facecam.w);
+                assert!(facecam.y <= fcy && fcy <= facecam.y + facecam.h);
+            }
+            other => panic!("expected forced Stacked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pref_stacked_with_no_face_uses_the_bottom_right_seed() {
+        // Forced Stacked must work with no detected cam (e.g. a non-`face` build):
+        // a bottom-right default facecam Crop, matching the facecam Panel aspect.
+        match decide_layout_with_pref(LayoutPref::Stacked, None, 1920.0, 1080.0, SEAM_DEFAULT) {
+            Layout::Stacked { seam, facecam, .. } => {
+                let (_, fa) = stacked_panel_aspects(seam);
+                assert!((facecam.w / facecam.h - fa).abs() < 1e-2, "facecam matches panel aspect");
+                assert!((facecam.x + facecam.w - 1920.0).abs() < 1e-3, "parked at right edge");
+                assert!((facecam.y + facecam.h - 1080.0).abs() < 1e-3, "parked at bottom edge");
+            }
+            other => panic!("expected forced Stacked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pref_full_cam_and_full_gameplay_force_full_frame() {
+        // Full cam with no face -> a centered 9:16 column.
+        match decide_layout_with_pref(LayoutPref::FullCam, None, 1920.0, 1080.0, SEAM_DEFAULT) {
+            Layout::FullFrame { crop } => {
+                assert!((crop.w / crop.h - CANVAS_W as f32 / CANVAS_H as f32).abs() < 1e-3);
+                assert!((crop.x + crop.w * 0.5 - 960.0).abs() < 1e-3, "centered");
+            }
+            other => panic!("expected FullFrame full-cam, got {other:?}"),
+        }
+        // Full gameplay is the whole frame fit to 9:16, regardless of any face.
+        let face = FaceCluster { bbox: fb(1600.0, 820.0, 200.0, 200.0), persistence: 1.0 };
+        assert_eq!(
+            decide_layout_with_pref(LayoutPref::FullGameplay, Some(&face), 1920.0, 1080.0, SEAM_DEFAULT),
+            Layout::FullFrame { crop: fullframe_gameplay_crop(1920.0, 1080.0) }
+        );
     }
 
     // ---- editor geometry (ADR 0012) ----

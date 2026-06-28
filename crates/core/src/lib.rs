@@ -258,6 +258,25 @@ pub enum Layout {
     FullFrame { crop: Crop },
 }
 
+/// The operator's explicit choice of how to frame a Clip (ADR 0017), overriding
+/// M6 auto-detect. `Auto` keeps the ADR 0011 three-way decision; the others
+/// force that Layout (still using the detected Facecam when one is found). A
+/// global session / per-invocation setting, defaulting to `Auto`; the forcing
+/// itself is pure (`yc_frame::decide_layout_with_pref`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutPref {
+    /// Let M6 auto-detect pick stacked / full-cam / full-frame (ADR 0011).
+    #[default]
+    Auto,
+    /// Always stacked: gameplay Panel above facecam Panel.
+    Stacked,
+    /// Always full-frame on the Facecam (talking-session framing).
+    FullCam,
+    /// Always full-frame gameplay.
+    FullGameplay,
+}
+
 /// A Moment the operator has promoted for production: it gets framing,
 /// captions, and an export.
 #[derive(Debug, Clone, Serialize, Deserialize)]
