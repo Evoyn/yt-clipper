@@ -4,6 +4,21 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-28 — operator-feedback pass (post-v1)
+
+Working the operator's 8 priority items from real-world testing of v1, one feature
+per iteration (grill → implement → live-verify → commit). Newest first.
+
+- **Layout is now selectable** — your preferred stacked framing (gameplay on top,
+  facecam below) stopped appearing because M6 auto-detect falls back to full-frame
+  whenever it can't confidently find a corner cam (and `--batch` never opens the
+  nudge editor to fix it by hand). Added an explicit **Layout** menu — *Auto* /
+  *Stacked* / *Full cam* / *Full gameplay* — in the GUI top bar, and a matching
+  `--batch`/`--headless` CLI token (`stacked` etc.). *Auto* keeps the smart
+  auto-detect; pick *Stacked* and every clip is framed game-on-top, cam-below,
+  including in batch. Live-verified on a real horror clip: forced *stacked* and
+  *gameplay* render visibly different layouts. (ADR 0017)
+
 ## 2026-06-28 — v1 complete (M0–M8), one autonomous `/loop` run
 
 Took the project from post-M6 caption work to **functionally complete v1**. Everything below is committed (13 commits); ship with `git push origin main`. All 111 unit tests pass and every feature was live-verified on real Indonesian gaming VODs.
