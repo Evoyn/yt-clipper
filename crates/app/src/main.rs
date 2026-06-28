@@ -404,9 +404,14 @@ impl eframe::App for App {
         while let Ok(msg) = self.from_worker.try_recv() {
             match msg {
                 Progress::Stage(s) => self.status = Status::Working(s.to_string()),
-                Progress::Imported { title, duration_s, analysis_wav } => {
+                Progress::Imported { title, duration_s, analysis_wav, caption_genre } => {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.analysis_wav = Some(analysis_wav);
+                    // Seed the caption-style picker to this Creator's remembered
+                    // choice (ADR 0016); the operator can still override it.
+                    if let Some(genre) = caption_genre {
+                        self.caption_genre = genre;
+                    }
                     self.status = Status::Idle;
                 }
                 Progress::Detected { moments, transcripts, llm_reasons, timeline } => {

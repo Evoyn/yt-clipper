@@ -2,6 +2,7 @@
 //! if a name here drifts from the glossary, the glossary wins.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The output canvas is always 9:16.
@@ -18,18 +19,85 @@ pub enum Language {
     Ja,
 }
 
-/// A streamer whose VODs the operator clips with their permission.
-/// Carries defaults applied to every VOD of theirs.
+/// A streamer whose VODs the operator clips with their permission. Carries
+/// defaults remembered across that Creator's VODs (ADR 0016), persisted in the
+/// global [`CreatorStore`]. Realizes the Creator scoping the per-stream output
+/// folders (ADR 0015) introduced on disk. Only `language` + `default_caption_genre`
+/// are applied today; the seam/crop defaults are recorded `Option`s reserved for
+/// the Creator-aware framing slice (they tangle with M6 per-Segment auto-framing,
+/// ADR 0011), and serialize only when set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Creator {
     pub name: String,
     pub language: Language,
-    /// Default Seam position for stacked Layouts, as a fraction of canvas height.
-    pub default_seam: f32,
-    /// Name of the default Caption Style preset.
-    pub default_caption_style: String,
+    /// Caption Style animation remembered for this Creator (ADR 0016): seeds the
+    /// render's genre on the next import, updated to whatever the operator last
+    /// rendered with. `None` until they render a clip for this Creator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_caption_genre: Option<CaptionGenre>,
+    /// Default Seam position for stacked Layouts (fraction of canvas height).
+    /// Reserved — not applied yet (Creator-aware framing slice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_seam: Option<f32>,
+    /// Reserved — not applied yet (tangles with M6 per-Segment facecam detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_gameplay_crop: Option<Crop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_facecam_crop: Option<Crop>,
+}
+
+impl Creator {
+    /// A fresh record for `name`/`language` with no remembered defaults yet.
+    pub fn new(name: String, language: Language) -> Self {
+        Self {
+            name,
+            language,
+            default_caption_genre: None,
+            default_seam: None,
+            default_gameplay_crop: None,
+            default_facecam_crop: None,
+        }
+    }
+}
+
+/// The global store of per-Creator defaults (ADR 0016), persisted as
+/// `creators.json` at the workspace root — the long-deferred `creators.json`. A
+/// map keyed by the Creator's name (as it comes from VOD metadata), so importing a
+/// known Creator's VOD can seed the remembered settings. No database, by design
+/// (mirrors `Project`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreatorStore {
+    #[serde(default)]
+    pub creators: HashMap<String, Creator>,
+}
+
+impl CreatorStore {
+    /// Load the store, falling back to an empty one when the file is absent or
+    /// unparseable (a bad or missing store never blocks importing or rendering;
+    /// use [`Self::try_load`] to surface the error instead).
+    pub fn load(path: &Path) -> Self {
+        Self::try_load(path).unwrap_or_default()
+    }
+
+    /// Like [`Self::load`] but surfaces a parse/read error (absent file included),
+    /// so a caller that wants to warn the operator can.
+    pub fn try_load(path: &Path) -> Result<Self, ProjectError> {
+        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
+        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+    }
+
+    /// The remembered record for `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&Creator> {
+        self.creators.get(name)
+    }
+
+    /// Insert or replace the record for `creator.name`.
+    pub fn upsert(&mut self, creator: Creator) {
+        self.creators.insert(creator.name.clone(), creator);
+    }
 }
 
 /// Where a VOD's media comes from.
@@ -241,6 +309,49 @@ mod tests {
         let back: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(back.vod.title, "test vod");
         assert_eq!(back.vod.language, Language::Id);
+    }
+
+    #[test]
+    fn creator_store_roundtrips_and_upserts() {
+        let mut store = CreatorStore::default();
+        let mut c = Creator::new("Joddy Barat".into(), Language::Id);
+        c.default_caption_genre = Some(CaptionGenre::KaraokeFill);
+        store.upsert(c);
+        // Round-trip through JSON.
+        let json = serde_json::to_string(&store).unwrap();
+        let back: CreatorStore = serde_json::from_str(&json).unwrap();
+        let got = back.get("Joddy Barat").expect("creator present");
+        assert_eq!(got.language, Language::Id);
+        assert_eq!(got.default_caption_genre, Some(CaptionGenre::KaraokeFill));
+        // Unknown name -> None.
+        assert!(back.get("someone else").is_none());
+        // Upsert replaces in place (one entry, updated genre).
+        let mut store = back;
+        let mut c2 = Creator::new("Joddy Barat".into(), Language::En);
+        c2.default_caption_genre = Some(CaptionGenre::HugeWord);
+        store.upsert(c2);
+        assert_eq!(store.creators.len(), 1);
+        assert_eq!(store.get("Joddy Barat").unwrap().language, Language::En);
+        assert_eq!(
+            store.get("Joddy Barat").unwrap().default_caption_genre,
+            Some(CaptionGenre::HugeWord)
+        );
+    }
+
+    #[test]
+    fn creator_store_skips_unset_optional_defaults_in_json() {
+        // A minimal record serializes without the reserved seam/crop fields (they
+        // skip_serializing_if None), so creators.json stays clean until they are used.
+        let mut store = CreatorStore::default();
+        store.upsert(Creator::new("solo".into(), Language::Id));
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(!json.contains("default_seam"), "json: {json}");
+        assert!(!json.contains("default_gameplay_crop"), "json: {json}");
+        // And a partial/older creators.json still loads (serde defaults fill in).
+        let partial = r#"{"creators":{"x":{"name":"x","language":"id"}}}"#;
+        let back: CreatorStore = serde_json::from_str(partial).unwrap();
+        let c = back.get("x").unwrap();
+        assert!(c.default_caption_genre.is_none() && c.default_seam.is_none());
     }
 
     #[test]

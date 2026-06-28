@@ -28,8 +28,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Language, Layout, Moment, Project, Signals, TimeRange,
-    Transcript, Vod, VodSource,
+    CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, Moment, Project,
+    Signals, TimeRange, Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -123,7 +123,15 @@ pub enum Progress {
     Stage(&'static str),
     /// Import finished; the VOD is ready to detect / promote ranges from.
     /// `analysis_wav` lets the review UI play a Moment's audio range.
-    Imported { title: String, duration_s: Option<f64>, analysis_wav: PathBuf },
+    /// `caption_genre` is this Creator's remembered Caption Style (ADR 0016), if
+    /// known, so the UI seeds its caption-style picker to the operator's usual
+    /// choice for this streamer; `None` for an unknown/new Creator.
+    Imported {
+        title: String,
+        duration_s: Option<f64>,
+        analysis_wav: PathBuf,
+        caption_genre: Option<CaptionGenre>,
+    },
     /// Detection finished; ranked candidate Moments, each one's transcript text
     /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
     /// id (`llm_reasons`, empty unless built `--features llm` with the GGUF
@@ -221,6 +229,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 title: s.vod.title.clone(),
                                 duration_s: s.vod.duration_s,
                                 analysis_wav: s.analysis_wav.clone(),
+                                caption_genre: remembered_caption_genre(&paths.workspace, &s.vod),
                             });
                             session = Some(s);
                             prepared = None; // a new VOD invalidates any prepared clip
@@ -418,6 +427,40 @@ fn save_project(vod: &Vod, data_dir: &Path) -> Result<()> {
     Project::new(vod.clone())
         .save(&data_dir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", data_dir.display()))
+}
+
+/// `workspace/creators.json` — the global per-Creator defaults store (ADR 0016).
+fn creators_path(workspace: &Path) -> PathBuf {
+    workspace.join("creators.json")
+}
+
+/// This VOD's Creator's remembered Caption Style genre (ADR 0016), if the store
+/// knows this Creator — used to seed the render's caption style on import. `None`
+/// for an unknown/new Creator (the operator's current selection then stands, and
+/// is saved to the store on the first render).
+fn remembered_caption_genre(workspace: &Path, vod: &Vod) -> Option<CaptionGenre> {
+    CreatorStore::load(&creators_path(workspace))
+        .get(&vod.creator)
+        .and_then(|c| c.default_caption_genre)
+}
+
+/// Remember the Caption Style the operator just rendered with for this Creator
+/// (ADR 0016): upsert the Creator record (creating it if new), keeping its
+/// language current and recording `genre` as the new default. Best-effort — a
+/// store read/write failure logs and never fails the render.
+fn remember_creator_genre(workspace: &Path, vod: &Vod, genre: CaptionGenre) {
+    let path = creators_path(workspace);
+    let mut store = CreatorStore::load(&path);
+    let mut creator = store
+        .get(&vod.creator)
+        .cloned()
+        .unwrap_or_else(|| Creator::new(vod.creator.clone(), vod.language));
+    creator.language = vod.language; // keep the recorded language current
+    creator.default_caption_genre = Some(genre);
+    store.upsert(creator);
+    if let Err(e) = store.save(&path) {
+        tracing::warn!("creators.json save failed ({e})");
+    }
 }
 
 /// Load the VOD's persisted project, or start a fresh one if none exists / it is
@@ -939,6 +982,9 @@ fn do_render(
         &out_name,
     );
     yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args)?;
+
+    // Remember this Creator's Caption Style for the next import (ADR 0016).
+    remember_creator_genre(&paths.workspace, &session.vod, caption_genre);
 
     Ok(out_path)
 }

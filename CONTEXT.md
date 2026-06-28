@@ -37,8 +37,12 @@ A catchy ≤60-character short-form title generated for a Moment by the LLM judg
 _Avoid_: caption (that is the on-screen burned text), filename, label
 
 **Stream folder**:
-A VOD's output directory, `workspace/<creator>/<stream-title>/` (sanitized from VOD metadata — ADR 0015). The rendered Shorts (named by their generated Title) sit at its root; every intermediate (analysis audio, downloaded Segments, `project.json`, captions, font) lives under its `data/` subfolder. It realizes Creator scoping on disk ahead of the `creators.json` defaults store (deferred to M7).
+A VOD's output directory, `workspace/<creator>/<stream-title>/` (sanitized from VOD metadata — ADR 0015). The rendered Shorts (named by their generated Title) sit at its root; every intermediate (analysis audio, downloaded Segments, `project.json`, captions, font) lives under its `data/` subfolder. It realizes Creator scoping on disk; the **Creator store** (`workspace/creators.json`) holds the matching per-Creator defaults.
 _Avoid_: workspace (that is the parent holding every stream folder), project folder
+
+**Creator store**:
+The global `workspace/creators.json` (`core::CreatorStore`) of per-Creator remembered defaults, keyed by Creator name (ADR 0016) — the long-deferred `creators.json`. Today it remembers a Creator's **Caption Style**: importing a known Creator's VOD seeds the render's genre to their last-used one, and each render saves it back (operator overrides always win). Language is recorded but not yet applied; seam/crop defaults are reserved for a later Creator-aware-framing slice.
+_Avoid_: project.json (that is per-VOD, under the stream folder's `data/`), dialect store (that is per-language transcription corrections)
 
 **Segment**:
 The padded span of full-quality VOD video downloaded for a Clip when it is promoted — bounded by keyframes, so always a little longer than the Clip's range. The frame-accurate export is cut from the Segment; the VOD's video is never downloaded whole (ADR 0001, ADR 0006).
