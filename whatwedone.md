@@ -9,6 +9,13 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **Common viewer names stop cluttering the review queue** — a correctly-read name
+  (Budi, Siti, Wahyuni, John, Kayla) used to get flagged as a "garble" because it
+  isn't in the Indonesian/English word lists. Bundled a common-given-names list
+  (`names.words.txt`, ~5,100 Indonesian + international names, always loaded) so
+  common names are now recognized; only an **unusual** handle still harvests (the
+  one actually worth curating — and item 6 now tags it with where it was said).
+  Complements your per-streamer `names.json` roster. (ADR 0023)
 - **The dialect review queue (`id.json`) is curatable now** — each auto-harvested
   word used to be just `{wrong, right:""}` with no clue where it came from. Now its
   note records the **source**: the generated Short title + the absolute VOD
