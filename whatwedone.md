@@ -9,6 +9,12 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **Captions no longer jump ahead of the audio** — sometimes a word appeared a
+  beat before it was spoken. whisper's word-onset timing occasionally runs early;
+  now each caption's start is nudged **forward** to where the audio actually rises
+  (bounded to 0.2s, never past the next word), so a caption never precedes its
+  sound. One fix covers all three caption styles. Measured on a real clip: 11 of
+  27 words were leading (by up to 0.2s); all corrected. (ADR 0019)
 - **Karaoke captions snap per word** — the karaoke style used a smooth
   left-to-right fill that looked like "a loading bar filling." Now each word
   **snaps** to the accent colour as a whole the moment it's spoken (and stays
