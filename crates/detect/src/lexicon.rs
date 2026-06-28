@@ -126,6 +126,7 @@ mod tests {
             range: TimeRange { start_s: 0.0, end_s: 30.0 },
             signals: lex_neutral_signals,
             score: 0.0,
+            title: None,
         };
         let base =
             Signals { chat_rate: Some(1.0), loudness: Some(1.0), lexicon: None, arousal: None, llm: None };

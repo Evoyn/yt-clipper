@@ -72,7 +72,9 @@ fn main() -> eframe::Result<()> {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
-                    to_worker.send(Job::Prepare { range }).expect("send prepare");
+                    // No detection in --headless, so no generated title; the
+                    // render names the Short by timestamp (ADR 0015).
+                    to_worker.send(Job::Prepare { range, title: None }).expect("send prepare");
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
@@ -134,6 +136,10 @@ fn main() -> eframe::Result<()> {
                             fmt_sig(m.signals.arousal),
                             fmt_sig(m.signals.llm),
                         );
+                        // The LLM-generated Shorts title (ADR 0015), if any.
+                        if let Some(t) = m.title.as_deref().filter(|t| !t.is_empty()) {
+                            println!("        title: {t}");
+                        }
                     }
                     std::process::exit(0);
                 }
@@ -535,6 +541,7 @@ impl eframe::App for App {
                                 range: TimeRange { start_s: self.start_s, end_s: self.end_s },
                                 signals: Signals::default(),
                                 score: 0.0,
+                                title: None, // manual Moment: render names the Short by timestamp
                             });
                             self.selected = Some(id);
                         }
@@ -621,7 +628,9 @@ impl eframe::App for App {
                 if self.moments.is_empty() {
                     ui.label("No Moments yet - click Detect Moments, or mark one manually.");
                 } else {
-                    let mut to_promote: Option<TimeRange> = None;
+                    // The promoted range plus that Moment's generated title (ADR
+                    // 0015), threaded to Prepare so the render names the Short.
+                    let mut to_promote: Option<(TimeRange, Option<String>)> = None;
                     let mut to_select: Option<u64> = None;
                     let selected = self.selected;
                     let enabled = !working;
@@ -648,7 +657,7 @@ impl eframe::App for App {
                                 ui.label(fmt_sig(m.signals.arousal));
                                 ui.label(fmt_sig(m.signals.llm));
                                 if ui.add_enabled(enabled, egui::Button::new("Promote")).clicked() {
-                                    to_promote = Some(m.range);
+                                    to_promote = Some((m.range, m.title.clone()));
                                     to_select = Some(m.id);
                                 }
                                 ui.end_row();
@@ -658,9 +667,9 @@ impl eframe::App for App {
                     if let Some(id) = to_select {
                         self.selected = Some(id);
                     }
-                    if let Some(range) = to_promote {
+                    if let Some((range, title)) = to_promote {
                         self.editor = None; // a new clip replaces any open editor
-                        let _ = self.to_worker.send(Job::Prepare { range });
+                        let _ = self.to_worker.send(Job::Prepare { range, title });
                         self.status = Status::Working("Preparing clip".into());
                     }
                 }
@@ -688,6 +697,14 @@ impl eframe::App for App {
                         .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
                         .changed();
                 });
+                // The LLM-generated Shorts title (ADR 0015) — this is what the
+                // rendered Short will be named, so the operator sees it pre-promote.
+                if let Some(title) = m.title.as_deref().filter(|t| !t.is_empty()) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Title:");
+                        ui.label(title);
+                    });
+                }
                 if let Some(reason) = self.llm_reasons.get(&id) {
                     ui.horizontal_wrapped(|ui| {
                         ui.strong("LLM:");

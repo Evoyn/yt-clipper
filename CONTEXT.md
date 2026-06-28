@@ -32,6 +32,14 @@ _Avoid_: rerank (it is a Signal in the ensemble, not a post-sort stage), GPT / c
 A Moment the operator has promoted for production. A Clip gets framing, captions, and an export; a Moment that is never promoted gets nothing.
 _Avoid_: short, video, segment
 
+**Title**:
+A catchy ≤60-character short-form title generated for a Moment by the LLM judge at detect time (it already reads the transcript — ADR 0010/0015), stored on the Moment and used to name the rendered Short (`<title>.mp4`) so a re-promote never overwrites a previous one. A manually-marked Moment has no generated title; the render then names the Short by timestamp (`clip-<m-ss>`). Distinct from the VOD's own `title` (the stream's name, which names the **stream folder**).
+_Avoid_: caption (that is the on-screen burned text), filename, label
+
+**Stream folder**:
+A VOD's output directory, `workspace/<creator>/<stream-title>/` (sanitized from VOD metadata — ADR 0015). The rendered Shorts (named by their generated Title) sit at its root; every intermediate (analysis audio, downloaded Segments, `project.json`, captions, font) lives under its `data/` subfolder. It realizes Creator scoping on disk ahead of the `creators.json` defaults store (deferred to M7).
+_Avoid_: workspace (that is the parent holding every stream folder), project folder
+
 **Segment**:
 The padded span of full-quality VOD video downloaded for a Clip when it is promoted — bounded by keyframes, so always a little longer than the Clip's range. The frame-accurate export is cut from the Segment; the VOD's video is never downloaded whole (ADR 0001, ADR 0006).
 _Avoid_: clip, chunk, section, source

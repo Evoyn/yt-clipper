@@ -224,6 +224,7 @@ mod tests {
             range: TimeRange { start_s: 0.0, end_s: 30.0 },
             signals,
             score: 0.0,
+            title: None,
         };
         let base = Signals { chat_rate: Some(1.0), loudness: Some(1.0), ..Default::default() };
         let mut moments = vec![mk(1, base), mk(2, base)];

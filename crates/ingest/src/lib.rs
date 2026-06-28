@@ -20,6 +20,57 @@ pub use youtube::{
 /// Sample rate (mono) whisper.cpp expects.
 pub const WHISPER_SR: u32 = 16_000;
 
+/// Sanitize `raw` into a single filesystem-safe path segment (a folder name or a
+/// file stem), valid on Windows and POSIX — the output organization feature names
+/// folders from VOD metadata and Shorts from LLM-generated titles (ADR 0015), and
+/// both arrive as arbitrary text. The transform:
+///
+/// - replaces the Windows-reserved characters `< > : " / \ | ? *` and any control
+///   character with `_` (so the result is always one segment, never a separator),
+/// - collapses runs of whitespace to a single space,
+/// - caps the length to `max_len` *characters* (not bytes, so multibyte titles
+///   aren't split mid-codepoint),
+/// - trims leading/trailing whitespace and dots (Windows silently strips trailing
+///   dots and spaces from names, which would otherwise desync a created path from
+///   the name we think we wrote),
+/// - prefixes an `_` to the reserved DOS device names (`CON`, `PRN`, `AUX`, `NUL`,
+///   `COM1`-`COM9`, `LPT1`-`LPT9`), which are unusable as filenames even with an
+///   extension,
+/// - and returns `fallback` when nothing usable survives (e.g. an all-symbol
+///   title), so a segment is never empty.
+///
+/// Pure, so the rules are unit-tested without touching the filesystem.
+pub fn sanitize_segment(raw: &str, fallback: &str, max_len: usize) -> String {
+    // Map reserved/control characters to '_'; keep everything else.
+    let mapped: String = raw
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    // Collapse internal whitespace runs to single spaces.
+    let collapsed = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Cap by character count, then trim trailing dots/spaces (Windows-illegal).
+    let capped: String = collapsed.chars().take(max_len).collect();
+    let trimmed = capped.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+    // Guard the reserved DOS device names (case-insensitive, base before any dot).
+    let base = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// ffmpeg args to extract a VOD's whole audio track to 16 kHz mono PCM wav —
 /// the audio-first analysis artifact (ADR 0001). `-vn -map 0:a:0` decodes only
 /// the first audio stream; no video is touched.
@@ -182,6 +233,45 @@ mod tests {
         let pf = args.iter().position(|a| a == "-pix_fmt").unwrap();
         assert_eq!(args[pf + 1], "rgb24");
         assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn sanitize_replaces_separators_and_reserved_chars() {
+        // Path separators and Windows-reserved chars become '_', so the result is
+        // always a single segment.
+        assert_eq!(
+            sanitize_segment(r#"a/b\c:d*e?"f|g"#, "x", 64),
+            "a_b_c_d_e__f_g"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_whitespace_and_trims_dots() {
+        assert_eq!(sanitize_segment("  hello   world  ", "x", 64), "hello world");
+        // Trailing dots/spaces are Windows-illegal on a name -> trimmed.
+        assert_eq!(sanitize_segment("My Clip...", "x", 64), "My Clip");
+        assert_eq!(sanitize_segment("....", "fallback", 64), "fallback");
+    }
+
+    #[test]
+    fn sanitize_caps_length_by_chars_not_bytes() {
+        let s = sanitize_segment("abcdefghij", "x", 4);
+        assert_eq!(s, "abcd");
+        // A multibyte title is capped on char boundaries, never split mid-codepoint.
+        let multi = sanitize_segment("héllo wörld", "x", 5);
+        assert_eq!(multi.chars().count(), 5);
+        assert_eq!(multi, "héllo");
+    }
+
+    #[test]
+    fn sanitize_guards_reserved_device_names_and_empties() {
+        assert_eq!(sanitize_segment("CON", "x", 64), "_CON");
+        assert_eq!(sanitize_segment("com1", "x", 64), "_com1"); // case-insensitive
+        assert_eq!(sanitize_segment("nul.txt", "x", 64), "_nul.txt");
+        // COM0 is not a reserved device -> left alone.
+        assert_eq!(sanitize_segment("COM0", "x", 64), "COM0");
+        // Empty / all-symbol input falls back.
+        assert_eq!(sanitize_segment("", "untitled", 64), "untitled");
     }
 
     #[test]

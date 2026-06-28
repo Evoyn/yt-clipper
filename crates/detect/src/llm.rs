@@ -42,16 +42,20 @@ Score 0-10 how clip-worthy the STREAMER'S OWN reaction is:
 
 CRITICAL: the transcript is the loudest voice in a MIXED game+microphone recording, so it may be scripted in-game dialogue or cutscene narration rather than the streamer. Score the STREAMER, not the game. A dramatic, emotional or shocking line that is clearly scripted game/cutscene narration is NOT clip-worthy on its own - score it low unless the streamer is audibly reacting to it. Use the provided signals to corroborate: high audience-chat and high vocal-arousal alongside reaction-like words point to a real streamer moment; dramatic words with flat arousal and no chat point to scripted game audio.
 
-Reply with ONLY a JSON object: {\"score\": <integer 0-10>, \"reason\": \"<at most 12 words>\"}.";
+Also write a catchy YouTube Shorts title for this moment: at most 60 characters, in the transcript's own language, punchy and specific to what happens - no hashtags, no surrounding quotes, no emoji.
 
-/// GBNF grammar constraining generation to `{"score": <0-10>, "reason": "<text>"}`
-/// so a local 7B emits a parseable object instead of free prose (ADR 0010). The
-/// reason forbids `"`/`\` to dodge JSON-escape edge cases; length is bounded by
-/// the inference's token cap, not the grammar. [`parse_output`] is lenient enough
-/// to also handle output produced without this grammar (the documented fallback).
-pub const GRAMMAR: &str = r#"root   ::= "{\"score\": " score ", \"reason\": \"" reason "\"}"
-score  ::= "10" | [0-9]
-reason ::= [^"\\]*"#;
+Reply with ONLY a JSON object: {\"score\": <integer 0-10>, \"reason\": \"<at most 12 words>\", \"title\": \"<at most 60 characters>\"}.";
+
+/// GBNF grammar constraining generation to
+/// `{"score": <0-10>, "reason": "<text>", "title": "<text>"}` so a local 7B emits
+/// a parseable object instead of free prose (ADR 0010/0015). Both free-text
+/// fields forbid `"`/`\` to dodge JSON-escape edge cases; their length is bounded
+/// by the inference's token cap, not the grammar. [`parse_output`] is lenient
+/// enough to also handle output produced without this grammar (the documented
+/// fallback) and to tolerate a missing `title`.
+pub const GRAMMAR: &str = r#"root  ::= "{\"score\": " score ", \"reason\": \"" text "\", \"title\": \"" text "\"}"
+score ::= "10" | [0-9]
+text  ::= [^"\\]*"#;
 
 /// The corroborating per-candidate context fed to the model so it judges by more
 /// than the words alone (the ADR 0010 mitigation). These are the z-scored signals
@@ -121,11 +125,23 @@ fn first_score(s: &str) -> Option<f32> {
     None
 }
 
-/// Parse the model's output into `(score in [0, SCORE_MAX], reason)`. Prefers the
-/// grammar-constrained JSON object; falls back to the first 0-10 integer in the
-/// text (reason = the whole trimmed text) so a malformed generation still yields
-/// a usable score rather than aborting the whole detect run.
-pub fn parse_output(raw: &str) -> (f32, String) {
+/// One parsed judgment: the clip-worthiness score, the one-line reason, and the
+/// generated Shorts title (ADR 0015). `title` is empty when the model omitted it
+/// or the output fell back to the lenient path — the render then names the Short
+/// from its timestamp instead.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Judgment {
+    pub score: f32,
+    pub reason: String,
+    pub title: String,
+}
+
+/// Parse the model's output into a [`Judgment`]. Prefers the grammar-constrained
+/// JSON object (`score`/`reason`/`title`); falls back to the first 0-10 integer
+/// in the text (reason = the whole trimmed text, no title) so a malformed
+/// generation still yields a usable score rather than aborting the whole detect
+/// run.
+pub fn parse_output(raw: &str) -> Judgment {
     let clamp = |s: f32| s.clamp(0.0, SCORE_MAX as f32);
     if let Some(start) = raw.find('{') {
         if let Some(rel_end) = raw[start..].rfind('}') {
@@ -136,14 +152,19 @@ pub fn parse_output(raw: &str) -> (f32, String) {
                     .and_then(|s| s.as_f64().map(|f| f as f32))
                     .or_else(|| v.get("score").and_then(|s| s.as_str()).and_then(|s| s.parse().ok()));
                 if let Some(score) = score {
-                    let reason =
-                        v.get("reason").and_then(|r| r.as_str()).unwrap_or("").trim().to_string();
-                    return (clamp(score), reason);
+                    let field = |k: &str| {
+                        v.get(k).and_then(|r| r.as_str()).unwrap_or("").trim().to_string()
+                    };
+                    return Judgment { score: clamp(score), reason: field("reason"), title: field("title") };
                 }
             }
         }
     }
-    (clamp(first_score(raw).unwrap_or(0.0)), raw.trim().to_string())
+    Judgment {
+        score: clamp(first_score(raw).unwrap_or(0.0)),
+        reason: raw.trim().to_string(),
+        title: String::new(),
+    }
 }
 
 /// Fill the `llm` Signal on candidates from their per-candidate raw scores and
@@ -199,6 +220,12 @@ pub struct JudgeVerdict {
     pub score: f32,
     /// One-line rationale for the review UI.
     pub reason: String,
+    /// Generated Shorts title (ADR 0015), used to name the rendered Short when
+    /// this Moment is promoted. Empty when the model omitted it (render falls back
+    /// to a timestamp name). `#[serde(default)]` so a pre-0015 judge response (no
+    /// title field) still deserializes.
+    #[serde(default)]
+    pub title: String,
 }
 
 #[cfg(test)]
@@ -216,6 +243,9 @@ mod tests {
         assert!(s.contains("not clip-worthy"), "must say scripted drama is not clip-worthy");
         assert!(s.contains("corroborate") || s.contains("signals"), "must use the signals");
         assert!(SYSTEM.contains("\"score\""), "must request the JSON score field");
+        // ADR 0015: the prompt must also request the generated Shorts title.
+        assert!(SYSTEM.contains("\"title\""), "must request the JSON title field");
+        assert!(s.contains("title"), "must ask for a title");
     }
 
     #[test]
@@ -236,30 +266,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_output_reads_clean_json() {
-        let (s, r) = parse_output(r#"{"score": 8, "reason": "big laugh"}"#);
-        assert_eq!(s, 8.0);
-        assert_eq!(r, "big laugh");
+    fn parse_output_reads_clean_json_with_title() {
+        let j = parse_output(r#"{"score": 8, "reason": "big laugh", "title": "He LOST it on the final boss"}"#);
+        assert_eq!(j.score, 8.0);
+        assert_eq!(j.reason, "big laugh");
+        assert_eq!(j.title, "He LOST it on the final boss");
+    }
+
+    #[test]
+    fn parse_output_tolerates_a_missing_title() {
+        // A pre-0015 / non-compliant generation with no title field still parses;
+        // the title is just empty (render falls back to a timestamp name).
+        let j = parse_output(r#"{"score": 8, "reason": "big laugh"}"#);
+        assert_eq!(j.score, 8.0);
+        assert_eq!(j.reason, "big laugh");
+        assert!(j.title.is_empty());
     }
 
     #[test]
     fn parse_output_accepts_string_score_and_surrounding_prose() {
-        let (s, r) = parse_output("Sure! {\"score\": \"3\", \"reason\": \"menu reading\"} done");
-        assert_eq!(s, 3.0);
-        assert_eq!(r, "menu reading");
+        let j = parse_output(
+            "Sure! {\"score\": \"3\", \"reason\": \"menu reading\", \"title\": \"Just the menu\"} done",
+        );
+        assert_eq!(j.score, 3.0);
+        assert_eq!(j.reason, "menu reading");
+        assert_eq!(j.title, "Just the menu");
     }
 
     #[test]
     fn parse_output_falls_back_to_first_integer() {
-        let (s, r) = parse_output("I'd say 7 out of 10, lots of hype");
-        assert_eq!(s, 7.0); // first 0-10 integer (the 7, not the 10)
-        assert!(r.contains("hype"));
+        let j = parse_output("I'd say 7 out of 10, lots of hype");
+        assert_eq!(j.score, 7.0); // first 0-10 integer (the 7, not the 10)
+        assert!(j.reason.contains("hype"));
+        assert!(j.title.is_empty()); // no title recoverable from free prose
     }
 
     #[test]
     fn parse_output_clamps_and_defaults() {
-        assert_eq!(parse_output(r#"{"score": 99, "reason": "x"}"#).0, SCORE_MAX as f32);
-        assert_eq!(parse_output("no number here").0, 0.0);
+        assert_eq!(parse_output(r#"{"score": 99, "reason": "x", "title": "y"}"#).score, SCORE_MAX as f32);
+        assert_eq!(parse_output("no number here").score, 0.0);
     }
 
     #[test]
@@ -270,6 +315,7 @@ mod tests {
             range: TimeRange { start_s: 0.0, end_s: 30.0 },
             signals,
             score: 0.0,
+            title: None,
         };
         let base = Signals { chat_rate: Some(1.0), loudness: Some(1.0), ..Default::default() };
         let mut moments = vec![mk(1, base), mk(2, base)];

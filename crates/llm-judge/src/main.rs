@@ -25,7 +25,9 @@ use std::sync::OnceLock;
 use anyhow::Context as _;
 use anyhow::{anyhow, Result};
 use yc_core::Language;
-use yc_detect::llm::{build_prompt, parse_output, Context, JudgeRequest, JudgeVerdict, GRAMMAR, SYSTEM};
+use yc_detect::llm::{
+    build_prompt, parse_output, Context, JudgeRequest, JudgeVerdict, Judgment, GRAMMAR, SYSTEM,
+};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -40,10 +42,12 @@ use llama_cpp_2::TokenToStringError;
 /// transcript + signals) is a few hundred tokens; 2048 leaves ample room (the
 /// llama.cpp default of 512 would overflow a dense transcript).
 const N_CTX: u32 = 2048;
-/// Cap on generated tokens — the JSON object is tiny; this bounds a runaway.
-const MAX_NEW_TOKENS: usize = 96;
+/// Cap on generated tokens — the JSON object is tiny (score + short reason + a
+/// <=60-char title; ADR 0015), this bounds a runaway. Raised from 96 to fit the
+/// added title field comfortably.
+const MAX_NEW_TOKENS: usize = 160;
 /// Hard cap on collected output bytes (defensive, alongside MAX_NEW_TOKENS).
-const MAX_OUT_BYTES: usize = 512;
+const MAX_OUT_BYTES: usize = 1024;
 
 fn main() -> Result<()> {
     // All logs to stderr; stdout is the JSON response channel and must stay clean.
@@ -69,12 +73,12 @@ fn main() -> Result<()> {
     let mut verdicts = Vec::with_capacity(req.candidates.len());
     for (i, c) in req.candidates.iter().enumerate() {
         match llm.score(&c.transcript, &c.context(), req.language) {
-            Ok((score, reason)) => verdicts.push(JudgeVerdict { score, reason }),
+            Ok(j) => verdicts.push(JudgeVerdict { score: j.score, reason: j.reason, title: j.title }),
             Err(e) => {
                 // A single bad candidate must not sink the batch: emit a 0 so the
                 // response stays one verdict per candidate (z-scoring lines up).
                 tracing::warn!("candidate {i} scoring failed: {e:#}");
-                verdicts.push(JudgeVerdict { score: 0.0, reason: String::new() });
+                verdicts.push(JudgeVerdict { score: 0.0, reason: String::new(), title: String::new() });
             }
         }
     }
@@ -126,8 +130,9 @@ impl Llm {
         Ok(Self { model, template })
     }
 
-    /// Score one candidate's transcript. Returns `(raw 0..=SCORE_MAX, reason)`.
-    fn score(&self, transcript: &str, ctx: &Context, language: Language) -> Result<(f32, String)> {
+    /// Score one candidate's transcript. Returns the parsed [`Judgment`] (raw
+    /// 0..=SCORE_MAX score, reason, and generated Shorts title).
+    fn score(&self, transcript: &str, ctx: &Context, language: Language) -> Result<Judgment> {
         let messages = vec![
             LlamaChatMessage::new("system".to_string(), SYSTEM.to_string())
                 .map_err(|e| anyhow!("system message: {e}"))?,

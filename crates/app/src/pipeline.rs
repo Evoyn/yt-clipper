@@ -98,8 +98,10 @@ pub enum Job {
     Detect,
     /// Phase-2a (ADR 0012): fetch the padded Segment, probe it, auto-detect the
     /// seed Layout, and extract preview frames for the nudge editor. Leaves a
-    /// [`PreparedClip`] the worker holds for the matching [`Job::Render`].
-    Prepare { range: TimeRange },
+    /// [`PreparedClip`] the worker holds for the matching [`Job::Render`]. `title`
+    /// is the promoted Moment's LLM-generated title (ADR 0015), carried to the
+    /// render to name the Short; `None` for a manually-marked / headless clip.
+    Prepare { range: TimeRange, title: Option<String> },
     /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
     /// NVENC export.
@@ -152,10 +154,19 @@ pub enum Progress {
 }
 
 /// What an import leaves ready for promotion. The worker holds one between jobs.
+///
+/// Output organization (ADR 0015): each VOD owns a **stream folder**
+/// `workspace/<creator>/<stream-title>/` (sanitized from VOD metadata, realizing
+/// Creator scoping without a `creators.json` defaults store yet). Rendered Shorts
+/// land at its root; every intermediate (analysis.wav, audio.m4a, segment*,
+/// chat, project.json, clip.ass, font) lives under its `data/` subfolder.
 struct Session {
     vod: Vod,
     promote: PromoteSource,
-    workdir: PathBuf,
+    /// `workspace/<creator>/<stream-title>/` — the rendered Shorts go here.
+    stream_dir: PathBuf,
+    /// `<stream_dir>/data/` — analysis audio, segments, project.json, captions.
+    data_dir: PathBuf,
     analysis_wav: PathBuf,
 }
 
@@ -180,6 +191,10 @@ struct PreparedClip {
     range: TimeRange,
     auto_layout: Layout,
     transcript: Option<Transcript>,
+    /// The promoted Moment's LLM-generated title (ADR 0015), used to name the
+    /// rendered Short. `None` for a manual / headless clip → render falls back to
+    /// a timestamp name. Held here so a re-render after a nudge keeps the name.
+    title: Option<String>,
 }
 
 /// Spawn the worker thread. Returns the job sender, the progress receiver, and a
@@ -233,12 +248,12 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Prepare { range } => match &session {
+                Job::Prepare { range, title } => match &session {
                     None => {
                         let _ = tx_prog
                             .send(Progress::Failed("import a VOD before making a clip".into()));
                     }
-                    Some(s) => match do_prepare(&paths, s, range, &worker_cancel, &tx_prog) {
+                    Some(s) => match do_prepare(&paths, s, range, title, &worker_cancel, &tx_prog) {
                         Ok((pc, frames, frame_w, frame_h)) => {
                             let _ = tx_prog.send(Progress::Prepared {
                                 layout: pc.auto_layout.clone(),
@@ -316,24 +331,27 @@ fn import_youtube(
 
     let _ = tx.send(Progress::Stage("Fetching metadata"));
     let vod = yc_ingest::youtube_metadata(&sc, &url, language, cancel)?;
-    let video_id = match &vod.source {
-        VodSource::YouTube { video_id } => video_id.clone(),
-        // youtube_metadata always builds a YouTube source.
-        VodSource::LocalFile { .. } => anyhow::bail!("expected a YouTube VOD"),
-    };
+    anyhow::ensure!(
+        matches!(vod.source, VodSource::YouTube { .. }),
+        "expected a YouTube VOD"
+    );
 
-    // Folder-per-VOD, keyed by video_id (Creator-scoped folders arrive at M5/M6).
-    let workdir = paths.workspace.join(&video_id);
-    fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
+    // Output organization (ADR 0015): `workspace/<creator>/<stream-title>/`, with
+    // intermediates under `data/`. The folder names come from VOD metadata
+    // (creator from yt-dlp uploader/channel, title from `title`), sanitized to
+    // safe path segments. Keyed by metadata (not the opaque video_id), so a
+    // re-import of the same VOD lands in the same folder and reuses cached audio.
+    let (stream_dir, data_dir) = stream_dirs(&paths.workspace, &vod);
+    fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
 
     let _ = tx.send(Progress::Stage("Downloading audio"));
-    let analysis_wav = yc_ingest::youtube_fetch_audio(&sc, &url, &workdir, cancel)?;
+    let analysis_wav = yc_ingest::youtube_fetch_audio(&sc, &url, &data_dir, cancel)?;
 
     let _ = tx.send(Progress::Stage("Fetching chat"));
-    let _chat = yc_ingest::youtube_fetch_chat(&sc, &url, &workdir, cancel)?;
+    let _chat = yc_ingest::youtube_fetch_chat(&sc, &url, &data_dir, cancel)?;
 
-    save_project(&vod, &workdir)?;
-    Ok(Session { vod, promote: PromoteSource::YouTube(url), workdir, analysis_wav })
+    save_project(&vod, &data_dir)?;
+    Ok(Session { vod, promote: PromoteSource::YouTube(url), stream_dir, data_dir, analysis_wav })
 }
 
 fn import_local(
@@ -355,13 +373,8 @@ fn import_local(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "clip".into());
-    let workdir = paths.workspace.join(&stem);
-    fs::create_dir_all(&workdir).with_context(|| format!("creating {}", workdir.display()))?;
-
-    let _ = tx.send(Progress::Stage("Extracting audio"));
-    let analysis_wav = workdir.join("analysis.wav");
-    yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav)?;
-
+    // A local file has no Creator: scope it under `workspace/local/<file-stem>/`
+    // (ADR 0015), matching the YouTube hierarchy. The fallback creator is "local".
     let vod = Vod {
         creator: "local".into(),
         title: stem,
@@ -369,21 +382,48 @@ fn import_local(
         language,
         duration_s: None,
     };
-    save_project(&vod, &workdir)?;
-    Ok(Session { vod, promote: PromoteSource::Local(path), workdir, analysis_wav })
+    let (stream_dir, data_dir) = stream_dirs(&paths.workspace, &vod);
+    fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
+
+    let _ = tx.send(Progress::Stage("Extracting audio"));
+    let analysis_wav = data_dir.join("analysis.wav");
+    yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav)?;
+
+    save_project(&vod, &data_dir)?;
+    Ok(Session { vod, promote: PromoteSource::Local(path), stream_dir, data_dir, analysis_wav })
 }
 
-fn save_project(vod: &Vod, workdir: &Path) -> Result<()> {
+/// Max chars for a sanitized folder segment (`<creator>` / `<stream-title>`).
+/// Bounded well under Windows MAX_PATH so `workspace/<creator>/<title>/data/
+/// segment.mp4` and the Short at the stream root both stay short enough.
+const DIR_SEGMENT_MAX: usize = 64;
+/// Max chars for a generated Short's filename stem — the Shorts-title ceiling
+/// (the LLM is asked for <=60; this enforces it after sanitizing).
+const TITLE_STEM_MAX: usize = 60;
+
+/// The `(stream_dir, data_dir)` for a VOD under `workspace` (ADR 0015):
+/// `workspace/<creator>/<stream-title>/` and its `data/` subfolder, both names
+/// sanitized from the VOD's metadata to safe path segments. Pure (no I/O), so the
+/// layout is unit-testable; the caller creates the directories.
+fn stream_dirs(workspace: &Path, vod: &Vod) -> (PathBuf, PathBuf) {
+    let creator = yc_ingest::sanitize_segment(&vod.creator, "unknown", DIR_SEGMENT_MAX);
+    let title = yc_ingest::sanitize_segment(&vod.title, "untitled", DIR_SEGMENT_MAX);
+    let stream_dir = workspace.join(creator).join(title);
+    let data_dir = stream_dir.join("data");
+    (stream_dir, data_dir)
+}
+
+fn save_project(vod: &Vod, data_dir: &Path) -> Result<()> {
     Project::new(vod.clone())
-        .save(&workdir.join("project.json"))
-        .with_context(|| format!("writing project.json in {}", workdir.display()))
+        .save(&data_dir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", data_dir.display()))
 }
 
 /// Load the VOD's persisted project, or start a fresh one if none exists / it is
 /// unreadable. Lets detect and promote update `project.json` without clobbering
 /// each other's records.
-fn load_or_new_project(vod: &Vod, workdir: &Path) -> Project {
-    Project::load(&workdir.join("project.json")).unwrap_or_else(|_| Project::new(vod.clone()))
+fn load_or_new_project(vod: &Vod, data_dir: &Path) -> Project {
+    Project::load(&data_dir.join("project.json")).unwrap_or_else(|_| Project::new(vod.clone()))
 }
 
 // --- detect (M3) ------------------------------------------------------------
@@ -406,7 +446,7 @@ fn do_detect(
     // yc_detect::discover) so the same series feeds both the ranking and the
     // review timeline - no second wav read.
     let _ = tx.send(Progress::Stage("Detecting moments (chat + loudness)"));
-    let chat = session.workdir.join("chat.live_chat.json");
+    let chat = session.data_dir.join("chat.live_chat.json");
     let loud_bins = yc_detect::loudness::read_rms_bins(&session.analysis_wav, params.bin_s)?;
     let chat_bins = if chat.exists() {
         let offsets = yc_detect::chat::message_offsets(&chat)?;
@@ -488,6 +528,10 @@ fn do_detect(
     // process boundary. Skipped (signal omitted, combined_score renormalizes) when
     // the judge binary or the GGUF is absent, exactly like a missing SER model.
     let mut llm_reasons_vec: Vec<String> = Vec::new();
+    // LLM-generated Shorts titles, aligned to `moments` (ADR 0015). Used to name
+    // each rendered Short when the Moment is promoted; carried through the rank
+    // reorder below onto `Moment.title`.
+    let mut llm_titles_vec: Vec<String> = Vec::new();
     if paths.llm_judge.is_file() && paths.llm_model.is_file() {
         let _ = tx.send(Progress::Stage("Refining moments (LLM judgment, GPU)"));
         let request = yc_detect::llm::JudgeRequest {
@@ -507,6 +551,7 @@ fn do_detect(
         match run_llm_judge(&paths.llm_judge, &request, cancel) {
             Ok(verdicts) if verdicts.len() == moments.len() => {
                 let scores: Vec<f32> = verdicts.iter().map(|v| v.score).collect();
+                llm_titles_vec = verdicts.iter().map(|v| v.title.clone()).collect();
                 llm_reasons_vec = verdicts.into_iter().map(|v| v.reason).collect();
                 yc_detect::llm::apply(&mut moments, &scores, &params.weights);
             }
@@ -532,6 +577,9 @@ fn do_detect(
     for (rank, &i) in order.iter().enumerate() {
         let mut m = moments[i].clone();
         m.id = (rank + 1) as u64;
+        if let Some(t) = llm_titles_vec.get(i).map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            m.title = Some(t.to_string());
+        }
         transcripts.insert(m.id, texts[i].clone());
         if let Some(r) = llm_reasons_vec.get(i).filter(|r| !r.trim().is_empty()) {
             llm_reasons.insert(m.id, r.clone());
@@ -539,11 +587,11 @@ fn do_detect(
         ranked.push(m);
     }
 
-    let mut project = load_or_new_project(&session.vod, &session.workdir);
+    let mut project = load_or_new_project(&session.vod, &session.data_dir);
     project.moments = ranked.clone();
     project
-        .save(&session.workdir.join("project.json"))
-        .with_context(|| format!("writing project.json in {}", session.workdir.display()))?;
+        .save(&session.data_dir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", session.data_dir.display()))?;
     Ok((ranked, transcripts, llm_reasons, timeline))
 }
 
@@ -637,6 +685,7 @@ fn do_prepare(
     paths: &PipelinePaths,
     session: &Session,
     range: TimeRange,
+    title: Option<String>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32)> {
@@ -653,7 +702,7 @@ fn do_prepare(
         PromoteSource::YouTube(url) => {
             let _ = tx.send(Progress::Stage("Fetching segment"));
             let padded = yc_ingest::pad_range(range, session.vod.duration_s);
-            let segment = yc_ingest::fetch_segment(&sc, url, padded, &session.workdir, cancel)?;
+            let segment = yc_ingest::fetch_segment(&sc, url, padded, &session.data_dir, cancel)?;
             let p = yc_ingest::probe_segment(&paths.ffprobe, &segment, cancel)?;
             let offset = yc_ingest::in_segment_offset(range.start_s, padded.start_s, &p);
             (segment, offset, p.width as f32, p.height as f32)
@@ -689,6 +738,7 @@ fn do_prepare(
         range,
         auto_layout,
         transcript: None,
+        title,
     };
     Ok((prepared, frames, frame_w, frame_h))
 }
@@ -711,7 +761,7 @@ fn caption_samples(
     {
         if paths.sep_model.is_file() {
             let _ = tx.send(Progress::Stage("Separating vocal stem"));
-            let wd = &session.workdir;
+            let wd = &session.data_dir;
             let in44 = wd.join("_sep_in44k.wav");
             let voc44 = wd.join("_sep_voc44k.wav");
             let voc16 = wd.join("_sep_voc16k.wav");
@@ -852,35 +902,90 @@ fn do_render(
     }
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
 
-    // Captions: generate the ASS and copy the font beside it (libass finds it
-    // via fontsdir=., dodging Windows filtergraph path escaping).
+    // Captions: generate the ASS and copy the font into the data folder (libass
+    // finds them via the relative name + fontsdir=. when ffmpeg runs there,
+    // dodging Windows filtergraph path escaping).
     let _ = tx.send(Progress::Stage("Generating captions"));
     let style = caption_style();
     let ass = yc_render::generate_ass(transcript, &style);
-    fs::write(session.workdir.join("clip.ass"), ass).context("writing clip.ass")?;
-    fs::copy(&paths.font, session.workdir.join("Anton-Regular.ttf"))
+    fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
+    fs::copy(&paths.font, session.data_dir.join("Anton-Regular.ttf"))
         .with_context(|| format!("copying font from {}", paths.font.display()))?;
 
-    // Record the promoted Clip with the operator's Layout, then render it.
-    let clip = build_clip(range, layout, &style.name);
-    persist_clip(&session.vod, &clip, &session.workdir)?;
+    // Name the Short from the LLM-generated title (ADR 0015), de-collided so a
+    // re-promote never clobbers a previous Short. It lands at the stream-folder
+    // root; intermediates (clip.ass, font, segment) stay under data/.
+    let stem = clip_title_stem(prepared.title.as_deref(), range);
+    let out_path = unique_path(&session.stream_dir, &stem, "mp4");
+
+    // Record the promoted Clip with the operator's Layout + its export path, then
+    // render it.
+    let clip = build_clip(range, layout, &style.name, &out_path);
+    persist_clip(&session.vod, &clip, &session.data_dir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
     let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
+    // The output is an absolute path (only the `subtitles=clip.ass` filter must
+    // stay relative for libass); ffmpeg runs in data/ so the relative ASS + font
+    // resolve, and writes the Short up at the stream-folder root.
+    let out_name = out_path.to_string_lossy();
     let args = yc_render::export_args(
         &prepared.render_src,
         prepared.seek_s,
         range.duration_s(),
         &filtergraph,
-        "export.mp4",
+        &out_name,
     );
-    yc_render::run_export(&paths.ffmpeg, &session.workdir, &args)?;
+    yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args)?;
 
-    Ok(session.workdir.join("export.mp4"))
+    Ok(out_path)
+}
+
+/// The filename stem for a rendered Short (no extension): the promoted Moment's
+/// LLM-generated title sanitized to a safe segment, or — when there is no title
+/// (manual / headless clip) or it sanitizes to nothing — a deterministic
+/// timestamp name `clip-<m-ss>` from the clip's start, so every Short still gets
+/// a meaningful, collision-resistant name (ADR 0015).
+fn clip_title_stem(title: Option<&str>, range: TimeRange) -> String {
+    title
+        .map(|t| yc_ingest::sanitize_segment(t, "", TITLE_STEM_MAX))
+        // Require a real word: an all-symbol / emoji title (sanitizes to e.g.
+        // "___" or stays punctuation) is not a meaningful filename — fall back.
+        .filter(|s| s.chars().any(|c| c.is_alphanumeric()))
+        .unwrap_or_else(|| format!("clip-{}", clock_stem(range.start_s)))
+}
+
+/// `m-ss` (or `h-mm-ss` past an hour) for a timestamp — a filesystem-safe clock
+/// (no `:`), used in the fallback Short name.
+fn clock_stem(t_s: f64) -> String {
+    let s = t_s.round().max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}-{:02}-{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}-{:02}", s / 60, s % 60)
+    }
+}
+
+/// A non-colliding `dir/<stem>.<ext>`: returned as-is when free, else
+/// `dir/<stem> (2).<ext>`, `(3)`, … so a re-promote of the same Moment never
+/// overwrites a previous Short (ADR 0015). Bounded so a pathological directory
+/// can't loop forever (falls back to the base name after the cap).
+fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..10_000 {
+        let candidate = dir.join(format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
 }
 
 /// A manually-picked range -> a marked Moment promoted to a Clip (CONTEXT.md).
-fn build_clip(range: TimeRange, layout: Layout, caption_style: &str) -> Clip {
+fn build_clip(range: TimeRange, layout: Layout, caption_style: &str, export_path: &Path) -> Clip {
     Clip {
         id: 1,
         moment_id: 1,
@@ -888,21 +993,22 @@ fn build_clip(range: TimeRange, layout: Layout, caption_style: &str) -> Clip {
         layout,
         caption_style: caption_style.to_string(),
         segment_path: None,
-        export_path: None,
+        export_path: Some(export_path.to_path_buf()),
     }
 }
 
 /// Re-save `project.json` with the promoted Clip recorded, preserving any
 /// detected Moments. Records the source Moment only if it isn't already known
 /// (e.g. a directly promoted range that never went through detection).
-fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
-    let mut project = load_or_new_project(vod, workdir);
+fn persist_clip(vod: &Vod, clip: &Clip, data_dir: &Path) -> Result<()> {
+    let mut project = load_or_new_project(vod, data_dir);
     if !project.moments.iter().any(|m| m.id == clip.moment_id) {
         project.moments.push(Moment {
             id: clip.moment_id,
             range: clip.range,
             signals: Signals::default(),
             score: 0.0,
+            title: None,
         });
     }
     // Replace any existing record of this Clip (a re-render after a nudge) so
@@ -910,8 +1016,8 @@ fn persist_clip(vod: &Vod, clip: &Clip, workdir: &Path) -> Result<()> {
     project.clips.retain(|c| c.id != clip.id);
     project.clips.push(clip.clone());
     project
-        .save(&workdir.join("project.json"))
-        .with_context(|| format!("writing project.json in {}", workdir.display()))
+        .save(&data_dir.join("project.json"))
+        .with_context(|| format!("writing project.json in {}", data_dir.display()))
 }
 
 // --- auto-detect framing (M6, ADR 0011) -------------------------------------
@@ -994,5 +1100,76 @@ fn caption_style() -> CaptionStyle {
         font_size: 150,
         primary_color: [255, 255, 255, 255],
         accent_color: [255, 209, 0, 255],
+    }
+}
+
+// --- output organization (ADR 0015) -----------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yc_core::VodSource;
+
+    fn vod(creator: &str, title: &str) -> Vod {
+        Vod {
+            creator: creator.into(),
+            title: title.into(),
+            source: VodSource::YouTube { video_id: "abc".into() },
+            language: Language::Id,
+            duration_s: None,
+        }
+    }
+
+    #[test]
+    fn stream_dirs_lay_out_creator_title_and_data_subfolder() {
+        let ws = Path::new("F:/ws");
+        let (stream, data) = stream_dirs(ws, &vod("Joddy Barat", "Main Game / Live!"));
+        // `<creator>/<title>` with the path-illegal '/' sanitized to '_'.
+        assert_eq!(stream, ws.join("Joddy Barat").join("Main Game _ Live!"));
+        // Intermediates live under a `data/` child of the stream folder.
+        assert_eq!(data, stream.join("data"));
+    }
+
+    #[test]
+    fn stream_dirs_fall_back_on_empty_metadata() {
+        let ws = Path::new("F:/ws");
+        let (stream, _) = stream_dirs(ws, &vod("", "..."));
+        assert_eq!(stream, ws.join("unknown").join("untitled"));
+    }
+
+    #[test]
+    fn clip_title_stem_prefers_the_title_else_a_timestamp_name() {
+        let r = TimeRange { start_s: 754.0, end_s: 784.0 }; // 12:34
+        assert_eq!(clip_title_stem(Some("He LOST it on the boss"), r), "He LOST it on the boss");
+        // No title (manual / headless clip) -> deterministic timestamp name.
+        assert_eq!(clip_title_stem(None, r), "clip-12-34");
+        // A title that sanitizes to nothing also falls back to the timestamp.
+        assert_eq!(clip_title_stem(Some("///"), r), "clip-12-34");
+    }
+
+    #[test]
+    fn clock_stem_is_filesafe_and_handles_hours() {
+        assert_eq!(clock_stem(0.0), "0-00");
+        assert_eq!(clock_stem(754.0), "12-34");
+        assert_eq!(clock_stem(3661.0), "1-01-01"); // past an hour
+        assert!(!clock_stem(754.0).contains(':')); // no colon -> filesystem-safe
+    }
+
+    #[test]
+    fn unique_path_dedupes_collisions_with_a_counter() {
+        let dir = std::env::temp_dir().join("yc_unique_path_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // First is the bare name; each existing file bumps the counter.
+        let p1 = unique_path(&dir, "My Clip", "mp4");
+        assert_eq!(p1, dir.join("My Clip.mp4"));
+        fs::write(&p1, b"x").unwrap();
+        let p2 = unique_path(&dir, "My Clip", "mp4");
+        assert_eq!(p2, dir.join("My Clip (2).mp4"));
+        fs::write(&p2, b"x").unwrap();
+        assert_eq!(unique_path(&dir, "My Clip", "mp4"), dir.join("My Clip (3).mp4"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
