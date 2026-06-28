@@ -54,6 +54,9 @@ pub const FACE_EXPAND_H: f32 = 2.4;
 /// Fraction of the expanded facecam height that sits above the face center
 /// (headroom); the rest is below (shoulders).
 pub const FACE_UPPER_FRAC: f32 = 0.38;
+/// How many static Facecams to frame at once (ADR 0011 ext): a co-stream cam has
+/// two; beyond this the extra persistent clusters are treated as noise.
+pub const MAX_FACECAM_FACES: usize = 3;
 
 /// A detected face bounding box in **source-video pixel** coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,19 +151,20 @@ fn median_box(boxes: &[FaceBox]) -> FaceBox {
     }
 }
 
-/// Cluster per-frame face detections by screen position and return the **static
-/// Facecam** — the cluster present in the most frames — if it persists across at
-/// least [`MIN_PERSISTENCE`] of them. `frames[i]` is frame i's detections (after
-/// per-frame [`nms`]), in source pixels. Returns `None` when no face is
-/// persistent enough (e.g. a faceless game, or only transient game characters).
-pub fn cluster_static_face(
+/// Cluster per-frame face detections by screen position and return **every static
+/// Facecam** — each cluster that persists across at least [`MIN_PERSISTENCE`] of
+/// the frames — most-persistent first, capped at [`MAX_FACECAM_FACES`]. A solo cam
+/// yields one, a 2-person co-stream cam yields two (ADR 0011 ext); a faceless game
+/// or only transient game characters yields none. `frames[i]` is frame i's
+/// detections (after per-frame [`nms`]), in source pixels.
+pub fn cluster_static_faces(
     frames: &[Vec<FaceBox>],
     frame_w: f32,
     frame_h: f32,
-) -> Option<FaceCluster> {
+) -> Vec<FaceCluster> {
     let total = frames.len();
     if total == 0 {
-        return None;
+        return Vec::new();
     }
     let merge_dist = MERGE_DIST_FRAC * (frame_w * frame_w + frame_h * frame_h).sqrt();
 
@@ -198,26 +202,69 @@ pub fn cluster_static_face(
         }
     }
 
-    // The static webcam is the most-persistent cluster (tie-break on member
-    // count). Moving game faces fragment into many low-persistence clusters.
-    let best = clusters.into_iter().max_by(|a, b| {
-        a.frames.len().cmp(&b.frames.len()).then_with(|| a.members.len().cmp(&b.members.len()))
-    })?;
-    let persistence = best.frames.len() as f32 / total as f32;
-    if persistence < MIN_PERSISTENCE {
-        return None;
+    // The static webcam faces are the most-persistent clusters (tie-break on member
+    // count). Moving game faces fragment into many low-persistence clusters, which
+    // fall below MIN_PERSISTENCE and drop out.
+    clusters.sort_by(|a, b| {
+        b.frames.len().cmp(&a.frames.len()).then_with(|| b.members.len().cmp(&a.members.len()))
+    });
+    let mut out = Vec::new();
+    for c in clusters {
+        let persistence = c.frames.len() as f32 / total as f32;
+        if persistence < MIN_PERSISTENCE {
+            break; // sorted descending, so the rest are below the bar too
+        }
+        out.push(FaceCluster { bbox: median_box(&c.members), persistence });
+        if out.len() >= MAX_FACECAM_FACES {
+            break;
+        }
     }
-    Some(FaceCluster { bbox: median_box(&best.members), persistence })
+    out
 }
 
-/// Expand a face box to the webcam-overlay region (head + shoulders + border),
-/// clamped to the frame: centered horizontally on the face, biased downward so
-/// the face sits in the upper portion with headroom above and shoulders below.
-fn expand_facecam(face: &FaceBox, src_w: f32, src_h: f32) -> Crop {
-    let w = (face.w * FACE_EXPAND_W).min(src_w);
-    let h = (face.h * FACE_EXPAND_H).min(src_h);
-    let x = (face.cx() - w * 0.5).clamp(0.0, src_w - w);
-    let y = (face.cy() - h * FACE_UPPER_FRAC).clamp(0.0, src_h - h);
+/// The single most-persistent static Facecam, or `None` — the solo-cam view over
+/// [`cluster_static_faces`], kept for callers that only need one face.
+pub fn cluster_static_face(
+    frames: &[Vec<FaceBox>],
+    frame_w: f32,
+    frame_h: f32,
+) -> Option<FaceCluster> {
+    cluster_static_faces(frames, frame_w, frame_h).into_iter().next()
+}
+
+/// The facecam Crop for the cam's `faces`, shaped to the facecam Panel's aspect
+/// (ADR 0011 ext). The union of the faces is expanded for head + shoulders +
+/// overlay border, then:
+/// - **solo (1 face):** the expanded box is *fit* to the Panel aspect so the
+///   streamer's face fills the Panel, exactly as before (no solo regression);
+/// - **2+ faces:** the crop *grows* to a Panel-aspect window that **contains the
+///   whole union**, so neither person is cropped out — the fix for a co-stream cam
+///   that previously zoomed into one of them.
+/// Centered horizontally on the faces and biased up for headroom, clamped to the
+/// frame. `faces` must be non-empty.
+fn facecam_crop(faces: &[FaceBox], src_w: f32, src_h: f32, panel_aspect: f32) -> Crop {
+    let x0 = faces.iter().map(|f| f.x).fold(f32::INFINITY, f32::min);
+    let y0 = faces.iter().map(|f| f.y).fold(f32::INFINITY, f32::min);
+    let x1 = faces.iter().map(|f| f.x + f.w).fold(f32::NEG_INFINITY, f32::max);
+    let y1 = faces.iter().map(|f| f.y + f.h).fold(f32::NEG_INFINITY, f32::max);
+    let (ucx, ucy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    // The expanded union (head + shoulders + border), centered on the faces, up-biased.
+    let ew = ((x1 - x0) * FACE_EXPAND_W).min(src_w);
+    let eh = ((y1 - y0) * FACE_EXPAND_H).min(src_h);
+    let ex = (ucx - ew * 0.5).clamp(0.0, (src_w - ew).max(0.0));
+    let ey = (ucy - eh * FACE_UPPER_FRAC).clamp(0.0, (src_h - eh).max(0.0));
+    let expanded = Crop { x: ex, y: ey, w: ew, h: eh };
+
+    if faces.len() <= 1 {
+        // Solo: fill the Panel with the face (shrink the expanded box to the aspect).
+        return expanded.fit_to_aspect(panel_aspect);
+    }
+    // 2+ faces: grow a Panel-aspect window to contain the whole expanded union.
+    let w = ew.max(eh * panel_aspect).min(src_w);
+    let h = (w / panel_aspect).min(src_h);
+    let w = (h * panel_aspect).min(src_w); // re-fit if height clamped to the frame
+    let x = (ucx - w * 0.5).clamp(0.0, (src_w - w).max(0.0));
+    let y = (ucy - h * FACE_UPPER_FRAC).clamp(0.0, (src_h - h).max(0.0));
     Crop { x, y, w, h }
 }
 
@@ -238,24 +285,29 @@ fn fullcam_crop(face: &FaceBox, src_w: f32, src_h: f32) -> Crop {
     }
 }
 
-/// Choose the Clip's [`Layout`] from the detected static Facecam (ADR 0011's
-/// three-way decision). `None` (no persistent face) -> full-frame gameplay.
-/// `seam` is the stacked Seam position (use [`SEAM_DEFAULT`]).
-pub fn decide_layout(face: Option<&FaceCluster>, src_w: f32, src_h: f32, seam: f32) -> Layout {
-    let Some(face) = face else {
-        return Layout::FullFrame { crop: fullframe_gameplay_crop(src_w, src_h) };
-    };
-
-    let w_frac = face.bbox.w / src_w;
-    let cx_frac = face.bbox.cx() / src_w;
-    let centered = (CENTER_LO..=CENTER_HI).contains(&cx_frac);
-
-    if w_frac >= FULLCAM_FACE_W_FRAC && centered {
-        // Talking session: the streamer is the content.
-        fullcam_layout(Some(&face.bbox), src_w, src_h)
-    } else {
-        // Gameplay with a corner cam: gameplay Panel above the detected facecam.
-        stacked_layout(Some(&face.bbox), src_w, src_h, seam)
+/// Choose the Clip's [`Layout`] from the detected static Facecam(s) (ADR 0011's
+/// decision, extended for multi-face cams). No persistent face -> full-frame
+/// gameplay; one large/centered face -> full-cam (a lone talking streamer); one
+/// corner face -> stacked over it; **2+ faces -> stacked framing all of them** (a
+/// co-stream cam). `seam` is the stacked Seam position (use [`SEAM_DEFAULT`]).
+pub fn decide_layout(faces: &[FaceCluster], src_w: f32, src_h: f32, seam: f32) -> Layout {
+    let boxes: Vec<FaceBox> = faces.iter().map(|f| f.bbox).collect();
+    match faces {
+        [] => Layout::FullFrame { crop: fullframe_gameplay_crop(src_w, src_h) },
+        [face] => {
+            let w_frac = face.bbox.w / src_w;
+            let cx_frac = face.bbox.cx() / src_w;
+            let centered = (CENTER_LO..=CENTER_HI).contains(&cx_frac);
+            if w_frac >= FULLCAM_FACE_W_FRAC && centered {
+                // Talking session: the lone streamer is the content.
+                fullcam_layout(&boxes, src_w, src_h)
+            } else {
+                // Gameplay with a corner cam: gameplay Panel above the facecam.
+                stacked_layout(&boxes, src_w, src_h, seam)
+            }
+        }
+        // 2+ persistent faces: a multi-person cam -> stacked, framing all of them.
+        _ => stacked_layout(&boxes, src_w, src_h, seam),
     }
 }
 
@@ -266,16 +318,16 @@ pub fn decide_layout(face: Option<&FaceCluster>, src_w: f32, src_h: f32, seam: f
 /// still work with no `face` feature and no detected cam. Pure and unit-tested.
 pub fn decide_layout_with_pref(
     pref: LayoutPref,
-    face: Option<&FaceCluster>,
+    faces: &[FaceCluster],
     src_w: f32,
     src_h: f32,
     seam: f32,
 ) -> Layout {
-    let bbox = face.map(|f| &f.bbox);
+    let boxes: Vec<FaceBox> = faces.iter().map(|f| f.bbox).collect();
     match pref {
-        LayoutPref::Auto => decide_layout(face, src_w, src_h, seam),
-        LayoutPref::Stacked => stacked_layout(bbox, src_w, src_h, seam),
-        LayoutPref::FullCam => fullcam_layout(bbox, src_w, src_h),
+        LayoutPref::Auto => decide_layout(faces, src_w, src_h, seam),
+        LayoutPref::Stacked => stacked_layout(&boxes, src_w, src_h, seam),
+        LayoutPref::FullCam => fullcam_layout(&boxes, src_w, src_h),
         LayoutPref::FullGameplay => {
             Layout::FullFrame { crop: fullframe_gameplay_crop(src_w, src_h) }
         }
@@ -283,27 +335,29 @@ pub fn decide_layout_with_pref(
 }
 
 /// A stacked Layout at `seam`: gameplay Panel above facecam Panel. The facecam
-/// Crop covers the detected Facecam when `face` is `Some`, else the bottom-right
-/// [`default_facecam_crop`] seed (forced Stacked with no detected cam). Shared by
-/// the Auto corner-cam branch and the forced-Stacked preference.
-fn stacked_layout(face: Option<&FaceBox>, src_w: f32, src_h: f32, seam: f32) -> Layout {
+/// Crop covers all detected Facecam `faces` (their union, ADR 0011 ext) when
+/// present, else the bottom-right [`default_facecam_crop`] seed (forced Stacked
+/// with no detected cam). Shared by the Auto corner-cam / multi-face branches and
+/// the forced-Stacked preference.
+fn stacked_layout(faces: &[FaceBox], src_w: f32, src_h: f32, seam: f32) -> Layout {
     let full = Crop { x: 0.0, y: 0.0, w: src_w, h: src_h };
     let gh = (CANVAS_H as f32 * seam).round();
     let fh = CANVAS_H as f32 - gh;
     let cam_aspect = CANVAS_W as f32 / fh;
     let gameplay = full.fit_to_aspect(CANVAS_W as f32 / gh);
-    let facecam = match face {
-        Some(f) => expand_facecam(f, src_w, src_h).fit_to_aspect(cam_aspect),
-        None => default_facecam_crop(src_w, src_h, cam_aspect),
+    let facecam = if faces.is_empty() {
+        default_facecam_crop(src_w, src_h, cam_aspect)
+    } else {
+        facecam_crop(faces, src_w, src_h, cam_aspect)
     };
     Layout::Stacked { seam, gameplay, facecam }
 }
 
-/// A full-frame talking-cam Layout: `FullFrame` centered on the detected face
-/// when `face` is `Some`, else a centered 9:16 column. Shared by the Auto
+/// A full-frame talking-cam Layout: `FullFrame` centered on the first detected
+/// face when present, else a centered 9:16 column. Shared by the Auto
 /// talking-session branch and the forced-FullCam preference.
-fn fullcam_layout(face: Option<&FaceBox>, src_w: f32, src_h: f32) -> Layout {
-    let crop = match face {
+fn fullcam_layout(faces: &[FaceBox], src_w: f32, src_h: f32) -> Layout {
+    let crop = match faces.first() {
         Some(f) => fullcam_crop(f, src_w, src_h),
         None => centered_fullcam_crop(src_w, src_h),
     };
@@ -486,7 +540,7 @@ mod tests {
 
     #[test]
     fn no_face_gives_full_frame_gameplay() {
-        let layout = decide_layout(None, 1920.0, 1080.0, SEAM_DEFAULT);
+        let layout = decide_layout(&[], 1920.0, 1080.0, SEAM_DEFAULT);
         match layout {
             Layout::FullFrame { crop } => {
                 // Full 16:9 fit to 9:16 trims width to a centered column.
@@ -500,7 +554,7 @@ mod tests {
     #[test]
     fn small_corner_face_gives_stacked_with_facecam_over_the_face() {
         let face = FaceCluster { bbox: fb(1600.0, 820.0, 200.0, 200.0), persistence: 1.0 };
-        match decide_layout(Some(&face), 1920.0, 1080.0, SEAM_DEFAULT) {
+        match decide_layout(&[face], 1920.0, 1080.0, SEAM_DEFAULT) {
             Layout::Stacked { seam, gameplay, facecam } => {
                 assert!((seam - SEAM_DEFAULT).abs() < 1e-6);
                 // gameplay fills the top Panel aspect from the full frame
@@ -518,7 +572,7 @@ mod tests {
     fn large_centered_face_gives_full_cam_centered_on_the_face() {
         // Face 600 wide (31% of 1920) centered at cx 960 -> talking full-cam.
         let face = FaceCluster { bbox: fb(660.0, 200.0, 600.0, 600.0), persistence: 1.0 };
-        match decide_layout(Some(&face), 1920.0, 1080.0, SEAM_DEFAULT) {
+        match decide_layout(&[face], 1920.0, 1080.0, SEAM_DEFAULT) {
             Layout::FullFrame { crop } => {
                 let aspect = crop.w / crop.h;
                 assert!((aspect - CANVAS_W as f32 / CANVAS_H as f32).abs() < 1e-3, "9:16 column");
@@ -532,14 +586,49 @@ mod tests {
     }
 
     #[test]
-    fn expand_facecam_contains_the_face_and_grows_it() {
+    fn facecam_crop_solo_fills_panel_over_the_face() {
+        // Solo cam: the crop is the facecam Panel aspect, frames the face center, and
+        // sits inside the frame (the streamer fills the Panel, as before).
+        let (_, cam_aspect) = stacked_panel_aspects(SEAM_DEFAULT);
         let face = fb(1600.0, 820.0, 200.0, 200.0);
-        let c = expand_facecam(&face, 1920.0, 1080.0);
-        assert!(c.w > face.w && c.h > face.h, "expanded");
-        assert!(c.x <= face.x && c.x + c.w >= face.x + face.w, "contains face horizontally");
-        assert!(c.y <= face.y && c.y + c.h >= face.y + face.h, "contains face vertically");
-        // stays inside the frame
-        assert!(c.x >= 0.0 && c.y >= 0.0 && c.x + c.w <= 1920.0 && c.y + c.h <= 1080.0);
+        let c = facecam_crop(&[face], 1920.0, 1080.0, cam_aspect);
+        assert!((c.w / c.h - cam_aspect).abs() < 1e-2, "panel aspect");
+        assert!(c.x <= face.cx() && face.cx() <= c.x + c.w, "face cx framed");
+        assert!(c.y <= face.cy() && face.cy() <= c.y + c.h, "face cy framed");
+        assert!(c.x >= 0.0 && c.y >= 0.0 && c.x + c.w <= 1920.0 + 1e-3 && c.y + c.h <= 1080.0 + 1e-3);
+    }
+
+    // ---- two-person facecam (ADR 0011 ext) ----
+
+    #[test]
+    fn cluster_static_faces_returns_both_persistent_faces() {
+        // Two faces, each fixed in its own half across every frame -> two clusters.
+        let (w, h) = (1920.0_f32, 1080.0_f32);
+        let mut frames = Vec::new();
+        for _ in 0..10 {
+            frames.push(vec![fb(300.0, 800.0, 180.0, 180.0), fb(1450.0, 800.0, 180.0, 180.0)]);
+        }
+        let faces = cluster_static_faces(&frames, w, h);
+        assert_eq!(faces.len(), 2, "both persistent cams found");
+        assert!(faces.iter().all(|c| (c.persistence - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn two_faces_frame_the_union_not_one() {
+        // A 2-person cam: decide_layout produces Stacked whose facecam Crop contains
+        // BOTH faces (the union), instead of zooming into one.
+        let f1 = FaceCluster { bbox: fb(300.0, 800.0, 180.0, 180.0), persistence: 1.0 };
+        let f2 = FaceCluster { bbox: fb(1450.0, 800.0, 180.0, 180.0), persistence: 1.0 };
+        match decide_layout(&[f1, f2], 1920.0, 1080.0, SEAM_DEFAULT) {
+            Layout::Stacked { facecam, .. } => {
+                for f in [&f1.bbox, &f2.bbox] {
+                    let (cx, cy) = (f.cx(), f.cy());
+                    assert!(facecam.x <= cx && cx <= facecam.x + facecam.w, "face cx {cx} framed");
+                    assert!(facecam.y <= cy && cy <= facecam.y + facecam.h, "face cy {cy} framed");
+                }
+            }
+            other => panic!("expected Stacked framing both, got {other:?}"),
+        }
     }
 
     // ---- explicit Layout preference (ADR 0017) ----
@@ -548,7 +637,7 @@ mod tests {
     fn pref_auto_matches_decide_layout_with_and_without_a_face() {
         // Auto must be byte-for-byte the ADR 0011 decision (no regression).
         let face = FaceCluster { bbox: fb(1600.0, 820.0, 200.0, 200.0), persistence: 1.0 };
-        for f in [None, Some(&face)] {
+        for f in [&[] as &[FaceCluster], &[face]] {
             let auto = decide_layout_with_pref(LayoutPref::Auto, f, 1920.0, 1080.0, SEAM_DEFAULT);
             let base = decide_layout(f, 1920.0, 1080.0, SEAM_DEFAULT);
             assert_eq!(auto, base);
@@ -561,10 +650,10 @@ mod tests {
         // still produce Stacked, with the facecam Panel over the detected face.
         let face = FaceCluster { bbox: fb(660.0, 200.0, 600.0, 600.0), persistence: 1.0 };
         assert!(matches!(
-            decide_layout(Some(&face), 1920.0, 1080.0, SEAM_DEFAULT),
+            decide_layout(&[face], 1920.0, 1080.0, SEAM_DEFAULT),
             Layout::FullFrame { .. }
         ));
-        match decide_layout_with_pref(LayoutPref::Stacked, Some(&face), 1920.0, 1080.0, SEAM_DEFAULT) {
+        match decide_layout_with_pref(LayoutPref::Stacked, &[face], 1920.0, 1080.0, SEAM_DEFAULT) {
             Layout::Stacked { seam, facecam, .. } => {
                 assert!((seam - SEAM_DEFAULT).abs() < 1e-6);
                 let (fcx, fcy) = (face.bbox.cx(), face.bbox.cy());
@@ -579,7 +668,7 @@ mod tests {
     fn pref_stacked_with_no_face_uses_the_bottom_right_seed() {
         // Forced Stacked must work with no detected cam (e.g. a non-`face` build):
         // a bottom-right default facecam Crop, matching the facecam Panel aspect.
-        match decide_layout_with_pref(LayoutPref::Stacked, None, 1920.0, 1080.0, SEAM_DEFAULT) {
+        match decide_layout_with_pref(LayoutPref::Stacked, &[], 1920.0, 1080.0, SEAM_DEFAULT) {
             Layout::Stacked { seam, facecam, .. } => {
                 let (_, fa) = stacked_panel_aspects(seam);
                 assert!((facecam.w / facecam.h - fa).abs() < 1e-2, "facecam matches panel aspect");
@@ -593,7 +682,7 @@ mod tests {
     #[test]
     fn pref_full_cam_and_full_gameplay_force_full_frame() {
         // Full cam with no face -> a centered 9:16 column.
-        match decide_layout_with_pref(LayoutPref::FullCam, None, 1920.0, 1080.0, SEAM_DEFAULT) {
+        match decide_layout_with_pref(LayoutPref::FullCam, &[], 1920.0, 1080.0, SEAM_DEFAULT) {
             Layout::FullFrame { crop } => {
                 assert!((crop.w / crop.h - CANVAS_W as f32 / CANVAS_H as f32).abs() < 1e-3);
                 assert!((crop.x + crop.w * 0.5 - 960.0).abs() < 1e-3, "centered");
@@ -603,7 +692,7 @@ mod tests {
         // Full gameplay is the whole frame fit to 9:16, regardless of any face.
         let face = FaceCluster { bbox: fb(1600.0, 820.0, 200.0, 200.0), persistence: 1.0 };
         assert_eq!(
-            decide_layout_with_pref(LayoutPref::FullGameplay, Some(&face), 1920.0, 1080.0, SEAM_DEFAULT),
+            decide_layout_with_pref(LayoutPref::FullGameplay, &[face], 1920.0, 1080.0, SEAM_DEFAULT),
             Layout::FullFrame { crop: fullframe_gameplay_crop(1920.0, 1080.0) }
         );
     }

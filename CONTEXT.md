@@ -65,7 +65,7 @@ The operator's explicit choice of which Layout to frame a Clip with (ADR 0017), 
 _Avoid_: layout (that is the realized arrangement; this is the operator's pick of it), template
 
 **Facecam**:
-The region of the source video showing the streamer's webcam overlay. Its location and size are not fixed across a VOD — a small corner inset during gameplay, but the streamer may switch to a full-screen cam during a talking session — so it is detected per Clip from the promoted Segment's frames, not assumed (M6, ADR 0011). The detected Facecam seeds the facecam Panel's Crop in a stacked Layout, or the whole canvas in a full-frame talking-session Layout.
+The region of the source video showing the streamer's webcam overlay. Its location and size are not fixed across a VOD — a small corner inset during gameplay, but the streamer may switch to a full-screen cam during a talking session — so it is detected per Clip from the promoted Segment's frames, not assumed (M6, ADR 0011). A cam can hold **more than one face** (a 2-person co-stream): all persistent faces are detected and the stacked facecam Panel frames their **union**, so neither person is cropped out (ADR 0026). The detected Facecam seeds the facecam Panel's Crop in a stacked Layout, or the whole canvas in a full-frame talking-session Layout.
 _Avoid_: webcam (the hardware), facecam Panel (that is the canvas region it is shown in, not the source region)
 
 **Panel**:

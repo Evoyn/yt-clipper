@@ -1206,12 +1206,13 @@ fn build_layout(
     src_h: f32,
     pref: LayoutPref,
 ) -> Layout {
-    let face = detect_facecam(paths, render_src, seek_s, src_w, src_h);
-    yc_frame::decide_layout_with_pref(pref, face.as_ref(), src_w, src_h, yc_frame::SEAM_DEFAULT)
+    let faces = detect_facecam(paths, render_src, seek_s, src_w, src_h);
+    yc_frame::decide_layout_with_pref(pref, &faces, src_w, src_h, yc_frame::SEAM_DEFAULT)
 }
 
-/// Detect the static Facecam in the Segment (ADR 0011), or `None` when the
-/// `face` feature / model is absent, detection errors, or no face persists.
+/// Detect the static Facecam(s) in the Segment (ADR 0011, multi-face ext) — one
+/// per cam, two for a co-stream cam — or an empty Vec when the `face` feature /
+/// model is absent, detection errors, or no face persists.
 #[cfg(feature = "face")]
 fn detect_facecam(
     paths: &PipelinePaths,
@@ -1219,23 +1220,23 @@ fn detect_facecam(
     seek_s: f64,
     src_w: f32,
     src_h: f32,
-) -> Option<yc_frame::FaceCluster> {
+) -> Vec<yc_frame::FaceCluster> {
     if !paths.face_model.is_file() {
         tracing::info!("face model absent; no Facecam (Layout uses pref seeds / fallback)");
-        return None;
+        return Vec::new();
     }
     match detect_facecam_inner(paths, render_src, seek_s, src_w, src_h) {
-        Ok(cluster) => cluster,
+        Ok(faces) => faces,
         Err(e) => {
             tracing::warn!("auto-frame failed: {e:#}; no Facecam (pref seeds / fallback)");
-            None
+            Vec::new()
         }
     }
 }
 
-/// Without the `face` feature there is no detector: the Facecam is always `None`
-/// and the Layout comes entirely from the operator's preference seeds (ADR 0017)
-/// or Auto's full-frame fallback.
+/// Without the `face` feature there is no detector: no Facecam, and the Layout
+/// comes entirely from the operator's preference seeds (ADR 0017) or Auto's
+/// full-frame fallback.
 #[cfg(not(feature = "face"))]
 fn detect_facecam(
     _paths: &PipelinePaths,
@@ -1243,12 +1244,12 @@ fn detect_facecam(
     _seek_s: f64,
     _src_w: f32,
     _src_h: f32,
-) -> Option<yc_frame::FaceCluster> {
-    None
+) -> Vec<yc_frame::FaceCluster> {
+    Vec::new()
 }
 
 /// Sample frames from the Segment, run Ultraface per frame, and cluster the
-/// static Facecam (ADR 0011). Frames are scaled to the model's fixed input; its
+/// static Facecam(s) (ADR 0011). Frames are scaled to the model's fixed input; its
 /// normalized detections map straight to source pixels.
 #[cfg(feature = "face")]
 fn detect_facecam_inner(
@@ -1257,7 +1258,7 @@ fn detect_facecam_inner(
     seek_s: f64,
     src_w: f32,
     src_h: f32,
-) -> Result<Option<yc_frame::FaceCluster>> {
+) -> Result<Vec<yc_frame::FaceCluster>> {
     let frames = yc_ingest::extract_frames_rgb(
         &paths.ffmpeg,
         render_src,
@@ -1273,15 +1274,15 @@ fn detect_facecam_inner(
         per_frame.push(detector.detect(f, src_w, src_h)?);
     }
     let faces: usize = per_frame.iter().map(|f| f.len()).sum();
-    let cluster = yc_frame::cluster_static_face(&per_frame, src_w, src_h);
+    let clusters = yc_frame::cluster_static_faces(&per_frame, src_w, src_h);
     tracing::info!(
         frames = frames.len(),
         faces,
-        cam = cluster.is_some(),
-        persistence = cluster.map(|c| c.persistence),
+        cams = clusters.len(),
+        persistence = clusters.first().map(|c| c.persistence),
         "auto-frame detection"
     );
-    Ok(cluster)
+    Ok(clusters)
 }
 
 /// The default Caption Style preset: one word per caption (huge-word), which
