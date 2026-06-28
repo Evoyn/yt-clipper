@@ -637,10 +637,22 @@ impl eframe::App for App {
         }
         let working = matches!(self.status, Status::Working(_));
 
-        ui.add_space(2.0);
-        ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD));
-        ui.weak("Turn long gaming VODs into vertical Shorts - on your machine.");
-        ui.add_space(2.0);
+        // Top brand bar (W4 / ADR 0024 theme): the gold brand mark + an
+        // always-visible status, instead of a heading buried in the scroll and a
+        // status pinned to the very bottom. A proper app bar — the first step of the
+        // SaaS shell; the moments-rail / detail-pane split is the next slice.
+        egui::TopBottomPanel::top("brandbar").show_inside(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD));
+                ui.add_space(12.0);
+                ui.weak("Turn long gaming VODs into vertical Shorts.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.status_bar(ui);
+                });
+            });
+            ui.add_space(4.0);
+        });
 
         // Preflight: are the sidecars / model / font present?
         ui.separator();
@@ -1077,31 +1089,7 @@ impl eframe::App for App {
             editor::EditorAction::None => {}
         }
 
-        // --- Status + Cancel ---
-        ui.separator();
-        match &self.status {
-            Status::Idle => {
-                ui.label("Idle.");
-            }
-            Status::Working(stage) => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(stage);
-                    if ui.button("Cancel").clicked() {
-                        self.cancel.cancel();
-                    }
-                });
-            }
-            Status::Done(path) => {
-                ui.colored_label(egui::Color32::GREEN, format!("Done -> {}", path.display()));
-            }
-            Status::Cancelled => {
-                ui.colored_label(egui::Color32::YELLOW, "Cancelled.");
-            }
-            Status::Failed(err) => {
-                ui.colored_label(egui::Color32::RED, format!("Failed: {err}"));
-            }
-        }
+        // (Status lives in the top brand bar now — see `status_bar`.)
 
         // While a GPU job runs, repaint at ~10 fps instead of unbounded: the
         // continuous wgpu render loop otherwise competes with whisper for the
@@ -1114,6 +1102,39 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The always-visible status painted into the top brand bar: a spinner + stage
+    /// + Cancel while a job runs, else a coloured outcome (full path / error on
+    /// hover). Rendered in a right-to-left layout, so the rightmost item is added
+    /// first.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        match &self.status {
+            Status::Idle => {
+                ui.weak("Ready");
+            }
+            Status::Working(stage) => {
+                if ui.button("Cancel").clicked() {
+                    self.cancel.cancel();
+                }
+                ui.label(stage.clone());
+                ui.spinner();
+            }
+            Status::Done(path) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                ui.colored_label(theme::OK, format!("Done: {name}"))
+                    .on_hover_text(path.display().to_string());
+            }
+            Status::Cancelled => {
+                ui.colored_label(theme::GOLD, "Cancelled");
+            }
+            Status::Failed(err) => {
+                ui.colored_label(theme::ERR, "Failed").on_hover_text(err.clone());
+            }
+        }
+    }
+
     fn start_import(&mut self, source: ImportSource) {
         self.imported = None;
         self.moments.clear();
