@@ -9,6 +9,11 @@ A running, readable log of completed features — **newest first**. Each session
 Working the operator's 8 priority items from real-world testing of v1, one feature
 per iteration (grill → implement → live-verify → commit). Newest first.
 
+- **The dialect review queue (`id.json`) is curatable now** — each auto-harvested
+  word used to be just `{wrong, right:""}` with no clue where it came from. Now its
+  note records the **source**: the generated Short title + the absolute VOD
+  timestamp, e.g. `from "He LOST it on the boss" at 1:23:45`, so you can jump
+  straight to the clip and decide what it should say. (ADR 0022)
 - **Quiet speech and viewer names get captioned now** — on a clip with loud
   reactions, a quietly-spoken word (a whispered name) was being dropped because the
   "is this silence?" bar was set relative to the loudest moment, so quiet-but-real
