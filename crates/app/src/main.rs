@@ -9,6 +9,7 @@
 
 mod editor;
 mod pipeline;
+mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -260,7 +261,8 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "yt-clipper",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx, &paths.font());
             Ok(Box::new(App {
                 paths,
                 deno_dir,
@@ -635,7 +637,10 @@ impl eframe::App for App {
         }
         let working = matches!(self.status, Status::Working(_));
 
-        ui.heading("yt-clipper - M3 detection");
+        ui.add_space(2.0);
+        ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD));
+        ui.weak("Turn long gaming VODs into vertical Shorts - on your machine.");
+        ui.add_space(2.0);
 
         // Preflight: are the sidecars / model / font present?
         ui.separator();
@@ -643,7 +648,7 @@ impl eframe::App for App {
             let ok = path.exists();
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    if ok { egui::Color32::GREEN } else { egui::Color32::RED },
+                    if ok { theme::OK } else { theme::ERR },
                     if ok { "ok" } else { "MISSING" },
                 );
                 ui.label(format!("{name}: {}", path.display()));
