@@ -4,6 +4,17 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-28 — round 2 (post-v1.1): UX polish, framing, caption accuracy
+
+A second operator-feedback batch — running W1→W4 (hide consoles → two-person
+facecam → caption accuracy → SaaS GUI) as an autonomous loop, same ritual. Newest
+first.
+
+- **No more console windows flashing during a render** — the GUI spawns ffmpeg /
+  yt-dlp / the judge as helpers, and on Windows each was popping its own console
+  window mid-render. They now run hidden. Verified on a real release render: zero
+  console windows appeared. (ADR 0025)
+
 ## 2026-06-28 — operator-feedback pass (post-v1)
 
 Working the operator's 8 priority items from real-world testing of v1, one feature
