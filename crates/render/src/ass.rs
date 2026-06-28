@@ -45,6 +45,20 @@ const WORD_MIN_S: f64 = 0.10;
 const MIN_READ_S: f64 = 0.40;
 const MAX_HOLD_S: f64 = 1.2;
 
+/// Onset clamp (ADR 0019): whisper's DTW word onset occasionally lands slightly
+/// *before* the word's audio, so the caption appears before it is spoken (an
+/// intermittent early lead, across all genres — huge-word per word, rolling /
+/// karaoke via the line's first-word onset). [`refine_caption_timing`] pushes
+/// each word's start **forward** to its acoustic onset — the first RMS-envelope
+/// frame at/after the DTW onset that rises past `ONSET_RISE_FRAC` of the word's
+/// own peak — bounded by `ONSET_MAX_LEAD_S` (so a correctly-timed onset is never
+/// delayed past its own peak) and never past the next word's onset. Audio already
+/// present at the DTW onset ⇒ no shift. Reuses the envelope + per-word peak the
+/// silence-drop already computes; per-word-peak-relative, so it scales to quiet
+/// speech too.
+const ONSET_RISE_FRAC: f32 = 0.30;
+const ONSET_MAX_LEAD_S: f64 = 0.20;
+
 /// The RMS envelope's one remaining job (ADR 0013): drop a word whose onset window
 /// is in near-silence — whisper hallucinates tokens on silent / pure-music windows
 /// (ADR 0007). Envelope at this hop/window; `loud_ref` is the p95 of the clip
@@ -238,24 +252,38 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
     let mut kept: Vec<CaptionUnit> = Vec::with_capacity(starts.len());
     for idx in 0..starts.len() {
-        let start = starts[idx];
+        let dtw_start = starts[idx];
         // The next word's onset bounds this one - one word on screen at a time.
-        // `.max(start)` guards a non-monotonic DTW onset (rare; absent on the repro).
-        let next = starts.get(idx + 1).copied().unwrap_or(clip_end).max(start);
+        // `.max(dtw_start)` guards a non-monotonic DTW onset (rare; absent on the repro).
+        let next = starts.get(idx + 1).copied().unwrap_or(clip_end).max(dtw_start);
         // Drop a word whose onset window is in near-silence: whisper hallucinates
         // tokens on silent / pure-music windows (ADR 0007). Quiet real speech sits
         // well above SILENCE_DROP_FRAC*loud_ref and survives.
-        let k0 = k_of(start);
-        let k_peak_end = k_of(start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
+        let k0 = k_of(dtw_start);
+        let k_peak_end = k_of(dtw_start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
         if peak < silence_drop {
             continue;
         }
-        // Gap-fill the end to the next onset, capped at MAX_HOLD and floored at
-        // MIN_READ where there is room; clamp to `next` LAST so neither the cap nor
-        // the floor can produce an overlap (one word at a time - ADR 0013).
+        // Onset clamp (ADR 0019): push the caption start forward to the acoustic
+        // onset when the DTW onset leads the audio. Scan from the DTW onset to the
+        // first envelope frame rising past ONSET_RISE_FRAC of the word's own peak,
+        // bounded by ONSET_MAX_LEAD_S and the next onset; audio already present at
+        // the DTW onset leaves the start unmoved. Forward only — a caption never
+        // precedes its sound, and a correct onset is never delayed past its peak.
+        let onset_level = ONSET_RISE_FRAC * peak;
+        let k_search_end = k_of((dtw_start + ONSET_MAX_LEAD_S).min(next));
+        let mut k = k0;
+        while k < k_search_end && env[k] < onset_level {
+            k += 1;
+        }
+        let start = t_of(k).max(dtw_start).min(next);
+        // Gap-fill the end from the (clamped) start to the next onset, capped at
+        // MAX_HOLD and floored at MIN_READ where there is room; clamp to `next` LAST
+        // so neither the cap nor the floor can produce an overlap (one word - ADR 0013).
         let end = (start + MAX_HOLD_S).min(next).max(start + MIN_READ_S).min(next);
         let mut u = transcript.units[idx].clone();
+        u.start_s = start;
         u.end_s = end;
         kept.push(u);
     }
@@ -606,6 +634,60 @@ mod tests {
         let r = refine_caption_timing(t, &samples, sr);
         let texts: Vec<&str> = r.units.iter().map(|u| u.text.as_str()).collect();
         assert_eq!(texts, vec!["a", "c"]); // the silent "b" is dropped
+    }
+
+    #[test]
+    fn refine_clamps_start_forward_when_dtw_onset_leads_the_audio() {
+        // ADR 0019: DTW puts "a" at 0.15 s but the audio only rises at 0.30 s (a
+        // 150 ms early lead). The clamp pushes the caption start forward to the
+        // acoustic onset (~0.30), so the word never shows before it is spoken.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 2 * sr as usize];
+        for s in samples.iter_mut().skip((0.30 * sr as f64) as usize) {
+            *s = 0.5; // speech from 0.30 s on
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![CaptionUnit { text: "a".into(), start_s: 0.15, end_s: 0.15 }],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        assert_eq!(r.units.len(), 1);
+        let start = r.units[0].start_s;
+        assert!((0.27..=0.34).contains(&start), "clamped to the acoustic onset, got {start}");
+    }
+
+    #[test]
+    fn refine_leaves_start_when_audio_is_already_present_at_the_dtw_onset() {
+        // A correctly-timed word (audio present at its DTW onset) must not be
+        // delayed by the clamp.
+        let sr = 16_000u32;
+        let samples = vec![0.4f32; 2 * sr as usize]; // steady speech throughout
+        let t = Transcript {
+            language: Language::En,
+            units: vec![CaptionUnit { text: "a".into(), start_s: 0.50, end_s: 0.50 }],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        assert!((r.units[0].start_s - 0.50).abs() < 1e-6, "unmoved, got {}", r.units[0].start_s);
+    }
+
+    #[test]
+    fn refine_caps_the_onset_clamp_at_the_max_lead() {
+        // A large DTW lead (onset 0.10, audio only at 0.60 = 500 ms) is corrected
+        // only up to ONSET_MAX_LEAD_S (to ~0.30), never the full 0.60 — a small,
+        // bounded clamp, not an aggressive re-time.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; 2 * sr as usize];
+        for s in samples.iter_mut().skip((0.60 * sr as f64) as usize) {
+            *s = 0.5; // speech only from 0.60 s (its peak window 0.10..0.70 still catches it -> kept)
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![CaptionUnit { text: "a".into(), start_s: 0.10, end_s: 0.10 }],
+        };
+        let r = refine_caption_timing(t, &samples, sr);
+        assert_eq!(r.units.len(), 1, "kept (peak window reaches the 0.60 s speech)");
+        let start = r.units[0].start_s;
+        assert!((0.28..=0.32).contains(&start), "capped at +0.20, got {start}");
     }
 
     #[test]
