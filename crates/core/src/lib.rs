@@ -100,6 +100,42 @@ impl CreatorStore {
     }
 }
 
+/// One Moment's review notes: the transcript text and the LLM judgment reason
+/// (ADR 0010) shown in the review panel. Persisted as part of [`ReviewCache`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MomentNote {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub transcript: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub llm_reason: String,
+}
+
+/// Per-Moment review notes persisted as `data/review.json` beside `project.json`
+/// (M8). Detection produces the transcripts + LLM reasons but the lean `Moment`
+/// records don't carry them, so re-importing a VOD would lose the review text; this
+/// sidecar restores it without re-transcribing. Keyed by Moment id (1..N by rank,
+/// stable until the next Detect, which rewrites the whole file). A missing/bad
+/// file yields an empty cache — a re-Detect refills it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewCache {
+    #[serde(default)]
+    pub notes: HashMap<u64, MomentNote>,
+}
+
+impl ReviewCache {
+    /// Load the cache, falling back to empty when the file is absent/unparseable.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
+        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+    }
+}
+
 /// Where a VOD's media comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -352,6 +388,26 @@ mod tests {
         let back: CreatorStore = serde_json::from_str(partial).unwrap();
         let c = back.get("x").unwrap();
         assert!(c.default_caption_genre.is_none() && c.default_seam.is_none());
+    }
+
+    #[test]
+    fn review_cache_roundtrips_per_moment_notes() {
+        let mut cache = ReviewCache::default();
+        cache.notes.insert(
+            1,
+            MomentNote { transcript: "kaget banget gua".into(), llm_reason: "shock reaction".into() },
+        );
+        cache.notes.insert(2, MomentNote { transcript: "menu reading".into(), llm_reason: String::new() });
+        let json = serde_json::to_string(&cache).unwrap();
+        let back: ReviewCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.notes.len(), 2);
+        assert_eq!(back.notes[&1].transcript, "kaget banget gua");
+        assert_eq!(back.notes[&1].llm_reason, "shock reaction");
+        // An empty llm_reason is skipped in JSON but loads back as empty.
+        assert!(!json.contains("\"llm_reason\":\"\""));
+        assert_eq!(back.notes[&2].llm_reason, "");
+        // u64 keys round-trip (serde_json encodes integer map keys as strings).
+        assert!(back.notes.contains_key(&2));
     }
 
     #[test]

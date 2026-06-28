@@ -404,7 +404,15 @@ impl eframe::App for App {
         while let Ok(msg) = self.from_worker.try_recv() {
             match msg {
                 Progress::Stage(s) => self.status = Status::Working(s.to_string()),
-                Progress::Imported { title, duration_s, analysis_wav, caption_genre, moments } => {
+                Progress::Imported {
+                    title,
+                    duration_s,
+                    analysis_wav,
+                    caption_genre,
+                    moments,
+                    transcripts,
+                    llm_reasons,
+                } => {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.analysis_wav = Some(analysis_wav);
                     // Seed the caption-style picker to this Creator's remembered
@@ -412,13 +420,15 @@ impl eframe::App for App {
                     if let Some(genre) = caption_genre {
                         self.caption_genre = genre;
                     }
-                    // Restore a prior session's detected Moments (M8) so a re-import
-                    // shows the review list (playable + promotable) without
-                    // re-detecting. Transcripts/waveform aren't persisted — a Detect
-                    // refills them; until then the transcript panel shows its empty
-                    // state. A fresh Detect replaces these.
+                    // Restore a prior session's detected Moments + their review text
+                    // from project.json / review.json (M8) so a re-import shows the
+                    // full review (list + transcript panel + LLM reason, playable +
+                    // promotable) without re-detecting. The waveform isn't persisted;
+                    // a fresh Detect rebuilds it and replaces all of this.
                     self.selected = moments.first().map(|m| m.id);
                     self.moments = moments;
+                    self.transcripts = transcripts;
+                    self.llm_reasons = llm_reasons;
                     self.status = Status::Idle;
                 }
                 Progress::Detected { moments, transcripts, llm_reasons, timeline } => {

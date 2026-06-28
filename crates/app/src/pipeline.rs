@@ -29,7 +29,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use yc_core::{
     CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, Moment, Project,
-    Signals, TimeRange, Transcript, Vod, VodSource,
+    ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -127,13 +127,16 @@ pub enum Progress {
     /// known, so the UI seeds its caption-style picker to the operator's usual
     /// choice for this streamer; `None` for an unknown/new Creator. `moments` are
     /// the Moments persisted from a prior session (M8), so a re-import restores the
-    /// review list without re-detecting (empty for a never-detected VOD).
+    /// review list without re-detecting (empty for a never-detected VOD), and
+    /// `transcripts`/`llm_reasons` restore the review panel text from `review.json`.
     Imported {
         title: String,
         duration_s: Option<f64>,
         analysis_wav: PathBuf,
         caption_genre: Option<CaptionGenre>,
         moments: Vec<Moment>,
+        transcripts: HashMap<u64, String>,
+        llm_reasons: HashMap<u64, String>,
     },
     /// Detection finished; ranked candidate Moments, each one's transcript text
     /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
@@ -232,12 +235,15 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                 Job::Import { source, language } => {
                     match do_import(&paths, source, language, &worker_cancel, &tx_prog) {
                         Ok(s) => {
+                            let (transcripts, llm_reasons) = load_review(&s.data_dir);
                             let _ = tx_prog.send(Progress::Imported {
                                 title: s.vod.title.clone(),
                                 duration_s: s.vod.duration_s,
                                 analysis_wav: s.analysis_wav.clone(),
                                 caption_genre: remembered_caption_genre(&paths.workspace, &s.vod),
                                 moments: s.moments.clone(),
+                                transcripts,
+                                llm_reasons,
                             });
                             session = Some(s);
                             prepared = None; // a new VOD invalidates any prepared clip
@@ -499,6 +505,44 @@ fn load_or_new_project(vod: &Vod, data_dir: &Path) -> Project {
     Project::load(&data_dir.join("project.json")).unwrap_or_else(|_| Project::new(vod.clone()))
 }
 
+/// Persist the per-Moment review notes (transcript + LLM reason) as
+/// `data/review.json` (M8), so a re-import restores the review panel without
+/// re-transcribing. Best-effort — a write failure logs and never fails Detect.
+fn save_review(
+    transcripts: &HashMap<u64, String>,
+    llm_reasons: &HashMap<u64, String>,
+    data_dir: &Path,
+) {
+    let mut cache = ReviewCache::default();
+    for (&id, t) in transcripts {
+        cache.notes.entry(id).or_default().transcript = t.clone();
+    }
+    for (&id, r) in llm_reasons {
+        cache.notes.entry(id).or_default().llm_reason = r.clone();
+    }
+    if let Err(e) = cache.save(&data_dir.join("review.json")) {
+        tracing::warn!("review.json save failed ({e})");
+    }
+}
+
+/// Load the persisted review notes as the two `Moment id -> text` maps the review
+/// UI consumes (empty when no `review.json` — a re-Detect refills it). Skips empty
+/// strings so a Moment with no LLM reason doesn't get a blank entry.
+fn load_review(data_dir: &Path) -> (HashMap<u64, String>, HashMap<u64, String>) {
+    let cache = ReviewCache::load(&data_dir.join("review.json"));
+    let mut transcripts = HashMap::new();
+    let mut llm_reasons = HashMap::new();
+    for (id, note) in cache.notes {
+        if !note.transcript.is_empty() {
+            transcripts.insert(id, note.transcript);
+        }
+        if !note.llm_reason.is_empty() {
+            llm_reasons.insert(id, note.llm_reason);
+        }
+    }
+    (transcripts, llm_reasons)
+}
+
 // --- detect (M3) ------------------------------------------------------------
 
 /// Detect candidate Moments over the imported VOD (ADR 0007). Discover with the
@@ -665,6 +709,8 @@ fn do_detect(
     project
         .save(&session.data_dir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", session.data_dir.display()))?;
+    // Persist the review notes alongside (M8) so a re-import restores the panel.
+    save_review(&transcripts, &llm_reasons, &session.data_dir);
     Ok((ranked, transcripts, llm_reasons, timeline))
 }
 
@@ -1261,6 +1307,34 @@ mod tests {
         assert_eq!(p2, dir.join("My Clip (2).mp4"));
         fs::write(&p2, b"x").unwrap();
         assert_eq!(unique_path(&dir, "My Clip", "mp4"), dir.join("My Clip (3).mp4"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_notes_save_and_load_roundtrip() {
+        // M8: Detect's transcript + llm-reason maps persist to review.json and a
+        // re-import loads them back, so the review panel restores without re-detect.
+        let dir = std::env::temp_dir().join("yc_review_roundtrip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let transcripts = HashMap::from([
+            (1u64, "kaget banget gua".to_string()),
+            (2u64, "baca menu doang".to_string()),
+        ]);
+        // Only Moment 1 got an LLM reason (Moment 2's judge ran without one).
+        let llm_reasons = HashMap::from([(1u64, "shock reaction".to_string())]);
+
+        save_review(&transcripts, &llm_reasons, &dir);
+        assert!(dir.join("review.json").is_file(), "wrote the sidecar");
+        let (t, r) = load_review(&dir);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[&1], "kaget banget gua");
+        assert_eq!(t[&2], "baca menu doang");
+        assert_eq!(r.len(), 1); // empty reasons are skipped, not stored blank
+        assert_eq!(r[&1], "shock reaction");
+        assert!(!r.contains_key(&2));
 
         let _ = fs::remove_dir_all(&dir);
     }
