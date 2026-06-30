@@ -7,8 +7,16 @@
 # Model files (whisper GGML, LLM GGUF)
 /models/
 
-# Per-VOD workspace data (audio, segments, exports)
-/workspace/
+# Per-VOD workspace data (audio, segments, exports) — ignored, EXCEPT the curated
+# per-Creator dialect stores (ADR 0031): workspace/<creator>/<lang>.json is the
+# operator's durable caption curation, so it is version-controlled. Per-clip stores
+# (deeper, beside each export) and everything else under workspace stay ignored.
+/workspace/*
+!/workspace/*/
+/workspace/*/*
+!/workspace/*/id.json
+!/workspace/*/en.json
+!/workspace/*/ja.json
 
 # Session-bridge artifacts (ephemeral, not project history)
 /handoffs/

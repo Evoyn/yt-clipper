@@ -50,10 +50,12 @@ unsigned-off status). It sets a `correct` bool on `Job::Render`, gating the
 - **Manual promotion only.** Rejected (operator chose auto): re-typing confirmed fixes
   into the Creator file is friction; auto-promote keeps the per-clip file as the single
   place to curate.
-- **Migrate the existing base corrections to per-Creator now.** Deferred: the bundled
-  base keeps its current clip-7 confirmations (they work for the operator's main
-  Creator); new corrections flow base-untouched into per-clip → per-Creator. The base
-  can be slimmed later.
+- **Migrate the existing base corrections to per-Creator.** **Done** (operator asked):
+  all 24 of the base's Ino/@guntur69 corrections (7 confirmed + 17 harvested to-dos)
+  moved to `workspace/Ino Gemink Live Streaming/id.json`; the bundled base is now
+  purely generic (config + dictionary, zero corrections). A `.gitignore` exception
+  version-controls the per-Creator stores (`workspace/<creator>/<lang>.json`) — the
+  operator's durable curation — while the rest of `workspace/` stays ignored.
 
 ## Consequences
 

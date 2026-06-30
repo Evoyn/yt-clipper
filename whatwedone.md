@@ -19,6 +19,11 @@ a GUI toggle for the LLM correction. Both done.
   automatically. Curate once, fixed forever for that streamer.
 - **Three layers stack, most-specific wins:** the shared bundled dictionary, then the
   Creator's file, then the clip's file. A fix for one streamer no longer leaks to others.
+- **Migrated your existing fixes:** all of Ino/@guntur69's confirmed slang/names + harvest
+  to-dos moved out of the shared `assets/dialect/id.json` into their own
+  `workspace/Ino Gemink Live Streaming/id.json`, so the bundled base is now purely
+  generic. Your per-Creator stores are version-controlled (a `.gitignore` exception),
+  so your curation is backed up; the rest of `workspace/` stays ignored.
 - **A "Correct captions (LLM)" checkbox** in the GUI (default **off** — opt-in) runs the
   correction pass for a render; for headless/batch use `YC_CORRECT=1`. Still needs a build
   that includes the feature + the LLM sidecar. (ADR 0031)
