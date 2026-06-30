@@ -4,6 +4,34 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-30 — voice isolation for captions (the W3 thread, unblocked)
+
+You pasted the real bad-caption VOD (the 2 h horror co-stream "Horror Tanpa
+Ekspresi bersama @guntur69") and asked to export the top 10. That gave the corpus
+the voice-isolation work needed — and we measured our way to a shipped fix. Newest
+first.
+
+- **Captions can clean the streamer's voice before whisper now** (cleaned-voice
+  captions, the big one) — on a noisy gameplay clip the game SFX used to drown the
+  voice and whisper invented gibberish (clip #7 literally hallucinated *English* —
+  "onions… comic book"). A **gentle speech denoiser** (DeepFilterNet, run as a
+  sidecar like ffmpeg) now cleans the caption audio first, so whisper reads the
+  voice above the noise. The result on #7: coherent Indonesian, no more English.
+  **Crucially we measured before shipping** — *full*-strength denoise *destroyed*
+  the speech (it gouged the quiet voice to silence and whisper looped "eh" 211
+  times), so it's tuned to a gentle setting that recovers masked speech while
+  leaving already-clean clips untouched. Off by default (`--features enh`); the
+  clip's audible audio is always the original mix. (ADR 0029)
+- **A flaky download no longer kills a whole batch render** — the top-10 export
+  died at clip 4 when YouTube returned a one-off "format not available" on the
+  segment fetch; the batch treated it as fatal and threw away 6 good clips. The
+  fetch now **retries** transient failures (they happen before any bytes download),
+  so a single hiccup costs a few seconds, not the run. Re-running, all 10 exported —
+  2 transient failures silently absorbed. (ADR 0028)
+- **Exported your top 10** from the guntur69 VOD (Indonesian, huge-word captions,
+  auto two-person facecam framing) — which doubled as the bad-caption corpus: the
+  loudest clips had the worst captions, exactly the audio-masking ADR 0027 predicted.
+
 ## 2026-06-28 — round 2 (post-v1.1): UX polish, framing, caption accuracy
 
 A second operator-feedback batch — running W1→W4 (hide consoles → two-person
