@@ -48,3 +48,10 @@ sep = ["yc-detect/sep"]
 # external sidecar like ffmpeg/yt-dlp. Off by default; the export then captions the
 # mix. Takes precedence over `sep`; the rendered clip's audible audio is the mix.
 enh = []
+# LLM caption-correction pass (ADR 0030): after whisper + the dialect dict, send the
+# caption units + per-word confidence + the store's context overrides to the
+# out-of-process `yc-llm-judge --correct` and map the reply back onto unit timing,
+# repairing linguistic errors (garble / slang / names) the audio path can't. Pulls
+# NO new deps (the sidecar already exists for the detect judge). Off by default; the
+# default build captions exactly as before. Operator A/Bs the real render first.
+correct = []

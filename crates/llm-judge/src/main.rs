@@ -49,11 +49,14 @@ const MAX_NEW_TOKENS: usize = 160;
 /// Hard cap on collected output bytes (defensive, alongside MAX_NEW_TOKENS).
 const MAX_OUT_BYTES: usize = 1024;
 
-/// Context window for the caption-correction spike (ADR 0030 WIP): a full caption
-/// plus slang/name hints runs longer than a judge prompt, so 4096.
+/// Context window for the caption correction (ADR 0030): a full caption plus
+/// slang/name hints runs longer than a judge prompt, so 4096.
 const N_CTX_CORRECT: u32 = 4096;
-/// Generated-token cap for one corrected caption (short text; bounds a runaway).
-const MAX_CORRECT_TOKENS: usize = 256;
+/// Generated-token cap for one corrected caption. The index-anchored reply echoes
+/// every input line ("N: word"), so the cap scales with caption length: ~5 tokens
+/// per word covers a dense ~100-word clip (a noisy 30 s clip hit 57 units here),
+/// still well inside `N_CTX_CORRECT`. Bounds a runaway.
+const MAX_CORRECT_TOKENS: usize = 512;
 
 fn main() -> Result<()> {
     // All logs to stderr; stdout is the JSON response channel and must stay clean.

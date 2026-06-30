@@ -777,6 +777,126 @@ fn run_llm_judge(
     serde_json::from_str(&out).context("parsing llm-judge verdicts")
 }
 
+/// LLM caption-correction pass (ADR 0030): hand whisper's caption units + per-unit
+/// confidence + the dialect store's context overrides + the clip's topic to the
+/// out-of-process `yc-llm-judge --correct`, then map its reply back onto the units
+/// under the confidence/curated guardrails (a confident word is changed only by a
+/// curated override; a spurious unsure word may be dropped; words are never added).
+/// Runs on the units **before** caption timing so a dropped word's slot is absorbed
+/// by the gap-fill. Best-effort: a missing sidecar/GGUF, a build-request no-op, or a
+/// sidecar failure leaves captions uncorrected — it never sinks a render. Off by
+/// default (compiled only under `--features correct`), pending operator sign-off on
+/// the real render (the enh over-claim lesson).
+#[cfg(feature = "correct")]
+fn correct_captions(
+    paths: &PipelinePaths,
+    session: &Session,
+    prepared: &PreparedClip,
+    transcript: &mut Transcript,
+    conf: &mut Vec<f32>,
+    lexicon: &yc_transcribe::DialectLexicon,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) {
+    if !paths.llm_judge.is_file() || !paths.llm_model.is_file() {
+        tracing::info!("correct: sidecar or GGUF absent; captions left uncorrected");
+        return;
+    }
+    // Collapse whisper's repeated-filler hallucinations first (deterministic): cleans
+    // the "eh eh eh..." spam AND keeps the list short so the model's per-line index
+    // numbering stays aligned with the units (a long run made it miscount).
+    let removed = yc_transcribe::collapse_adjacent_duplicates(&mut transcript.units, conf);
+    if removed > 0 {
+        tracing::info!("correct: collapsed {removed} repeated filler unit(s)");
+    }
+    // Topic for the corrector: the clip's generated title + the store's note. Safe
+    // to feed a chat model (unlike whisper's initial_prompt, which it never reaches).
+    let mut topic = prepared.title.clone().unwrap_or_default();
+    if !lexicon.note.is_empty() {
+        if !topic.is_empty() {
+            topic.push_str("; ");
+        }
+        topic.push_str(&lexicon.note);
+    }
+    let ctx = yc_transcribe::CorrectionContext { language: session.vod.language, topic };
+    let Some(req) = yc_transcribe::build_correction_request(&transcript.units, conf, lexicon, &ctx)
+    else {
+        return; // a clean clip with no overrides — nothing the model could safely do
+    };
+    let _ = tx.send(Progress::Stage("Correcting captions (LLM)"));
+    match run_llm_correct(&paths.llm_judge, &paths.llm_model, &req.system, &req.user, cancel) {
+        Ok(raw) => {
+            let stats = yc_transcribe::apply_correction(&mut transcript.units, conf, lexicon, &raw);
+            tracing::info!("correct: {}", stats.summary());
+        }
+        Err(e) if cancel.is_cancelled() => tracing::info!("correct: cancelled ({e:#})"),
+        Err(e) => tracing::warn!("correct: failed ({e:#}); captions left uncorrected"),
+    }
+}
+
+/// Run `yc-llm-judge --correct` over one caption (ADR 0030): write the
+/// `{model_path, system, user}` request to its stdin and read back the raw
+/// free-form completion (the corrected `N: word` list) from its stdout. Mirrors
+/// [`run_llm_judge`] — stderr inherited for the load logs, killed on cancel to free
+/// VRAM, request small enough that writing it before reading can't deadlock.
+#[cfg(feature = "correct")]
+fn run_llm_correct(
+    bin: &Path,
+    model: &Path,
+    system: &str,
+    user: &str,
+    cancel: &CancelToken,
+) -> Result<String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "model_path": model.to_string_lossy(),
+        "system": system,
+        "user": user,
+    }))
+    .context("serializing correct request")?;
+    let mut child = Command::new(bin)
+        .arg("--correct")
+        .no_console()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+
+    child
+        .stdin
+        .take()
+        .context("correct stdin unavailable")?
+        .write_all(&payload)
+        .context("writing correct request")?;
+
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("cancelled");
+        }
+        match child.try_wait().context("waiting on correct")? {
+            Some(status) => {
+                anyhow::ensure!(status.success(), "yc-llm-judge --correct exited with {status}");
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .context("correct stdout unavailable")?
+        .read_to_string(&mut out)
+        .context("reading correct output")?;
+    Ok(out)
+}
+
 // --- prepare + render (phase 2, split for the nudge editor - ADR 0012) ------
 
 /// Number of preview frames sampled across the clip range for the editor's
@@ -1134,7 +1254,8 @@ fn do_render(
             let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
             let lexicon =
                 yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
-            let (transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
+            #[cfg_attr(not(feature = "correct"), allow(unused_mut, unused_variables))]
+            let (mut transcript, mut conf, harvest) = yc_transcribe::transcribe_range_full(
                 &paths.model,
                 &samples,
                 session.vod.language,
@@ -1162,6 +1283,13 @@ fn do_render(
                     tracing::info!("dialect: harvested {n} low-confidence word(s) to review");
                 }
             }
+            // LLM caption-correction pass (ADR 0030): repair the linguistic errors
+            // (garble / slang / names) the audio path can't, on the units BEFORE
+            // timing so a dropped spurious word's slot rides the gap-fill. Gated
+            // behind the `correct` feature + the sidecar, off by default until the
+            // operator A/Bs the real render (no repeat of the enh over-claim).
+            #[cfg(feature = "correct")]
+            correct_captions(paths, session, prepared, &mut transcript, &mut conf, &lexicon, cancel, tx);
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.

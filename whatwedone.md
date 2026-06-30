@@ -4,6 +4,36 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-30 (later) — the LLM caption-correction pass, integrated
+
+The remaining caption errors are *linguistic* — local slang, names, and garbles that
+no audio cleanup fixes — so we built the correction pass that was designed + spiked
+last session (ADR 0030), and re-validated it end-to-end on your clip-7 ground-truth.
+
+- **Captions can now be repaired word-by-word by the local LLM** after whisper, before
+  they're drawn. It does three things, each with a guardrail so it can't make captions
+  *worse* (the thing you were worried about):
+  - **Applies your confirmed slang/names in context.** `cowok -> cok` and
+    `tidur -> tur` (the guest "Guntur") now correct on clip-7 — but *only* through the
+    LLM, which reads the surrounding words. They are **never** global rules (that would
+    wreck every real "cowok"), so a normal "cowok" elsewhere stays "cowok".
+  - **Fixes a clear garble** like `dimalai-malai -> dimarahin` (this one via the
+    deterministic dictionary, now that you've confirmed it).
+  - **Kills the "eh eh eh" spam.** A noisy spot made whisper loop "eh" 22 times on
+    clip-7; those now collapse to one automatically.
+  - It **leaves confident real words alone** — it tried to shorten a confident
+    "pelan-pelan" and the guard refused; every other real word was untouched.
+- **It's OFF by default and unproven on a real render — your call decides.** It builds
+  in only with `--features correct`, and even then needs the LLM sidecar present. We
+  matched the spike exactly on clip-7 (`dimarahin`, `cok`, `tur`, zero over-correction)
+  but on the *real audio path this time* — and we are **not** claiming a win until you
+  watch a real render and sign off (the enh lesson). One known miss, same as the spike:
+  it won't drop the stray "itu" in "yang horor itu" (it's a confident real word).
+- How to try it: build `--features correct` and render clip-7
+  (`--headless "<wav-or-url>" 2203.5 2233.5 id`), then A/B against a normal build. (ADR 0030)
+
+---
+
 ## 2026-06-30 — voice isolation for captions (the W3 thread, unblocked)
 
 You pasted the real bad-caption VOD (the 2 h horror co-stream "Horror Tanpa

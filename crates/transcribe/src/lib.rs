@@ -19,6 +19,12 @@ use whisper_rs::{
 };
 use yc_core::{CaptionUnit, Language, Transcript};
 
+mod correct;
+pub use correct::{
+    apply_correction, build_correction_request, collapse_adjacent_duplicates, CorrectionContext,
+    CorrectionRequest, CorrectionStats,
+};
+
 fn lang_code(l: Language) -> &'static str {
     match l {
         Language::En => "en",
@@ -225,6 +231,14 @@ pub struct Correction {
     /// application keys off whether `right` is filled, not this.
     #[serde(default)]
     pub status: String,
+    /// Context-sensitive override (ADR 0030): when true this `wrong -> right` is
+    /// **not** applied by the always-on global dict — that would corrupt every
+    /// real occurrence of `wrong` — but offered to the LLM correction pass, which
+    /// applies it only where the surrounding context fits. For real words whisper
+    /// transcribes *confidently* yet the streamer meant as slang or a name (e.g.
+    /// `cowok -> cok`, `tidur -> tur`). Inert unless the correction pass runs.
+    #[serde(default)]
+    pub context: bool,
 }
 
 /// `names.json` — the roster of viewer names the streamer reads aloud, loaded
@@ -330,12 +344,28 @@ impl DialectLexicon {
     }
 
     /// Confirmed `(wrong_lowercased, right)` pairs for the post-transcription
-    /// whole-word fix-up. Blank-`right` entries (operator to-dos) are skipped.
+    /// whole-word fix-up. Blank-`right` entries (operator to-dos) and
+    /// **context-sensitive** entries (ADR 0030, applied by the LLM pass instead)
+    /// are skipped — the global dict only carries the unambiguous garble fixes.
     fn pairs(&self) -> Vec<(String, &str)> {
         self.corrections
             .iter()
-            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty())
+            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty() && !c.context)
             .map(|c| (c.wrong.to_lowercase(), c.right.as_str()))
+            .collect()
+    }
+
+    /// Confirmed context-sensitive `(wrong_lowercased, right)` overrides (ADR
+    /// 0030): the curated corrections the LLM correction pass may apply over a word
+    /// whisper transcribed *confidently*, but only where the surrounding context
+    /// fits. The always-on global dict ([`pairs`](Self::pairs)) deliberately skips
+    /// these — it can't tell a real `cowok` from the slang `cok` — so they are
+    /// inert unless the correction pass runs. Blank-`right` entries are skipped.
+    pub fn context_overrides(&self) -> Vec<(String, String)> {
+        self.corrections
+            .iter()
+            .filter(|c| c.context && !c.wrong.is_empty() && !c.right.is_empty())
+            .map(|c| (c.wrong.to_lowercase(), c.right.clone()))
             .collect()
     }
 
@@ -401,6 +431,7 @@ impl DialectLexicon {
                     right: String::new(),
                     note,
                     status: "unverified".into(),
+                    context: false, // a harvested garble is a global fix-up, not a context override
                 });
                 added += 1;
             }
@@ -466,7 +497,8 @@ fn apply_multiword_corrections(
     lexicon: &DialectLexicon,
 ) {
     for c in &lexicon.corrections {
-        if c.wrong.is_empty() || c.right.is_empty() {
+        // Context-sensitive overrides (ADR 0030) are LLM-applied, never global.
+        if c.wrong.is_empty() || c.right.is_empty() || c.context {
             continue;
         }
         let words: Vec<String> =
@@ -693,9 +725,28 @@ impl Transcriber {
         lexicon: &DialectLexicon,
         should_abort: impl FnMut() -> bool + 'static,
     ) -> Result<(Transcript, Vec<HarvestCandidate>)> {
+        let (transcript, _conf, harvest) =
+            self.transcribe_full(samples, language, lexicon, should_abort)?;
+        Ok((transcript, harvest))
+    }
+
+    /// Like [`Self::transcribe_with_harvest`], but also returns the **per-unit
+    /// whisper confidence** (the minimum token probability over each unit's
+    /// tokens), aligned 1:1 with the returned units. The LLM caption-correction
+    /// pass (ADR 0030) gates on it: a word whisper was *unsure* of it may auto-fix
+    /// or drop, a *confident* one it may change only via a curated context
+    /// override. Confidence survives the dialect dict's multi-word collapse (it
+    /// shrinks in lockstep), so it still lines up with the corrected units.
+    pub fn transcribe_full(
+        &self,
+        samples: &[f32],
+        language: Language,
+        lexicon: &DialectLexicon,
+        should_abort: impl FnMut() -> bool + 'static,
+    ) -> Result<(Transcript, Vec<f32>, Vec<HarvestCandidate>)> {
         let (transcript, conf) = self.run(samples, language, lexicon, should_abort)?;
         let harvest = harvest_candidates(&transcript.units, &conf, lexicon);
-        Ok((transcript, harvest))
+        Ok((transcript, conf, harvest))
     }
 
     fn run(
@@ -810,6 +861,20 @@ pub fn transcribe_range_harvesting(
     should_abort: impl FnMut() -> bool + 'static,
 ) -> Result<(Transcript, Vec<HarvestCandidate>)> {
     Transcriber::load(model)?.transcribe_with_harvest(samples, language, lexicon, should_abort)
+}
+
+/// Like [`transcribe_range_harvesting`], but also returns the per-unit whisper
+/// confidence the LLM caption-correction pass gates on (ADR 0030). One-shot model
+/// load for the Promote path; the resident [`Transcriber::transcribe_full`] is the
+/// reusable form.
+pub fn transcribe_range_full(
+    model: &Path,
+    samples: &[f32],
+    language: Language,
+    lexicon: &DialectLexicon,
+    should_abort: impl FnMut() -> bool + 'static,
+) -> Result<(Transcript, Vec<f32>, Vec<HarvestCandidate>)> {
+    Transcriber::load(model)?.transcribe_full(samples, language, lexicon, should_abort)
 }
 
 #[cfg(test)]

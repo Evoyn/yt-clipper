@@ -1,7 +1,7 @@
 {
   "creator": "",
   "language": "id",
-  "note": "",
+  "note": "Casual Indonesian gaming streams: expect local/Jawa slang, game jargon, and viewer/streamer nicknames. (Used as topic context for the LLM caption-correction pass, ADR 0030 - never fed to whisper.)",
   "prime": false,
   "harvest": true,
   "dictionaries": [
@@ -10,6 +10,20 @@
   ],
   "vocabulary": [],
   "corrections": [
+    {
+      "wrong": "cowok",
+      "right": "cok",
+      "note": "clip-7 ground-truth (operator-confirmed): slang interjection 'cok', NOT the real word 'cowok' (boy). Context-only via the LLM pass - never a global rule (ADR 0030).",
+      "status": "confirmed",
+      "context": true
+    },
+    {
+      "wrong": "tidur",
+      "right": "tur",
+      "note": "clip-7 ground-truth (operator-confirmed): 'tur' (short for guest Guntur / @guntur69), NOT 'tidur' (sleep). Context-only via the LLM pass - never global (ADR 0030).",
+      "status": "confirmed",
+      "context": true
+    },
     {
       "wrong": "nyoli-nyoli",
       "right": "",
@@ -60,9 +74,9 @@
     },
     {
       "wrong": "dimalai-malai",
-      "right": "",
-      "note": "auto-harvested (conf 0.23) from \"Streamers game dialogue\" at 36:54 - operator verify",
-      "status": "unverified"
+      "right": "dimarahin",
+      "note": "clip-7 ground-truth (operator-confirmed): garble of 'dimarahin' (got scolded). Unambiguous non-word -> safe as a GLOBAL dict fix (applied before the LLM pass; ADR 0030).",
+      "status": "confirmed"
     },
     {
       "wrong": "kanan-kanan",
