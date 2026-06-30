@@ -114,7 +114,10 @@ pub enum Job {
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
     /// NVENC export. `caption_genre` selects the Caption Style animation (M7):
     /// huge-word / rolling-pop / karaoke-fill; the rest of the style is data.
-    Render { layout: Layout, caption_genre: CaptionGenre },
+    /// `correct` requests the LLM caption-correction pass (ADR 0030/0031) for this
+    /// render — the operator's per-render toggle (only effective in a `correct`
+    /// build with the sidecar; `YC_CORRECT=0` is a global override).
+    Render { layout: Layout, caption_genre: CaptionGenre, correct: bool },
 }
 
 /// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
@@ -303,9 +306,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Render { layout, caption_genre } => match (&session, &mut prepared) {
+                Job::Render { layout, caption_genre, correct } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, caption_genre, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, caption_genre, correct, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -800,13 +803,8 @@ fn correct_captions(
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) {
-    // Runtime A/B switch: a `correct` build runs the pass by default, but
-    // `YC_CORRECT=0` (or off/false/no) skips it — so the operator can A/B the
-    // corrected vs uncorrected render from ONE build, on the same fetched segment.
-    if std::env::var("YC_CORRECT").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
-        tracing::info!("correct: disabled via YC_CORRECT; captions left uncorrected");
-        return;
-    }
+    // Gating is the caller's `correct` bool (GUI checkbox / headless YC_CORRECT);
+    // here we only need the sidecar + GGUF present.
     if !paths.llm_judge.is_file() || !paths.llm_model.is_file() {
         tracing::info!("correct: sidecar or GGUF absent; captions left uncorrected");
         return;
@@ -1243,10 +1241,15 @@ fn do_render(
     prepared: &mut PreparedClip,
     layout: Layout,
     caption_genre: CaptionGenre,
+    correct: bool,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
     anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
+    // `correct` gates the LLM caption-correction pass below; it is only read inside
+    // the `#[cfg(feature = "correct")]` block, so silence the unused warning otherwise.
+    #[cfg(not(feature = "correct"))]
+    let _ = correct;
     let range = prepared.range;
 
     // Transcribe once, then reuse: re-rendering a nudged Layout skips whisper.
@@ -1270,44 +1273,73 @@ fn do_render(
             Transcript { language: session.vod.language, units: Vec::new() }
         } else {
             let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
-            let lexicon =
-                yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
+            let language = session.vod.language;
+            // Layered dialect stores (ADR 0031): bundled base < per-Creator < per-clip.
+            // The per-Creator store (workspace/<creator>/<lang>.json) carries a
+            // streamer's confirmed slang/names across all their VODs; the per-clip
+            // store (<stream>/<stem>.<lang>.json, beside the exported Short) gets THIS
+            // clip's harvest, so each export has a small, easy-to-curate review queue.
+            let lc = dialect_lang_code(language);
+            let clip_stem = clip_title_stem(prepared.title.as_deref(), range);
+            let creator_store = session
+                .stream_dir
+                .parent()
+                .unwrap_or(session.stream_dir.as_path())
+                .join(format!("{lc}.json"));
+            let clip_store = session.stream_dir.join(format!("{clip_stem}.{lc}.json"));
+            let lexicon = yc_transcribe::DialectLexicon::load_layered(
+                &paths.dialect_dir,
+                &[creator_store.clone(), clip_store.clone()],
+                language,
+            );
             #[cfg_attr(not(feature = "correct"), allow(unused_mut))]
             let (mut transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
                 &paths.model,
                 &samples,
-                session.vod.language,
+                language,
                 &lexicon,
                 {
                     let c = cancel.clone();
                     move || c.is_cancelled()
                 },
             )?;
-            // Self-populate the store's review queue with words whisper was unsure
-            // about (auto-harvest), unless the store froze it. Best-effort: a write
-            // failure logs and never sinks the render.
+            // Auto-harvest this clip's unsure/unknown words to the PER-CLIP store
+            // (ADR 0031), so the operator curates a small per-export list (with each
+            // word's title + VOD timestamp, ADR 0022). Best-effort, never sinks render.
             if lexicon.harvest {
-                // Record each harvested word's source (ADR 0022): the generated
-                // Short title + the absolute VOD timestamp (clip start + the word's
-                // clip-relative onset), so the operator can find and curate it.
-                let n = yc_transcribe::DialectLexicon::harvest_to_store(
-                    &paths.dialect_dir,
-                    session.vod.language,
+                let n = yc_transcribe::DialectLexicon::harvest_to_file(
+                    &clip_store,
+                    language,
                     &harvest,
                     range.start_s,
                     prepared.title.as_deref(),
                 );
                 if n > 0 {
-                    tracing::info!("dialect: harvested {n} low-confidence word(s) to review");
+                    tracing::info!("dialect: harvested {n} word(s) -> {}", clip_store.display());
                 }
             }
-            // LLM caption-correction pass (ADR 0030): repair the linguistic errors
-            // (garble / slang / names) the audio path can't, on the units BEFORE
-            // timing so a dropped spurious word's slot rides the gap-fill. Gated
-            // behind the `correct` feature + the sidecar, off by default until the
-            // operator A/Bs the real render (no repeat of the enh over-claim).
+            // Auto-promote (the operator's choice, ADR 0031): any correction they have
+            // confirmed in this clip's store rises to the per-Creator store, so it
+            // applies to every future clip of theirs. Best-effort.
+            let promoted = yc_transcribe::DialectLexicon::promote_confirmed(
+                &clip_store,
+                &creator_store,
+                language,
+            );
+            if promoted > 0 {
+                tracing::info!(
+                    "dialect: promoted {promoted} confirmed correction(s) -> {}",
+                    creator_store.display()
+                );
+            }
+            // LLM caption-correction pass (ADR 0030): apply the operator's curated
+            // context overrides (slang/names in context) the dict can't do safely.
+            // Gated on the per-render `correct` toggle (GUI checkbox / CLI), the
+            // `correct` feature, and the sidecar — off by default until sign-off.
             #[cfg(feature = "correct")]
-            correct_captions(paths, session, prepared, &mut transcript, &lexicon, cancel, tx);
+            if correct {
+                correct_captions(paths, session, prepared, &mut transcript, &lexicon, cancel, tx);
+            }
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.
@@ -1362,6 +1394,17 @@ fn do_render(
     remember_creator_genre(&paths.workspace, &session.vod, caption_genre);
 
     Ok(out_path)
+}
+
+/// Language code for the dialect-store filenames (`<lang>.json`), matching
+/// `yc_transcribe`'s internal mapping — used for the per-Creator and per-clip
+/// stores (ADR 0031).
+fn dialect_lang_code(l: Language) -> &'static str {
+    match l {
+        Language::En => "en",
+        Language::Id => "id",
+        Language::Ja => "ja",
+    }
 }
 
 /// The filename stem for a rendered Short (no extension): the promoted Moment's

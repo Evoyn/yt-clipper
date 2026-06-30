@@ -317,6 +317,35 @@ impl DialectLexicon {
         lex
     }
 
+    /// Load the bundled **base** store for `language` (dictionary + config + base
+    /// corrections via [`load`](Self::load)), then layer **overlay** corrections
+    /// from each path in `overlays` on top — later overlays win on a duplicate
+    /// `wrong` (ADR 0031). Used to stack the per-Creator and per-clip dialect stores
+    /// over the bundled per-language base: base < per-Creator < per-clip, so a
+    /// clip-specific fix overrides a Creator one overrides the bundled default. The
+    /// dictionary, wordlists, and config (prime/harvest/dictionaries) come from the
+    /// base; overlays contribute only `corrections` (a missing/unparseable overlay
+    /// is skipped, so a fresh Creator/clip with no store still transcribes).
+    pub fn load_layered(base_dir: &Path, overlays: &[std::path::PathBuf], language: Language) -> Self {
+        let mut lex = Self::load(base_dir, language);
+        let mut n_overlay = 0;
+        for path in overlays {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(overlay) = serde_json::from_str::<DialectLexicon>(&text) {
+                    merge_corrections(&mut lex.corrections, overlay.corrections);
+                    n_overlay += 1;
+                }
+            }
+        }
+        if n_overlay > 0 {
+            tracing::info!(
+                "dialect: layered {n_overlay} overlay store(s) -> {} corrections total",
+                lex.corrections.iter().filter(|c| !c.right.is_empty()).count(),
+            );
+        }
+        lex
+    }
+
     /// whisper `initial_prompt` (#1): a **bare comma-separated term list** — the
     /// vocabulary plus every confirmed correct word (deduped, order-preserving).
     ///
@@ -369,20 +398,40 @@ impl DialectLexicon {
             .collect()
     }
 
-    /// Append `candidates` to `<dir>/<lang>.json` as `unverified` to-dos, skipping
-    /// any the store already knows (wrong / right / vocabulary). Re-reads the file
-    /// first so concurrent operator edits to the `right` fields are preserved, and
-    /// writes back pretty-printed. Returns how many new entries were added. Best-
-    /// effort: a read/parse/write failure logs and adds nothing (never fails a
-    /// render). The caption path calls this so the review queue self-populates.
+    /// Append `candidates` to the bundled base store `<dir>/<lang>.json` (the
+    /// pre-layering target). Thin wrapper over [`harvest_to_file`](Self::harvest_to_file);
+    /// the layered caption path harvests to the **per-clip** store instead (ADR 0031).
+    pub fn harvest_to_store(
+        dir: &Path,
+        language: Language,
+        candidates: &[HarvestCandidate],
+        clip_start_s: f64,
+        title: Option<&str>,
+    ) -> usize {
+        Self::harvest_to_file(
+            &dir.join(format!("{}.json", lang_code(language))),
+            language,
+            candidates,
+            clip_start_s,
+            title,
+        )
+    }
+
+    /// Append `candidates` to the dialect store **file** at `path` as `unverified`
+    /// to-dos, skipping any the file already knows (wrong / right / vocabulary).
+    /// Re-reads the file first so concurrent operator edits to the `right` fields are
+    /// preserved, and writes back pretty-printed. Returns how many new entries were
+    /// added. Best-effort: a read/parse/write failure logs and adds nothing (never
+    /// fails a render). The layered caption path points this at the **per-clip** store
+    /// so each export gets its own small, easy-to-curate review queue (ADR 0031).
     ///
     /// Each new entry's note records **where the word came from** (ADR 0022) so the
     /// operator can curate it: the generated Short `title` (if any) and the
     /// **absolute VOD timestamp** `clip_start_s + candidate.start_s` (the clip's VOD
     /// start plus the word's clip-relative onset), as `from "Title" at h:mm:ss`. A
-    /// word is recorded once (first clip it is flagged in); a later clip skips it.
-    pub fn harvest_to_store(
-        dir: &Path,
+    /// word is recorded once (first run it is flagged in); a later run skips it.
+    pub fn harvest_to_file(
+        path: &Path,
         language: Language,
         candidates: &[HarvestCandidate],
         clip_start_s: f64,
@@ -391,7 +440,6 @@ impl DialectLexicon {
         if candidates.is_empty() {
             return 0;
         }
-        let path = dir.join(format!("{}.json", lang_code(language)));
         // Re-read (not the in-memory copy) so any hand-edits since load survive.
         let mut lex: DialectLexicon = std::fs::read_to_string(&path)
             .ok()
@@ -451,6 +499,80 @@ impl DialectLexicon {
             }
         }
         added
+    }
+
+    /// Copy every confirmed correction (a filled `right`) from the per-clip store at
+    /// `clip_path` up into the per-Creator store at `creator_path`, skipping any the
+    /// Creator store already knows (by `wrong`). Creates/updates the Creator store
+    /// (pretty-printed). So a fix curated once in a clip's store **sticks for the
+    /// Creator** — it applies to every future clip of theirs (ADR 0031, the operator's
+    /// auto-promote choice). Best-effort: a read/serialize/write failure logs and
+    /// promotes nothing (never fails a render). Returns how many were promoted.
+    pub fn promote_confirmed(clip_path: &Path, creator_path: &Path, language: Language) -> usize {
+        let clip: DialectLexicon = std::fs::read_to_string(clip_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let confirmed: Vec<&Correction> = clip
+            .corrections
+            .iter()
+            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty())
+            .collect();
+        if confirmed.is_empty() {
+            return 0;
+        }
+        let mut creator: DialectLexicon = std::fs::read_to_string(creator_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if creator.language.is_empty() {
+            creator.language = lang_code(language).to_string();
+        }
+        let known: HashSet<String> =
+            creator.corrections.iter().map(|c| c.wrong.to_lowercase()).collect();
+        let mut added = 0;
+        for c in confirmed {
+            if !known.contains(&c.wrong.to_lowercase()) {
+                creator.corrections.push((*c).clone());
+                added += 1;
+            }
+        }
+        if added > 0 {
+            match serde_json::to_string_pretty(&creator) {
+                Ok(s) => {
+                    if let Err(e) = std::fs::write(creator_path, s + "\n") {
+                        tracing::warn!(
+                            "dialect: promote write to {} failed ({e})",
+                            creator_path.display()
+                        );
+                        return 0;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("dialect: promote serialize failed ({e})");
+                    return 0;
+                }
+            }
+        }
+        added
+    }
+}
+
+/// Merge `overlay` corrections into `into`, **overlay wins** on a duplicate `wrong`
+/// (case-insensitive): an overlay entry replaces a matching base/earlier one, else
+/// it is appended. The layering primitive for [`DialectLexicon::load_layered`] —
+/// per-clip over per-Creator over base (ADR 0031). Pure, so it is unit-tested.
+fn merge_corrections(into: &mut Vec<Correction>, overlay: Vec<Correction>) {
+    for c in overlay {
+        if c.wrong.is_empty() {
+            continue;
+        }
+        let key = c.wrong.to_lowercase();
+        if let Some(existing) = into.iter_mut().find(|e| e.wrong.to_lowercase() == key) {
+            *existing = c;
+        } else {
+            into.push(c);
+        }
     }
 }
 
@@ -1089,6 +1211,68 @@ mod tests {
         assert!(note.contains("1:00:12"), "absolute timestamp in note: {note}");
         assert!(note.contains("0.42"), "confidence in note: {note}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_corrections_overlay_wins_on_duplicate_else_appends() {
+        let mut base = vec![
+            Correction { wrong: "a".into(), right: "base-a".into(), ..Default::default() },
+            Correction { wrong: "b".into(), right: "base-b".into(), ..Default::default() },
+        ];
+        let overlay = vec![
+            Correction { wrong: "A".into(), right: "over-a".into(), ..Default::default() }, // dup (ci) -> replace
+            Correction { wrong: "c".into(), right: "over-c".into(), ..Default::default() }, // new -> append
+        ];
+        merge_corrections(&mut base, overlay);
+        assert_eq!(base.len(), 3);
+        assert_eq!(base.iter().find(|c| c.wrong.eq_ignore_ascii_case("a")).unwrap().right, "over-a");
+        assert_eq!(base.iter().find(|c| c.wrong == "b").unwrap().right, "base-b");
+        assert!(base.iter().any(|c| c.wrong == "c"));
+    }
+
+    #[test]
+    fn load_layered_stacks_clip_over_creator_over_base() {
+        // ADR 0031: base < per-Creator < per-clip on a duplicate `wrong`.
+        let dir = std::env::temp_dir().join("yc_layered_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("id.json"),
+            r#"{"language":"id","corrections":[{"wrong":"x","right":"base-x"},{"wrong":"shared","right":"base"}]}"#,
+        )
+        .unwrap();
+        let creator = dir.join("creator.json");
+        std::fs::write(&creator, r#"{"corrections":[{"wrong":"shared","right":"creator"},{"wrong":"y","right":"creator-y"}]}"#).unwrap();
+        let clip = dir.join("clip.json");
+        std::fs::write(&clip, r#"{"corrections":[{"wrong":"shared","right":"clip"}]}"#).unwrap();
+        let lex = DialectLexicon::load_layered(&dir, &[creator, clip], Language::Id);
+        let r = |w: &str| lex.corrections.iter().find(|c| c.wrong == w).map(|c| c.right.clone());
+        assert_eq!(r("x"), Some("base-x".into()));
+        assert_eq!(r("y"), Some("creator-y".into()));
+        assert_eq!(r("shared"), Some("clip".into())); // clip wins
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_confirmed_copies_filled_rights_to_creator_skipping_known() {
+        let dir = std::env::temp_dir().join("yc_promote_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.json");
+        std::fs::write(&clip, r#"{"corrections":[
+            {"wrong":"buntur","right":"Guntur"},
+            {"wrong":"todo","right":""},
+            {"wrong":"cowok","right":"cok","context":true}]}"#).unwrap();
+        let creator = dir.join("creator.json");
+        std::fs::write(&creator, r#"{"language":"id","corrections":[{"wrong":"buntur","right":"Guntur"}]}"#).unwrap();
+        // buntur already known -> skip; blank `todo` -> skip; cowok -> promoted (keeps context).
+        let n = DialectLexicon::promote_confirmed(&clip, &creator, Language::Id);
+        assert_eq!(n, 1);
+        let saved: DialectLexicon =
+            serde_json::from_str(&std::fs::read_to_string(&creator).unwrap()).unwrap();
+        assert!(saved.corrections.iter().any(|c| c.wrong == "cowok" && c.right == "cok" && c.context));
+        assert_eq!(saved.corrections.iter().filter(|c| c.wrong == "buntur").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

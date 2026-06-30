@@ -4,6 +4,27 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-30 (latest) — per-Creator + per-clip caption dictionaries; GUI correction toggle
+
+You asked for an id.json per exported clip (easy to curate) plus a per-Creator one, and
+a GUI toggle for the LLM correction. Both done.
+
+- **Each export now gets its own small correction file.** Beside every rendered Short, a
+  `<ClipName>.id.json` collects just *that clip's* uncertain words (each noted with the
+  title + VOD timestamp it came from). You curate that short, focused list instead of one
+  giant global pile.
+- **Confirmed fixes stick for the whole streamer.** When you fill in the right word in a
+  clip's file, the next render copies it up to that Creator's own
+  `workspace/<creator>/id.json` — so it applies to every future clip of theirs,
+  automatically. Curate once, fixed forever for that streamer.
+- **Three layers stack, most-specific wins:** the shared bundled dictionary, then the
+  Creator's file, then the clip's file. A fix for one streamer no longer leaks to others.
+- **A "Correct captions (LLM)" checkbox** in the GUI (default **off** — opt-in) runs the
+  correction pass for a render; for headless/batch use `YC_CORRECT=1`. Still needs a build
+  that includes the feature + the LLM sidecar. (ADR 0031)
+
+---
+
 ## 2026-06-30 (later) — the LLM caption-correction pass, integrated + tuned to your A/B
 
 The remaining caption errors are *linguistic* — local slang, names, and garbles that

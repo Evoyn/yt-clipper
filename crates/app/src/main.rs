@@ -91,7 +91,7 @@ fn main() -> eframe::Result<()> {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
                     // preserving the old one-shot promote behavior (ADR 0012).
                     to_worker
-                        .send(Job::Render { layout, caption_genre })
+                        .send(Job::Render { layout, caption_genre, correct: correct_from_env() })
                         .expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
@@ -222,7 +222,9 @@ fn main() -> eframe::Result<()> {
                     }
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
-                    to_worker.send(Job::Render { layout, caption_genre }).expect("send render");
+                    to_worker
+                        .send(Job::Render { layout, caption_genre, correct: correct_from_env() })
+                        .expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
                     println!("{}", p.display()); // one Short path per rendered Moment
@@ -273,6 +275,7 @@ fn main() -> eframe::Result<()> {
                 end_s: 30.0,
                 language: Language::Id,
                 caption_genre: CaptionGenre::HugeWord,
+                correct_captions: false, // opt-in (ADR 0031); off until the operator ticks it
                 layout_pref: LayoutPref::default(),
                 imported: None,
                 moments: Vec::new(),
@@ -434,6 +437,10 @@ struct App {
     /// Caption animation for the next render (M7): huge-word / rolling-pop /
     /// karaoke-fill. A global selection for now; per-Clip override is later M7.
     caption_genre: CaptionGenre,
+    /// Run the LLM caption-correction pass on the next render (ADR 0030/0031):
+    /// applies the operator's curated slang/name overrides in context. Default off
+    /// (opt-in) and only effective in a `correct` build with the sidecar present.
+    correct_captions: bool,
     /// Explicit Layout preference for the next clip (ADR 0017): Auto runs M6
     /// auto-detect, the others force stacked / full-cam / full-gameplay. A global
     /// session selection (the nudge editor can still override per-Clip).
@@ -535,6 +542,16 @@ fn parse_layout_pref(arg: Option<&str>) -> LayoutPref {
     }
 }
 
+/// Whether headless/batch renders should run the LLM caption-correction pass (ADR
+/// 0030/0031). Off by default (matching the GUI checkbox); opt in with `YC_CORRECT=1`
+/// (or on/true/yes). Only effective in a `correct` build with the sidecar present.
+fn correct_from_env() -> bool {
+    matches!(
+        std::env::var("YC_CORRECT").ok().as_deref().map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    )
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Drain worker messages.
@@ -581,9 +598,11 @@ impl eframe::App for App {
                     // Layout (no editor); the Done handler advances the queue.
                     // `continue` skips the editor setup and drains the next message.
                     if !self.render_queue.is_empty() {
-                        let _ = self
-                            .to_worker
-                            .send(Job::Render { layout, caption_genre: self.caption_genre });
+                        let _ = self.to_worker.send(Job::Render {
+                            layout,
+                            caption_genre: self.caption_genre,
+                            correct: self.correct_captions,
+                        });
                         continue;
                     }
                     // Single clip: upload the preview frames to textures and open the
@@ -717,7 +736,11 @@ impl eframe::App for App {
                 // The editor's per-Clip pick wins; mirror it back to the app's
                 // selection so it stays the default for the next clip.
                 self.caption_genre = caption_genre;
-                let _ = self.to_worker.send(Job::Render { layout, caption_genre });
+                let _ = self.to_worker.send(Job::Render {
+                    layout,
+                    caption_genre,
+                    correct: self.correct_captions,
+                });
                 self.status = Status::Working("Rendering".into());
             }
             editor::EditorAction::Cancel => self.editor = None,
@@ -840,6 +863,10 @@ impl App {
                     ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
                     ui.selectable_value(&mut self.caption_genre, CaptionGenre::KaraokeFill, "Karaoke");
                 });
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.correct_captions, "Correct captions (LLM)");
+            ui.weak("(curated slang/name fixes; needs a 'correct' build + sidecar)");
         });
         ui.horizontal(|ui| {
             ui.label("Layout");
