@@ -49,6 +49,12 @@ const MAX_NEW_TOKENS: usize = 160;
 /// Hard cap on collected output bytes (defensive, alongside MAX_NEW_TOKENS).
 const MAX_OUT_BYTES: usize = 1024;
 
+/// Context window for the caption-correction spike (ADR 0030 WIP): a full caption
+/// plus slang/name hints runs longer than a judge prompt, so 4096.
+const N_CTX_CORRECT: u32 = 4096;
+/// Generated-token cap for one corrected caption (short text; bounds a runaway).
+const MAX_CORRECT_TOKENS: usize = 256;
+
 fn main() -> Result<()> {
     // All logs to stderr; stdout is the JSON response channel and must stay clean.
     tracing_subscriber::fmt()
@@ -63,6 +69,14 @@ fn main() -> Result<()> {
     // flood we just fixed. Our tracing::info covers status; llama API failures
     // still surface as Rust errors. (Flip to with_logs_enabled(true) to debug.)
     llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
+
+    // `--correct` (ADR 0030, WIP): caption-correction spike mode. Reads
+    // {model_path, system, user} JSON and returns Qwen's free-form completion, so
+    // the correction prompt can be iterated via the request without a rebuild. The
+    // default (no arg) path stays the detect-time judge IPC.
+    if std::env::args().skip(1).any(|a| a == "--correct") {
+        return run_correct();
+    }
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).context("reading request from stdin")?;
@@ -86,6 +100,27 @@ fn main() -> Result<()> {
 
     let out = serde_json::to_vec(&verdicts).context("serializing verdicts")?;
     std::io::stdout().write_all(&out).context("writing verdicts to stdout")?;
+    Ok(())
+}
+
+/// Caption-correction spike (ADR 0030, WIP): read `{model_path, system, user}`
+/// from stdin, run Qwen free-form (greedy, reproducible), write the raw completion
+/// to stdout. Keeps the correction prompt out of the binary so it is tuned via the
+/// request, not a rebuild. Uses `serde_json::Value` to avoid touching the shared
+/// judge IPC structs.
+fn run_correct() -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).context("reading correct request from stdin")?;
+    let v: serde_json::Value =
+        serde_json::from_str(&input).context("parsing correct request JSON")?;
+    let model_path = v["model_path"].as_str().context("correct request: model_path missing")?;
+    let system = v["system"].as_str().context("correct request: system missing")?;
+    let user = v["user"].as_str().context("correct request: user missing")?;
+    tracing::info!("llm-correct: running caption-correction completion");
+    let llm = Llm::load(Path::new(model_path))?;
+    let out = llm.complete(system, user, MAX_CORRECT_TOKENS)?;
+    drop(llm); // free the GGUF's VRAM before we exit
+    std::io::stdout().write_all(out.as_bytes()).context("writing completion to stdout")?;
     Ok(())
 }
 
@@ -199,6 +234,58 @@ impl Llm {
 
         let raw = String::from_utf8_lossy(&out);
         Ok(parse_output(&raw))
+    }
+
+    /// Free-form completion for the correction spike (ADR 0030): the same decode
+    /// loop as [`score`] but with no grammar (raw text out) and a larger context.
+    /// Greedy / temp 0, so a given prompt is reproducible.
+    fn complete(&self, system: &str, user: &str, max_tokens: usize) -> Result<String> {
+        let messages = vec![
+            LlamaChatMessage::new("system".to_string(), system.to_string())
+                .map_err(|e| anyhow!("system message: {e}"))?,
+            LlamaChatMessage::new("user".to_string(), user.to_string())
+                .map_err(|e| anyhow!("user message: {e}"))?,
+        ];
+        let prompt = self
+            .model
+            .apply_chat_template(&self.template, &messages, true)
+            .map_err(|e| anyhow!("apply chat template: {e}"))?;
+        let tokens = self
+            .model
+            .str_to_token(&prompt, AddBos::Never)
+            .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(N_CTX_CORRECT))
+            .with_n_batch(N_CTX_CORRECT);
+        let mut lctx = self
+            .model
+            .new_context(backend()?, ctx_params)
+            .map_err(|e| anyhow!("new llama context: {e}"))?;
+
+        let mut batch = LlamaBatch::new(N_CTX_CORRECT as usize, 1);
+        batch.add_sequence(&tokens, 0, false).map_err(|e| anyhow!("batch add: {e}"))?;
+        lctx.decode(&mut batch).map_err(|e| anyhow!("decode prompt: {e}"))?;
+
+        let mut sampler = LlamaSampler::chain_simple(vec![LlamaSampler::greedy()]);
+        let mut pos = tokens.len() as i32;
+        let mut out: Vec<u8> = Vec::new();
+        for _ in 0..max_tokens {
+            let idx = batch.n_tokens() - 1;
+            let mut data = lctx.token_data_array_ith(idx);
+            sampler.apply(&mut data);
+            let Some(token) = data.selected_token() else { break };
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            sampler.accept(token);
+            out.extend_from_slice(&piece_bytes(&self.model, token)?);
+            batch.clear();
+            batch.add(token, pos, &[0], true).map_err(|e| anyhow!("batch add: {e}"))?;
+            pos += 1;
+            lctx.decode(&mut batch).map_err(|e| anyhow!("decode token: {e}"))?;
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 }
 
