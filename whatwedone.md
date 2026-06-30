@@ -22,6 +22,12 @@ first.
   times), so it's tuned to a gentle setting that recovers masked speech while
   leaving already-clean clips untouched. Off by default (`--features enh`); the
   clip's audible audio is always the original mix. (ADR 0029)
+  **Caveat (found on the real render):** the spike validated on the clip's
+  re-encoded audio, but production denoises the cleaner *Segment* audio — on which
+  denoising over-processed and made #7's opening *worse*. enh is off-by-default and
+  **not** validated on the real path. The remaining errors are linguistic, not
+  noise — so the next lever is an **LLM correction pass** (spiked, 3/4 of your
+  clip-7 fixes exact with zero over-correction; ADR 0030), to be integrated next.
 - **A flaky download no longer kills a whole batch render** — the top-10 export
   died at clip 4 when YouTube returned a one-off "format not available" on the
   segment fetch; the batch treated it as fatal and threw away 6 good clips. The

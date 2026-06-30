@@ -104,3 +104,17 @@ the mix's "duluaries onions… comic book… ministerspoin" is gone. Note: produ
 denoises the freshly-fetched **Segment** audio (48 kHz), not the clip-mix the spike
 used, so exact words differ slightly (here "buntur", not the spike's "Guntur") —
 both coherent. `ENH_ATTEN_LIM_DB` is the first knob if other content regresses.
+
+## Correction (2026-06-30, operator A/B on the real renders)
+
+The operator watched the actual rendered clips and the finding **overturns the win
+claim for #7**: the *mix* render got the opening right ("guntur dah kenyang"); the
+*enh* render gave "hai buntur sakitnya", "ah"→"hati hati" — **worse**. Root cause:
+the spike validated `-a 12` on the **clip's re-encoded (AAC) audio**, but production
+denoises the **Segment** audio, which is already cleaner — so denoising it
+*over-processes*. **enh is therefore NOT validated on the production audio path** and
+is not a confirmed win. It stays **off by default**; it may help genuinely noisy
+clips (e.g. #8, never rendered end-to-end) but needs re-validation on the Segment
+path, and may be re-tuned or dropped. **Lesson: a spike must use the same audio
+source as production.** The remaining #7 errors are linguistic (mishear / slang /
+spurious word), addressed by the LLM correction pass (ADR 0030), not denoising.
