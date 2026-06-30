@@ -141,6 +141,14 @@ context overrides** the global dict cannot do safely; the garble fix came from t
 dict (operator-curated) and the filler cleanup from deterministic code. That is the
 design working as intended (dict + LLM + collapse compose), not the LLM alone.
 
+A second clip (#3 "Streamers Repetitive Chat", no curated overrides) stress-tested the
+*auto-fix* path the curated clip-7 didn't exercise: of 25 units the model changed
+exactly one — a 0.09-confidence garble `ngomplok -> ngumpul` — and left every other
+word, including coherent-but-unsure ones (`pilih`, `lagi`, `ngomong`, `aja`, `ke`) and
+an odd-but-confident `torah`, untouched. So the surgical, zero-over-correction
+behaviour holds on the un-curated path too (semantic correctness of the one fix is the
+operator's to confirm).
+
 ## Outcome
 
 **Integrated and re-validated; OFF by default, pending operator A/B (2026-06-30).**
