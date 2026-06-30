@@ -4,33 +4,32 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
-## 2026-06-30 (later) — the LLM caption-correction pass, integrated
+## 2026-06-30 (later) — the LLM caption-correction pass, integrated + tuned to your A/B
 
 The remaining caption errors are *linguistic* — local slang, names, and garbles that
-no audio cleanup fixes — so we built the correction pass that was designed + spiked
-last session (ADR 0030), and re-validated it end-to-end on your clip-7 ground-truth.
+no audio cleanup fixes — so we built the correction pass designed last session
+(ADR 0030), you A/B'd a real render, and we tuned it to exactly what your ground-truth
+showed. It is **OFF by default** and **awaiting your sign-off**.
 
-- **Captions can now be repaired word-by-word by the local LLM** after whisper, before
-  they're drawn. It does three things, each with a guardrail so it can't make captions
-  *worse* (the thing you were worried about):
-  - **Applies your confirmed slang/names in context.** `cowok -> cok` and
-    `tidur -> tur` (the guest "Guntur") now correct on clip-7 — but *only* through the
-    LLM, which reads the surrounding words. They are **never** global rules (that would
-    wreck every real "cowok"), so a normal "cowok" elsewhere stays "cowok".
-  - **Fixes a clear garble** like `dimalai-malai -> dimarahin` (this one via the
-    deterministic dictionary, now that you've confirmed it).
-  - **Kills the "eh eh eh" spam.** A noisy spot made whisper loop "eh" 22 times on
-    clip-7; those now collapse to one automatically.
-  - It **leaves confident real words alone** — it tried to shorten a confident
-    "pelan-pelan" and the guard refused; every other real word was untouched.
-- **It's OFF by default and unproven on a real render — your call decides.** It builds
-  in only with `--features correct`, and even then needs the LLM sidecar present. We
-  matched the spike exactly on clip-7 (`dimarahin`, `cok`, `tur`, zero over-correction)
-  but on the *real audio path this time* — and we are **not** claiming a win until you
-  watch a real render and sign off (the enh lesson). One known miss, same as the spike:
-  it won't drop the stray "itu" in "yang horor itu" (it's a confident real word).
-- How to try it: build `--features correct` and render clip-7
-  (`--headless "<wav-or-url>" 2203.5 2233.5 id`), then A/B against a normal build. (ADR 0030)
+- **What it does now (deliberately narrow + safe):** after whisper, the local LLM
+  applies *only your confirmed slang/name corrections, in context* — the one thing a
+  blind dictionary can't do (e.g. `cowok -> cok`, `tidur -> tur`, `teh -> eh`-reaction
+  vs "teh"=tea). Plain garbles are fixed by the **dictionary** once you confirm them,
+  not by the LLM guessing.
+- **Why narrow:** your first A/B caught the LLM *guessing wrong* on words it can't know
+  (it turned the guest "Guntur" into "buntut", `dakenyang` into "dakanya") and
+  *collapsing your real repeated "eh" reactions*. So we removed the guessing and the
+  collapse — the LLM now never invents, and repeated reactions stay.
+- **Re-rendered clip-7, every error you flagged is fixed:** "Hai buntut dakanya" ->
+  **"Guntur dah kenyang"**, "teh" -> **"eh"**, the repeated **"eh" reactions kept**,
+  plus `cok` / `tur` / `dimarahin`. Two clips are in the guntur69 folder to compare:
+  `clip7_A_NO-correction.mp4` vs `clip7_B_WITH-correction.mp4`.
+- **Two known limits (not linguistic):** the stray "itu" in "yang horor itu" stays
+  (a real word — the pass never deletes), and "diam dulu diam dulu" is still missing
+  because whisper never heard it (an audio-masking problem, not a word problem).
+- **The dictionary is now self-improving for you:** every garble whisper is unsure of
+  gets queued in `assets/dialect/id.json` with where it came from; you fill the right
+  word once and it's fixed forever after. We seeded your clip-7 confirmations. (ADR 0030)
 
 ---
 

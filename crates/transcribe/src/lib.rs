@@ -21,8 +21,8 @@ use yc_core::{CaptionUnit, Language, Transcript};
 
 mod correct;
 pub use correct::{
-    apply_correction, build_correction_request, collapse_adjacent_duplicates, CorrectionContext,
-    CorrectionRequest, CorrectionStats,
+    apply_correction, build_correction_request, CorrectionContext, CorrectionRequest,
+    CorrectionStats,
 };
 
 fn lang_code(l: Language) -> &'static str {

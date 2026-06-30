@@ -25,6 +25,31 @@
       "context": true
     },
     {
+      "wrong": "teh",
+      "right": "eh",
+      "note": "clip-7 ground-truth (operator-confirmed): a shock-reaction 'eh'/'ah', NOT 'teh' (tea). Context-only (teh is a real word) - the LLM applies it where the context is a reaction, not a drink.",
+      "status": "confirmed",
+      "context": true
+    },
+    {
+      "wrong": "hai buntur",
+      "right": "Guntur",
+      "note": "clip-7 ground-truth (operator-confirmed): whisper split the guest's name into 'Hai buntur'; the multi-word dict fix collapses the pair to 'Guntur', dropping the spurious 'Hai'. Runs before the single-word buntur->Guntur.",
+      "status": "confirmed"
+    },
+    {
+      "wrong": "buntur",
+      "right": "Guntur",
+      "note": "clip-7 ground-truth (operator-confirmed): the guest's name 'Guntur' (@guntur69). Garble of a name -> safe global dict fix (catches a lone 'buntur' not preceded by 'Hai').",
+      "status": "confirmed"
+    },
+    {
+      "wrong": "dakenyang",
+      "right": "dah kenyang",
+      "note": "clip-7 ground-truth (operator-confirmed): 'dah kenyang' (already full). Garble of two words -> global dict fix (the dict may expand one unit into a short phrase; the LLM never splits).",
+      "status": "confirmed"
+    },
+    {
       "wrong": "nyoli-nyoli",
       "right": "",
       "note": "auto-harvested (conf 0.21) from \"Nyoli Setan, Kaki Tiket!\" at 1:11:11 - operator verify",
@@ -58,18 +83,6 @@
       "wrong": "bangke",
       "right": "",
       "note": "auto-harvested (conf 0.04) from \"Streamers game dialogue\" at 37:03 - operator verify",
-      "status": "unverified"
-    },
-    {
-      "wrong": "dakenyang",
-      "right": "",
-      "note": "auto-harvested (conf 0.04) from \"Streamers game dialogue\" at 36:44 - operator verify",
-      "status": "unverified"
-    },
-    {
-      "wrong": "buntur",
-      "right": "",
-      "note": "auto-harvested (conf 0.05) from \"Streamers game dialogue\" at 36:44 - operator verify",
       "status": "unverified"
     },
     {

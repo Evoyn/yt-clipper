@@ -166,15 +166,51 @@ conservative auto-fix (only replace into a real dictionary word). The operator's
 verdict decides. The two renders are `clip7_A_NO-correction.mp4` /
 `clip7_B_WITH-correction.mp4` in the guntur69 stream folder.
 
+### Narrowed to curated-only (2026-06-30, operator A/B feedback)
+
+The operator watched render B and reported the parts that were *worse*: the unsure
+**auto-fix guessed wrong** on this streamer's names/slang (the guest "Guntur", split
+by whisper into "Hai buntur", became "buntut"; `dakenyang` -> "dakanya"), and the
+**filler collapse ate real repeated shock-reactions** ("eh eh eh"). The curated
+overrides (`cok`, `tur`) were fine. Diagnosis: the model can't hear the audio, so on
+domain words it doesn't know (local names/slang) it produces confident-but-wrong
+guesses — exactly the ADR 0027 risk — and a blind collapse can't tell a hallucinated
+zero-width pile from genuine spaced repeats.
+
+So the pass was **narrowed to do only the one thing the global dict cannot**: apply a
+curated **context override** (a real word the streamer meant as slang/a name) where
+the context fits. Removed: the unsure-word auto-fix, the repeated-filler collapse, and
+all deletion. Consequences:
+
+- **Garbles/names are curated, not guessed.** They harvest -> the operator confirms ->
+  the deterministic dict fixes them (accurate; the operator is ground truth). This
+  session curated `dimalai-malai -> dimarahin`, `buntur -> Guntur` (+ a **multi-word**
+  `hai buntur -> Guntur` that collapses whisper's split and drops the spurious "Hai"),
+  `dakenyang -> dah kenyang`, and `teh -> eh` (context — `teh` is a real word "tea").
+- **Repeated reactions are kept.** No collapse; the timing pass already renders the
+  zero-width hallucination pile to ~nothing while the genuine spaced "eh"s show.
+- **The LLM applies only curated overrides**, index-anchored, refusing any other
+  change (`apply_correction` is curated-only; a non-curated replacement or a delete is
+  rejected). `build_correction_request` returns `None` when the store has no context
+  overrides, so a clip with none skips the GPU entirely.
+
+Re-rendered clip-7 (real path): B now reads `Guntur dah kenyang ... eh eh eh (kept) ...
+semua cok ... itu tur ... harus dimarahin ...` — every operator-flagged error fixed,
+"3 applied, 1 rejected" (the one non-curated guess refused). Remaining: the spurious
+confident `itu` (`yang horor itu`) is not dropped (this pass never deletes), and
+`diam dulu diam dulu` stays missing (whisper didn't hear it — audio limit, not
+linguistic). 30 transcribe tests green.
+
 ## Outcome
 
-**Integrated and re-validated; OFF by default, pending operator A/B (2026-06-30).**
-The render-path pass reproduces the spike's clip-7 result (`dimarahin`, `cok`, `tur`,
-zero over-correction) on the real beam transcript, plus a deterministic eh-spam
-collapse. Pure logic is unit-tested (11 correction tests); the `--features correct`
-bin builds; the default build is unchanged. It stays **off** until the operator A/Bs a
-real render and signs off — the enh over-claim lesson
-([[validate-on-production-path-before-claiming]]). Next levers if wanted: dropping a
-*confident* spurious word (the `itu` 1/4 miss), and per-Creator topic/name context so
-the corrector can fix names like `buntur -> Guntur` (it did when the guest was named
-in the topic).
+**Integrated, narrowed to curated-only after the operator's A/B, re-rendered; OFF by
+default, pending the operator's sign-off (2026-06-30).** The pass now applies only the
+operator's curated context overrides (the one thing the dict can't do safely);
+everything else is curated into the dict or left for the timing pass. Real clip-7
+render B fixes every error the operator flagged. It stays **off** (`--features
+correct`; `YC_CORRECT=0` disables at runtime for the A/B) until the operator signs off
+on the re-rendered B — the enh over-claim lesson
+([[validate-on-production-path-before-claiming]]). Open, lower-priority: dropping a
+*confident* spurious word (the `itu` miss) needs a safe rule; recovering whisper-missed
+speech (`diam dulu`) is an audio problem (the rejected/unvalidated enh path), not this
+pass's job.

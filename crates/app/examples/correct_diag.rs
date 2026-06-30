@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use yc_core::{Language, TimeRange};
 use yc_ingest::read_range_samples;
 use yc_transcribe::{
-    apply_correction, build_correction_request, collapse_adjacent_duplicates,
-    transcribe_range_full, CorrectionContext, DialectLexicon,
+    apply_correction, build_correction_request, transcribe_range_full, CorrectionContext,
+    DialectLexicon,
 };
 
 const MODEL_GGUF: &str = "models/qwen2.5-7b-instruct-q5_k_m.gguf";
@@ -49,23 +49,19 @@ fn main() -> anyhow::Result<()> {
     eprintln!("[correct_diag] transcribing {:.1}-{:.1}s ({:.1}s) on GPU...", start_s, end_s, (end_s - start_s));
     let (transcript, conf, _harvest) =
         transcribe_range_full(&model, &samples, lang, &lexicon, || false)?;
-    let mut units = transcript.units;
-    let mut conf = conf;
-    // Mirror the pipeline: collapse repeated-filler runs before building the request.
-    let removed = collapse_adjacent_duplicates(&mut units, &mut conf);
+    let units = transcript.units;
 
-    println!("=== correct_diag: {} [{:.1}-{:.1}s] {:?} — {} units ({} filler unit(s) collapsed) ===", wav.display(), start_s, end_s, lang, units.len(), removed);
+    println!("=== correct_diag: {} [{:.1}-{:.1}s] {:?} — {} units ===", wav.display(), start_s, end_s, lang, units.len());
     let n_overrides = lexicon.context_overrides().len();
     let n_corr = lexicon.corrections.iter().filter(|c| !c.right.is_empty() && !c.context).count();
     println!("dialect: {n_corr} global corrections, {n_overrides} context overrides\n");
-    println!("--- units (conf; [?] = unsure, eligible for auto-fix/drop) ---");
-    let mut n_unsure = 0;
+    println!("--- units (conf shown for diagnostics; the pass applies only curated context overrides) ---");
     for (i, u) in units.iter().enumerate() {
         let c = conf.get(i).copied().unwrap_or(0.0);
-        let mark = if c < 0.50 { n_unsure += 1; "[?]" } else { "   " };
+        let mark = if c < 0.50 { "[?]" } else { "   " };
         println!("{:>3} {:.2} {} {}", i + 1, c, mark, u.text);
     }
-    println!("({n_unsure}/{} unsure at <0.50)\n", units.len());
+    println!();
 
     let ctx = CorrectionContext {
         language: lang,
@@ -77,20 +73,13 @@ fn main() -> anyhow::Result<()> {
         let raw = std::fs::read_to_string(resp)?;
         println!("--- raw model reply ---\n{}\n", raw.trim());
         let mut corrected = units.clone();
-        let stats = apply_correction(&mut corrected, &conf, &lexicon, &raw);
+        let stats = apply_correction(&mut corrected, &lexicon, &raw);
         println!("--- correction stats ---\n{}\n", stats.summary());
-        println!("--- diff (only changed/dropped) ---");
-        // Walk both lists; a dropped unit shows as DEL, a changed one as before->after.
-        let mut bi = 0; // pointer into corrected
-        for (i, u) in units.iter().enumerate() {
-            match corrected.get(bi) {
-                Some(c) if (c.start_s - u.start_s).abs() < 1e-6 && c.end_s.to_bits() == u.end_s.to_bits() => {
-                    if c.text != u.text {
-                        println!("{:>3} CHANGE  {:>18}  ->  {}", i + 1, u.text, c.text);
-                    }
-                    bi += 1;
-                }
-                _ => println!("{:>3} DELETE  {:>18}", i + 1, u.text),
+        println!("--- diff (only changed) ---");
+        // The pass preserves unit count + timing, so units and corrected align 1:1.
+        for (i, (u, c)) in units.iter().zip(corrected.iter()).enumerate() {
+            if u.text != c.text {
+                println!("{:>3} CHANGE  {:>18}  ->  {}", i + 1, u.text, c.text);
             }
         }
         println!("\nbefore: {}", units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "));
@@ -99,8 +88,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // BUILD mode: write the sidecar request JSON.
-    match build_correction_request(&units, &conf, &lexicon, &ctx) {
-        None => println!("build_correction_request: None (nothing to correct)"),
+    match build_correction_request(&units, &lexicon, &ctx) {
+        None => println!("build_correction_request: None (no curated context overrides)"),
         Some(req) => {
             println!("--- system ---\n{}\n", req.system);
             println!("--- user ---\n{}\n", req.user);

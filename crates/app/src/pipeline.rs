@@ -777,23 +777,25 @@ fn run_llm_judge(
     serde_json::from_str(&out).context("parsing llm-judge verdicts")
 }
 
-/// LLM caption-correction pass (ADR 0030): hand whisper's caption units + per-unit
-/// confidence + the dialect store's context overrides + the clip's topic to the
-/// out-of-process `yc-llm-judge --correct`, then map its reply back onto the units
-/// under the confidence/curated guardrails (a confident word is changed only by a
-/// curated override; a spurious unsure word may be dropped; words are never added).
-/// Runs on the units **before** caption timing so a dropped word's slot is absorbed
-/// by the gap-fill. Best-effort: a missing sidecar/GGUF, a build-request no-op, or a
-/// sidecar failure leaves captions uncorrected — it never sinks a render. Off by
-/// default (compiled only under `--features correct`), pending operator sign-off on
-/// the real render (the enh over-claim lesson).
+/// LLM caption-correction pass (ADR 0030): hand whisper's caption units + the
+/// dialect store's curated **context overrides** + the clip's topic to the
+/// out-of-process `yc-llm-judge --correct`, then apply its reply — accepting **only**
+/// a curated override the model placed in context (`cowok -> cok`), refusing any
+/// other change. Garbles/names are left for the harvest -> curate -> dict loop, not
+/// guessed: the operator's real-render A/B showed the model guessing at un-curated
+/// garbles (the guest "Guntur" became "buntut") and collapsing real repeated
+/// reactions made captions *worse*, so this pass now does only the one thing the
+/// global dict can't — apply a real-word slang/name override in context. Runs
+/// **before** caption timing. Best-effort: a missing sidecar/GGUF, no curated
+/// overrides, or a sidecar failure leaves captions uncorrected — never sinks a
+/// render. Off by default (`--features correct` + the sidecar; `YC_CORRECT=0`
+/// disables at runtime for an A/B), pending operator sign-off.
 #[cfg(feature = "correct")]
 fn correct_captions(
     paths: &PipelinePaths,
     session: &Session,
     prepared: &PreparedClip,
     transcript: &mut Transcript,
-    conf: &mut Vec<f32>,
     lexicon: &yc_transcribe::DialectLexicon,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
@@ -809,13 +811,6 @@ fn correct_captions(
         tracing::info!("correct: sidecar or GGUF absent; captions left uncorrected");
         return;
     }
-    // Collapse whisper's repeated-filler hallucinations first (deterministic): cleans
-    // the "eh eh eh..." spam AND keeps the list short so the model's per-line index
-    // numbering stays aligned with the units (a long run made it miscount).
-    let removed = yc_transcribe::collapse_adjacent_duplicates(&mut transcript.units, conf);
-    if removed > 0 {
-        tracing::info!("correct: collapsed {removed} repeated filler unit(s)");
-    }
     // Topic for the corrector: the clip's generated title + the store's note. Safe
     // to feed a chat model (unlike whisper's initial_prompt, which it never reaches).
     let mut topic = prepared.title.clone().unwrap_or_default();
@@ -826,14 +821,14 @@ fn correct_captions(
         topic.push_str(&lexicon.note);
     }
     let ctx = yc_transcribe::CorrectionContext { language: session.vod.language, topic };
-    let Some(req) = yc_transcribe::build_correction_request(&transcript.units, conf, lexicon, &ctx)
+    let Some(req) = yc_transcribe::build_correction_request(&transcript.units, lexicon, &ctx)
     else {
-        return; // a clean clip with no overrides — nothing the model could safely do
+        return; // no curated context overrides — nothing for the LLM to apply
     };
     let _ = tx.send(Progress::Stage("Correcting captions (LLM)"));
     match run_llm_correct(&paths.llm_judge, &paths.llm_model, &req.system, &req.user, cancel) {
         Ok(raw) => {
-            let stats = yc_transcribe::apply_correction(&mut transcript.units, conf, lexicon, &raw);
+            let stats = yc_transcribe::apply_correction(&mut transcript.units, lexicon, &raw);
             tracing::info!("correct: {}", stats.summary());
         }
         Err(e) if cancel.is_cancelled() => tracing::info!("correct: cancelled ({e:#})"),
@@ -1261,8 +1256,8 @@ fn do_render(
             let _ = tx.send(Progress::Stage("Transcribing (whisper, GPU)"));
             let lexicon =
                 yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
-            #[cfg_attr(not(feature = "correct"), allow(unused_mut, unused_variables))]
-            let (mut transcript, mut conf, harvest) = yc_transcribe::transcribe_range_full(
+            #[cfg_attr(not(feature = "correct"), allow(unused_mut))]
+            let (mut transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
                 &paths.model,
                 &samples,
                 session.vod.language,
@@ -1296,7 +1291,7 @@ fn do_render(
             // behind the `correct` feature + the sidecar, off by default until the
             // operator A/Bs the real render (no repeat of the enh over-claim).
             #[cfg(feature = "correct")]
-            correct_captions(paths, session, prepared, &mut transcript, &mut conf, &lexicon, cancel, tx);
+            correct_captions(paths, session, prepared, &mut transcript, &lexicon, cancel, tx);
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.
