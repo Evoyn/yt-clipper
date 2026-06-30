@@ -432,6 +432,17 @@ pub fn youtube_fetch_chat(
 /// (CONTEXT.md: the Segment is always a little longer than the Clip).
 pub const SEGMENT_PAD_S: f64 = 2.0;
 
+/// How many times to attempt a Segment fetch. yt-dlp's `web_safari` HLS
+/// extraction intermittently fails format selection ("Requested format is not
+/// available") on an unlucky webpage response - bailing before the m3u8 stage,
+/// before any bytes download (ADR 0006's SABR-era flakiness). A fresh invocation
+/// almost always re-resolves itag 301, so the fetch is retried; a genuinely
+/// unfetchable range still errors after the final attempt. Tune-from-use.
+const SEGMENT_FETCH_ATTEMPTS: u32 = 4;
+/// Backoff between Segment-fetch attempts. Sleeps on the pipeline worker thread,
+/// never the UI thread.
+const SEGMENT_RETRY_BACKOFF_S: u64 = 3;
+
 /// Pad a Clip's range on both sides and clamp to the VOD (`[0, duration]`).
 pub fn pad_range(range: TimeRange, duration_s: Option<f64>) -> TimeRange {
     let start_s = (range.start_s - SEGMENT_PAD_S).max(0.0);
@@ -443,6 +454,10 @@ pub fn pad_range(range: TimeRange, duration_s: Option<f64>) -> TimeRange {
 }
 
 /// Fetch the padded Segment (HLS section download). Returns the file path.
+///
+/// Retries transient yt-dlp format-resolution failures up to
+/// [`SEGMENT_FETCH_ATTEMPTS`] times (one bad webpage response would otherwise
+/// abort a whole batch render); a user cancel is terminal and never retried.
 pub fn fetch_segment(
     sc: &Sidecars,
     url: &str,
@@ -450,15 +465,35 @@ pub fn fetch_segment(
     workdir: &Path,
     cancel: &CancelToken,
 ) -> Result<PathBuf> {
-    clear_prefix(workdir, "segment.");
-    run(
-        &sc.ytdlp,
-        &segment_args(url, padded, &sc.ffmpeg, workdir),
-        sc.deno_dir.as_deref(),
-        cancel,
-    )?;
-    single_with_prefix(workdir, "segment.")
-        .context("yt-dlp produced no segment.* (segment fetch)")
+    let args = segment_args(url, padded, &sc.ffmpeg, workdir);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=SEGMENT_FETCH_ATTEMPTS {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        // Start each attempt from a clean slate (a failed try may leave a .part).
+        clear_prefix(workdir, "segment.");
+        match run(&sc.ytdlp, &args, sc.deno_dir.as_deref(), cancel) {
+            Ok(()) => {
+                return single_with_prefix(workdir, "segment.")
+                    .context("yt-dlp produced no segment.* (segment fetch)");
+            }
+            // A cancel surfaces as a run error; it is terminal, not transient.
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "segment fetch attempt {attempt}/{SEGMENT_FETCH_ATTEMPTS} failed: {e:#}"
+                );
+                last_err = Some(e);
+                if attempt < SEGMENT_FETCH_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_secs(SEGMENT_RETRY_BACKOFF_S));
+                }
+            }
+        }
+    }
+    Err(last_err
+        .expect("loop body runs at least once")
+        .context(format!("segment fetch failed after {SEGMENT_FETCH_ATTEMPTS} attempts")))
 }
 
 /// What ffprobe tells us about a Segment (or any local media): the layout
