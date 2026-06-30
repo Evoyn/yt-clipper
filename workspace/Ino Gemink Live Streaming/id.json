@@ -57,6 +57,13 @@
       "context": false
     },
     {
+      "wrong": "horor itu",
+      "right": "horor",
+      "note": "clip-7 ground-truth (operator-confirmed): whisper consistently tacks a spurious 'itu' after 'horor' for this streamer (never means 'that horror'). Multi-word dict fix collapses 'horor itu' -> 'horor', dropping the residue while keeping 'yang'/'horor' as separate captions.",
+      "status": "confirmed",
+      "context": false
+    },
+    {
       "wrong": "nyoli-nyoli",
       "right": "",
       "note": "auto-harvested (conf 0.21) from \"Nyoli Setan, Kaki Tiket!\" at 1:11:11 - operator verify",

@@ -203,14 +203,21 @@ linguistic). 30 transcribe tests green.
 
 ## Outcome
 
-**Integrated, narrowed to curated-only after the operator's A/B, re-rendered; OFF by
-default, pending the operator's sign-off (2026-06-30).** The pass now applies only the
+**Integrated, narrowed to curated-only after the operator's A/B, and OPERATOR-SIGNED-OFF
+(2026-06-30): "90% correct" on the real clip-7 render.** The pass applies only the
 operator's curated context overrides (the one thing the dict can't do safely);
-everything else is curated into the dict or left for the timing pass. Real clip-7
-render B fixes every error the operator flagged. It stays **off** (`--features
-correct`; `YC_CORRECT=0` disables at runtime for the A/B) until the operator signs off
-on the re-rendered B — the enh over-claim lesson
-([[validate-on-production-path-before-claiming]]). Open, lower-priority: dropping a
-*confident* spurious word (the `itu` miss) needs a safe rule; recovering whisper-missed
-speech (`diam dulu`) is an audio problem (the rejected/unvalidated enh path), not this
+everything else is curated into the dict or left for the timing pass. The operator's
+two residual notes on render B were both addressed/explained: the spurious confident
+`itu` (`yang horor itu`) — the operator confirmed it is *always* a whisper artifact
+for this streamer, so a deterministic per-Creator multi-word rule `horor itu -> horor`
+now drops it (kept off the LLM, since a context-judged delete is the guessing to
+avoid); and `diam dulu diam dulu`, which whisper never transcribed (audio masking —
+not linguistic, not this pass's job; a separate mic track is the only real fix).
+It remains **off by default** (`--features correct` + the per-render toggle, ADR 0031;
+`YC_CORRECT=1` for headless) — opt-in, not because it's unproven but because the
+operator chose opt-in. The validate-before-claiming discipline held throughout
+([[validate-on-production-path-before-claiming]]). Open, lower-priority: a general
+safe rule for a *confident* spurious word (the per-Creator `horor itu` rule is the
+targeted version); recovering whisper-missed speech (`diam dulu`) is an audio problem
+(the rejected/unvalidated enh path), not this
 pass's job.

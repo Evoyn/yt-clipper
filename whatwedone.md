@@ -4,6 +4,24 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-06-30 (latest+) — you signed off the correction pass (90%); last residue fixed
+
+You watched the curated-only `clip7_B_WITH-correction.mp4` and called it **90% correct**.
+The two remaining notes are both handled:
+- **"itu" residue ("yang horor itu" → "yang horor"):** you confirmed whisper *always*
+  tacks a spurious "itu" after "horor" for this streamer, so a deterministic per-Creator
+  rule (`horor itu → horor`) now drops it — verified: the stray "itu" is gone, the
+  real "itu tur" stays. The pass still never deletes a real word on its own (the safety
+  that keeps it from eating good captions); this is your confirmed, targeted rule.
+- **"diam dulu" not captioned:** that's whisper never hearing it (game masks the voice),
+  not the correction — unfixable from the mixed VOD without a separate mic track.
+
+The correction pass is **validated and stays off-by-default by your choice** (tick the
+GUI checkbox, or `YC_CORRECT=1` headless). Curate going forward in the small per-clip
+files; confirmed fixes auto-promote to the streamer's store.
+
+---
+
 ## 2026-06-30 (latest) — per-Creator + per-clip caption dictionaries; GUI correction toggle
 
 You asked for an id.json per exported clip (easy to curate) plus a per-Creator one, and
