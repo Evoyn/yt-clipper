@@ -118,3 +118,26 @@ clips (e.g. #8, never rendered end-to-end) but needs re-validation on the Segmen
 path, and may be re-tuned or dropped. **Lesson: a spike must use the same audio
 source as production.** The remaining #7 errors are linguistic (mishear / slang /
 spurious word), addressed by the LLM correction pass (ADR 0030), not denoising.
+
+## Tuning probe (2026-06-30, later): attenuation strength + the "diam dulu" miss
+
+Chasing a whisper **miss** the operator flagged on clip-7 ("diam dulu diam dulu ah",
+never transcribed) led to probing `ENH_ATTEN_LIM_DB`. Made it runtime-overridable via
+**`YC_ENH_ATTEN`** (default still `12`), then swept it. Two findings, both confirming
+the source-sensitivity lesson:
+
+- **Strength is backwards from intuition, and source-dependent.** On the 16 kHz
+  `analysis.wav` region, `-a6` (gentler) *recovered* "diam" + the name "Guntur" and
+  killed the eh-loop, while `-a12`/`-a24`/`-a40` drove whisper into a long "eh"/"hey"
+  repetition loop. But on the production **Segment** audio, `-a6` did **not** recover
+  "diam" (it produced "jantung aja"), and it *scrambled* other words (`cowok→jok`,
+  `tidur→dur`) so the dialect overrides stopped matching — net worse for the slang.
+- **"diam dulu" is not reliably recoverable from the mixed VOD audio.** It is masked
+  game-over-voice; denoising trades it for different garbles. The real fix is the
+  streamer's **separate mic track**, which yt-clipper doesn't have (it works from the
+  mixed VOD). The repeated "eh"s there are largely *real reactions* the operator wants
+  kept, so removing them (as a strong denoise does) is also undesirable.
+
+Conclusion unchanged: **enh stays off**, now with a tuning knob for future probes; the
+caption wins come from the dialect dict + the (curated-only) LLM correction (ADR 0030),
+not denoising. `YC_ENH_ATTEN` lets the operator re-probe per-clip without a rebuild.

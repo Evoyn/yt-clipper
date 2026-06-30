@@ -35,127 +35,148 @@
       "wrong": "hai buntur",
       "right": "Guntur",
       "note": "clip-7 ground-truth (operator-confirmed): whisper split the guest's name into 'Hai buntur'; the multi-word dict fix collapses the pair to 'Guntur', dropping the spurious 'Hai'. Runs before the single-word buntur->Guntur.",
-      "status": "confirmed"
+      "status": "confirmed",
+      "context": false
     },
     {
       "wrong": "buntur",
       "right": "Guntur",
       "note": "clip-7 ground-truth (operator-confirmed): the guest's name 'Guntur' (@guntur69). Garble of a name -> safe global dict fix (catches a lone 'buntur' not preceded by 'Hai').",
-      "status": "confirmed"
+      "status": "confirmed",
+      "context": false
     },
     {
       "wrong": "dakenyang",
       "right": "dah kenyang",
       "note": "clip-7 ground-truth (operator-confirmed): 'dah kenyang' (already full). Garble of two words -> global dict fix (the dict may expand one unit into a short phrase; the LLM never splits).",
-      "status": "confirmed"
+      "status": "confirmed",
+      "context": false
     },
     {
       "wrong": "nyoli-nyoli",
       "right": "",
       "note": "auto-harvested (conf 0.21) from \"Nyoli Setan, Kaki Tiket!\" at 1:11:11 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "dijekat",
       "right": "",
       "note": "auto-harvested (conf 0.11) from \"Diskusi game biasa\" at 31:24 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Cimri",
       "right": "",
       "note": "auto-harvested (conf 0.11) from \"Diskusi game biasa\" at 31:51 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "ngomplok",
       "right": "",
       "note": "auto-harvested (conf 0.09) from \"Streamers Repetitive Chat\" at 46:49 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "sajil",
       "right": "",
       "note": "auto-harvested (conf 0.32) from \"Streamers Repetitive Chat\" at 47:00 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "bangke",
       "right": "",
       "note": "auto-harvested (conf 0.04) from \"Streamers game dialogue\" at 37:03 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "dimalai-malai",
       "right": "dimarahin",
       "note": "clip-7 ground-truth (operator-confirmed): garble of 'dimarahin' (got scolded). Unambiguous non-word -> safe as a GLOBAL dict fix (applied before the LLM pass; ADR 0030).",
-      "status": "confirmed"
+      "status": "confirmed",
+      "context": false
     },
     {
       "wrong": "kanan-kanan",
       "right": "",
       "note": "auto-harvested (conf 0.29) from \"Streamers game dialogue\" at 36:57 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Dapan",
       "right": "",
       "note": "auto-harvested (conf 0.14) from \"VS Miten, Aman Nih!!!\" at 1:22:03 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Amane",
       "right": "",
       "note": "auto-harvested (conf 0.25) from \"VS Miten, Aman Nih!!!\" at 1:22:06 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "ganjeng",
       "right": "",
       "note": "auto-harvested (conf 0.30) from \"Dua Kali Anjing Disuruh Turun\" at 1:15:31 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "bangke-bangke",
       "right": "",
       "note": "auto-harvested (conf 0.49) from \"Dua Kali Anjing Disuruh Turun\" at 1:15:25 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Goco",
       "right": "",
       "note": "auto-harvested (conf 0.13) from \"Pertanyaan Sederhana Ini?\" at 1:13:04 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Satoru",
       "right": "",
       "note": "auto-harvested (conf 0.19) from \"Pertanyaan Sederhana Ini?\" at 1:13:04 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "Mayonez",
       "right": "",
       "note": "auto-harvested (conf 0.30) from \"Pertanyaan Sederhana Ini?\" at 1:13:13 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "dulu-diam",
       "right": "",
       "note": "auto-harvested (conf 0.13) at 36:49 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "jembalin",
       "right": "",
       "note": "auto-harvested (conf 0.15) at 36:54 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     },
     {
       "wrong": "dimalai",
       "right": "",
       "note": "auto-harvested (conf 0.36) at 36:54 - operator verify",
-      "status": "unverified"
+      "status": "unverified",
+      "context": false
     }
   ]
 }

@@ -1138,7 +1138,23 @@ fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()>
 /// repetitions. The full default (100 dB) was *measured* to destroy masked speech
 /// (40 real units -> "eh" x211). Tune-from-use, like the caption-timing consts.
 #[cfg(feature = "enh")]
-const ENH_ATTEN_LIM_DB: &str = "12";
+const ENH_ATTEN_LIM_DB_DEFAULT: &str = "12";
+
+/// The DeepFilterNet attenuation limit (dB), overridable at runtime via
+/// `YC_ENH_ATTEN` for tuning without a rebuild. **Lower = gentler** (less noise
+/// suppression, more of the original mixed back). Measured on clip-7: the default
+/// `12` is too strong — it pushes whisper into a long "eh" repetition loop on a
+/// masked stretch — while `6` recovers the masked speech (e.g. "diam") and the
+/// name "Guntur" with no loop. Re-tune against a real render before changing the
+/// default (the ADR 0029 lesson: validate on the production Segment audio).
+#[cfg(feature = "enh")]
+fn enh_atten_lim_db() -> String {
+    std::env::var("YC_ENH_ATTEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ENH_ATTEN_LIM_DB_DEFAULT.to_string())
+}
 
 /// Extract `dur_s` of `src` from `seek_s` as a 48 kHz **mono** PCM wav — the
 /// DeepFilterNet input (the model is full-band 48 kHz). `-ss` before `-i`
@@ -1187,7 +1203,7 @@ fn run_deep_filter(deep_filter: &Path, in_wav: &Path, out_dir: &Path) -> Result<
     std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let args: Vec<String> = vec![
         "-a".into(),
-        ENH_ATTEN_LIM_DB.into(),
+        enh_atten_lim_db(),
         "-D".into(),
         "-o".into(),
         out_dir.display().to_string(),
