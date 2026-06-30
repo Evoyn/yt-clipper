@@ -798,6 +798,13 @@ fn correct_captions(
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) {
+    // Runtime A/B switch: a `correct` build runs the pass by default, but
+    // `YC_CORRECT=0` (or off/false/no) skips it — so the operator can A/B the
+    // corrected vs uncorrected render from ONE build, on the same fetched segment.
+    if std::env::var("YC_CORRECT").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
+        tracing::info!("correct: disabled via YC_CORRECT; captions left uncorrected");
+        return;
+    }
     if !paths.llm_judge.is_file() || !paths.llm_model.is_file() {
         tracing::info!("correct: sidecar or GGUF absent; captions left uncorrected");
         return;

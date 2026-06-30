@@ -149,6 +149,23 @@ an odd-but-confident `torah`, untouched. So the surgical, zero-over-correction
 behaviour holds on the un-curated path too (semantic correctness of the one fix is the
 operator's to confirm).
 
+### Real-render A/B (2026-06-30, this session)
+
+Rendered clip-7 both ways from the VOD (`--features correct,face`, cached
+`analysis.wav`), toggled by a new **`YC_CORRECT` env switch** (a `correct` build runs
+the pass unless `YC_CORRECT=0` — so the operator A/Bs from one build, same segment).
+The treatment render applied **4 corrections, 0 rejected**: `cok` + `tur` (curated),
+two unsure garble auto-fixes, plus the **21-unit filler collapse** — captions go from
+a `cowok / tidur` + `eh x22` mess to clean text. **But the real render also exposed a
+caveat the curated spike hid:** with only the generic per-language topic (no guest
+name), the two unsure auto-fixes were *questionable* — `buntur -> buntut`,
+`dakenyang -> dakanya` (neither clearly right; `buntur` is really the guest "Guntur").
+The curated + dict + collapse wins are solid; the **un-curated garble auto-fix is the
+weak spot** — the proper fix is curation (confirm `buntur -> Guntur`) or a more
+conservative auto-fix (only replace into a real dictionary word). The operator's A/B
+verdict decides. The two renders are `clip7_A_NO-correction.mp4` /
+`clip7_B_WITH-correction.mp4` in the guntur69 stream folder.
+
 ## Outcome
 
 **Integrated and re-validated; OFF by default, pending operator A/B (2026-06-30).**
