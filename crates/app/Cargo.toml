@@ -42,3 +42,9 @@ face = ["yc-frame/face"]
 # mixed analysis audio. Off by default; the export then captions the mix as
 # before. Only the caption source changes — the rendered clip's audio is the mix.
 sep = ["yc-detect/sep"]
+# Cleaned-voice captions (ADR 0029): runs the bundled `deep-filter` DeepFilterNet
+# sidecar (gentle -a12 denoise) over the caption audio before whisper, so the
+# streamer's voice reads above game SFX. Pulls NO new deps — the denoiser is an
+# external sidecar like ffmpeg/yt-dlp. Off by default; the export then captions the
+# mix. Takes precedence over `sep`; the rendered clip's audible audio is the mix.
+enh = []

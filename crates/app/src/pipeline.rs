@@ -64,6 +64,12 @@ pub struct PipelinePaths {
     /// `sep`-gated caption pass.
     #[cfg_attr(not(feature = "sep"), allow(dead_code))]
     pub sep_model: PathBuf,
+    /// The bundled `deep-filter` DeepFilterNet sidecar for Cleaned-voice captions
+    /// (`enh`, ADR 0029): a gentle denoise of the caption audio before whisper, so
+    /// the streamer's voice reads above game SFX. May be absent: the export then
+    /// captions the mixed analysis audio. Only read by the `enh`-gated caption pass.
+    #[cfg_attr(not(feature = "enh"), allow(dead_code))]
+    pub deep_filter: PathBuf,
     /// Directory of per-language dialect/slang correction stores (`<lang>.json`,
     /// see `yc_transcribe::DialectLexicon`). Primes whisper + patches known
     /// mishears; a missing file just disables the fix-ups for that language.
@@ -873,7 +879,7 @@ fn do_prepare(
 /// voice rather than the loudest sound in the mix. Otherwise it is the mixed
 /// analysis-wav range (the historical path). Either way the rendered clip's
 /// audible audio stays the mix — only what whisper *hears* changes.
-#[cfg_attr(not(feature = "sep"), allow(unused_variables))]
+#[cfg_attr(not(any(feature = "sep", feature = "enh")), allow(unused_variables))]
 fn caption_samples(
     paths: &PipelinePaths,
     session: &Session,
@@ -881,6 +887,38 @@ fn caption_samples(
     range: TimeRange,
     tx: &Sender<Progress>,
 ) -> Result<Vec<f32>> {
+    // Cleaned-voice captions (ADR 0029): a gentle DeepFilterNet denoise of the
+    // caption audio before whisper, so the streamer's voice reads above game SFX.
+    // Measured to recover masked speech while leaving clean clips intact; full
+    // denoise, by contrast, over-suppressed quiet speech to silence and whisper
+    // hallucinated. Takes precedence over `sep`; the clip's audible audio is the mix.
+    #[cfg(feature = "enh")]
+    {
+        if paths.deep_filter.is_file() {
+            let _ = tx.send(Progress::Stage("Cleaning voice"));
+            let wd = &session.data_dir;
+            let in48 = wd.join("_enh_in48k.wav");
+            let out_dir = wd.join("_enh_out");
+            let clean48 = out_dir.join("_enh_in48k.wav"); // deep-filter keeps the basename
+            let clean16 = wd.join("_enh_clean16k.wav");
+            // 48 kHz mono for the clip range, from the render source at its
+            // in-segment offset — the same window the mix would caption.
+            ffmpeg_extract_mono_48k(
+                &paths.ffmpeg,
+                &prepared.render_src,
+                prepared.seek_s,
+                range.duration_s(),
+                &in48,
+            )?;
+            run_deep_filter(&paths.deep_filter, &in48, &out_dir)?;
+            // Back to whisper's 16 kHz mono; the temp file spans exactly the range.
+            ffmpeg_resample_16k_mono(&paths.ffmpeg, &clean48, &clean16)?;
+            return yc_ingest::read_range_samples(
+                &clean16,
+                TimeRange { start_s: 0.0, end_s: range.duration_s() + 1.0 },
+            );
+        }
+    }
     #[cfg(feature = "sep")]
     {
         if paths.sep_model.is_file() {
@@ -948,8 +986,8 @@ fn ffmpeg_extract_stereo_44k(
     Ok(())
 }
 
-/// Resample a wav to whisper's 16 kHz mono PCM (the vocal stem -> caption input).
-#[cfg(feature = "sep")]
+/// Resample a wav to whisper's 16 kHz mono PCM (the cleaned/stem -> caption input).
+#[cfg(any(feature = "sep", feature = "enh"))]
 fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()> {
     let args: Vec<String> = vec![
         "-i".into(),
@@ -969,6 +1007,76 @@ fn ffmpeg_resample_16k_mono(ffmpeg: &Path, src: &Path, out: &Path) -> Result<()>
         .status()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
     anyhow::ensure!(status.success(), "ffmpeg vocal-sep resample failed ({status})");
+    Ok(())
+}
+
+/// Gentle DeepFilterNet attenuation limit (dB) for Cleaned-voice captions (ADR
+/// 0029): mixes ~12 dB of the original back, so quiet speech buried in game noise
+/// is denoised but never gated to the dead silence that makes whisper hallucinate
+/// repetitions. The full default (100 dB) was *measured* to destroy masked speech
+/// (40 real units -> "eh" x211). Tune-from-use, like the caption-timing consts.
+#[cfg(feature = "enh")]
+const ENH_ATTEN_LIM_DB: &str = "12";
+
+/// Extract `dur_s` of `src` from `seek_s` as a 48 kHz **mono** PCM wav — the
+/// DeepFilterNet input (the model is full-band 48 kHz). `-ss` before `-i`
+/// fast-seeks (the render source is the padded Segment, or the whole local file).
+#[cfg(feature = "enh")]
+fn ffmpeg_extract_mono_48k(
+    ffmpeg: &Path,
+    src: &Path,
+    seek_s: f64,
+    dur_s: f64,
+    out: &Path,
+) -> Result<()> {
+    let args: Vec<String> = vec![
+        "-ss".into(),
+        format!("{seek_s:.3}"),
+        "-t".into(),
+        format!("{dur_s:.3}"),
+        "-i".into(),
+        src.display().to_string(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        "48000".into(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-y".into(),
+        out.display().to_string(),
+    ];
+    let status = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    anyhow::ensure!(status.success(), "ffmpeg cleaned-voice extract failed ({status})");
+    Ok(())
+}
+
+/// Run the bundled `deep-filter` DeepFilterNet sidecar over `in_wav`, writing the
+/// cleaned wav into `out_dir` under the same file name. Gentle attenuation limit
+/// (`-a`) plus delay compensation (`-D`) so the cleaned audio stays time-aligned
+/// with the input for caption timing. The model is baked into the binary (no `-m`).
+#[cfg(feature = "enh")]
+fn run_deep_filter(deep_filter: &Path, in_wav: &Path, out_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let args: Vec<String> = vec![
+        "-a".into(),
+        ENH_ATTEN_LIM_DB.into(),
+        "-D".into(),
+        "-o".into(),
+        out_dir.display().to_string(),
+        in_wav.display().to_string(),
+    ];
+    let status = std::process::Command::new(deep_filter)
+        .no_console()
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning deep-filter at {}", deep_filter.display()))?;
+    anyhow::ensure!(status.success(), "deep-filter (cleaned voice) failed ({status})");
     Ok(())
 }
 
