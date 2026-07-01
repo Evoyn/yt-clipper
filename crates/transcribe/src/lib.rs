@@ -239,6 +239,14 @@ pub struct Correction {
     /// `cowok -> cok`, `tidur -> tur`). Inert unless the correction pass runs.
     #[serde(default)]
     pub context: bool,
+    /// Clip-scoped (2026-07-02): when true this correction applies to **this clip's**
+    /// render (via the layered merge) but is **not** auto-promoted to the per-Creator
+    /// store by [`DialectLexicon::promote_confirmed`] (ADR 0031). For a fix that is right
+    /// for one clip yet would be wrong globalized — a real word the streamer means
+    /// literally in most clips but as slang/an insult in this one (e.g. `pancingan ->
+    /// bajingan` on a single clip). Curated in the per-clip store, it stays there.
+    #[serde(default)]
+    pub clip_only: bool,
 }
 
 /// `names.json` — the roster of viewer names the streamer reads aloud, loaded
@@ -480,6 +488,7 @@ impl DialectLexicon {
                     note,
                     status: "unverified".into(),
                     context: false, // a harvested garble is a global fix-up, not a context override
+                    clip_only: false, // and it promotes to the Creator once confirmed (ADR 0031)
                 });
                 added += 1;
             }
@@ -506,8 +515,10 @@ impl DialectLexicon {
     /// Creator store already knows (by `wrong`). Creates/updates the Creator store
     /// (pretty-printed). So a fix curated once in a clip's store **sticks for the
     /// Creator** — it applies to every future clip of theirs (ADR 0031, the operator's
-    /// auto-promote choice). Best-effort: a read/serialize/write failure logs and
-    /// promotes nothing (never fails a render). Returns how many were promoted.
+    /// auto-promote choice). A **`clip_only`** correction is deliberately NOT promoted —
+    /// it stays scoped to its clip (2026-07-02). Best-effort: a read/serialize/write
+    /// failure logs and promotes nothing (never fails a render). Returns how many were
+    /// promoted.
     pub fn promote_confirmed(clip_path: &Path, creator_path: &Path, language: Language) -> usize {
         let clip: DialectLexicon = std::fs::read_to_string(clip_path)
             .ok()
@@ -516,7 +527,9 @@ impl DialectLexicon {
         let confirmed: Vec<&Correction> = clip
             .corrections
             .iter()
-            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty())
+            // Skip `clip_only` corrections: they are curated to fix THIS clip and would
+            // be wrong globalized to the Creator (2026-07-02).
+            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty() && !c.clip_only)
             .collect();
         if confirmed.is_empty() {
             return 0;
@@ -1407,6 +1420,35 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&creator).unwrap()).unwrap();
         assert!(saved.corrections.iter().any(|c| c.wrong == "cowok" && c.right == "cok" && c.context));
         assert_eq!(saved.corrections.iter().filter(|c| c.wrong == "buntur").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_confirmed_skips_clip_only() {
+        // A clip_only correction fixes THIS clip but must NOT rise to the Creator store
+        // (it would corrupt other clips where the word is literal) - 2026-07-02.
+        let dir = std::env::temp_dir().join("yc_promote_cliponly_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.json");
+        std::fs::write(
+            &clip,
+            r#"{"corrections":[
+            {"wrong":"buntur","right":"Guntur"},
+            {"wrong":"pancingan","right":"bajingan","clip_only":true}]}"#,
+        )
+        .unwrap();
+        let creator = dir.join("creator.json");
+        std::fs::write(&creator, r#"{"language":"id","corrections":[]}"#).unwrap();
+        let n = DialectLexicon::promote_confirmed(&clip, &creator, Language::Id);
+        assert_eq!(n, 1, "only the non-clip_only correction promotes");
+        let saved: DialectLexicon =
+            serde_json::from_str(&std::fs::read_to_string(&creator).unwrap()).unwrap();
+        assert!(saved.corrections.iter().any(|c| c.wrong == "buntur"));
+        assert!(
+            !saved.corrections.iter().any(|c| c.wrong == "pancingan"),
+            "clip_only stays scoped to its clip"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

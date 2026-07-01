@@ -74,3 +74,15 @@ unsigned-off status). It sets a `correct` bool on `Job::Render`, gating the
 **Shipped (2026-06-30).** Layered base/per-Creator/per-clip stores with auto-promotion,
 and a default-off GUI correction toggle. Tests green; default + all-feature builds
 clean. The correction pass itself stays off until the operator signs off (ADR 0030).
+
+## `clip_only` escape hatch (2026-07-02)
+
+Auto-promote assumes a confirmed per-clip fix is safe to globalize — true for garbles /
+non-words, **false for a real word** the streamer means literally in most clips but as
+slang/an insult in one (e.g. `pancingan -> bajingan` on a single clip; promoting it would
+turn every genuine "pancingan" into the swear on that Creator's other clips — the ADR 0030
+trap). Added **`clip_only: bool`** on `Correction` (serde-default false, so every existing
+store still parses): such a correction still applies to its clip via the layered merge, but
+`promote_confirmed` skips it, so it stays scoped. Before this, the operator had to render
+and then manually undo the promote leak (the 2026-07-02 `clip-31-22` pancingan fix).
+Unit-tested (`promote_confirmed_skips_clip_only`).

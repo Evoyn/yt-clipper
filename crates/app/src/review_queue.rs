@@ -161,6 +161,7 @@ mod tests {
             note: note.into(),
             status: "unverified".into(),
             context: false,
+            clip_only: false,
         }
     }
     fn confirmed(wrong: &str, right: &str) -> Correction {
@@ -170,6 +171,7 @@ mod tests {
             note: String::new(),
             status: "confirmed".into(),
             context: false,
+            clip_only: false,
         }
     }
 

@@ -4,6 +4,17 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 1) — a caption fix can now be scoped to ONE clip, without touching the streamer's other clips
+
+Autonomous overnight run, item 1. Earlier today's clip-31-22 fix (`pancingan → bajingan`)
+had a catch: any per-clip correction automatically **promotes** to the streamer's shared
+file — so a fix that's only right for one clip would wrongly apply to *all* their clips
+(I had to undo that by hand). Now a correction can be marked **clip-only**: it fixes just
+that clip and never spreads. Backward-compatible (every existing file still loads),
+unit-tested. This makes today's manual workaround automatic and durable. (ADR 0031.)
+
+---
+
 ## 2026-07-02 — tried to fix the "Diskusi biasa" clip's slang; mapped why the corrector can't reach it (and made the checker honest)
 
 Goal: finish item "A" — teach the caption corrector this clip's leftover slang
