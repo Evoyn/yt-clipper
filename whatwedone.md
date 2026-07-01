@@ -4,6 +4,42 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 6) — three new caption decode dials to try on hard clips (defaults untouched), and WHY decode changes keep breaking your curated fixes
+
+You asked for help with bad captions on noisy / fast-slang clips. I wired up the three
+standard whisper anti-hallucination settings the render never used, measured them on
+your two documented hard clips via the honest caption checker, and learned something
+that reframes the whole fight:
+
+- **`YC_SUPPRESS_NST=1`** (suppress whisper's "non-speech" junk tokens) on the "Diskusi
+  biasa" clip **recovered everything the rejected voice-cleaner recovered — from the
+  plain mix**: the missed 23–26s speech ("Mana dah ini anjing…"), the real "bangke" at
+  20s (was a mistimed 4-second "pusing"), "kamu main dulu". 23 → 40 words.
+- **But it also re-scrambled the exact words your curated fixes are keyed to**
+  (dijekat→dijegat, pancingan→Pacingan…), so `dicegat`, `bajingan bajingan`, `dah cok`,
+  `biadab anjing` all fell back to fresh garbles — the same trade that got the
+  denoiser shelved, twice. **The lesson (now written down as ADR 0033): your correction
+  store is keyed to whisper's garbles under ONE exact decode — ANY decode change is a
+  curation-breaking event.** That's why every "just improve the audio/decoder" attempt
+  keeps souring: it un-does your curation on already-fixed clips.
+- So: **all three dials ship OFF; a no-dials render is byte-identical to before**
+  (proven by diffing the checker's output). Use them per-clip, on NEW clips, BEFORE
+  curating: `YC_SUPPRESS_NST=1` (the promising one), `YC_CAPTION_NOCTX=1` (fresh slate
+  per 30s window — only matters on clips longer than 30s), `YC_VAD=1` (Silero speech
+  gating; needs the tiny model `fetch-models.ps1` now also fetches — measured a no-op
+  on your clips because loud game audio reads as "speech", kept for truly-quiet ones).
+- The infamous "eh"×115 pile on clip #7 is untouched by all three — it needs a
+  repetition guard in our own timing pass, not a decoder setting (queued as follow-up).
+- Bonus: the caption/correction checkers now actually SHOW their diagnostic logs
+  (which dialect store loaded, the decode settings used) — they were silently
+  swallowing them before.
+
+**Recommended flow for a new noisy clip:** run the checker twice (with and without
+`YC_SUPPRESS_NST=1`), keep whichever transcript misses less real speech, then curate
+against THAT decode's garbles.
+
+---
+
 ## 2026-07-02 (overnight 5) — the GPU-job repaint throttle now actually throttles
 
 The app was supposed to drop to ~10 fps while whisper/NVENC runs (so the UI doesn't

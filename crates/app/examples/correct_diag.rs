@@ -28,6 +28,15 @@ use yc_transcribe::{
 const MODEL_GGUF: &str = "models/qwen2.5-7b-instruct-q5_k_m.gguf";
 
 fn main() -> anyhow::Result<()> {
+    // Same subscriber as the app (see caption_diag): without one, the dialect
+    // store line, the caption decode config, and whisper.cpp's hooked logs are
+    // silently dropped. Logs to stderr; the report stays clean on stdout.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let mut a = std::env::args().skip(1);
     let wav = PathBuf::from(a.next().expect("usage: correct_diag <wav> <start_s> <end_s> [lang] [reqfile] [respfile]"));
     let start_s: f64 = a.next().expect("start_s").parse()?;

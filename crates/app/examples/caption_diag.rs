@@ -35,6 +35,16 @@ fn ts(t: f64) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Same subscriber as the app: without one, every tracing event — the dialect
+    // store line, the caption decode config, whisper.cpp's own hooked logs — is
+    // silently dropped, and the inspector hides exactly the context it exists to
+    // show. Logs go to stderr; the report stays clean on stdout.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let mut a = std::env::args().skip(1);
     let wav = PathBuf::from(a.next().expect("usage: caption_diag <wav> <start_s> <end_s> [lang]"));
     let start_s: f64 = a.next().expect("start_s").parse()?;

@@ -696,6 +696,60 @@ const HARVEST_MAX_PER_CLIP: usize = 8;
 /// render is not time-bound and accuracy is the goal. Tune-from-use.
 const BEAM_SIZE: i32 = 5;
 
+// --- caption decode trial knobs (2026-07-02, ADR 0033) -----------------------
+// OPT-IN anti-hallucination decoder settings for the CAPTION path only (the
+// beam/DTW load; detect refine is untouched). ALL DEFAULT OFF: an A/B on the
+// guntur69 "Diskusi" clip showed ANY decode perturbation reshuffles whisper's
+// garbles on a masked clip — suppress_nst alone recovered the missed 23-26 s
+// speech AND the mistimed "bangke" (what the rejected enh recovered), but it
+// also re-garbled every word the operator's curated corrections were keyed to
+// (dijekat->dijegat, pancingan->Pacingan...), silently breaking the curation.
+// The dialect store is coupled to the exact decoder config, so a decode change
+// is a curation-breaking event the operator must opt into per render — never a
+// silent default flip. Env knobs (the YC_ENH_ATTEN precedent), read here inside
+// the transcriber so every caption consumer — do_render AND the diag
+// inspectors — always decodes identically (the inspector-fidelity lesson,
+// ADR 0030).
+
+/// `YC_CAPTION_NOCTX=1` (trial, default off) decodes each 30 s window from a
+/// fresh slate (`no_context=true`). whisper seeds each window with the previous
+/// window's text, so on masked audio a window-1 hallucination propagates into
+/// window 2 — and promoted clips (30 s + up to 10 s loud pre-roll) cross that
+/// seam exactly at the loud Moment. Inert on a <=30 s (single-window) clip.
+fn parse_caption_noctx(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+
+/// `YC_SUPPRESS_NST=1` (trial, default off) suppresses whisper's non-speech
+/// tokens (music notes, bracketed sound-effect marks). Measured on the masked
+/// "Diskusi" clip to recover real missed speech (23 -> 40 units, the 23-26 s
+/// hole, "bangke") by redistributing probability off the junk tokens — and to
+/// re-garble the curated anchor words in the same stroke (see the module note).
+/// Worth trying on a NEW noisy clip before curating it; wrong for an
+/// already-curated one.
+fn parse_suppress_nst(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+
+/// `YC_VAD=1` (trial, default off) turns on whisper.cpp's built-in Silero VAD
+/// pre-segmentation: only voiced spans are decoded, so whisper never free-runs
+/// over a pure music/SFX window. Needs [`VAD_MODEL_FILE`] beside the whisper
+/// model. Measured a NO-OP on two masked gaming clips (Silero reads loud game
+/// audio as speech, so nothing was trimmed — byte-identical output); its value,
+/// if any, is on clips with real silent/music-only stretches. Timestamps are
+/// remapped through the VAD segment map; validate with `caption_diag` first.
+fn parse_vad_requested(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+
+/// The Silero VAD model (ggml), expected beside the whisper model:
+/// `models/ggml-silero-v5.1.2.bin` (whisper.cpp's pinned VAD release).
+const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
+
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
 /// Words whisper was least sure about (confidence below [`HARVEST_MAX_P`]) that
 /// the store doesn't already know — the review queue the auto-harvest appends,
 /// each paired with its confidence so the operator can prioritise. Skips short /
@@ -850,6 +904,10 @@ pub struct Transcriber {
     /// Beam-search decoding (ADR 0027) for accuracy on the caption path; greedy
     /// for the bulk text-only detect refine (speed). Tied to the DTW load.
     beam: bool,
+    /// Silero VAD model path when the caption path opted in (`YC_VAD=1` + the
+    /// model beside the whisper model) — pre-segments so whisper never decodes a
+    /// pure-noise window. `None` = VAD off (the default).
+    vad_model: Option<String>,
 }
 
 impl Transcriber {
@@ -887,9 +945,26 @@ impl Transcriber {
         }
         let ctx = WhisperContext::new_with_params(model, cparams)
             .with_context(|| format!("loading whisper model {}", model.display()))?;
+        // Opt-in VAD (caption load only): resolve the Silero model beside the
+        // whisper model. Requested-but-missing warns and runs without, so a
+        // stray YC_VAD=1 never sinks a render.
+        let vad_model = if dtw && parse_vad_requested(env_opt("YC_VAD").as_deref()) {
+            let path = model.with_file_name(VAD_MODEL_FILE);
+            if path.is_file() {
+                Some(path.to_string_lossy().into_owned())
+            } else {
+                tracing::warn!(
+                    "caption: YC_VAD=1 but {} is missing - VAD off",
+                    path.display()
+                );
+                None
+            }
+        } else {
+            None
+        };
         // The DTW (caption) load decodes with beam search for accuracy; the
         // text-only detect load stays greedy for speed (ADR 0027).
-        Ok(Self { ctx, beam: dtw })
+        Ok(Self { ctx, beam: dtw, vad_model })
     }
 
     /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
@@ -979,6 +1054,35 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_print_special(false);
+        // Caption-path decode trial knobs (2026-07-02, ADR 0033; see the parse_*
+        // docs). ALL OFF by default — a decode change re-garbles the words the
+        // operator's curated corrections are keyed to, so each is an explicit
+        // per-render opt-in. The detect load keeps whisper defaults regardless.
+        if self.beam {
+            // Fresh slate per 30 s window, UNLESS the store primes: whisper.cpp
+            // feeds `initial_prompt` through the same cross-window context
+            // (`prompt_past`) that `no_context` disables, so forcing no_context
+            // would silently kill opt-in priming.
+            let no_context =
+                prompt.is_empty() && parse_caption_noctx(env_opt("YC_CAPTION_NOCTX").as_deref());
+            let suppress_nst = parse_suppress_nst(env_opt("YC_SUPPRESS_NST").as_deref());
+            if no_context {
+                params.set_no_context(true);
+            }
+            if suppress_nst {
+                params.set_suppress_nst(true);
+            }
+            if let Some(vad) = self.vad_model.as_deref() {
+                params.set_vad_model_path(Some(vad));
+                params.set_vad_params(whisper_rs::WhisperVadParams::default());
+                params.enable_vad(true);
+            }
+            tracing::info!(
+                "caption decode: beam={BEAM_SIZE} no_context={no_context} \
+                 suppress_nst={suppress_nst} vad={}",
+                if self.vad_model.is_some() { "on" } else { "off" },
+            );
+        }
         // NOTE: we deliberately do NOT install whisper's abort callback here.
         // Installing it collapsed whisper's GPU throughput to a crawl (a
         // hung-looking ~5% util detect) under concurrent desktop GPU load -
@@ -1075,6 +1179,21 @@ pub fn transcribe_range_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_decode_trial_knobs_are_strictly_opt_in() {
+        // ALL default off (ADR 0033): a decode change re-garbles the words the
+        // curated corrections are keyed to, so it must never be a silent default.
+        assert!(!parse_caption_noctx(None));
+        assert!(parse_caption_noctx(Some("1")));
+        assert!(!parse_caption_noctx(Some("0")));
+        assert!(!parse_suppress_nst(None));
+        assert!(parse_suppress_nst(Some("1")));
+        assert!(!parse_suppress_nst(Some("0")));
+        assert!(!parse_vad_requested(None));
+        assert!(parse_vad_requested(Some("1")));
+        assert!(!parse_vad_requested(Some("true")));
+    }
 
     #[test]
     fn groups_leading_space_tokens_into_words_with_min_confidence() {

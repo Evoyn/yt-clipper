@@ -23,12 +23,28 @@ if (Test-Path $out) {
     if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE" }
 }
 
+# Silero VAD (ggml) from whisper.cpp's official VAD model repo (public, no token).
+# Opt-in caption pre-segmentation (YC_VAD=1, ADR 0033); tiny (~0.9 MB).
+$vad = "ggml-silero-v5.1.2.bin"
+$vadUri = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/$vad"
+$vadOut = Join-Path $models $vad
+
+if (Test-Path $vadOut) {
+    Write-Host "$vad already present -- skipping. Delete it to re-fetch."
+} else {
+    Write-Host "Downloading $vad (~0.9 MB) from Hugging Face..."
+    & curl.exe -L --fail --progress-bar -o $vadOut $vadUri
+    if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE" }
+}
+
 Write-Host "Recording versions..."
 $gb = [math]::Round((Get-Item $out).Length / 1GB, 2)
 $versions = @(
     "whisper model: $model (f16, M1 default)",
     "size: $gb GB",
     "source: $uri",
+    "vad model: $vad (Silero, opt-in YC_VAD=1 - ADR 0033)",
+    "vad source: $vadUri",
     "fetched: $(Get-Date -Format o)"
 )
 $versions | Out-File (Join-Path $models "VERSIONS.txt") -Encoding utf8
