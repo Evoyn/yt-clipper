@@ -436,7 +436,7 @@ pub fn youtube_fetch_audio(
     run(&sc.ytdlp, &audio_args(url, workdir), sc.deno_dir.as_deref(), cancel)?;
     let audio = single_with_prefix(workdir, "audio.")
         .context("yt-dlp produced no audio.* (import audio download)")?;
-    crate::extract_audio(&sc.ffmpeg, &audio, &analysis)?;
+    crate::extract_audio(&sc.ffmpeg, &audio, &analysis, cancel)?;
     Ok(analysis)
 }
 

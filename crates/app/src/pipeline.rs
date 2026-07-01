@@ -382,7 +382,7 @@ fn do_import(
     anyhow::ensure!(paths.ffmpeg.is_file(), "ffmpeg sidecar missing - run fetch-sidecars.ps1");
     match source {
         ImportSource::YouTube(url) => import_youtube(paths, url, language, cancel, tx),
-        ImportSource::Local(path) => import_local(paths, path, language, tx),
+        ImportSource::Local(path) => import_local(paths, path, language, cancel, tx),
     }
 }
 
@@ -459,6 +459,7 @@ fn import_local(
     paths: &PipelinePaths,
     path: PathBuf,
     language: Option<Language>,
+    cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<Session> {
     // A local file's Creator is the "local" placeholder (ADR 0015), so Auto
@@ -491,7 +492,7 @@ fn import_local(
 
     let _ = tx.send(Progress::Stage("Extracting audio"));
     let analysis_wav = data_dir.join("analysis.wav");
-    yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav)?;
+    yc_ingest::extract_audio(&paths.ffmpeg, &path, &analysis_wav, cancel)?;
 
     let project = save_project(&vod, &data_dir)?;
     Ok(Session {
@@ -1494,7 +1495,7 @@ fn do_render(
         &filtergraph,
         &out_name,
     );
-    yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args)?;
+    yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args, &|| cancel.is_cancelled())?;
 
     // Remember this Creator's Caption Style for the next import (ADR 0016).
     remember_creator_genre(&paths.workspace, &session.vod, caption_genre);

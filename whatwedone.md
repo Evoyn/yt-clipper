@@ -4,6 +4,17 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 9) — Cancel now actually stops the render and the audio extract
+
+Hitting **Cancel** only ever killed downloads (yt-dlp). The two longest local
+operations — the **NVENC export** and the whole-VOD **audio extraction** on import —
+ignored it: the button set a flag, the work ran to completion anyway, and only then did
+the app say "Cancelled". Both now poll the flag ~20x/second and kill the ffmpeg child
+within ~50ms of the click (unit-tested with a real process). Cancelling a batch render
+mid-encode no longer burns the rest of the encode first.
+
+---
+
 ## 2026-07-02 (overnight 8) — three caption-pipeline fixes: cleaner review queue, no more truncated corrections on long clips, no cross-seam word fusing
 
 - **The review queue stops collecting ghosts.** Words whisper hallucinates into a

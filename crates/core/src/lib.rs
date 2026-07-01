@@ -369,6 +369,29 @@ impl ProjectError {
     }
 }
 
+/// Wait on a spawned child, polling `should_cancel` (~20x/s); on cancel the
+/// child is killed and `None` is returned (else `Some(exit_status)`). For
+/// single-process children (ffmpeg extract / NVENC export) whose whole cost is
+/// wall-clock: without this, hitting Cancel merely sets a flag and the encode
+/// runs to completion before anything notices. The ingest `CancelToken` keeps
+/// its registered-PID *tree*-kill for yt-dlp, which spawns grandchildren.
+pub fn wait_killable(
+    child: &mut std::process::Child,
+    should_cancel: &dyn Fn() -> bool,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if should_cancel() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Write `contents` to `path` via a same-directory temp file + rename, so a
 /// crash / kill / power-loss mid-write can never leave a truncated file. Every
 /// persisted store (project.json, creators.json, review.json, the dialect
@@ -402,6 +425,44 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_killable_kills_a_running_child_on_cancel() {
+        // A child that would run ~10 s; an already-cancelled wait must kill it
+        // and return None promptly instead of letting it run to completion.
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "10", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("10");
+            c
+        };
+        let started = std::time::Instant::now();
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn test child");
+        let outcome = wait_killable(&mut child, &|| true).expect("wait");
+        assert!(outcome.is_none(), "cancelled wait reports None");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "child was killed, not waited out"
+        );
+        // And an un-cancelled wait returns the real exit status.
+        let mut quick = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "exit 0"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("true");
+            c
+        };
+        let mut child = quick.spawn().expect("spawn quick child");
+        let status = wait_killable(&mut child, &|| false).expect("wait").expect("not cancelled");
+        assert!(status.success());
+    }
 
     #[test]
     fn write_atomic_replaces_existing_and_leaves_no_temp() {

@@ -108,13 +108,26 @@ pub fn export_args(
 
 /// Run the export. ffmpeg runs with `workdir` as cwd so the relative ASS and
 /// `fontsdir=.` resolve (and Windows filtergraph path-escaping is avoided).
-pub fn run_export(ffmpeg: &Path, workdir: &Path, args: &[String]) -> Result<()> {
-    let status = std::process::Command::new(ffmpeg)
+/// `should_cancel` is polled while the encode runs: the NVENC export is the
+/// longest single child the app spawns, and before this a Cancel merely set a
+/// flag the worker read *after* the full encode finished.
+pub fn run_export(
+    ffmpeg: &Path,
+    workdir: &Path,
+    args: &[String],
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<()> {
+    let mut child = std::process::Command::new(ffmpeg)
         .no_console()
         .current_dir(workdir)
         .args(args)
-        .status()
+        .spawn()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    let status = yc_core::wait_killable(&mut child, should_cancel)
+        .context("waiting on ffmpeg export")?;
+    let Some(status) = status else {
+        anyhow::bail!("cancelled");
+    };
     anyhow::ensure!(status.success(), "ffmpeg export failed ({status})");
     Ok(())
 }

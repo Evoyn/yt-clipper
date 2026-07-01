@@ -99,17 +99,29 @@ pub fn extract_audio_args(video: &Path, out_wav: &Path) -> Vec<String> {
 /// Writes to a `.tmp` sibling and renames on success: the import caches any
 /// non-empty `analysis.wav` forever (re-import reuse), so a cancelled/killed
 /// extract must never leave a truncated wav behind to be silently analysed on
-/// every future import.
-pub fn extract_audio(ffmpeg: &Path, video: &Path, out_wav: &Path) -> Result<()> {
+/// every future import. `cancel` is polled while ffmpeg runs — a whole-VOD
+/// extract takes minutes on a long stream, and before this a Cancel merely set
+/// a flag the worker read after the extract finished.
+pub fn extract_audio(
+    ffmpeg: &Path,
+    video: &Path,
+    out_wav: &Path,
+    cancel: &youtube::CancelToken,
+) -> Result<()> {
     let mut name = out_wav.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".tmp");
     let tmp = out_wav.with_file_name(name);
     let args = extract_audio_args(video, &tmp);
-    let status = std::process::Command::new(ffmpeg)
+    let mut child = std::process::Command::new(ffmpeg)
         .no_console()
         .args(&args)
-        .status()
+        .spawn()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    let status = yc_core::wait_killable(&mut child, &|| cancel.is_cancelled())
+        .context("waiting on ffmpeg audio extract")?;
+    let Some(status) = status else {
+        anyhow::bail!("cancelled");
+    };
     anyhow::ensure!(status.success(), "ffmpeg audio extract failed ({status})");
     std::fs::rename(&tmp, out_wav)
         .with_context(|| format!("moving extracted audio into {}", out_wav.display()))?;
