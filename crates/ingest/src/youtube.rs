@@ -20,6 +20,7 @@ use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use yc_core::{Language, NoConsole, TimeRange, Vod, VodSource};
 
@@ -36,22 +37,24 @@ pub struct Sidecars {
 
 // --- cancellation -----------------------------------------------------------
 
-#[derive(Default)]
-struct CancelState {
-    cancelled: bool,
-    /// PID of the child currently being waited on, if any.
-    pid: Option<u32>,
-}
-
 /// Cooperative cancellation for ingest child processes. Cloneable and shareable
 /// across threads: one clone lives on the worker (which registers each child it
 /// waits on) and one on the UI (which flips the flag and kills the registered
-/// process tree). The shared `Mutex` makes register/cancel race-free - a cancel
-/// that lands between spawn and register is seen by `register`, which then tells
-/// the caller to kill immediately.
+/// process tree).
+///
+/// The flag is an `AtomicBool` because `is_cancelled` is the **hot** read — the
+/// detect loop polls it per candidate and the sidecar waits spin on it — and a
+/// Mutex lock per call was the M5 follow-up this replaces. The PID registry
+/// stays behind a `Mutex`: it is touched only at spawn/exit/cancel, and the lock
+/// is what keeps register/cancel race-free — `cancel` stores the flag **before**
+/// taking the registry lock, and `register` checks the flag **inside** it, so a
+/// cancel that lands between spawn and register either sees the registered PID
+/// (and kills it) or is seen by `register` (which tells the caller to kill).
 #[derive(Clone, Default)]
 pub struct CancelToken {
-    state: Arc<Mutex<CancelState>>,
+    cancelled: Arc<AtomicBool>,
+    /// PID of the child currently being waited on, if any.
+    pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl CancelToken {
@@ -60,24 +63,22 @@ impl CancelToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.state.lock().unwrap().cancelled
+        self.cancelled.load(Ordering::SeqCst)
     }
 
     /// Clear the flag and any registered PID. Call at the start of each job so a
     /// cancel of the previous job does not bleed into the next.
     pub fn reset(&self) {
-        let mut s = self.state.lock().unwrap();
-        s.cancelled = false;
-        s.pid = None;
+        *self.pid.lock().unwrap() = None;
+        self.cancelled.store(false, Ordering::SeqCst);
     }
 
-    /// Request cancellation and kill any currently-registered child tree.
+    /// Request cancellation and kill any currently-registered child tree. The
+    /// flag is set before the registry is read (see the type docs for why the
+    /// ordering closes the spawn/register race).
     pub fn cancel(&self) {
-        let pid = {
-            let mut s = self.state.lock().unwrap();
-            s.cancelled = true;
-            s.pid
-        };
+        self.cancelled.store(true, Ordering::SeqCst);
+        let pid = *self.pid.lock().unwrap();
         if let Some(pid) = pid {
             kill_tree(pid);
         }
@@ -86,16 +87,49 @@ impl CancelToken {
     /// Register a freshly-spawned child. Returns `false` if cancellation already
     /// fired (the caller must then kill the child and bail).
     fn register(&self, pid: u32) -> bool {
-        let mut s = self.state.lock().unwrap();
-        if s.cancelled {
+        let mut slot = self.pid.lock().unwrap();
+        if self.cancelled.load(Ordering::SeqCst) {
             return false;
         }
-        s.pid = Some(pid);
+        *slot = Some(pid);
         true
     }
 
     fn clear(&self) {
-        self.state.lock().unwrap().pid = None;
+        *self.pid.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_sets_the_flag_and_reset_clears_it() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        t.cancel();
+        assert!(t.is_cancelled(), "a cancelled token reports cancelled");
+        // Clones share state (worker + UI hold clones of one token).
+        let clone = t.clone();
+        assert!(clone.is_cancelled());
+        t.reset();
+        assert!(!t.is_cancelled(), "reset readies the token for the next job");
+        assert!(!clone.is_cancelled());
+    }
+
+    #[test]
+    fn register_refuses_after_cancel_so_the_caller_kills_the_child() {
+        let t = CancelToken::new();
+        t.cancel();
+        // The cancel landed between spawn and register: register must say no.
+        assert!(!t.register(4242), "register after cancel refuses");
+        t.reset();
+        assert!(t.register(4242), "after reset the next job registers normally");
+        t.clear();
+        // A cancel with no registered child just sets the flag (nothing to kill).
+        t.cancel();
+        assert!(t.is_cancelled());
     }
 }
 

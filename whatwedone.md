@@ -4,6 +4,17 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 4) — Cancel's hot flag no longer takes a lock
+
+Internal engineering (the M5 follow-up): the "did the operator hit Cancel?" check —
+polled constantly during detection and while waiting on the LLM sidecar — was locking a
+Mutex on every call. It's now a lock-free atomic flag; the child-process registry (the
+part that actually kills a download mid-flight) keeps its lock, with the ordering that
+makes "cancel lands exactly as a child spawns" safe spelled out and unit-tested for the
+first time. No behavior change.
+
+---
+
 ## 2026-07-02 (overnight 3) — importing a known streamer now remembers their language
 
 The Language picker gained an **"Auto (Creator's saved)"** option — and it's the new
