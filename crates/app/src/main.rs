@@ -9,6 +9,7 @@
 
 mod editor;
 mod pipeline;
+mod review_queue;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -292,6 +293,7 @@ fn main() -> eframe::Result<()> {
                 batch_selected: HashSet::new(),
                 render_queue: Vec::new(),
                 queue_idx: 0,
+                review: None,
                 to_worker,
                 from_worker,
                 cancel,
@@ -478,6 +480,10 @@ struct App {
     /// auto-renders each (Prepared -> Render) and advances on Done.
     render_queue: Vec<(TimeRange, Option<String>)>,
     queue_idx: usize,
+    /// The Caption review queue for the imported VOD's Creator (ADR 0032): the
+    /// per-Creator dialect store's harvested to-dos, curated in-app. `None` until a
+    /// VOD is imported; reloaded fresh on each import.
+    review: Option<review_queue::ReviewState>,
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
     cancel: CancelToken,
@@ -566,9 +572,14 @@ impl eframe::App for App {
                     moments,
                     transcripts,
                     llm_reasons,
+                    creator_store,
+                    video_id,
                 } => {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.analysis_wav = Some(analysis_wav);
+                    // Load this Creator's caption review queue (ADR 0032): the
+                    // per-Creator store's harvested to-dos, curated in the detail pane.
+                    self.review = Some(review_queue::ReviewState::load(creator_store, video_id));
                     // Seed the caption-style picker to this Creator's remembered
                     // choice (ADR 0016); the operator can still override it.
                     if let Some(genre) = caption_genre {
@@ -1039,7 +1050,97 @@ impl App {
     /// Right pane: the VOD overview waveform (click a marker to select) + the
     /// selected Moment's detail — signals, title, LLM reason, transcript, audio
     /// scrub, and the Promote action. An empty state when nothing is selected.
+    /// The Caption review queue (ADR 0032): surface the imported Creator's harvested
+    /// caption to-dos (blank-`right` corrections, ADR 0014/0022) grouped by source
+    /// clip, so the operator fills the correct word + Saves in-app instead of editing
+    /// JSON. Edits the per-Creator store directly (the promote target), so a Save is
+    /// durable for the Creator immediately. Save is disabled while a job runs, so it
+    /// never races the worker's mid-render `promote_confirmed`.
+    fn ui_review(&mut self, ui: &mut egui::Ui, working: bool) {
+        let Some(review) = self.review.as_mut() else { return };
+        let n = review_queue::todo_count(&review.lexicon.corrections);
+        let header = if n == 0 {
+            "Caption review queue".to_string()
+        } else {
+            format!("Caption review queue · {n} to-do{}", if n == 1 { "" } else { "s" })
+        };
+        egui::CollapsingHeader::new(egui::RichText::new(header).strong())
+            .id_salt("review-queue")
+            .default_open(n > 0)
+            .show(ui, |ui| {
+                if n == 0 {
+                    ui.weak("No caption to-dos — this Creator's captions are clean, or none harvested yet.");
+                    return;
+                }
+                ui.weak("Fill the word whisper should have written, then Save. Confirmed fixes apply to every future clip of this Creator (ADR 0031).");
+                ui.add_space(4.0);
+                // Build the grouped view (owns its rows + source indices), then edit
+                // corrections[idx] in place — the group holds no borrow into the store.
+                let groups = review_queue::group_unverified(&review.lexicon.corrections);
+                egui::ScrollArea::vertical().id_salt("review-rows").max_height(320.0).show(ui, |ui| {
+                    for g in &groups {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&g.title).color(theme::GOLD));
+                        for row in &g.rows {
+                            ui.horizontal(|ui| {
+                                ui.monospace(&row.wrong);
+                                if let Some(conf) = row.note.confidence {
+                                    ui.weak(format!("· conf {conf:.2}"));
+                                }
+                                if let Some(at) = row.note.at_s {
+                                    match review.video_id.as_deref() {
+                                        Some(vid) => {
+                                            ui.hyperlink_to(
+                                                format!("▶ {}", fmt_clock(at)),
+                                                review_queue::youtube_jump_url(vid, at),
+                                            );
+                                        }
+                                        None => {
+                                            ui.weak(format!("@ {}", fmt_clock(at)));
+                                        }
+                                    }
+                                }
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut review.lexicon.corrections[row.idx].right,
+                                    )
+                                    .desired_width(150.0)
+                                    .hint_text("correct word"),
+                                );
+                                ui.checkbox(
+                                    &mut review.lexicon.corrections[row.idx].context,
+                                    "context",
+                                )
+                                .on_hover_text("Tick for a real word the streamer means as slang or a name — routes through the LLM pass in context, not the always-on global dict (ADR 0030).");
+                            });
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!working, egui::Button::new("Save curation"))
+                        .on_hover_text("Writes workspace/<creator>/<lang>.json (ADR 0031)")
+                        .clicked()
+                    {
+                        review.status = match review.save() {
+                            Ok(k) => format!("Saved — {k} confirmed correction(s)."),
+                            Err(e) => format!("Save failed: {e}"),
+                        };
+                    }
+                    ui.weak(&review.status);
+                });
+            });
+        ui.add_space(8.0);
+        ui.separator();
+    }
+
     fn ui_detail(&mut self, ui: &mut egui::Ui, working: bool) {
+        // Caption review queue (ADR 0032): the Creator's harvested caption to-dos,
+        // curated in-app. Creator-level, so it shows regardless of Moment selection.
+        self.ui_review(ui, working);
+
         let mut tl_select: Option<u64> = None;
         if let Some(tl) = &self.timeline {
             let total_s = tl.loudness.len() as f64 * tl.bin_s;
@@ -1212,6 +1313,7 @@ impl App {
         self.timeline = None;
         self.selected = None;
         self.editor = None;
+        self.review = None;
         let _ = self.to_worker.send(Job::Import { source, language: self.language });
         self.status = Status::Working("Starting import".into());
     }

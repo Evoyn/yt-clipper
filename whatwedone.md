@@ -4,6 +4,26 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-01 — Caption review queue in the app (curate to-dos without opening JSON)
+
+You said id.json is hard to curate. Now you don't open it. Import a streamer's VOD and
+the detail pane shows a **Caption review queue** — every word whisper misheard that's
+still waiting on you (17 for Ino/@guntur69 right now), grouped by the clip each came from.
+
+- **Fill the right word, hit Save.** No JSON. Each row shows the garble, how unsure
+  whisper was, and a **click-to-hear** link that jumps straight to that moment in the
+  YouTube VOD so you can check what was actually said.
+- **A saved fix sticks for the whole streamer right away** — it writes their
+  `workspace/<creator>/id.json` directly (no re-render needed), so it applies to every
+  future clip of theirs.
+- **Tick "context"** for a real word the streamer means as slang or a name (like
+  cowok → cok) so it goes through the smart LLM pass, not the blunt global find-replace.
+- Save is greyed out while a job runs, so it can never collide with a render.
+
+No flags, no build features — it's just there after you import. (ADR 0032.)
+
+---
+
 ## 2026-06-30 (latest+) — you signed off the correction pass (90%); last residue fixed
 
 You watched the curated-only `clip7_B_WITH-correction.mp4` and called it **90% correct**.

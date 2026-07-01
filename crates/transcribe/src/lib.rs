@@ -714,6 +714,59 @@ fn vod_clock(t_s: f64) -> String {
     }
 }
 
+/// The parsed contents of a harvested to-do's provenance note (ADR 0022), for the
+/// caption review-queue UI (ADR 0032). The note is the single source of provenance
+/// (ADR 0022 deferred structured fields), so this parses it back: the UI groups by
+/// `title`, shows `confidence`, and builds a VOD jump link from `at_s`. Lenient — any
+/// field not present comes back `None` (a hand-written note still lists as a to-do).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HarvestNote {
+    pub confidence: Option<f32>,
+    pub title: Option<String>,
+    pub at_s: Option<f64>,
+}
+
+/// Parse a note written by [`DialectLexicon::harvest_to_file`] — e.g. `auto-harvested
+/// (conf 0.42) from "He LOST it on the boss" at 1:23:45 - operator verify` (or without
+/// the `from "..."` for a manual clip). Inverse of that `format!` + [`vod_clock`];
+/// pure, unit-tested. Hand-edited/unknown notes yield whatever fields are present.
+pub fn parse_harvest_note(note: &str) -> HarvestNote {
+    // confidence: `conf 0.42)` -> 0.42
+    let confidence = note
+        .split("conf ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|c| c.trim().parse::<f32>().ok());
+    // title: the text between `from "` and `" at ` (empty title -> None)
+    let title = note
+        .split("from \"")
+        .nth(1)
+        .and_then(|rest| rest.split("\" at ").next())
+        .map(|t| t.to_string())
+        .filter(|t| !t.is_empty());
+    // timestamp: the `h:mm:ss`/`m:ss` after the last ` at `, before ` - operator
+    // verify`. Anchoring on the trailer keeps a title containing " at " from fooling us.
+    let head = note.split(" - operator verify").next().unwrap_or(note);
+    let at_s = head
+        .rsplit(" at ")
+        .next()
+        .filter(|seg| *seg != head) // only if an " at " was actually present
+        .and_then(parse_vod_clock);
+    HarvestNote { confidence, title, at_s }
+}
+
+/// Inverse of [`vod_clock`]: `h:mm:ss` or `m:ss` -> seconds. `None` unless the string
+/// is a colon-separated clock of 2 or 3 numeric parts.
+fn parse_vod_clock(s: &str) -> Option<f64> {
+    let nums: Option<Vec<u64>> =
+        s.trim().split(':').map(|p| p.trim().parse::<u64>().ok()).collect();
+    match nums?.as_slice() {
+        [m, s] => Some((m * 60 + s) as f64),
+        [h, m, s] => Some((h * 3600 + m * 60 + s) as f64),
+        _ => None,
+    }
+}
+
 /// A word the harvest flags for review: the garbled text, the whisper confidence
 /// that flagged it, and its **clip-relative onset**. The onset lets the render
 /// record an absolute VOD timestamp (clip start + this) in the review note, so the
@@ -1183,6 +1236,51 @@ mod tests {
         assert_eq!(vod_clock(0.0), "0:00");
         assert_eq!(vod_clock(83.0), "1:23");
         assert_eq!(vod_clock(3723.0), "1:02:03"); // past an hour -> h:mm:ss
+    }
+
+    #[test]
+    fn parse_harvest_note_full_entry() {
+        // The exact shape harvest_to_file writes with a title (ADR 0022).
+        let n = "auto-harvested (conf 0.42) from \"He LOST it on the boss\" at 1:23:45 - operator verify";
+        let p = parse_harvest_note(n);
+        assert_eq!(p.confidence, Some(0.42));
+        assert_eq!(p.title.as_deref(), Some("He LOST it on the boss"));
+        assert_eq!(p.at_s, Some((3600 + 23 * 60 + 45) as f64));
+    }
+
+    #[test]
+    fn parse_harvest_note_no_title() {
+        // A manual clip (no generated title) degrades to `at h:mm:ss`.
+        let p = parse_harvest_note("auto-harvested (conf 0.13) at 36:49 - operator verify");
+        assert_eq!(p.confidence, Some(0.13));
+        assert_eq!(p.title, None);
+        assert_eq!(p.at_s, Some((36 * 60 + 49) as f64));
+    }
+
+    #[test]
+    fn parse_harvest_note_real_store_entries() {
+        // Verbatim from workspace/Ino Gemink Live Streaming/id.json.
+        let p = parse_harvest_note(
+            "auto-harvested (conf 0.21) from \"Nyoli Setan, Kaki Tiket!\" at 1:11:11 - operator verify",
+        );
+        assert_eq!(p.confidence, Some(0.21));
+        assert_eq!(p.title.as_deref(), Some("Nyoli Setan, Kaki Tiket!")); // comma + `!` survive
+        assert_eq!(p.at_s, Some((3600 + 11 * 60 + 11) as f64));
+    }
+
+    #[test]
+    fn parse_harvest_note_roundtrips_vod_clock() {
+        for t in [0.0, 59.0, 60.0, 3599.0, 3600.0, 4271.0] {
+            assert_eq!(parse_vod_clock(&vod_clock(t)), Some(t), "roundtrip {t}");
+        }
+    }
+
+    #[test]
+    fn parse_harvest_note_tolerates_junk() {
+        // A hand-written note with none of the machine fields -> all None, still a to-do.
+        assert_eq!(parse_harvest_note("some hand-written note"), HarvestNote::default());
+        assert_eq!(parse_vod_clock("not:a:clock"), None);
+        assert_eq!(parse_vod_clock("1:2:3:4"), None);
     }
 
     #[test]

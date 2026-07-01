@@ -148,6 +148,12 @@ pub enum Progress {
         moments: Vec<Moment>,
         transcripts: HashMap<u64, String>,
         llm_reasons: HashMap<u64, String>,
+        /// The per-Creator dialect store path (`workspace/<creator>/<lang>.json`, ADR
+        /// 0031) and the VOD's `video_id` (`None` for a local file), so the
+        /// review-queue panel (ADR 0032) can load + curate this Creator's caption
+        /// to-dos and deep-link each garble to its moment in the source VOD.
+        creator_store: PathBuf,
+        video_id: Option<String>,
     },
     /// Detection finished; ranked candidate Moments, each one's transcript text
     /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
@@ -255,6 +261,18 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 moments: s.moments.clone(),
                                 transcripts,
                                 llm_reasons,
+                                // Per-Creator store lives beside the stream folder:
+                                // workspace/<creator>/<lang>.json (ADR 0031), same path
+                                // do_render loads/promotes to.
+                                creator_store: s
+                                    .stream_dir
+                                    .parent()
+                                    .unwrap_or(s.stream_dir.as_path())
+                                    .join(format!("{}.json", dialect_lang_code(s.vod.language))),
+                                video_id: match &s.vod.source {
+                                    VodSource::YouTube { video_id } => Some(video_id.clone()),
+                                    VodSource::LocalFile { .. } => None,
+                                },
                             });
                             session = Some(s);
                             prepared = None; // a new VOD invalidates any prepared clip
