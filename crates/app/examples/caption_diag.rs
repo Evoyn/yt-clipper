@@ -1,16 +1,21 @@
 //! Caption-timing inspector (ADR 0013). Replays the REAL caption path over a wav
 //! range - whisper large-v3 + DTW (`transcribe_range`, exactly as `do_render`),
-//! then the real `refine_caption_timing` - and reports raw whisper units (flagging
-//! non-monotonic DTW onsets), the RMS envelope distribution, and a per-word verdict
-//! (dropped vs kept, each kept word's on-screen duration + what bounded it). The
-//! feedback loop ADR 0013's gap-fill decision was made and verified against; kept
-//! for future caption-timing work.
+//! then the real `refine_caption_timing_traced` - and reports raw whisper units
+//! (flagging non-monotonic DTW onsets), the RMS envelope distribution, and a
+//! per-word verdict (dropped vs kept, each kept word's on-screen duration + what
+//! bounded it). The feedback loop ADR 0013's gap-fill decision was made and verified
+//! against; kept for future caption-timing work.
 //!
 //!   scripts\cargo-cuda.bat run -p yt-clipper --example caption_diag -- workspace\9-X80Ozwo1I\analysis.wav 2049.5 2079.5 id
 //!
-//! Everything comes from the real functions - the only mirrored numbers are the
-//! MIN_READ/MAX_HOLD labels used to *describe* each kept word's limiter (not to
-//! recompute anything), so they cannot silently change the verdict.
+//! Everything comes from the real functions: the per-word verdict is read straight
+//! off `refine_caption_timing_traced` (the render's own keep/drop + re-timing
+//! decision, one entry per unit), NOT reconstructed from the output timing. The
+//! onset clamp (ADR 0019) can push a kept word's start onto the next word's onset,
+//! which made the old output-matching heuristic misreport it as DROP and desync
+//! every word after it (that was this tool's bug). The only mirrored numbers now are
+//! the MIN_READ/MAX_HOLD labels that *describe* each kept word's limiter - they
+//! cannot change the kept/dropped verdict, which is the trace's.
 
 use std::path::PathBuf;
 use yc_core::Language;
@@ -24,7 +29,6 @@ const ENV_HOP_S: f64 = 0.02;
 const ENV_WIN_S: f64 = 0.04;
 const SILENCE_DROP_FRAC: f32 = 0.10;
 const SILENCE_DROP_ABS: f32 = 0.006; // ADR 0021 absolute floor
-const PEAK_WINDOW_S: f64 = 0.6;
 
 fn ts(t: f64) -> String {
     format!("{:6.2}", t)
@@ -120,7 +124,9 @@ fn main() -> anyhow::Result<()> {
     }
     println!("(non-monotonic starts: {nonmono})");
 
-    // 2) RMS envelope distribution (context for the silence-drop).
+    // 2) RMS envelope distribution (context for calibrating SILENCE_DROP_ABS; the
+    // actual drop bar the render applies is reported with the verdict below, straight
+    // from the trace - not recomputed here).
     let hop = ((sr as f64) * ENV_HOP_S) as usize;
     let win = ((sr as f64) * ENV_WIN_S) as usize;
     let mut env = Vec::new();
@@ -131,78 +137,66 @@ fn main() -> anyhow::Result<()> {
         env.push((w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt());
         i += hop;
     }
-    // Keep `env` time-indexed for the per-word onset peak below; sort a clone for
-    // the percentile summary only.
-    let mut sorted = env.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pct = |p: f64| sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)];
-    let loud_ref = pct(0.95);
-    // Mirrors ass.rs (label only): relative bar SILENCE_DROP_FRAC*loud_ref, plus
-    // the ADR 0021 absolute floor SILENCE_DROP_ABS - the effective drop is the min.
-    let rel_drop = SILENCE_DROP_FRAC * loud_ref;
-    let eff_drop = rel_drop.min(SILENCE_DROP_ABS);
-    println!("\n--- RMS envelope ({} frames) ---", sorted.len());
+    env.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |p: f64| env[((env.len() as f64 * p) as usize).min(env.len() - 1)];
+    println!("\n--- RMS envelope ({} frames) ---", env.len());
     println!(
         "p10 {:.4}  p25 {:.4}  p50 {:.4}  p75 {:.4}  p90 {:.4}  p95(loud_ref) {:.4}  max {:.4}",
-        pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90), loud_ref, pct(1.0)
+        pct(0.10), pct(0.25), pct(0.50), pct(0.75), pct(0.90), pct(0.95), pct(1.0)
     );
-    println!(
-        "silence-drop: relative {:.4} (={:.2}*loud_ref), abs floor {:.4} -> effective {:.4}",
-        rel_drop, SILENCE_DROP_FRAC, SILENCE_DROP_ABS, eff_drop
-    );
-    let onset_peak = |start: f64| -> f32 {
-        let k0 = ((start * sr as f64 / hop as f64).round() as usize).min(env.len().saturating_sub(1));
-        let k1 = (((start + PEAK_WINDOW_S) * sr as f64 / hop as f64).round() as usize)
-            .max(k0 + 1)
-            .min(env.len());
-        env[k0..k1].iter().copied().fold(0.0_f32, f32::max)
-    };
 
-    // 3) Per-word verdict from the REAL refine. refined is the kept subsequence of
-    // raw (silence-drops removed) with each kept word's start possibly clamped
-    // FORWARD to its acoustic onset (ADR 0019) - so align by walking refined in
-    // order, matching a kept word when its (clamped) start sits in [raw onset, next
-    // raw onset). `lead` is how far the clamp pushed the start past the DTW onset.
-    let refined = yc_render::refine_caption_timing(raw.clone(), &samples, sr);
+    // 3) Per-word verdict, read straight off the REAL decision.
+    // `refine_caption_timing_traced` returns one outcome per raw unit, IN ORDER - the
+    // render's own keep/drop + re-timing - so the verdict is the trace itself, never a
+    // reconstruction from output timing. (The old loop matched the kept *subsequence*
+    // back onto the raw units by an "output start < next onset" window; the onset
+    // clamp can push a kept word's start onto the next onset, so that window failed on
+    // closely-spaced / clamped units - a false DROP, then a desync of every word
+    // after. Reading the 1:1 trace removes the whole class of error.)
+    let trace = yc_render::refine_caption_timing_traced(&raw, &samples, sr);
     let clip_end = samples.len() as f64 / sr as f64;
-    println!("\n--- refine verdict (real refine_caption_timing) ---");
-    println!("  (show = clamped start; lead = forward clamp applied to the DTW onset, ADR 0019)");
+    // The trace's own thresholds (the render's, not mirrored): the effective drop bar
+    // and its relative component, used only to annotate the drop lines below.
+    let trace_rel_drop = SILENCE_DROP_FRAC * trace.loud_ref;
+    println!("\n--- refine verdict (real refine_caption_timing_traced) ---");
+    println!(
+        "  (drop bar {:.4} = min(rel {:.4} = {:.2}*loud_ref {:.4}, abs {:.4}); show = clamped start; lead = forward clamp, ADR 0019)",
+        trace.silence_drop, trace_rel_drop, SILENCE_DROP_FRAC, trace.loud_ref, SILENCE_DROP_ABS
+    );
     let (mut kept, mut dropped, mut flash_with_room, mut held) = (0, 0, 0, 0);
     let (mut clamped, mut total_lead, mut max_lead) = (0, 0.0_f64, 0.0_f64);
     let mut max_dur = 0.0_f64;
-    let mut j = 0usize; // pointer into refined.units (the kept subsequence)
-    for (idx, u) in raw.units.iter().enumerate() {
+    for (idx, (u, outcome)) in raw.units.iter().zip(&trace.outcomes).enumerate() {
         let next = raw.units.get(idx + 1).map(|n| n.start_s).unwrap_or(clip_end);
         let room = next - u.start_s;
-        let matched = refined.units.get(j).filter(|r| r.start_s + 1e-6 >= u.start_s && r.start_s < next);
-        match matched {
-            None => {
+        match *outcome {
+            yc_render::UnitOutcome::Dropped { peak } => {
                 dropped += 1;
-                let pk = onset_peak(u.start_s);
                 // Flag a word the relative bar drops but the abs floor would keep -
-                // i.e. quiet-but-present speech wrongly dropped on a loud clip.
-                let rescue = if pk >= SILENCE_DROP_ABS && pk < rel_drop {
+                // quiet-but-present speech. (Only possible if SILENCE_DROP_ABS is ever
+                // raised above the relative bar; the render's bar is the min of the two,
+                // so this stays empty today - it is a tripwire, not a live case.)
+                let rescue = if peak >= SILENCE_DROP_ABS && peak < trace_rel_drop {
                     "  <- abs floor KEEPS (quiet speech)"
                 } else {
                     ""
                 };
                 println!(
-                    " DROP {:>3} [{}] peak {:.4} (rel bar {:.4}){}  {}",
-                    idx, ts(u.start_s), pk, rel_drop, rescue, u.text
+                    " DROP {:>3} [{}] peak {:.4} (bar {:.4}){}  {}",
+                    idx, ts(u.start_s), peak, trace.silence_drop, rescue, u.text
                 );
             }
-            Some(r) => {
-                j += 1;
+            yc_render::UnitOutcome::Kept { start_s, end_s } => {
                 kept += 1;
-                let lead = r.start_s - u.start_s;
+                let lead = start_s - u.start_s;
                 if lead > 1e-3 {
                     clamped += 1;
                     total_lead += lead;
                     max_lead = max_lead.max(lead);
                 }
-                let dur = r.end_s - r.start_s;
+                let dur = end_s - start_s;
                 max_dur = max_dur.max(dur);
-                let limiter = if (r.end_s - next).abs() < 1e-3 {
+                let limiter = if (end_s - next).abs() < 1e-3 {
                     "next"
                 } else if (dur - MAX_HOLD_S).abs() < 1e-3 {
                     held += 1;
@@ -216,7 +210,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 println!(
                     " keep {:>3} dtw[{}] show[{}-{}] lead +{:>4.2} dur {:>5.2} room {:>5.2} via {:<9} {}",
-                    idx, ts(u.start_s), ts(r.start_s), ts(r.end_s), lead, dur, room, limiter, u.text
+                    idx, ts(u.start_s), ts(start_s), ts(end_s), lead, dur, room, limiter, u.text
                 );
             }
         }
@@ -224,7 +218,13 @@ fn main() -> anyhow::Result<()> {
 
     println!("\n--- summary ---");
     println!("raw units:                 {}", raw.units.len());
-    println!("kept / dropped:            {} / {}", kept, dropped);
+    // kept + dropped must equal raw units: the verdict is 1:1 with the input (one
+    // trace outcome per unit). The old subsequence-matching loop could violate this
+    // by desyncing on a clamped unit - printing the reconciliation makes it visible.
+    println!(
+        "kept / dropped:            {} / {}  (sum {} == raw {})",
+        kept, dropped, kept + dropped, raw.units.len()
+    );
     println!("flashes WITH room (<MIN_READ but room to show longer - should be 0): {}", flash_with_room);
     println!("held at MAX_HOLD:          {}", held);
     println!("longest on-screen (s):     {:.2}", max_dur);

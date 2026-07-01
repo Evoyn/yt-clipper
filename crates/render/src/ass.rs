@@ -214,24 +214,66 @@ fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
     s
 }
 
-/// Synthesise each caption unit's on-screen end (ADR 0013), called on the render
-/// path before `generate_ass`. whisper's DTW gives a precise word *onset* but a
-/// zero-width *end*, so we **gap-fill**: a word shows from its onset until the next
-/// word's onset, capped at `MAX_HOLD_S` (never linger into a real pause) and
-/// floored at `MIN_READ_S` where there is room (never a sub-readable flash), one
-/// word at a time (the end never crosses the next onset). The earlier approach -
-/// ending a word when the *mixed* RMS envelope fell toward a per-clip baseline -
-/// set its threshold from the word's onset peak, which loud game SFX/music inflate,
-/// so words rode background transients and cleared too fast (or held too slow): see
-/// ADR 0013's diagnosis. The envelope now does one job only: **drop** a word whose
-/// onset window is in near-silence (whisper's spurious tokens on silent / pure-music
-/// windows, ADR 0007) - relative to the loud (p95) reference, so quiet real speech
-/// survives. `samples` is the clip's 16 kHz mono audio, aligned to the transcript's
-/// 0-based times.
-pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u32) -> Transcript {
+/// The fate of one input caption unit under [`refine_caption_timing`], in input
+/// order — the *real* keep/drop + re-timing decision, surfaced so an inspector
+/// (`caption_diag`) can report a trustworthy verdict without reverse-engineering
+/// it from the output. Reconstructing keep-vs-drop from output timing is unsafe:
+/// the onset clamp (ADR 0019) can push a kept word's start *forward all the way to
+/// the next word's onset*, so an "output start < next onset" heuristic misreads
+/// that kept word as dropped — and, walking a shrunken output against the full
+/// input, desyncs every unit after it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnitOutcome {
+    /// Dropped as near-silence: its onset-window peak stayed below `silence_drop`.
+    /// This is the **only** reason `refine_caption_timing` drops a unit — whisper's
+    /// spurious tokens on silent / pure-music windows (ADR 0007).
+    Dropped { peak: f32 },
+    /// Kept, re-timed to these onset-clamped (ADR 0019), gap-filled (ADR 0013) bounds.
+    Kept { start_s: f64, end_s: f64 },
+}
+
+/// The full decision trace of [`refine_caption_timing`]: one [`UnitOutcome`] per
+/// input unit (same order, same length), plus the thresholds it decided against —
+/// so a caller can explain a drop without mirroring the silence math.
+/// [`refine_caption_timing`] is a thin filter over [`refine_caption_timing_traced`],
+/// so the surviving subsequence and this trace can never disagree.
+#[derive(Debug, Clone)]
+pub struct RefineTrace {
+    /// Effective drop threshold: `min(SILENCE_DROP_FRAC * loud_ref, SILENCE_DROP_ABS)`
+    /// (ADR 0021). A unit is dropped iff its onset-window peak is below this.
+    pub silence_drop: f32,
+    /// p95 of the clip's RMS envelope — the loud reference the relative bar scales
+    /// from (`SILENCE_DROP_FRAC * loud_ref` is the relative half of `silence_drop`).
+    pub loud_ref: f32,
+    /// One outcome per input unit, in input order (1:1 with `transcript.units`).
+    pub outcomes: Vec<UnitOutcome>,
+}
+
+/// The real caption-timing decision (ADR 0013 + ADR 0019 + ADR 0021) as a per-unit
+/// [`RefineTrace`], the shared core of [`refine_caption_timing`]. Same inputs, same
+/// order; returns the fate + re-timing of *every* input unit (kept and dropped)
+/// instead of only the surviving subsequence. `caption_diag` reads this directly so
+/// its verdict is the render's actual decision, never a reconstruction. `samples`
+/// is the clip's 16 kHz mono audio, aligned to the transcript's 0-based times.
+pub fn refine_caption_timing_traced(
+    transcript: &Transcript,
+    samples: &[f32],
+    sr: u32,
+) -> RefineTrace {
+    // Degenerate input: nothing to measure. Match refine_caption_timing's early
+    // return — every unit is kept, unchanged, and no drop threshold applies.
+    let keep_all_unchanged = || RefineTrace {
+        silence_drop: 0.0,
+        loud_ref: 0.0,
+        outcomes: transcript
+            .units
+            .iter()
+            .map(|u| UnitOutcome::Kept { start_s: u.start_s, end_s: u.end_s })
+            .collect(),
+    };
     let n = samples.len();
     if n == 0 || sr == 0 || transcript.units.is_empty() {
-        return transcript;
+        return keep_all_unchanged();
     }
     let hop = ((sr as f64) * ENV_HOP_S).max(1.0) as usize;
     let win = ((sr as f64) * ENV_WIN_S).max(1.0) as usize;
@@ -246,7 +288,7 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
     }
     let n_env = env.len();
     if n_env == 0 {
-        return transcript;
+        return keep_all_unchanged();
     }
     let t_of = |k: usize| (k * hop) as f64 / sr as f64;
     let k_of = |t: f64| (((t * sr as f64) / hop as f64).round() as usize).min(n_env - 1);
@@ -263,7 +305,7 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
 
     let clip_end = t_of(n_env);
     let starts: Vec<f64> = transcript.units.iter().map(|u| u.start_s).collect();
-    let mut kept: Vec<CaptionUnit> = Vec::with_capacity(starts.len());
+    let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(starts.len());
     for idx in 0..starts.len() {
         let dtw_start = starts[idx];
         // The next word's onset bounds this one - one word on screen at a time.
@@ -277,6 +319,7 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
         let k_peak_end = k_of(dtw_start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
         if peak < silence_drop {
+            outcomes.push(UnitOutcome::Dropped { peak });
             continue;
         }
         // Onset clamp (ADR 0019): push the caption start forward to the acoustic
@@ -296,12 +339,44 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
         // MAX_HOLD and floored at MIN_READ where there is room; clamp to `next` LAST
         // so neither the cap nor the floor can produce an overlap (one word - ADR 0013).
         let end = (start + MAX_HOLD_S).min(next).max(start + MIN_READ_S).min(next);
-        let mut u = transcript.units[idx].clone();
-        u.start_s = start;
-        u.end_s = end;
-        kept.push(u);
+        outcomes.push(UnitOutcome::Kept { start_s: start, end_s: end });
     }
-    transcript.units = kept;
+    RefineTrace { silence_drop, loud_ref, outcomes }
+}
+
+/// Synthesise each caption unit's on-screen end (ADR 0013), called on the render
+/// path before `generate_ass`. whisper's DTW gives a precise word *onset* but a
+/// zero-width *end*, so we **gap-fill**: a word shows from its onset until the next
+/// word's onset, capped at `MAX_HOLD_S` (never linger into a real pause) and
+/// floored at `MIN_READ_S` where there is room (never a sub-readable flash), one
+/// word at a time (the end never crosses the next onset). The earlier approach -
+/// ending a word when the *mixed* RMS envelope fell toward a per-clip baseline -
+/// set its threshold from the word's onset peak, which loud game SFX/music inflate,
+/// so words rode background transients and cleared too fast (or held too slow): see
+/// ADR 0013's diagnosis. The envelope now does one job only: **drop** a word whose
+/// onset window is in near-silence (whisper's spurious tokens on silent / pure-music
+/// windows, ADR 0007) - relative to the loud (p95) reference, so quiet real speech
+/// survives. `samples` is the clip's 16 kHz mono audio, aligned to the transcript's
+/// 0-based times.
+///
+/// The keep/drop + re-timing logic lives in [`refine_caption_timing_traced`]; this
+/// is the filter that applies it, keeping only the surviving units. The two are
+/// derived from one pass, so they cannot disagree.
+pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u32) -> Transcript {
+    let trace = refine_caption_timing_traced(&transcript, samples, sr);
+    let units = std::mem::take(&mut transcript.units);
+    transcript.units = units
+        .into_iter()
+        .zip(trace.outcomes)
+        .filter_map(|(mut u, outcome)| match outcome {
+            UnitOutcome::Kept { start_s, end_s } => {
+                u.start_s = start_s;
+                u.end_s = end_s;
+                Some(u)
+            }
+            UnitOutcome::Dropped { .. } => None,
+        })
+        .collect();
     transcript
 }
 
@@ -731,6 +806,90 @@ mod tests {
         let r = refine_caption_timing(t, &samples, sr);
         let texts: Vec<&str> = r.units.iter().map(|u| u.text.as_str()).collect();
         assert_eq!(texts, vec!["loud", "quiet"], "abs floor keeps the quiet aside; silence dropped");
+    }
+
+    #[test]
+    fn trace_reports_kept_when_the_onset_clamp_reaches_the_next_onset() {
+        // The bug `caption_diag` had (this is the render-side guarantee that fixes it):
+        // it reconstructed keep-vs-drop by testing each kept word's *output* start
+        // against the next raw onset. The onset clamp (ADR 0019) can push a kept word's
+        // start FORWARD all the way to the next word's onset, so that "output start <
+        // next onset" test wrongly reported the word DROPped (and desynced every word
+        // after it). The trace reports the real per-unit decision, so a
+        // kept-but-clamped-to-next word reads Kept. "a" (dtw 0.10) and "b" (dtw 0.20)
+        // sit 0.10 s apart; no audio arrives until 0.30 s (past b's onset, beyond the
+        // 0.04 s envelope window's reach), so "a"'s forward clamp - bounded by the next
+        // onset - lands exactly on 0.20 == b's onset. Its (clamped) start therefore
+        // equals `next`, so the old "output start < next onset" test read false and
+        // reported "a" DROPped. Its peak window (0.10..0.70) still catches the 0.30 s
+        // speech, so refine keeps it - the trace must say Kept.
+        let sr = 16_000u32;
+        let mut samples = vec![0.0f32; sr as usize]; // 1 s
+        for s in samples.iter_mut().skip((0.30 * sr as f64) as usize) {
+            *s = 0.5; // speech only from 0.30 s on - past b's onset
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.10, end_s: 0.10 },
+                CaptionUnit { text: "b".into(), start_s: 0.20, end_s: 0.20 },
+            ],
+        };
+        let trace = refine_caption_timing_traced(&t, &samples, sr);
+        assert_eq!(trace.outcomes.len(), 2, "one outcome per input unit");
+        match trace.outcomes[0] {
+            UnitOutcome::Kept { start_s, .. } => {
+                // The clamp reached "b"'s onset (0.20) exactly - the condition (start ==
+                // next) that made the old diag misreport "a" as DROP and desync the rest.
+                assert!(start_s >= 0.20 - 1e-6, "a clamped up to b's onset, got {start_s}");
+            }
+            UnitOutcome::Dropped { peak } => panic!("a wrongly reported dropped (peak {peak})"),
+        }
+        assert!(matches!(trace.outcomes[1], UnitOutcome::Kept { .. }), "b must be kept");
+    }
+
+    #[test]
+    fn refine_output_is_exactly_its_trace_filtered() {
+        // `refine_caption_timing` is a thin filter over `refine_caption_timing_traced`:
+        // the surviving subsequence must equal the Kept outcomes applied in order, so
+        // the render and the inspector can never disagree. A clip with a genuine
+        // silence-drop exercises both arms.
+        let sr = 16_000u32;
+        // loud "a" 0.0-0.5, silence, loud "c" 2.0-2.5; spurious "b" at 1.0 in silence.
+        let mut samples = vec![0.0f32; 3 * sr as usize];
+        for s in samples.iter_mut().take((0.5 * sr as f64) as usize) {
+            *s = 0.5;
+        }
+        for s in samples.iter_mut().skip((2.0 * sr as f64) as usize).take((0.5 * sr as f64) as usize)
+        {
+            *s = 0.5;
+        }
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 0.4 },
+                CaptionUnit { text: "b".into(), start_s: 1.0, end_s: 1.1 },
+                CaptionUnit { text: "c".into(), start_s: 2.0, end_s: 2.4 },
+            ],
+        };
+        let trace = refine_caption_timing_traced(&t, &samples, sr);
+        let refined = refine_caption_timing(t.clone(), &samples, sr);
+        // Derive the expected kept units from the trace, the way `refine` does.
+        let expected: Vec<CaptionUnit> = t
+            .units
+            .iter()
+            .zip(&trace.outcomes)
+            .filter_map(|(u, o)| match *o {
+                UnitOutcome::Kept { start_s, end_s } => {
+                    Some(CaptionUnit { text: u.text.clone(), start_s, end_s })
+                }
+                UnitOutcome::Dropped { .. } => None,
+            })
+            .collect();
+        assert_eq!(refined.units, expected, "refine output == trace's Kept units");
+        assert!(matches!(trace.outcomes[1], UnitOutcome::Dropped { .. }), "silent b dropped");
+        let texts: Vec<&str> = refined.units.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "c"]);
     }
 
     #[test]
