@@ -4,6 +4,18 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 3) — importing a known streamer now remembers their language
+
+The Language picker gained an **"Auto (Creator's saved)"** option — and it's the new
+default. Import a streamer the app has rendered before and it applies the language you
+last used for them (from `creators.json`, which was recording languages all along but
+never reading them). Picking English/Bahasa/Nihongo explicitly still always wins, same
+for the CLI (`--headless <url> ... id` forces Id; omit the token for Auto). The Moments
+header now shows which language the import resolved to, so Auto is never a mystery.
+(ADR 0016; CONTEXT.md updated.)
+
+---
+
 ## 2026-07-02 (overnight 2) — the caption corrector now knows WHO is talking and WHAT the stream is
 
 The smart LLM caption pass used to be handed a useless "topic": a description of a

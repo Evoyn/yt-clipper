@@ -98,7 +98,11 @@ pub enum ImportSource {
 /// A unit of work requested by the UI. Cancel is out-of-band (the worker is
 /// busy inside a job), so it travels via the [`CancelToken`], not this channel.
 pub enum Job {
-    Import { source: ImportSource, language: Language },
+    /// `language: None` = **Auto** (the GUI default / an omitted CLI token): the
+    /// import applies this Creator's saved language from `creators.json` (ADR
+    /// 0016), falling back to Bahasa Indonesia for an unknown Creator. An explicit
+    /// `Some(lang)` (operator picked a language / CLI `en|id|ja`) always wins.
+    Import { source: ImportSource, language: Option<Language> },
     /// Run detection over the imported VOD (discover + refine), surfacing
     /// ranked candidate Moments (ADR 0007). Operates on the current session.
     Detect,
@@ -143,6 +147,10 @@ pub enum Progress {
     Imported {
         title: String,
         duration_s: Option<f64>,
+        /// The language this import resolved to — the operator's explicit pick, or
+        /// (on Auto) the Creator's saved default (ADR 0016) — so the UI can show
+        /// what the transcription will actually use.
+        language: Language,
         analysis_wav: PathBuf,
         caption_genre: Option<CaptionGenre>,
         moments: Vec<Moment>,
@@ -260,6 +268,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             let _ = tx_prog.send(Progress::Imported {
                                 title: s.vod.title.clone(),
                                 duration_s: s.vod.duration_s,
+                                language: s.vod.language,
                                 analysis_wav: s.analysis_wav.clone(),
                                 caption_genre: remembered_caption_genre(&paths.workspace, &s.vod),
                                 moments: s.moments.clone(),
@@ -366,7 +375,7 @@ fn fail_or_cancel(e: anyhow::Error, cancel: &CancelToken) -> Progress {
 fn do_import(
     paths: &PipelinePaths,
     source: ImportSource,
-    language: Language,
+    language: Option<Language>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<Session> {
@@ -377,10 +386,32 @@ fn do_import(
     }
 }
 
+/// The transcription language an import (`Auto`) falls back to when the Creator
+/// has no saved default — the operator's primary content language.
+const AUTO_LANGUAGE_FALLBACK: Language = Language::Id;
+
+/// Resolve an import's language (ADR 0016): an explicit operator pick wins;
+/// `None` (**Auto**) takes the Creator's saved language from `creators.json`
+/// (recorded on every render), else [`AUTO_LANGUAGE_FALLBACK`]. Applying the
+/// saved language is what makes the Creator store's recorded language *do*
+/// something — before this it was written but never read (CONTEXT.md).
+fn resolve_language(workspace: &Path, creator: &str, explicit: Option<Language>) -> Language {
+    if let Some(l) = explicit {
+        return l;
+    }
+    match CreatorStore::load(&creators_path(workspace)).get(creator).map(|c| c.language) {
+        Some(l) => {
+            tracing::info!("language: Auto -> {creator}'s saved default {l:?} (ADR 0016)");
+            l
+        }
+        None => AUTO_LANGUAGE_FALLBACK,
+    }
+}
+
 fn import_youtube(
     paths: &PipelinePaths,
     url: String,
-    language: Language,
+    language: Option<Language>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<Session> {
@@ -388,7 +419,12 @@ fn import_youtube(
     let sc = paths.sidecars();
 
     let _ = tx.send(Progress::Stage("Fetching metadata"));
-    let vod = yc_ingest::youtube_metadata(&sc, &url, language, cancel)?;
+    // The Creator's name is only known once the metadata arrives, so fetch with a
+    // provisional language, then resolve Auto against the Creator store.
+    let mut vod =
+        yc_ingest::youtube_metadata(&sc, &url, language.unwrap_or(AUTO_LANGUAGE_FALLBACK), cancel)?;
+    vod.language = resolve_language(&paths.workspace, &vod.creator, language);
+    let vod = vod;
     anyhow::ensure!(
         matches!(vod.source, VodSource::YouTube { .. }),
         "expected a YouTube VOD"
@@ -422,9 +458,12 @@ fn import_youtube(
 fn import_local(
     paths: &PipelinePaths,
     path: PathBuf,
-    language: Language,
+    language: Option<Language>,
     tx: &Sender<Progress>,
 ) -> Result<Session> {
+    // A local file's Creator is the "local" placeholder (ADR 0015), so Auto
+    // resolves to the language last rendered for local files, else the fallback.
+    let language = resolve_language(&paths.workspace, "local", language);
     // Absolutize: the export runs ffmpeg in the clip folder (so libass resolves
     // clip.ass + the font by relative name), so a relative source path would
     // resolve against the wrong cwd there. YouTube Segments are already absolute.
@@ -1719,6 +1758,23 @@ mod tests {
         assert_eq!(clip_title_stem(None, r), "clip-12-34");
         // A title that sanitizes to nothing also falls back to the timestamp.
         assert_eq!(clip_title_stem(Some("///"), r), "clip-12-34");
+    }
+
+    #[test]
+    fn resolve_language_applies_the_creators_saved_default_only_on_auto() {
+        let ws = std::env::temp_dir().join("yc_resolve_language_test");
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        // Auto + unknown Creator -> the fallback.
+        assert_eq!(resolve_language(&ws, "Somebody", None), AUTO_LANGUAGE_FALLBACK);
+        // Auto + a saved Creator language -> the saved language (ADR 0016)...
+        let mut store = CreatorStore::default();
+        store.upsert(Creator::new("Somebody".into(), Language::Ja));
+        store.save(&creators_path(&ws)).unwrap();
+        assert_eq!(resolve_language(&ws, "Somebody", None), Language::Ja);
+        // ...but an explicit operator pick always wins.
+        assert_eq!(resolve_language(&ws, "Somebody", Some(Language::En)), Language::En);
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]

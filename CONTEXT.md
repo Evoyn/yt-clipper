@@ -41,7 +41,7 @@ A VOD's output directory, `workspace/<creator>/<stream-title>/` (sanitized from 
 _Avoid_: workspace (that is the parent holding every stream folder), project folder
 
 **Creator store**:
-The global `workspace/creators.json` (`core::CreatorStore`) of per-Creator remembered defaults, keyed by Creator name (ADR 0016) — the long-deferred `creators.json`. Today it remembers a Creator's **Caption Style**: importing a known Creator's VOD seeds the render's genre to their last-used one, and each render saves it back (operator overrides always win). Language is recorded but not yet applied; seam/crop defaults are reserved for a later Creator-aware-framing slice.
+The global `workspace/creators.json` (`core::CreatorStore`) of per-Creator remembered defaults, keyed by Creator name (ADR 0016) — the long-deferred `creators.json`. Today it remembers a Creator's **Caption Style** and **language**: importing a known Creator's VOD seeds the render's genre to their last-used one, and an **Auto**-language import (the GUI/CLI default since 2026-07-02) applies the Creator's saved language — each render saves both back (operator overrides always win; explicit `en|id|ja` beats Auto). Seam/crop defaults are reserved for a later Creator-aware-framing slice.
 _Avoid_: project.json (that is per-VOD, under the stream folder's `data/`), dialect store (that is per-language transcription corrections)
 
 **Segment**:

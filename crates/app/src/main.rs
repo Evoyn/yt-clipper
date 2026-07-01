@@ -59,11 +59,7 @@ fn main() -> eframe::Result<()> {
             .clone();
         let start_s: f64 = argv.get(i + 2).and_then(|s| s.parse().ok()).expect("start_s");
         let end_s: f64 = argv.get(i + 3).and_then(|s| s.parse().ok()).expect("end_s");
-        let language = match argv.get(i + 4).map(|s| s.as_str()) {
-            Some("en") => Language::En,
-            Some("ja") => Language::Ja,
-            _ => Language::Id,
-        };
+        let language = parse_language(argv.get(i + 4).map(|s| s.as_str()));
         // Optional 6th arg picks the caption animation (M7): huge | rolling |
         // karaoke. Defaults to huge-word (the historical headless default).
         let caption_genre = parse_genre(argv.get(i + 5).map(|s| s.as_str()));
@@ -117,11 +113,7 @@ fn main() -> eframe::Result<()> {
     //   yt-clipper --detect <url-or-file> [en|id|ja]
     if let Some(i) = argv.iter().position(|a| a == "--detect") {
         let target = argv.get(i + 1).expect("--detect needs <url-or-file> [en|id|ja]").clone();
-        let language = match argv.get(i + 2).map(|s| s.as_str()) {
-            Some("en") => Language::En,
-            Some("ja") => Language::Ja,
-            _ => Language::Id,
-        };
+        let language = parse_language(argv.get(i + 2).map(|s| s.as_str()));
         let source = if target.starts_with("http") {
             ImportSource::YouTube(target)
         } else {
@@ -181,11 +173,7 @@ fn main() -> eframe::Result<()> {
     if let Some(i) = argv.iter().position(|a| a == "--batch") {
         let target =
             argv.get(i + 1).expect("--batch needs <url-or-file> [en|id|ja] [genre] [k]").clone();
-        let language = match argv.get(i + 2).map(|s| s.as_str()) {
-            Some("en") => Language::En,
-            Some("ja") => Language::Ja,
-            _ => Language::Id,
-        };
+        let language = parse_language(argv.get(i + 2).map(|s| s.as_str()));
         let caption_genre = parse_genre(argv.get(i + 3).map(|s| s.as_str()));
         let k: usize = argv.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(3);
         // Optional 6th arg picks the Layout for every clip (ADR 0017): auto |
@@ -274,7 +262,7 @@ fn main() -> eframe::Result<()> {
                 video_path: String::new(),
                 start_s: 0.0,
                 end_s: 30.0,
-                language: Language::Id,
+                language: None, // Auto: the Creator's saved language (ADR 0016)
                 caption_genre: CaptionGenre::HugeWord,
                 correct_captions: false, // opt-in (ADR 0031); off until the operator ticks it
                 layout_pref: LayoutPref::default(),
@@ -418,6 +406,10 @@ impl AppPaths {
 struct ImportedInfo {
     title: String,
     duration_s: Option<f64>,
+    /// What the import's language resolved to (the explicit pick, or — on Auto —
+    /// the Creator's saved default, ADR 0016), shown so the operator can see what
+    /// the transcription will use.
+    language: Language,
 }
 
 enum Status {
@@ -435,7 +427,11 @@ struct App {
     video_path: String,
     start_s: f64,
     end_s: f64,
-    language: Language,
+    /// Transcription language for the next import: `None` = **Auto** (apply the
+    /// Creator's saved language from `creators.json`, ADR 0016); `Some` = the
+    /// operator's explicit pick, which always wins. The import reports what it
+    /// resolved to via `Progress::Imported`.
+    language: Option<Language>,
     /// Caption animation for the next render (M7): huge-word / rolling-pop /
     /// karaoke-fill. A global selection for now; per-Clip override is later M7.
     caption_genre: CaptionGenre,
@@ -489,6 +485,15 @@ struct App {
     cancel: CancelToken,
 }
 
+/// Display label for a transcription language (the combo + the imported header).
+fn lang_label(l: Language) -> &'static str {
+    match l {
+        Language::En => "English",
+        Language::Id => "Bahasa Indonesia",
+        Language::Ja => "Nihongo",
+    }
+}
+
 fn fmt_duration(duration_s: Option<f64>) -> String {
     match duration_s {
         Some(d) => {
@@ -521,6 +526,19 @@ fn ellipsize(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
+/// Parse the headless / batch language arg: an explicit `en` / `id` / `ja` forces
+/// that language; anything else (omitted, or a following positional like the
+/// genre) is **Auto** — the import applies the Creator's saved language (ADR
+/// 0016), falling back to Bahasa Indonesia. Matches the GUI's Auto default.
+fn parse_language(arg: Option<&str>) -> Option<Language> {
+    match arg {
+        Some("en") => Some(Language::En),
+        Some("id") => Some(Language::Id),
+        Some("ja") => Some(Language::Ja),
+        _ => None,
     }
 }
 
@@ -567,6 +585,7 @@ impl eframe::App for App {
                 Progress::Imported {
                     title,
                     duration_s,
+                    language,
                     analysis_wav,
                     caption_genre,
                     moments,
@@ -576,7 +595,7 @@ impl eframe::App for App {
                     video_id,
                     clip_stores,
                 } => {
-                    self.imported = Some(ImportedInfo { title, duration_s });
+                    self.imported = Some(ImportedInfo { title, duration_s, language });
                     self.analysis_wav = Some(analysis_wav);
                     // Load this Creator's caption review queue (ADR 0032): the
                     // per-Creator store's harvested to-dos plus any per-clip stores'
@@ -856,14 +875,14 @@ impl App {
             ui.label("Language");
             egui::ComboBox::from_id_salt("lang")
                 .selected_text(match self.language {
-                    Language::En => "English",
-                    Language::Id => "Bahasa Indonesia",
-                    Language::Ja => "Nihongo",
+                    None => "Auto (Creator's saved)",
+                    Some(l) => lang_label(l),
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.language, Language::En, "English");
-                    ui.selectable_value(&mut self.language, Language::Id, "Bahasa Indonesia");
-                    ui.selectable_value(&mut self.language, Language::Ja, "Nihongo");
+                    ui.selectable_value(&mut self.language, None, "Auto (Creator's saved)");
+                    ui.selectable_value(&mut self.language, Some(Language::En), "English");
+                    ui.selectable_value(&mut self.language, Some(Language::Id), "Bahasa Indonesia");
+                    ui.selectable_value(&mut self.language, Some(Language::Ja), "Nihongo");
                 });
             ui.weak("(streamer, not the game)");
         });
@@ -945,15 +964,16 @@ impl App {
     fn ui_moments(&mut self, ui: &mut egui::Ui, working: bool) {
         ui.separator();
         let enabled = !working;
-        let Some((title, duration_s)) =
-            self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s))
+        let Some((title, duration_s, language)) =
+            self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s, i.language))
         else {
             ui.strong("2 · Moments");
             ui.weak("Import a VOD to detect Moments.");
             return;
         };
         ui.strong("2 · Moments");
-        ui.weak(format!("{title}  ({})", fmt_duration(duration_s)));
+        // Show the resolved language so an Auto import's Creator default is visible.
+        ui.weak(format!("{title}  ({} · {})", fmt_duration(duration_s), lang_label(language)));
         ui.add_enabled_ui(enabled, |ui| {
             if ui.button("Detect Moments").clicked() {
                 self.moments.clear();
