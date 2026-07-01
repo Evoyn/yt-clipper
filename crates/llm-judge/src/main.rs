@@ -52,11 +52,31 @@ const MAX_OUT_BYTES: usize = 1024;
 /// Context window for the caption correction (ADR 0030): a full caption plus
 /// slang/name hints runs longer than a judge prompt, so 4096.
 const N_CTX_CORRECT: u32 = 4096;
-/// Generated-token cap for one corrected caption. The index-anchored reply echoes
-/// every input line ("N: word"), so the cap scales with caption length: ~5 tokens
-/// per word covers a dense ~100-word clip (a noisy 30 s clip hit 57 units here),
-/// still well inside `N_CTX_CORRECT`. Bounds a runaway.
-const MAX_CORRECT_TOKENS: usize = 512;
+/// Floor for the corrected-caption token cap — the old fixed cap, kept as the
+/// minimum headroom for small clips. See [`correct_token_cap`].
+const MIN_CORRECT_TOKENS: usize = 512;
+/// Ceiling for the corrected-caption token cap: half of [`N_CTX_CORRECT`], so
+/// prompt + reply always fit. Bounds a runaway.
+const MAX_CORRECT_TOKENS: usize = 2048;
+
+/// Generated-token cap for one corrected caption, scaled to the request. The
+/// index-anchored reply echoes every input line ("N: word"), so a FIXED cap
+/// silently truncates dense clips — fast Indonesian speech runs 120-160 words
+/// in 30-40 s, past the ~100 words the old 512 covered, and `apply_correction`
+/// treats missing tail lines as "keep", so curated overrides in the tail were
+/// silently never applied. ~9 tokens per input line ("NNN: word\n", Indonesian
+/// words are 1-4 tokens) plus the floor's slack; clamped into
+/// [`MIN_CORRECT_TOKENS`], [`MAX_CORRECT_TOKENS`].
+fn correct_token_cap(user: &str) -> usize {
+    let n_lines = user
+        .lines()
+        .filter(|l| {
+            let d = l.bytes().take_while(u8::is_ascii_digit).count();
+            d > 0 && l.as_bytes().get(d) == Some(&b':')
+        })
+        .count();
+    (n_lines * 9).clamp(MIN_CORRECT_TOKENS, MAX_CORRECT_TOKENS)
+}
 
 fn main() -> Result<()> {
     // All logs to stderr; stdout is the JSON response channel and must stay clean.
@@ -119,9 +139,10 @@ fn run_correct() -> Result<()> {
     let model_path = v["model_path"].as_str().context("correct request: model_path missing")?;
     let system = v["system"].as_str().context("correct request: system missing")?;
     let user = v["user"].as_str().context("correct request: user missing")?;
-    tracing::info!("llm-correct: running caption-correction completion");
+    let cap = correct_token_cap(user);
+    tracing::info!("llm-correct: running caption-correction completion (token cap {cap})");
     let llm = Llm::load(Path::new(model_path))?;
-    let out = llm.complete(system, user, MAX_CORRECT_TOKENS)?;
+    let out = llm.complete(system, user, cap)?;
     drop(llm); // free the GGUF's VRAM before we exit
     std::io::stdout().write_all(out.as_bytes()).context("writing completion to stdout")?;
     Ok(())
@@ -300,5 +321,32 @@ fn piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>> {
             .token_to_piece_bytes(token, (-i) as usize, false, None)
             .map_err(|e| anyhow!("token_to_piece: {e}")),
         Err(e) => Err(anyhow!("token_to_piece: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correct_token_cap_scales_with_the_word_list() {
+        // Small clip -> the floor (the old fixed cap's headroom).
+        let small = "Language: Indonesian.\n1: halo\n2: dunia\n";
+        assert_eq!(correct_token_cap(small), MIN_CORRECT_TOKENS);
+        // A dense fast-speech clip (150 words) needs more than the old 512 —
+        // the truncated tail's curated overrides silently never applied.
+        let mut dense = String::from("Confirmed corrections: none\nWords:\n");
+        for i in 1..=150 {
+            dense.push_str(&format!("{i}: kata\n"));
+        }
+        assert_eq!(correct_token_cap(&dense), 150 * 9);
+        // A runaway-sized request still respects the ceiling (fits N_CTX_CORRECT).
+        let mut huge = String::new();
+        for i in 1..=1000 {
+            huge.push_str(&format!("{i}: kata\n"));
+        }
+        assert_eq!(correct_token_cap(&huge), MAX_CORRECT_TOKENS);
+        // Prose lines without the "N:" anchor don't count.
+        assert_eq!(correct_token_cap("no numbered lines here\n123 but no colon\n"), MIN_CORRECT_TOKENS);
     }
 }

@@ -1381,21 +1381,6 @@ fn do_render(
                     move || c.is_cancelled()
                 },
             )?;
-            // Auto-harvest this clip's unsure/unknown words to the PER-CLIP store
-            // (ADR 0031), so the operator curates a small per-export list (with each
-            // word's title + VOD timestamp, ADR 0022). Best-effort, never sinks render.
-            if lexicon.harvest {
-                let n = yc_transcribe::DialectLexicon::harvest_to_file(
-                    &clip_store,
-                    language,
-                    &harvest,
-                    range.start_s,
-                    prepared.title.as_deref(),
-                );
-                if n > 0 {
-                    tracing::info!("dialect: harvested {n} word(s) -> {}", clip_store.display());
-                }
-            }
             // Auto-promote (the operator's choice, ADR 0031): any correction they have
             // confirmed in this clip's store rises to the per-Creator store, so it
             // applies to every future clip of theirs. Best-effort.
@@ -1418,9 +1403,52 @@ fn do_render(
             if correct {
                 correct_captions(paths, session, prepared, &mut transcript, &lexicon, cancel, tx);
             }
+            // Auto-harvest this clip's unsure/unknown words to the PER-CLIP store
+            // (ADR 0031), so the operator curates a small per-export list (with each
+            // word's title + VOD timestamp, ADR 0022) — but only words the timing
+            // pass KEEPS. A unit the refine drops as near-silence is whisper
+            // hallucinating into a silent/music window; recording it would send the
+            // operator chasing a word that never appears in the caption (the trace
+            // is 1:1 with pre-refine units, so `unit_index` addresses it directly).
+            // Best-effort, never sinks the render.
+            if lexicon.harvest {
+                let trace = yc_render::refine_caption_timing_traced(
+                    &transcript,
+                    &samples,
+                    yc_ingest::WHISPER_SR,
+                );
+                let n_raw = harvest.len();
+                let kept: Vec<yc_transcribe::HarvestCandidate> = harvest
+                    .into_iter()
+                    .filter(|c| {
+                        matches!(
+                            trace.outcomes.get(c.unit_index),
+                            Some(yc_render::UnitOutcome::Kept { .. })
+                        )
+                    })
+                    .collect();
+                if kept.len() < n_raw {
+                    tracing::info!(
+                        "dialect: {} harvest candidate(s) skipped (unit silence-dropped)",
+                        n_raw - kept.len()
+                    );
+                }
+                let n = yc_transcribe::DialectLexicon::harvest_to_file(
+                    &clip_store,
+                    language,
+                    &kept,
+                    range.start_s,
+                    prepared.title.as_deref(),
+                );
+                if n > 0 {
+                    tracing::info!("dialect: harvested {n} word(s) -> {}", clip_store.display());
+                }
+            }
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.
+            // (Recomputes the same pure trace as the harvest filter above — the two
+            // can never disagree, and the envelope pass is trivial next to whisper.)
             yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR)
         };
         prepared.transcript = Some(transcript);

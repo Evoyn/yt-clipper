@@ -855,6 +855,12 @@ pub struct HarvestCandidate {
     pub word: String,
     pub confidence: f32,
     pub start_s: f64,
+    /// Index of the source unit in the transcript this candidate was harvested
+    /// from (pre-timing-refine order). Lets the render skip candidates whose unit
+    /// the timing pass then **drops** as near-silence — whisper hallucinating into
+    /// a silent/music window — so they never pollute the review queue with words
+    /// that aren't in the caption (ADR 0032).
+    pub unit_index: usize,
 }
 
 fn harvest_candidates(
@@ -874,7 +880,7 @@ fn harvest_candidates(
     }
     let mut out: Vec<HarvestCandidate> = Vec::new();
     let mut seen = HashSet::new();
-    for (u, &c) in units.iter().zip(conf.iter()) {
+    for (i, (u, &c)) in units.iter().zip(conf.iter()).enumerate() {
         if c >= HARVEST_MAX_P {
             continue;
         }
@@ -888,7 +894,12 @@ fn harvest_candidates(
             continue;
         }
         if !known.contains(&lc) && seen.insert(lc) {
-            out.push(HarvestCandidate { word: core, confidence: c, start_s: u.start_s });
+            out.push(HarvestCandidate {
+                word: core,
+                confidence: c,
+                start_s: u.start_s,
+                unit_index: i,
+            });
         }
     }
     out.sort_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal));
@@ -1110,13 +1121,27 @@ impl Transcriber {
             let segment = state
                 .get_segment(s)
                 .ok_or_else(|| anyhow!("segment {s} out of bounds mid-read"))?;
+            // A segment boundary always starts a new word. whisper emits most
+            // word-initial tokens space-led, but a segment's FIRST token can lack
+            // the space (after punctuation, or a mid-word window split) — the
+            // grouping would then fuse it onto the *previous segment's* last word,
+            // stretching that word's span across the 30 s seam. Mark the first
+            // real token space-led so `group_into_words` starts a fresh unit
+            // (JA chunking trims the space; EN/ID display trims it too).
+            let mut first_real_token = true;
             for t in 0..segment.n_tokens() {
                 let Some(token) = segment.get_token(t) else {
                     continue;
                 };
-                let text = token.to_str_lossy().context("reading token text")?.into_owned();
+                let mut text = token.to_str_lossy().context("reading token text")?.into_owned();
                 if is_special(&text) {
                     continue;
+                }
+                if first_real_token {
+                    first_real_token = false;
+                    if s > 0 && !(text.starts_with(' ') || text.starts_with('\u{2581}')) {
+                        text.insert(0, ' ');
+                    }
                 }
                 let data = token.token_data();
                 // Prefer the DTW-aligned time; fall back to the heuristic t0/t1
@@ -1324,6 +1349,11 @@ mod tests {
         let words: Vec<&str> = got.iter().map(|c| c.word.as_str()).collect();
         // least-confident first: lenjakgawa(0.10) before kusursekali(0.30)
         assert_eq!(words, vec!["lenjakgawa", "kusursekali"]);
+        // Each candidate addresses its source unit (pre-refine order), so the
+        // render can skip candidates whose unit the timing pass drops — the
+        // index survives the least-confident-first sort.
+        assert_eq!(got[1].unit_index, 4, "kusursekali is the 5th unit");
+        assert_eq!(units[got[0].unit_index].text, "lenjakgawa");
     }
 
     #[test]
@@ -1465,7 +1495,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let cands =
-            vec![HarvestCandidate { word: "garblexyz".into(), confidence: 0.42, start_s: 12.0 }];
+            vec![HarvestCandidate {
+                word: "garblexyz".into(),
+                confidence: 0.42,
+                start_s: 12.0,
+                unit_index: 0,
+            }];
         // Clip starts at 1:00:00 in the VOD; the word at +12 s -> 1:00:12.
         let n = DialectLexicon::harvest_to_store(
             &dir,

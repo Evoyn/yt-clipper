@@ -4,6 +4,25 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 8) — three caption-pipeline fixes: cleaner review queue, no more truncated corrections on long clips, no cross-seam word fusing
+
+- **The review queue stops collecting ghosts.** Words whisper hallucinates into a
+  silent/music stretch were being harvested into your per-clip review queue even though
+  the render itself then DROPS them (they never appear in the caption) — so you could
+  spend curation time on a word that isn't in any clip. Harvest now runs after the
+  keep/drop decision and only records words that actually render.
+- **The LLM corrector's reply no longer gets cut off on dense clips.** Its reply
+  echoes every word; the fixed 512-token cap covered ~100 words, but fast Indonesian
+  speech runs 120–160 words per clip — past the cap, your curated fixes in the clip's
+  tail were silently never applied. The cap now scales with the clip (up to 4x).
+- **A word can no longer fuse across whisper's 30s seam.** If a decode window's first
+  token arrives without its word marker, it used to glue onto the previous window's
+  last word, stretching one caption across the boundary. Now a window boundary always
+  starts a fresh word. (Verified: today's test clip decodes byte-identically — this is
+  a safety net for the rare case.)
+
+---
+
 ## 2026-07-02 (overnight 7) — your saved data can no longer be silently wiped by a crash
 
 A project-wide review found a quiet hazard: every saved file (`project.json`, the
