@@ -221,3 +221,80 @@ safe rule for a *confident* spurious word (the per-Creator `horor itu` rule is t
 targeted version); recovering whisper-missed speech (`diam dulu`) is an audio problem
 (the rejected/unvalidated enh path), not this
 pass's job.
+
+## Scope limits + declined extensions (2026-07-02)
+
+Attempted the deferred "finish A": curate the *Diskusi game biasa* clip's residual
+slang (1881.5-1911.5s) as context overrides and A/B. The grill-against-code +
+render-validation mapped exactly where this pass reaches and where it does **not**.
+Four targets, and what each ran into:
+
+| target | shape | outcome |
+|--------|-------|---------|
+| `pancingan -> bajingan` | 1-word real word, **doubled** by whisper | context:true applied **1-of-2** on the real render (see below) - declined |
+| `banget -> bangke` (2nd) | 1-word real word, **doubled** | too common to override + occurrence-targeting doesn't exist - declined |
+| `tadi luar -> dah cok` | 2-word -> 2-word | **no context:true path** (see limit 1) - declined |
+| `biasa kamu -> biadab anjing` | 2-word -> 2-word | same - declined |
+
+**Limit 1 - the pass is single-word-per-unit.** `apply_correction` matches one unit's
+core against one reply token (`parse_decisions` takes only the first whitespace token),
+and the override set is keyed `(single_wrong, single_right)`. A **multi-word** `wrong`
+or `right` can therefore never match a unit. And `apply_multiword_corrections`
+(the dict's collapse) **skips context:true** (`c.context` guard, lib.rs). So a
+**multi-word `context:true` entry applies nowhere** - the dict skips it, the LLM can't
+match it. It sits in the store looking curated and changes nothing (a silent no-op).
+Multi-word `wrong` is a **dict-only (context:false), global collapse** feature; there
+is no context-sensitive multi-word override.
+
+**Limit 2 - fragile on whisper's DOUBLED identical tokens.** whisper emitted `pancingan
+pancingan` and `banget banget` as adjacent identical units. The pass applies a curated
+override *"only where the context fits"* - a per-occurrence judgment. On identical
+adjacent tokens with weak context, the model can't tell them apart and **under-applies**:
+the real render corrected `pancingan pancingan` **1-of-2** -> the inconsistent
+`PANCINGAN BAJINGAN`. Qwen is **deterministic** (3/3 identical replies on a fixed
+request), so this is **topic-sensitivity, not randomness** - the exact same request
+always yields the same (incomplete) result. The pass's **reliable domain is SINGLE
+distinct occurrences** (clip-7's `cok`/`tur`/`teh` each appeared once); whisper's doubled
+tokens are beyond it. Forcing "all occurrences" would mean dropping the "only where
+context fits" guard - re-opening the over-correction the operator rejected. So a real
+word + doubled-by-whisper (like `pancingan`) is caught **between both mechanisms**: the
+dict would corrupt every genuine "pancingan" (the ADR 0030 trap), the LLM is unreliable
+on the double.
+
+**Defect found - `do_render` feeds a weak topic.** The "domain context" handed to the
+corrector (`correct_captions`, pipeline.rs) is `prepared.title + lexicon.note`. For a
+headless render `title` is `None`, and after layering `lexicon.note` is the **base
+store's meta-description** (*"Generic Indonesian base store (ADR 0031): shared config +
+the bundled real-word dictionary..."*) - a description of a *file*, not useful domain
+context. That weak topic is what tipped the `pancingan` 1-of-2 (a richer hand-written
+topic naming the streamer/genre got 2-of-2 offline). **Not fixed here** - and note that
+"tune the topic" is a band-aid, not a reliability fix (still topic-fragile across clips).
+The proper fix (feed real context - creator/guest names, genre - instead of the store
+meta-note) is a separate change.
+
+**`correct_diag` hardened (kept).** The correction inspector was **doubly unfaithful**:
+it loaded the base store only (`load`, not `load_layered` - the same stale-loader lie
+caption_diag had, ADR 0031 / commit 863af86) so it saw **0 context overrides**; and it
+**hardcoded** a richer topic than `do_render` sends. Both fixed - it now loads layered
+and builds its topic exactly like `do_render` (title+note), so it **faithfully
+reproduces the render** (including the 1-of-2). This is why the offline spike (even after
+the load_layered fix) still *lied* about `pancingan` (2-of-2) and only the **real render**
+caught it - a fresh instance of [[validate-on-production-path-before-claiming]]: a
+"production-path" spike can still diverge from production if any input (here, the topic)
+isn't identical. Render before signing off.
+
+**Decision.** Declined all four curations; **no store entries added** (the per-Creator
+store stays at its prior 25 confirmed). The clip is a fast/masked one *near whisper's
+limit* (the operator's own read), and its residual slang is not cleanly reachable. "A"
+concludes: **the LLM correction pass is validated for single distinct context overrides
+(clip-7) and its limits are now mapped** - it is not a tool for whisper's doubled tokens
+or multi-word phrases.
+
+**Open / deferred.** (a) `do_render`'s weak-topic defect (above). (b) If doubled-token
+real-word slang ever matters enough: a mechanism that applies a curated override to
+**all in-clip occurrences of a token** (reliable) while staying **context-scoped, not
+global** - bigger than v1, and weighed against the fact that these are marginal residuals.
+(c) Cosmetic: a dict-collapsed multi-word unit (e.g. `anjing ngeri`) echoes back and the
+single-token reply parser reads only `anjing` != `anjing ngeri`, so the guardrail counts
+a harmless "1 rejected" while correctly keeping the word - pre-existing, not a
+correctness bug.

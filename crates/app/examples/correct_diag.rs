@@ -42,8 +42,37 @@ fn main() -> anyhow::Result<()> {
 
     let model = PathBuf::from("models/ggml-large-v3.bin");
     anyhow::ensure!(model.is_file(), "whisper model missing: {}", model.display());
-    let dialect_dir = PathBuf::from("assets/dialect");
-    let lexicon = DialectLexicon::load(&dialect_dir, lang);
+
+    // Load the LAYERED dialect store the way do_render does (ADR 0031): base <
+    // per-Creator < per-clip, derived from the wav's location
+    // (`<workspace>/<creator>/<stream>/data/analysis.wav`). The bundled base is now
+    // generic (0 corrections since ADR 0031), so a plain `load` would see NO context
+    // overrides and always print `build_correction_request: None` - the same
+    // stale-loader lie caption_diag had (fixed 863af86), which would make this
+    // inspector useless for validating a per-Creator curated override. (Was `load`.)
+    let base_dir = PathBuf::from("assets/dialect");
+    let lc = match lang {
+        Language::En => "en",
+        Language::Ja => "ja",
+        Language::Id => "id",
+    };
+    let mut overlays: Vec<PathBuf> = Vec::new();
+    if let Some(stream_dir) = wav.parent().and_then(|d| d.parent()) {
+        if let Some(creator_dir) = stream_dir.parent() {
+            overlays.push(creator_dir.join(format!("{lc}.json"))); // per-Creator
+        }
+        if let Ok(rd) = std::fs::read_dir(stream_dir) {
+            let suffix = format!(".{lc}.json");
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.file_name().and_then(|n| n.to_str()).map(|n| n.ends_with(&suffix)).unwrap_or(false)
+                {
+                    overlays.push(p); // per-clip
+                }
+            }
+        }
+    }
+    let lexicon = DialectLexicon::load_layered(&base_dir, &overlays, lang);
 
     let samples = read_range_samples(&wav, TimeRange { start_s, end_s })?;
     eprintln!("[correct_diag] transcribing {:.1}-{:.1}s ({:.1}s) on GPU...", start_s, end_s, (end_s - start_s));
@@ -63,10 +92,13 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let ctx = CorrectionContext {
-        language: lang,
-        topic: "Indonesian horror-game live stream; streamer Ino with guest Guntur (@guntur69)".into(),
-    };
+    // Mirror do_render's topic EXACTLY (pipeline.rs `correct_captions`): the clip's
+    // generated title (absent for this inspector, as in a headless render) + the
+    // store `note`. A hardcoded topic here made the preview UNFAITHFUL: do_render's
+    // different topic string flips Qwen's decision on whisper's doubled tokens (it
+    // applied `pancingan pancingan` 1-of-2 vs this inspector's 2-of-2), which is the
+    // whole point of a preview - it must send the request do_render sends.
+    let ctx = CorrectionContext { language: lang, topic: lexicon.note.clone() };
 
     // APPLY mode: a response file is present -> apply it and show the diff.
     if let Some(resp) = respfile.as_ref().filter(|p| p.is_file()) {

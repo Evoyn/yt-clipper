@@ -4,6 +4,41 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 — tried to fix the "Diskusi biasa" clip's slang; mapped why the corrector can't reach it (and made the checker honest)
+
+Goal: finish item "A" — teach the caption corrector this clip's leftover slang
+(`pancingan→bajingan`, `banget→bangke`, `tadi luar→dah cok`, `biasa kamu→biadab anjing`)
+and A/B it with you. Outcome: **none of the four could be fixed cleanly — but I can now
+show you exactly why.** That's a real result, just not the hoped-for one. Your instinct
+to render before signing off is what caught it.
+
+- **Two are two-word phrases** (tadi luar, biasa kamu). The smart LLM pass only ever swaps
+  **one word for one word** — it structurally can't do a two-word fix. (Two-word fixes only
+  exist as a blunt global find-replace, which we won't use on real words.)
+- **The other two are words whisper said twice in a row** (`pancingan pancingan`,
+  `banget banget`). The LLM fixes a word "only where it fits the meaning" — and on two
+  identical back-to-back words it can't tell them apart, so on the **real render it fixed
+  only one of the two** (`PANCINGAN BAJINGAN` — worse than leaving both). So the pass is
+  reliable for slang that appears **once** (last clip's cok/tur/teh), not for whisper's
+  doubled words.
+- `banget` we wouldn't touch regardless — it's one of the commonest Indonesian words
+  ("very"), so a rule on it would misfire everywhere.
+
+**Nothing was added to the streamer's correction file** — this clip is, as you said, near
+whisper's limit, and its residual slang isn't cleanly reachable. Your already-confirmed
+fixes (dicegat, anjing ngeri) still work here.
+
+**Fixed the checker that briefly fooled us.** The offline correction preview (`correct_diag`)
+was reading the wrong dictionary (the empty base, not your streamer's file) **and** using a
+different "topic" than the real render — so it claimed the pancingan fix worked (2 of 2)
+when the render only did 1 of 2. Both fixed: it now reads your layered store and sends the
+*exact* request the render sends, so it can't give false confidence again (same class of
+"the tool was lying" bug we killed in the caption checker last session). Also flagged for
+later: the real render hands the LLM a near-useless "topic" (a description of a settings
+file instead of the streamer/game context) — worth fixing so it has real context next time.
+
+---
+
 ## 2026-07-01 (later 4) — the caption inspector (caption_diag) now tells the truth
 
 Last session the caption-checking tool `caption_diag` **lied**: on the guntur69 clip it
