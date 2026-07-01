@@ -141,3 +141,27 @@ the source-sensitivity lesson:
 Conclusion unchanged: **enh stays off**, now with a tuning knob for future probes; the
 caption wins come from the dialect dict + the (curated-only) LLM correction (ADR 0030),
 not denoising. `YC_ENH_ATTEN` lets the operator re-probe per-clip without a rebuild.
+
+## Re-validation on a 2nd clip's production path (2026-07-01)
+
+The review-queue work surfaced a fresh bad-caption clip — the guntur69 "Diskusi game
+biasa" moment (1881.5–1911.5 s): fast masked slang with a ~3 s stretch (23–26 s) whisper
+misses entirely. A `caption_diag` spike on the 16 kHz `analysis.wav` at `-a6` *again*
+looked like a clean win (recovered the 23–26 s "Mana… Anjing pusing…" and fixed a
+mistimed "pusing"→"bangke"). **But a real `--features enh,face` render on the production
+Segment path (`YC_ENH_ATTEN=6`) confirmed the trade-off, not a win** — the same
+analysis.wav-vs-Segment divergence that overturned the #7 claim:
+
+- **Recovered:** the 23–26 s hole ("MANA DAH INI ANJING GUSING…"), "KAMU MAIN DULU",
+  "BANGKE" at 20 s (was a mistimed "pusing"), "BANGKE" as the 2nd repeat at 29 s.
+- **Scrambled (the cost):** `dijekat`→**`DIJEGAN`**, which **broke the curated
+  `dijekat→dicegat` correction** (the mixed render captions it right); `pancingan`→
+  `BACINGAN`; a spurious `TORBIANTE`; + 4 new enh-only harvested garbles.
+
+So on the production path enh **trades missed speech for different garbles and can break
+curated corrections** — the ADR 0029 conclusion, now with a 2nd clip. The mixed render +
+the dialect corrections is the *cleaner* result here; the 23–26 s miss is an audio limit
+(the streamer's separate mic track is the only clean fix). **enh stays off.** Lesson
+re-confirmed — the analysis.wav spike over-promised again, so benchmark enh on the
+**Segment/render path**, never the analysis.wav. Both renders kept for A/B in the stream
+folder: `clip-31-22.mp4` (mix + curation) vs `clip-31-22 (2).mp4` (enh).

@@ -4,6 +4,21 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-01 (later 3) — tested cleaned-voice (enh) on a hard clip: recovers, but trades for garbles
+
+You flagged that the "Diskusi biasa" clip still has bad captions — missed speech (23–26s)
+and misplaced words. I tested the cleaned-voice denoiser (enh) on it end-to-end. Result:
+it **does** recover the missed speech and fix the timing (BANGKE at 20s, "kamu main dulu",
+the 23–26s hole) — **but it scrambles other clean words** (it turned the correct "dicegat"
+back into a garble "dijegan"). That's the same trade-off that shelved enh before, now
+confirmed on a 2nd clip's real render. So enh **stays off**; the mixed audio + your
+corrections is the cleaner result. This clip's missing bits are a fundamental audio limit
+(fast speech buried under game SFX) — the real fix would be the streamer's separate mic,
+which the VOD doesn't have. Both versions are kept side by side to compare:
+`clip-31-22.mp4` (normal) vs `clip-31-22 (2).mp4` (cleaned-voice).
+
+---
+
 ## 2026-07-01 (later 2) — review queue surfaces fresh per-clip harvests
 
 The Caption review queue used to show only the per-Creator backlog. Now it also surfaces
