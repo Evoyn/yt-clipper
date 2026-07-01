@@ -4,6 +4,23 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-01 (later 4) — the caption inspector (caption_diag) now tells the truth
+
+Last session the caption-checking tool `caption_diag` **lied**: on the guntur69 clip it
+claimed 44 of 55 caption words were being *dropped* — including the curated ones
+(dimarahin, cowok, tidur, horor) — when the render actually drops none of them. That false
+report is what steered a wrong recommendation. The bug was in the tool, not the captions.
+
+The tool used to *guess* which words the render kept by matching timings, and that guess
+broke on fast, closely-spaced words (a rapid "eh eh eh" run) — one bad match cascaded into
+a wall of fake "DROP"s. Now it reads the render's **actual** keep/drop decision directly,
+so it can't guess wrong. Re-run on the same clip: **55 of 55 kept, 0 dropped** — correct.
+It also prints a self-check line (kept + dropped = total) so a desync can never hide again.
+No change to any rendered Short — this only fixes the diagnostic you use to sanity-check
+captions before curating.
+
+---
+
 ## 2026-07-01 (later 3) — tested cleaned-voice (enh) on a hard clip: recovers, but trades for garbles
 
 You flagged that the "Diskusi biasa" clip still has bad captions — missed speech (23–26s)
