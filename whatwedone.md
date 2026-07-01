@@ -4,6 +4,16 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-01 (later) — bug fix: batch renders all recorded in project.json
+
+A batch render ("Render N selected" in the GUI, or `--batch`) now records **all N clips**
+in `project.json` — before, it only ever kept the **last** one. Every render was tagged
+with the same hardcoded id, so each overwrote the previous record. Now each clip is keyed
+to its Moment, so all N coexist; a re-render of the same clip still replaces its own entry
+(no duplicates). Internal bookkeeping only — no change to the rendered Shorts themselves.
+
+---
+
 ## 2026-07-01 — Caption review queue in the app (curate to-dos without opening JSON)
 
 You said id.json is hard to curate. Now you don't open it. Import a streamer's VOD and

@@ -1468,11 +1468,21 @@ fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     first
 }
 
-/// A manually-picked range -> a marked Moment promoted to a Clip (CONTEXT.md).
+/// A stable id for a promoted range: its start in whole milliseconds. Distinct
+/// Moments (their ranges are seconds apart) get distinct ids, so a batch of N records
+/// N Clips; a re-render of the same range reuses the id. (Was a hardcoded `1`, which
+/// made `persist_clip`'s dedup collapse every batch render onto a single record.)
+fn clip_id_for(range: TimeRange) -> u64 {
+    (range.start_s * 1000.0).round().max(0.0) as u64
+}
+
+/// A promoted range -> a Clip record (CONTEXT.md). The id is provisional; `persist_clip`
+/// relinks it to the detected Moment covering this range.
 fn build_clip(range: TimeRange, layout: Layout, caption_style: &str, export_path: &Path) -> Clip {
+    let id = clip_id_for(range);
     Clip {
-        id: 1,
-        moment_id: 1,
+        id,
+        moment_id: id,
         range,
         layout,
         caption_style: caption_style.to_string(),
@@ -1486,19 +1496,32 @@ fn build_clip(range: TimeRange, layout: Layout, caption_style: &str, export_path
 /// (e.g. a directly promoted range that never went through detection).
 fn persist_clip(vod: &Vod, clip: &Clip, data_dir: &Path) -> Result<()> {
     let mut project = load_or_new_project(vod, data_dir);
-    if !project.moments.iter().any(|m| m.id == clip.moment_id) {
-        project.moments.push(Moment {
+    let mut clip = clip.clone();
+    // Link the Clip to the detected Moment covering its range (matched by start within
+    // the Moment's window, so a nudge-trim still links to its source Moment), so the
+    // record references the real Moment and a re-render replaces the same entry. A
+    // directly-promoted range with no detected Moment gets a Moment recorded for it.
+    let linked = project
+        .moments
+        .iter()
+        .find(|m| clip.range.start_s >= m.range.start_s - 1.0 && clip.range.start_s <= m.range.end_s + 1.0)
+        .map(|m| m.id);
+    match linked {
+        Some(id) => clip.moment_id = id,
+        None => project.moments.push(Moment {
             id: clip.moment_id,
             range: clip.range,
             signals: Signals::default(),
             score: 0.0,
             title: None,
-        });
+        }),
     }
-    // Replace any existing record of this Clip (a re-render after a nudge) so
-    // project.json holds one entry per Clip, not one per render (ADR 0012).
-    project.clips.retain(|c| c.id != clip.id);
-    project.clips.push(clip.clone());
+    clip.id = clip.moment_id;
+    // One entry per promoted Moment (ADR 0012): a re-render replaces its own record;
+    // distinct Moments coexist — so a batch of N records all N, not just the last (the
+    // bug was a constant id that overwrote every render onto one entry).
+    project.clips.retain(|c| c.moment_id != clip.moment_id);
+    project.clips.push(clip);
     project
         .save(&data_dir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", data_dir.display()))
@@ -1762,6 +1785,77 @@ mod tests {
         let reloaded = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(reloaded.moments.len(), 1);
         assert_eq!(reloaded.moments[0].title.as_deref(), Some("Big play"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clip_id_for_is_distinct_per_range_start() {
+        assert_eq!(clip_id_for(TimeRange { start_s: 100.0, end_s: 130.0 }), 100_000);
+        assert_ne!(
+            clip_id_for(TimeRange { start_s: 100.0, end_s: 130.0 }),
+            clip_id_for(TimeRange { start_s: 500.0, end_s: 530.0 })
+        );
+        // Same start -> same id (a re-render dedups onto one record, not a new one).
+        assert_eq!(
+            clip_id_for(TimeRange { start_s: 4259.5, end_s: 4289.5 }),
+            clip_id_for(TimeRange { start_s: 4259.5, end_s: 9999.0 })
+        );
+    }
+
+    #[test]
+    fn persist_clip_records_every_batch_render_not_just_the_last() {
+        // The bug: a hardcoded Clip id made persist_clip's dedup overwrite each batch
+        // render onto one record. Three distinct Moments must yield three Clip records,
+        // each linked to its Moment, with no phantom Moments invented.
+        let dir = std::env::temp_dir().join("yc_persist_clip_batch");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let v = vod("local", "stream");
+
+        // Seed three detected Moments (as a Detect would), distinct ranges.
+        let mut prior = Project::new(v.clone());
+        for (id, start) in [(1u64, 100.0), (2, 500.0), (3, 900.0)] {
+            prior.moments.push(Moment {
+                id,
+                range: TimeRange { start_s: start, end_s: start + 30.0 },
+                signals: Signals::default(),
+                score: 1.0,
+                title: None,
+            });
+        }
+        prior.save(&dir.join("project.json")).unwrap();
+
+        let lay =
+            || yc_core::Layout::FullFrame { crop: yc_core::Crop { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 } };
+        // Render all three (the batch), each at its Moment's range.
+        for start in [100.0_f64, 500.0, 900.0] {
+            let r = TimeRange { start_s: start, end_s: start + 30.0 };
+            let clip = build_clip(r, lay(), "huge-word", &dir.join(format!("{start}.mp4")));
+            persist_clip(&v, &clip, &dir).unwrap();
+        }
+        let p = Project::load(&dir.join("project.json")).unwrap();
+        assert_eq!(p.clips.len(), 3, "all three batch renders recorded, not just the last");
+        assert_eq!(p.moments.len(), 3, "no phantom Moments added");
+        let linked: std::collections::HashSet<u64> = p.clips.iter().map(|c| c.moment_id).collect();
+        assert_eq!(linked, [1, 2, 3].into_iter().collect(), "each Clip links to its Moment");
+
+        // A re-render of one Moment replaces its own record (still three, not four).
+        let r2 = TimeRange { start_s: 500.0, end_s: 530.0 };
+        let clip2 = build_clip(r2, lay(), "karaoke", &dir.join("500b.mp4"));
+        persist_clip(&v, &clip2, &dir).unwrap();
+        let p = Project::load(&dir.join("project.json")).unwrap();
+        assert_eq!(p.clips.len(), 3, "re-render replaces its own record");
+        let m2 = p.clips.iter().find(|c| c.moment_id == 2).unwrap();
+        assert_eq!(m2.caption_style, "karaoke", "the re-render's data won");
+
+        // A directly-promoted range with no detected Moment records its own Moment.
+        let r4 = TimeRange { start_s: 2000.0, end_s: 2030.0 };
+        let clip4 = build_clip(r4, lay(), "huge-word", &dir.join("direct.mp4"));
+        persist_clip(&v, &clip4, &dir).unwrap();
+        let p = Project::load(&dir.join("project.json")).unwrap();
+        assert_eq!(p.clips.len(), 4, "the direct promote adds a fourth Clip");
+        assert_eq!(p.moments.len(), 4, "and records a Moment for the un-detected range");
 
         let _ = fs::remove_dir_all(&dir);
     }
