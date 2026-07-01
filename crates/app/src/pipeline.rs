@@ -558,7 +558,20 @@ fn remembered_caption_genre(workspace: &Path, vod: &Vod) -> Option<CaptionGenre>
 /// store read/write failure logs and never fails the render.
 fn remember_creator_genre(workspace: &Path, vod: &Vod, genre: CaptionGenre) {
     let path = creators_path(workspace);
-    let mut store = CreatorStore::load(&path);
+    // Load-mutate-save on the GLOBAL store: a lossy load here would rewrite the
+    // whole file with just this one Creator, silently wiping every other
+    // Creator's defaults. Absent file = a fresh workspace (fine); any other
+    // read/parse failure = data we must not overwrite, so skip the remember.
+    let mut store = match CreatorStore::try_load(&path) {
+        Ok(s) => s,
+        Err(e) if e.is_not_found() => CreatorStore::default(),
+        Err(e) => {
+            tracing::warn!(
+                "creators.json unreadable ({e}); NOT overwriting it - genre not remembered"
+            );
+            return;
+        }
+    };
     let mut creator = store
         .get(&vod.creator)
         .cloned()

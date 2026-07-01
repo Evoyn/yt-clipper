@@ -73,7 +73,8 @@ pub fn sanitize_segment(raw: &str, fallback: &str, max_len: usize) -> String {
 
 /// ffmpeg args to extract a VOD's whole audio track to 16 kHz mono PCM wav —
 /// the audio-first analysis artifact (ADR 0001). `-vn -map 0:a:0` decodes only
-/// the first audio stream; no video is touched.
+/// the first audio stream; no video is touched. `-f wav` is explicit so the
+/// output name needn't end in `.wav` (the caller extracts to a temp name).
 pub fn extract_audio_args(video: &Path, out_wav: &Path) -> Vec<String> {
     vec![
         "-i".into(),
@@ -87,20 +88,31 @@ pub fn extract_audio_args(video: &Path, out_wav: &Path) -> Vec<String> {
         WHISPER_SR.to_string(),
         "-c:a".into(),
         "pcm_s16le".into(),
+        "-f".into(),
+        "wav".into(),
         "-y".into(),
         out_wav.display().to_string(),
     ]
 }
 
 /// Extract the whole-VOD analysis wav by shelling out to the pinned ffmpeg.
+/// Writes to a `.tmp` sibling and renames on success: the import caches any
+/// non-empty `analysis.wav` forever (re-import reuse), so a cancelled/killed
+/// extract must never leave a truncated wav behind to be silently analysed on
+/// every future import.
 pub fn extract_audio(ffmpeg: &Path, video: &Path, out_wav: &Path) -> Result<()> {
-    let args = extract_audio_args(video, out_wav);
+    let mut name = out_wav.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    let tmp = out_wav.with_file_name(name);
+    let args = extract_audio_args(video, &tmp);
     let status = std::process::Command::new(ffmpeg)
         .no_console()
         .args(&args)
         .status()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
     anyhow::ensure!(status.success(), "ffmpeg audio extract failed ({status})");
+    std::fs::rename(&tmp, out_wav)
+        .with_context(|| format!("moving extracted audio into {}", out_wav.display()))?;
     Ok(())
 }
 
@@ -219,6 +231,10 @@ mod tests {
         assert_eq!(args[ac + 1], "1");
         assert!(args.contains(&"pcm_s16le".to_string()));
         assert!(args.contains(&"F:/in.mkv".to_string()));
+        // -f wav is explicit so the temp-name output (extract_audio's .tmp +
+        // rename durability) still muxes as wav.
+        let f = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[f + 1], "wav");
     }
 
     #[test]

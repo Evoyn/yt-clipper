@@ -4,6 +4,27 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 7) — your saved data can no longer be silently wiped by a crash
+
+A project-wide review found a quiet hazard: every saved file (`project.json`, the
+global `creators.json`, `review.json`, and — most precious — your **dialect correction
+stores**) was written by truncate-then-write. A crash, kill, or power cut mid-write
+leaves a half-file; and because every loader deliberately treats a bad file as empty
+(so nothing ever blocks a render), the NEXT save would quietly rewrite it from empty —
+your curation, gone, no error shown. Three fixes:
+
+- **All saves are now atomic** (write a temp sibling, then rename): a torn write can
+  no longer exist, the old file survives any crash.
+- **The one save that rewrites the global `creators.json`** now refuses to save if it
+  couldn't READ the file first (before, an unreadable file read as empty and the save
+  wiped every other streamer's remembered settings).
+- **A cancelled import can no longer poison the cache**: `analysis.wav` extraction now
+  goes to a temp name and only becomes `analysis.wav` on success — before, a truncated
+  wav from a cancel/crash was cached and silently reused for every future import of
+  that VOD (wrong detection, wrong everything, no error).
+
+---
+
 ## 2026-07-02 (overnight 6) — three new caption decode dials to try on hard clips (defaults untouched), and WHY decode changes keep breaking your curated fixes
 
 You asked for help with bad captions on noisy / fast-slang clips. I wired up the three

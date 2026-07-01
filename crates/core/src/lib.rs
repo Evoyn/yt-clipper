@@ -86,7 +86,7 @@ impl CreatorStore {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
-        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+        Ok(write_atomic(path, &serde_json::to_string_pretty(self)?)?)
     }
 
     /// The remembered record for `name`, if any.
@@ -132,7 +132,7 @@ impl ReviewCache {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
-        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+        Ok(write_atomic(path, &serde_json::to_string_pretty(self)?)?)
     }
 }
 
@@ -359,6 +359,32 @@ pub enum ProjectError {
     Json(#[from] serde_json::Error),
 }
 
+impl ProjectError {
+    /// True when the underlying cause is "the file does not exist" — the one
+    /// load failure that is *normal* (a fresh workspace) rather than data at
+    /// risk. Write paths use this to distinguish "start a new store" from "the
+    /// store exists but didn't parse — do NOT overwrite it".
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Io(e) if e.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
+/// Write `contents` to `path` via a same-directory temp file + rename, so a
+/// crash / kill / power-loss mid-write can never leave a truncated file. Every
+/// persisted store (project.json, creators.json, review.json, the dialect
+/// stores) loads lossily — a bad file reads as empty so nothing blocks a
+/// render — which turns a torn plain `fs::write` into silent total data loss on
+/// the next save-through. The temp name appends `.tmp` (never collides with the
+/// `.{lang}.json` suffix scans); rename on the same volume replaces the target
+/// atomically.
+pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
 impl Project {
     pub fn new(vod: Vod) -> Self {
         Self { vod, moments: Vec::new(), clips: Vec::new() }
@@ -369,13 +395,29 @@ impl Project {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
-        Ok(std::fs::write(path, serde_json::to_string_pretty(self)?)?)
+        Ok(write_atomic(path, &serde_json::to_string_pretty(self)?)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_atomic_replaces_existing_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join("yc_write_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+        write_atomic(&path, "{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\":1}");
+        // Overwrite an existing file (the every-render save-through path).
+        write_atomic(&path, "{\"v\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\":2}");
+        // The temp sibling is renamed away, not left to confuse suffix scans.
+        assert!(!dir.join("store.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn no_console_is_chainable_and_builds() {

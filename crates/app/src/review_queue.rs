@@ -145,7 +145,9 @@ impl ReviewState {
         }
         let s = serde_json::to_string_pretty(&self.lexicon)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(&self.path, s + "\n")?;
+        // Atomic (temp + rename): this file is the operator's curation; a torn
+        // write would read back as an empty store and silently lose it all.
+        yc_core::write_atomic(&self.path, &(s + "\n"))?;
         Ok(confirmed)
     }
 }

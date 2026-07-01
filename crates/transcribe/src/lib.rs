@@ -495,8 +495,11 @@ impl DialectLexicon {
         }
         if added > 0 {
             match serde_json::to_string_pretty(&lex) {
+                // Atomic (temp + rename): a kill mid-write must never tear the
+                // operator's curated store — the lossy loader would then read it
+                // as empty and the curation would be silently gone.
                 Ok(s) => {
-                    if let Err(e) = std::fs::write(&path, s + "\n") {
+                    if let Err(e) = yc_core::write_atomic(&path, &(s + "\n")) {
                         tracing::warn!("dialect: harvest write to {} failed ({e})", path.display());
                         return 0;
                     }
@@ -552,8 +555,10 @@ impl DialectLexicon {
         }
         if added > 0 {
             match serde_json::to_string_pretty(&creator) {
+                // Atomic for the same reason as the harvest write: the
+                // per-Creator store is the operator's cross-VOD curation.
                 Ok(s) => {
-                    if let Err(e) = std::fs::write(creator_path, s + "\n") {
+                    if let Err(e) = yc_core::write_atomic(creator_path, &(s + "\n")) {
                         tracing::warn!(
                             "dialect: promote write to {} failed ({e})",
                             creator_path.display()
