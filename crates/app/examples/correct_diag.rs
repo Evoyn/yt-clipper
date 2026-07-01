@@ -18,11 +18,11 @@
 //! default until the operator A/Bs the real render.
 
 use std::path::PathBuf;
-use yc_core::{Language, TimeRange};
+use yc_core::{Language, Project, TimeRange};
 use yc_ingest::read_range_samples;
 use yc_transcribe::{
-    apply_correction, build_correction_request, transcribe_range_full, CorrectionContext,
-    DialectLexicon,
+    apply_correction, build_correction_request, correction_topic, transcribe_range_full,
+    CorrectionContext, DialectLexicon,
 };
 
 const MODEL_GGUF: &str = "models/qwen2.5-7b-instruct-q5_k_m.gguf";
@@ -92,13 +92,29 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    // Mirror do_render's topic EXACTLY (pipeline.rs `correct_captions`): the clip's
-    // generated title (absent for this inspector, as in a headless render) + the
-    // store `note`. A hardcoded topic here made the preview UNFAITHFUL: do_render's
-    // different topic string flips Qwen's decision on whisper's doubled tokens (it
-    // applied `pancingan pancingan` 1-of-2 vs this inspector's 2-of-2), which is the
-    // whole point of a preview - it must send the request do_render sends.
-    let ctx = CorrectionContext { language: lang, topic: lexicon.note.clone() };
+    // Mirror do_render's topic EXACTLY (pipeline.rs `correct_captions`): the shared
+    // `correction_topic` over the clip's generated title (absent for this inspector,
+    // as in a headless render) + the REAL Creator + VOD title, read from the
+    // project.json beside the wav. A topic that diverges from do_render's makes the
+    // preview UNFAITHFUL: the topic string flips Qwen's decision on whisper's
+    // doubled tokens (an earlier hardcoded topic applied `pancingan pancingan`
+    // 2-of-2 vs the render's 1-of-2) - the preview must send the request the render
+    // sends. A missing project.json (bare wav outside a stream folder) degrades to
+    // an empty topic, printed below so the divergence is visible, never silent.
+    let vod = wav
+        .parent()
+        .map(|d| d.join("project.json"))
+        .and_then(|p| Project::load(&p).ok())
+        .map(|p| p.vod);
+    let topic = match &vod {
+        Some(v) => correction_topic(None, &v.creator, &v.title),
+        None => {
+            eprintln!("[correct_diag] WARNING: no project.json beside the wav - empty topic (do_render would send the real Creator/stream)");
+            String::new()
+        }
+    };
+    println!("topic: {topic:?}");
+    let ctx = CorrectionContext { language: lang, topic };
 
     // APPLY mode: a response file is present -> apply it and show the diff.
     if let Some(resp) = respfile.as_ref().filter(|p| p.is_file()) {

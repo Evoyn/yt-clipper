@@ -298,3 +298,17 @@ global** - bigger than v1, and weighed against the fact that these are marginal 
 single-token reply parser reads only `anjing` != `anjing ngeri`, so the guardrail counts
 a harmless "1 rejected" while correctly keeping the word - pre-existing, not a
 correctness bug.
+
+## Real-context topic shipped (2026-07-02, overnight #2)
+
+The weak-topic defect above is fixed: the corrector's domain context is now the
+shared `yc_transcribe::correction_topic` — the clip's generated title + the
+Creator's name + the VOD's title (`clip "..."; streamer <creator>; stream "..."`),
+the real "who is talking, about what" the model needs; the layered store's `note`
+(the base meta-description that tipped the 1-of-2) is no longer sent. `correct_diag`
+reads the same Creator/title from the `project.json` beside the wav and calls the
+same function, so the preview keeps sending exactly the render's request (the
+fidelity lesson above); it prints the topic it used. The pass stays opt-in and
+**unreliable on doubled tokens either way** (topic is a bias, not a mechanism) —
+**wants an operator A/B on the next correction render** since the changed topic can
+flip Qwen's per-occurrence decisions.

@@ -4,6 +4,19 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 2) — the caption corrector now knows WHO is talking and WHAT the stream is
+
+The smart LLM caption pass used to be handed a useless "topic": a description of a
+settings file ("Generic Indonesian base store...") instead of anything about the clip.
+That blind context is part of why it fumbled the doubled-word fix. Now it gets the real
+thing — the clip's title, the streamer's name, and the stream's title (which names the
+game and guests). The offline preview tool (`correct_diag`) reads the same names from
+the project file and sends the exact same request, so it stays honest, and prints the
+topic so you can see it. **Wants your A/B the next time you render with correction on**
+(the richer topic can change which words Qwen decides to fix). (ADR 0030.)
+
+---
+
 ## 2026-07-02 (overnight 1) — a caption fix can now be scoped to ONE clip, without touching the streamer's other clips
 
 Autonomous overnight run, item 1. Earlier today's clip-31-22 fix (`pancingan → bajingan`)

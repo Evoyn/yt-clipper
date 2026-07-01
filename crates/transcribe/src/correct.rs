@@ -69,6 +69,34 @@ pub struct CorrectionContext {
     pub topic: String,
 }
 
+/// Build the corrector's domain [`CorrectionContext::topic`]: the clip's generated
+/// title, the Creator's name, and the VOD's title, joined into one line — the real
+/// "who is talking, about what" context (streamer, guests, game) the model needs
+/// to judge whether a curated override fits. The layered store's `note` is
+/// deliberately NOT used: after ADR 0031 layering it is the bundled base's
+/// meta-description ("Generic Indonesian base store..."), and that context-free
+/// topic is what tipped a doubled-token override into a 1-of-2 under-apply on a
+/// real render (ADR 0030 "Scope limits"). Absent pieces are skipped — a manual
+/// clip has no generated title, and a local file's placeholder `local` Creator
+/// (ADR 0015) names nobody — so the result may be empty (the request builder then
+/// omits the `Stream:` line). Shared by `do_render` and the `correct_diag`
+/// inspector so the preview always sends the request the render sends. Pure.
+pub fn correction_topic(clip_title: Option<&str>, creator: &str, vod_title: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = clip_title {
+        if !t.trim().is_empty() {
+            parts.push(format!("clip \"{}\"", t.trim()));
+        }
+    }
+    if !creator.trim().is_empty() && creator.trim() != "local" {
+        parts.push(format!("streamer {}", creator.trim()));
+    }
+    if !vod_title.trim().is_empty() {
+        parts.push(format!("stream \"{}\"", vod_title.trim()));
+    }
+    parts.join("; ")
+}
+
 /// The two prompt strings handed to the `yc-llm-judge --correct` sidecar. The app
 /// shells out with these (the prompt rides in the request, ADR 0030); the model's
 /// raw reply comes back to [`apply_correction`].
@@ -261,6 +289,33 @@ mod tests {
 
     fn ctx() -> CorrectionContext {
         CorrectionContext { language: Language::Id, topic: "Horror game w/ Guntur".into() }
+    }
+
+    #[test]
+    fn correction_topic_names_clip_streamer_and_stream() {
+        // Real domain context (ADR 0030 "Scope limits" / nextprompt #2), not the
+        // layered store's base meta-note.
+        let topic = correction_topic(
+            Some("Dikejar setan bareng Guntur"),
+            "Ino Gemink Live Streaming",
+            "MAIN GAME HOROR BARENG @guntur69",
+        );
+        assert_eq!(
+            topic,
+            "clip \"Dikejar setan bareng Guntur\"; streamer Ino Gemink Live Streaming; \
+             stream \"MAIN GAME HOROR BARENG @guntur69\""
+        );
+        // A manual/headless clip has no generated title -> creator + stream only.
+        let topic = correction_topic(None, "Ino Gemink Live Streaming", "MAIN GAME HOROR");
+        assert_eq!(topic, "streamer Ino Gemink Live Streaming; stream \"MAIN GAME HOROR\"");
+    }
+
+    #[test]
+    fn correction_topic_skips_the_local_placeholder_creator() {
+        // A local import has no real Creator ("local", ADR 0015) — naming it would
+        // feed the corrector noise; the file-stem title still carries context.
+        assert_eq!(correction_topic(None, "local", "horror-part2"), "stream \"horror-part2\"");
+        assert_eq!(correction_topic(None, "local", ""), "", "all-absent context -> empty topic");
     }
 
     #[test]

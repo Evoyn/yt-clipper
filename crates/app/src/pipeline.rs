@@ -832,15 +832,18 @@ fn correct_captions(
         tracing::info!("correct: sidecar or GGUF absent; captions left uncorrected");
         return;
     }
-    // Topic for the corrector: the clip's generated title + the store's note. Safe
-    // to feed a chat model (unlike whisper's initial_prompt, which it never reaches).
-    let mut topic = prepared.title.clone().unwrap_or_default();
-    if !lexicon.note.is_empty() {
-        if !topic.is_empty() {
-            topic.push_str("; ");
-        }
-        topic.push_str(&lexicon.note);
-    }
+    // Topic for the corrector: REAL domain context — the clip's generated title,
+    // the Creator's name, and the VOD's title (which names the game / guests /
+    // session type). NOT the layered store's `note`: after layering that is the
+    // bundled base's meta-description ("Generic Indonesian base store..."), and
+    // that context-free topic is what tipped the pancingan 1-of-2 under-apply
+    // (ADR 0030 "Scope limits"). Safe to feed a chat model (unlike whisper's
+    // initial_prompt, which it never reaches).
+    let topic = yc_transcribe::correction_topic(
+        prepared.title.as_deref(),
+        &session.vod.creator,
+        &session.vod.title,
+    );
     let ctx = yc_transcribe::CorrectionContext { language: session.vod.language, topic };
     let Some(req) = yc_transcribe::build_correction_request(&transcript.units, lexicon, &ctx)
     else {
