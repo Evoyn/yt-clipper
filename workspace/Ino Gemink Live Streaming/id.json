@@ -65,9 +65,9 @@
     },
     {
       "wrong": "nyoli-nyoli",
-      "right": "",
+      "right": "setan nyoli",
       "note": "auto-harvested (conf 0.21) from \"Nyoli Setan, Kaki Tiket!\" at 1:11:11 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
@@ -79,9 +79,9 @@
     },
     {
       "wrong": "Cimri",
-      "right": "",
+      "right": "anjing ngeri",
       "note": "auto-harvested (conf 0.11) from \"Diskusi game biasa\" at 31:51 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
