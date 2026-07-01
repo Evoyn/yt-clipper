@@ -72,9 +72,9 @@
     },
     {
       "wrong": "dijekat",
-      "right": "",
+      "right": "dicegat",
       "note": "auto-harvested (conf 0.11) from \"Diskusi game biasa\" at 31:24 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
@@ -86,100 +86,100 @@
     },
     {
       "wrong": "ngomplok",
-      "right": "",
+      "right": "goblok",
       "note": "auto-harvested (conf 0.09) from \"Streamers Repetitive Chat\" at 46:49 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "sajil",
-      "right": "",
+      "right": "anjir",
       "note": "auto-harvested (conf 0.32) from \"Streamers Repetitive Chat\" at 47:00 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "bangke",
-      "right": "",
+      "right": "bangke",
       "note": "auto-harvested (conf 0.04) from \"Streamers game dialogue\" at 37:03 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "kanan-kanan",
-      "right": "",
+      "right": "kanan-kanan",
       "note": "auto-harvested (conf 0.29) from \"Streamers game dialogue\" at 36:57 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "Dapan",
-      "right": "",
+      "right": "delapan",
       "note": "auto-harvested (conf 0.14) from \"VS Miten, Aman Nih!!!\" at 1:22:03 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "Amane",
-      "right": "",
+      "right": "amane",
       "note": "auto-harvested (conf 0.25) from \"VS Miten, Aman Nih!!!\" at 1:22:06 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "ganjeng",
-      "right": "",
+      "right": "ganjeng",
       "note": "auto-harvested (conf 0.30) from \"Dua Kali Anjing Disuruh Turun\" at 1:15:31 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "bangke-bangke",
-      "right": "",
+      "right": "bangke-bangke",
       "note": "auto-harvested (conf 0.49) from \"Dua Kali Anjing Disuruh Turun\" at 1:15:25 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "Goco",
-      "right": "",
+      "right": "Gojo",
       "note": "auto-harvested (conf 0.13) from \"Pertanyaan Sederhana Ini?\" at 1:13:04 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "Satoru",
-      "right": "",
+      "right": "Satoru",
       "note": "auto-harvested (conf 0.19) from \"Pertanyaan Sederhana Ini?\" at 1:13:04 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "Mayonez",
-      "right": "",
+      "right": "mayones",
       "note": "auto-harvested (conf 0.30) from \"Pertanyaan Sederhana Ini?\" at 1:13:13 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "dulu-diam",
-      "right": "",
+      "right": "diam dulu",
       "note": "auto-harvested (conf 0.13) at 36:49 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "jembalin",
-      "right": "",
+      "right": "harus",
       "note": "auto-harvested (conf 0.15) at 36:54 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     },
     {
       "wrong": "dimalai",
-      "right": "",
+      "right": "dimarahin",
       "note": "auto-harvested (conf 0.36) at 36:54 - operator verify",
-      "status": "unverified",
+      "status": "confirmed",
       "context": false
     }
   ]
