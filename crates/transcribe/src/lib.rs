@@ -569,6 +569,13 @@ fn merge_corrections(into: &mut Vec<Correction>, overlay: Vec<Correction>) {
         }
         let key = c.wrong.to_lowercase();
         if let Some(existing) = into.iter_mut().find(|e| e.wrong.to_lowercase() == key) {
+            // A blank-`right` overlay entry (an operator to-do) must NOT shadow a
+            // confirmed fix from a lower layer: a stale per-clip to-do would otherwise
+            // erase the per-Creator correction of the same word, which then `pairs()`
+            // filters out as empty (ADR 0031/0032). A filled overlay still wins.
+            if c.right.is_empty() && !existing.right.is_empty() {
+                continue;
+            }
             *existing = c;
         } else {
             into.push(c);
@@ -1281,6 +1288,35 @@ mod tests {
         assert_eq!(parse_harvest_note("some hand-written note"), HarvestNote::default());
         assert_eq!(parse_vod_clock("not:a:clock"), None);
         assert_eq!(parse_vod_clock("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn merge_corrections_a_todo_does_not_shadow_a_confirmed_fix() {
+        // ADR 0031/0032: a stale per-clip to-do (blank right) must not erase a
+        // confirmed per-Creator fix of the same word when layered on top.
+        let mut base = vec![Correction {
+            wrong: "dijekat".into(),
+            right: "dicegat".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        }];
+        merge_corrections(
+            &mut base,
+            vec![Correction {
+                wrong: "dijekat".into(),
+                right: String::new(),
+                status: "unverified".into(),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(base.len(), 1);
+        assert_eq!(base[0].right, "dicegat", "the confirmed fix survives the stale to-do");
+        // A filled overlay still wins (clip > creator) — real layering preserved.
+        merge_corrections(
+            &mut base,
+            vec![Correction { wrong: "dijekat".into(), right: "digondol".into(), ..Default::default() }],
+        );
+        assert_eq!(base[0].right, "digondol");
     }
 
     #[test]

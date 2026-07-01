@@ -89,11 +89,32 @@ impl ReviewState {
     /// Load the per-Creator store at `path` (ADR 0031/0032). A missing or unparseable
     /// file yields an empty store (the queue is simply empty) — not an error: a new
     /// Creator has no store until the first render harvests one.
-    pub fn load(path: PathBuf, video_id: Option<String>) -> Self {
-        let lexicon = std::fs::read_to_string(&path)
+    pub fn load(path: PathBuf, clip_stores: &[PathBuf], video_id: Option<String>) -> Self {
+        let mut lexicon = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<DialectLexicon>(&s).ok())
             .unwrap_or_default();
+        // Surface per-clip harvests too (ADR 0032, closing the per-clip gap): append
+        // each per-clip store's unverified to-dos whose `wrong` this store doesn't
+        // already know. On Save they consolidate into the per-Creator store (its
+        // established home for this Creator's to-dos, like the migrated ones); a
+        // confirmed fix there is never shadowed by the lingering per-clip entry
+        // (yc_transcribe::merge_corrections guards that at render time).
+        let mut known: std::collections::HashSet<String> =
+            lexicon.corrections.iter().map(|c| c.wrong.to_lowercase()).collect();
+        for cp in clip_stores {
+            let Some(clip) = std::fs::read_to_string(cp)
+                .ok()
+                .and_then(|s| serde_json::from_str::<DialectLexicon>(&s).ok())
+            else {
+                continue;
+            };
+            for c in clip.corrections {
+                if !c.wrong.is_empty() && c.right.is_empty() && known.insert(c.wrong.to_lowercase()) {
+                    lexicon.corrections.push(c);
+                }
+            }
+        }
         let n = todo_count(&lexicon.corrections);
         let status = match n {
             0 => "No caption to-dos to curate.".to_string(),
@@ -214,6 +235,39 @@ mod tests {
         assert!(reloaded.corrections[1].right.is_empty());
         assert_eq!(reloaded.corrections[1].status, "unverified");
         assert_eq!(todo_count(&reloaded.corrections), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_surfaces_per_clip_todos_deduped_against_known() {
+        let dir = std::env::temp_dir().join("yc_review_clipmerge");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let creator = dir.join("id.json");
+        let clip = dir.join("Big Play.id.json");
+        // per-Creator: one confirmed fix + one open to-do.
+        let cl = DialectLexicon {
+            corrections: vec![confirmed("dijekat", "dicegat"), todo("cimri", "note")],
+            ..Default::default()
+        };
+        std::fs::write(&creator, serde_json::to_string_pretty(&cl).unwrap()).unwrap();
+        // per-clip: a fresh to-do + a dup of an already-confirmed word (must be skipped).
+        let clp = DialectLexicon {
+            corrections: vec![
+                todo("ngomplok", "auto-harvested (conf 0.09) from \"Big Play\" at 1:00 - operator verify"),
+                todo("dijekat", "note"),
+            ],
+            ..Default::default()
+        };
+        std::fs::write(&clip, serde_json::to_string_pretty(&clp).unwrap()).unwrap();
+
+        let st = ReviewState::load(creator, &[clip], None);
+        let todos: Vec<&str> =
+            st.lexicon.corrections.iter().filter(|c| c.right.is_empty()).map(|c| c.wrong.as_str()).collect();
+        assert!(todos.contains(&"ngomplok"), "fresh per-clip to-do surfaced");
+        assert!(todos.contains(&"cimri"), "existing per-Creator to-do kept");
+        assert!(!todos.contains(&"dijekat"), "already-confirmed word not re-surfaced as a to-do");
+        assert_eq!(todo_count(&st.lexicon.corrections), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

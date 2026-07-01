@@ -574,12 +574,18 @@ impl eframe::App for App {
                     llm_reasons,
                     creator_store,
                     video_id,
+                    clip_stores,
                 } => {
                     self.imported = Some(ImportedInfo { title, duration_s });
                     self.analysis_wav = Some(analysis_wav);
                     // Load this Creator's caption review queue (ADR 0032): the
-                    // per-Creator store's harvested to-dos, curated in the detail pane.
-                    self.review = Some(review_queue::ReviewState::load(creator_store, video_id));
+                    // per-Creator store's harvested to-dos plus any per-clip stores'
+                    // fresh harvests, curated in the detail pane.
+                    self.review = Some(review_queue::ReviewState::load(
+                        creator_store,
+                        &clip_stores,
+                        video_id,
+                    ));
                     // Seed the caption-style picker to this Creator's remembered
                     // choice (ADR 0016); the operator can still override it.
                     if let Some(genre) = caption_genre {

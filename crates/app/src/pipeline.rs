@@ -154,6 +154,10 @@ pub enum Progress {
         /// to-dos and deep-link each garble to its moment in the source VOD.
         creator_store: PathBuf,
         video_id: Option<String>,
+        /// The per-clip dialect stores in the stream folder (`<ClipStem>.<lang>.json`,
+        /// ADR 0031), so the review queue can also surface a fresh render's harvested
+        /// to-dos, not just the per-Creator backlog (ADR 0032).
+        clip_stores: Vec<PathBuf>,
     },
     /// Detection finished; ranked candidate Moments, each one's transcript text
     /// (keyed by Moment id), the LLM judgment Signal's one-line reason per Moment
@@ -273,6 +277,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                     VodSource::YouTube { video_id } => Some(video_id.clone()),
                                     VodSource::LocalFile { .. } => None,
                                 },
+                                clip_stores: clip_store_paths(&s.stream_dir, s.vod.language),
                             });
                             session = Some(s);
                             prepared = None; // a new VOD invalidates any prepared clip
@@ -1423,6 +1428,26 @@ fn dialect_lang_code(l: Language) -> &'static str {
         Language::Id => "id",
         Language::Ja => "ja",
     }
+}
+
+/// The per-clip dialect stores in a stream folder (`<ClipStem>.<lang>.json`, ADR
+/// 0031) — the review queue surfaces their harvested to-dos too (ADR 0032). The
+/// per-Creator store lives in the *parent* dir, so scanning the stream folder for
+/// the `.<lang>.json` suffix picks up only per-clip stores. Best effort: an
+/// unreadable/absent dir yields none. Sorted for a stable panel order.
+fn clip_store_paths(stream_dir: &Path, language: Language) -> Vec<PathBuf> {
+    let suffix = format!(".{}.json", dialect_lang_code(language));
+    let mut out: Vec<PathBuf> = std::fs::read_dir(stream_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).map(|n| n.ends_with(&suffix)).unwrap_or(false)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The filename stem for a rendered Short (no extension): the promoted Moment's

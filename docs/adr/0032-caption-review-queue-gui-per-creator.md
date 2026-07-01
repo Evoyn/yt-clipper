@@ -87,3 +87,23 @@ harvests — last), confidences parsed, and correct YouTube jump URLs (`nyoli-ny
 t=4271s = 1:11:11; `dulu-diam` → t=2209s = 36:49). Default + `--features face` builds
 clean, no new warnings. The interactive click (fill → Save → next render applies) is the
 operator's verify-on-use, per the codebase's GUI-wiring convention.
+
+## Follow-up (2026-07-01): per-clip stores surfaced + merge shadowing fixed
+
+The initial panel read only the per-Creator layer, so a *fresh* render's harvest (which
+lands in a per-clip `<ClipStem>.<lang>.json`) didn't show — the "Merged" option above was
+only half-addressed. Closed the gap: the worker scans the stream folder for per-clip
+stores and sends their paths on `Progress::Imported` (`clip_store_paths`);
+`ReviewState::load` appends each per-clip store's unverified to-dos whose `wrong` isn't
+already known (deduped), so the panel shows the per-Creator backlog **plus** fresh
+per-clip harvests, grouped by clip as before. On Save they consolidate into the
+per-Creator store — its established home for this Creator's to-dos (the migrated backlog
+already lives there as blank-`right` entries).
+
+This exposed a latent shadowing bug in the layered store: `merge_corrections` replaced a
+lower-layer entry by `wrong` unconditionally, so a stale per-clip to-do (blank `right`)
+would erase a confirmed per-Creator fix of the same word — which `pairs()` then drops as
+empty, silently disabling the correction at render. Fixed: a blank-`right` overlay entry
+no longer shadows a filled lower-layer entry (a filled overlay still wins). Unit-tested
+(`merge_corrections_a_todo_does_not_shadow_a_confirmed_fix`,
+`load_surfaces_per_clip_todos_deduped_against_known`).

@@ -4,6 +4,16 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-01 (later 2) — review queue surfaces fresh per-clip harvests
+
+The Caption review queue used to show only the per-Creator backlog. Now it also surfaces
+the to-dos harvested into each rendered clip's own file — so after you render new clips,
+their new garbles appear in the queue automatically (grouped by clip, deduped against what
+you've already confirmed). Also fixed a lurking bug where a stale clip-level to-do could
+silently cancel a confirmed correction of the same word at render time.
+
+---
+
 ## 2026-07-01 (later) — bug fix: batch renders all recorded in project.json
 
 A batch render ("Render N selected" in the GUI, or `--batch`) now records **all N clips**
