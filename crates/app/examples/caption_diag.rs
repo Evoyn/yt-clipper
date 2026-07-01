@@ -50,8 +50,34 @@ fn main() -> anyhow::Result<()> {
         wav.display(), start_s, end_s, lang, samples.len(), samples.len() as f64 / sr as f64
     );
 
-    // Dialect store (priming + post-correction) - the same path do_render takes.
-    let lexicon = yc_transcribe::DialectLexicon::load(&PathBuf::from("assets/dialect"), lang);
+    // Dialect store (priming + post-correction) - the LAYERED path do_render takes
+    // (ADR 0031): base < per-Creator < per-clip. Derived from the wav's location
+    // (`<workspace>/<creator>/<stream>/data/analysis.wav`) so the units reflect the
+    // real render's corrections; the bundled base is now generic (0 corrections), so
+    // plain `load` would show none. (Was `load` — drifted from do_render since ADR 0031.)
+    let base_dir = PathBuf::from("assets/dialect");
+    let lc = match lang {
+        Language::En => "en",
+        Language::Ja => "ja",
+        Language::Id => "id",
+    };
+    let mut overlays: Vec<PathBuf> = Vec::new();
+    if let Some(stream_dir) = wav.parent().and_then(|d| d.parent()) {
+        if let Some(creator_dir) = stream_dir.parent() {
+            overlays.push(creator_dir.join(format!("{lc}.json"))); // per-Creator
+        }
+        if let Ok(rd) = std::fs::read_dir(stream_dir) {
+            let suffix = format!(".{lc}.json");
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.file_name().and_then(|n| n.to_str()).map(|n| n.ends_with(&suffix)).unwrap_or(false)
+                {
+                    overlays.push(p); // per-clip
+                }
+            }
+        }
+    }
+    let lexicon = yc_transcribe::DialectLexicon::load_layered(&base_dir, &overlays, lang);
     let prompt = lexicon.initial_prompt();
     let n_corr = lexicon.corrections.iter().filter(|c| !c.right.is_empty()).count();
     println!(
