@@ -485,6 +485,35 @@ struct App {
     cancel: CancelToken,
 }
 
+/// egui's `Spinner`, minus its `request_repaint()`. The stock widget requests an
+/// **immediate** repaint every frame it is visible ("because it is animated"),
+/// and egui honours the soonest request — so drawing it while a job runs
+/// silently overrode the 10 fps GPU-job throttle and kept the wgpu loop
+/// repainting flat-out against whisper/NVENC on the single 8 GB card. This
+/// paints the same arc (radius/points/stroke copied from egui 0.34
+/// `Spinner::paint_at`) and lets the throttle's `request_repaint_after` drive
+/// the animation at ~10 fps instead.
+fn throttled_spinner(ui: &mut egui::Ui) {
+    let size = ui.style().spacing.interact_size.y;
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let color = ui.visuals().strong_text_color();
+        let radius = (rect.height().min(rect.width()) / 2.0) - 2.0;
+        let n_points = (radius.round() as u32).clamp(8, 128);
+        let time = ui.input(|i| i.time);
+        let start_angle = time * std::f64::consts::TAU;
+        let end_angle = start_angle + 240f64.to_radians() * time.sin();
+        let points: Vec<egui::Pos2> = (0..n_points)
+            .map(|i| {
+                let angle = egui::lerp(start_angle..=end_angle, f64::from(i) / f64::from(n_points));
+                let (sin, cos) = angle.sin_cos();
+                rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+            })
+            .collect();
+        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+    }
+}
+
 /// Display label for a transcription language (the combo + the imported header).
 fn lang_label(l: Language) -> &'static str {
     match l {
@@ -788,7 +817,11 @@ impl eframe::App for App {
         // While a GPU job runs, repaint at ~10 fps instead of unbounded: the
         // continuous wgpu render loop otherwise competes with whisper for the
         // single 8 GB card and starves it (the detect-hang scar). 10 fps still
-        // drains worker progress and animates the spinner smoothly.
+        // drains worker progress and animates the spinner smoothly. This only
+        // holds because nothing else requests an immediate repaint while working —
+        // egui's stock `ui.spinner()` does exactly that every frame (an animated
+        // widget), which silently overrode this throttle until 2026-07-02; the
+        // status bar draws [`throttled_spinner`] instead.
         if working {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -810,7 +843,7 @@ impl App {
                     self.cancel.cancel();
                 }
                 ui.label(stage.clone());
-                ui.spinner();
+                throttled_spinner(ui);
             }
             Status::Done(path) => {
                 let name = path

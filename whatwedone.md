@@ -4,6 +4,19 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (overnight 5) — the GPU-job repaint throttle now actually throttles
+
+The app was supposed to drop to ~10 fps while whisper/NVENC runs (so the UI doesn't
+fight the render for the one graphics card) — that throttle shipped back on June 19. It
+turns out it never engaged: the little loading **spinner** is an animated egui widget
+that demands a fresh frame every frame it's visible, which quietly overrode the
+throttle the whole time. The status bar now draws an identical-looking spinner that
+doesn't do that, so a running job finally repaints at 10 fps (the spinner just animates
+a bit less silkily — that's the trade, and the point). Detects/renders with the GUI open
+should feel less like the GPU is being strangled.
+
+---
+
 ## 2026-07-02 (overnight 4) — Cancel's hot flag no longer takes a lock
 
 Internal engineering (the M5 follow-up): the "did the operator hit Cancel?" check —
