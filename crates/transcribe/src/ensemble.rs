@@ -255,23 +255,39 @@ fn decode_one(
     language: Language,
     _head_pad: bool,
 ) -> Result<Vec<String>> {
-    let out = Command::new(&cfg.mtmd_cli)
+    // The sidecar cannot be handed the wav's full path: `--audio` is a list
+    // flag that SPLITS ON COMMAS, and stream folders carry VOD-title text
+    // ("... Tretan, Coki, Adriano", emoji) that also trips its C-level file
+    // open. The variant file NAME is ours (`_ens_N.wav`, pure ASCII) — spawn
+    // in the wav's directory and pass the bare name; exe/model paths are
+    // absolutized so the cwd change cannot break them.
+    let dir = match wav.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = wav.file_name().context("variant wav has no file name")?;
+    let out = Command::new(std::path::absolute(&cfg.mtmd_cli)?)
+        .current_dir(dir)
         .arg("-m")
-        .arg(&cfg.qwen_model)
+        .arg(std::path::absolute(&cfg.qwen_model)?)
         .arg("--mmproj")
-        .arg(&cfg.qwen_mmproj)
+        .arg(std::path::absolute(&cfg.qwen_mmproj)?)
         .arg("--audio")
-        .arg(wav)
+        .arg(name)
         .args(["--temp", "0", "-ngl", "99", "-p", "Transcribe the audio."])
         .args(["-sys", bias_context(language)])
         .output()
         .context("spawning llama-mtmd-cli")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "llama-mtmd-cli failed ({}): {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()
-    );
+    if !out.status.success() {
+        // llama.cpp logs load noise first and any fatal line last — report the tail.
+        let err = String::from_utf8_lossy(&out.stderr);
+        let skip = err.chars().count().saturating_sub(600);
+        anyhow::bail!(
+            "llama-mtmd-cli failed ({}): {}",
+            out.status,
+            err.chars().skip(skip).collect::<String>()
+        );
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     Ok(normalize(&stdout))
 }
@@ -501,8 +517,11 @@ fn edit1(a: &str, b: &str) -> bool {
 /// phantom) anchor, which is exactly the "caption runs ahead of the streamer"
 /// bug this replaces. Unmatched anchors are skipped entirely (a phantom must
 /// not consume timeline). Inserted runs land on RMS onsets inside their gap
-/// (rising crossings of the ADR 0021 silence bar), falling back to
-/// character-proportional spread when the gap has fewer onsets than words.
+/// (rising crossings of the ADR 0021 silence bar), spreading
+/// character-proportionally when the gap's onsets can't structure the run.
+/// A skeleton whose anchors go mostly unclaimed (< 1/3 — the vote rejected
+/// what the skeletons heard: the hallucination-pile clip class) is dropped
+/// wholesale and every word onset-places instead.
 /// Zero-width results are fine downstream (DTW single-token units already are).
 pub fn fuse_onto_timing(
     merged: &[String],
@@ -555,6 +574,24 @@ pub fn fuse_onto_timing(
                 last_start = anchors[ai].0;
             }
         }
+    }
+    // Skeleton trust: when the vote rejected most of what the skeletons heard
+    // (the 107-"eh" hallucination pile), the few claimed anchors are accidents
+    // — a lone mid-pile "ada" match boxed 21 real words into a 0.12 s gap.
+    // The signal is SKELETON-side (units left unclaimed), not word-side:
+    // edit-1 lookalikes ("deh"/"es" against "eh") keep word-side adoption high
+    // on exactly the clips whose skeleton is pure hallucination. Under 1/3 of
+    // anchors claimed, drop the skeleton entirely and place every word by the
+    // clip's speech onsets; the `at_s` store pass still pins operator-heard
+    // moments afterwards.
+    let adopted_n = adopted.iter().filter(|a| a.is_some()).count();
+    if adopted_n * 3 < anchors.len() {
+        tracing::info!(
+            "qwen ensemble: skeleton distrusted ({adopted_n}/{} anchors claimed) \
+             -> onset-spread fallback",
+            anchors.len()
+        );
+        adopted.fill(None);
     }
 
     // Second pass: place words — adopted ones on their anchor span, runs of
@@ -677,10 +714,12 @@ fn rms_onsets(samples: &[f32], sample_rate: u32) -> Vec<f64> {
     onsets
 }
 
-/// Lay a run of words into [gap_start, gap_end]: consecutive words snap to the
-/// gap's speech onsets in order; words beyond the available onsets spread
-/// character-proportionally through what remains. Each word ends where the
-/// next begins (the refine pass owns display durations).
+/// Lay a run of words into [gap_start, gap_end]. With onsets to spare the run
+/// spreads across them in order; with a modest shortfall the first words snap
+/// to the onsets and the rest spread proportionally after; when onsets are too
+/// scarce to structure the run (words > 2x onsets) the whole run spreads
+/// character-proportionally through the gap. Each word ends where the next
+/// begins (the refine pass owns display durations).
 fn place_run(
     words: &[String],
     gap_start: f64,
@@ -697,16 +736,35 @@ fn place_run(
         .filter(|t| *t >= gap_start && *t < gap_end - 0.02)
         .collect();
     let mut starts: Vec<f64> = Vec::with_capacity(words.len());
-    let n_on = usable.len().min(words.len());
-    starts.extend_from_slice(&usable[..n_on]);
-    if n_on < words.len() {
-        // proportional tail from the last placed start (or the gap start)
-        let rem = &words[n_on..];
-        let from = starts.last().copied().unwrap_or(gap_start);
+    let (m, n) = (usable.len(), words.len());
+    if m >= n {
+        // Enough onsets: spread the run across them in order (taking the
+        // FIRST n crams the run into the gap's head — the words are spoken
+        // through the gap, not at its start).
+        for k in 0..n {
+            starts.push(usable[if n == 1 { 0 } else { k * (m - 1) / (n - 1) }]);
+        }
+    } else if m * 2 >= n && m > 0 {
+        // Modest overflow: onsets first, proportional tail after the last one.
+        starts.extend_from_slice(&usable);
+        let rem = &words[m..];
+        let from = *starts.last().expect("m > 0");
         let total_chars: usize = rem.iter().map(|w| w.chars().count().max(1)).sum();
-        let mut t = if n_on == 0 { gap_start } else { from + 0.15 };
+        let mut t = from + 0.15;
         let span = (gap_end - t).max(0.0);
         for w in rem {
+            starts.push(t.min(gap_end));
+            t += span * (w.chars().count().max(1) as f64 / total_chars as f64);
+        }
+    } else {
+        // Onsets too scarce to structure the run (a loud mix barely dips
+        // below the silence bar): snapping the first words to them stacks
+        // the rest against the gap's end — spread the WHOLE run
+        // character-proportionally instead.
+        let total_chars: usize = words.iter().map(|w| w.chars().count().max(1)).sum();
+        let span = (gap_end - gap_start).max(0.0);
+        let mut t = gap_start;
+        for w in words {
             starts.push(t.min(gap_end));
             t += span * (w.chars().count().max(1) as f64 / total_chars as f64);
         }
@@ -1168,6 +1226,80 @@ mod tests {
             "second pusing placed in its gap, got {}",
             fused[3].start_s
         );
+    }
+
+    #[test]
+    fn fuse_distrusts_a_hallucination_pile_skeleton() {
+        // The eh-pile clip class: whisper hallucinated "eh" wall-to-wall, the
+        // vote replaced nearly all of it, and the skeleton's lone accidental
+        // match ("ada" mid-pile, far from where the word is really said) boxed
+        // the whole run against itself — 21 words in 0.12 s on the export.
+        // Below-1/3 adoption must drop the skeleton and spread by the clip.
+        let mut units: Vec<CaptionUnit> = (0..40)
+            .map(|k| {
+                let t = 0.5 + k as f64 * 0.2;
+                CaptionUnit { text: "eh".into(), start_s: t, end_s: t + 0.15 }
+            })
+            .collect();
+        // two accidental matches whose spans leave a 0.1 s window — the four
+        // words voted between them have nowhere to go (the export's pileup)
+        units.push(CaptionUnit { text: "ada".into(), start_s: 2.0, end_s: 8.5 });
+        units.push(CaptionUnit { text: "kunci".into(), start_s: 8.6, end_s: 8.8 });
+        let whisper = Transcript { language: Language::Id, units };
+        let merged = words("nggak mau es krim aku ada kanan deh kayak gini kunci tor");
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(12.0), 16000, 12.0);
+        assert_eq!(fused.len(), 12);
+        // no pileup: every word gets readable width across the clip
+        for u in &fused {
+            assert!(
+                u.end_s - u.start_s >= MIN_WORD_S - 1e-9,
+                "{} squeezed to {:.3}s",
+                u.text,
+                u.end_s - u.start_s
+            );
+        }
+        for w in fused.windows(2) {
+            assert!(w[0].start_s <= w[1].start_s + 1e-9);
+        }
+        // the run actually reaches the clip's tail instead of stacking early
+        assert!(fused.last().unwrap().start_s > 9.0);
+    }
+
+    #[test]
+    fn place_run_spreads_words_across_dense_onsets() {
+        // 19 onsets, 3 words: the run is spoken THROUGH the gap — first-N
+        // placement crammed all three into the first 1.5 s.
+        let onsets: Vec<f64> = (1..=19).map(|k| k as f64 * 0.5).collect();
+        let mut fused = Vec::new();
+        place_run(&words("satu dua tiga"), 0.0, 10.0, &onsets, &mut fused);
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[0].start_s, 0.5);
+        assert_eq!(fused[1].start_s, 5.0);
+        assert_eq!(fused[2].start_s, 9.5);
+    }
+
+    #[test]
+    fn place_run_ignores_onsets_too_scarce_to_structure_the_run() {
+        // One late onset, eight words: snapping word 1 to it stacked the other
+        // seven into the last 0.85 s. The run must spread through the gap.
+        let mut fused = Vec::new();
+        place_run(
+            &words("a b c d e f g h"),
+            0.0,
+            10.0,
+            &[9.0],
+            &mut fused,
+        );
+        assert_eq!(fused.len(), 8);
+        assert!(fused[0].start_s < 0.5, "run starts at the gap, got {}", fused[0].start_s);
+        for u in &fused {
+            assert!(
+                u.end_s - u.start_s > 0.5,
+                "{} squeezed to {:.3}s",
+                u.text,
+                u.end_s - u.start_s
+            );
+        }
     }
 
     #[test]

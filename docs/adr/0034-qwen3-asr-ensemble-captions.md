@@ -116,3 +116,39 @@ render provably unchanged when unset — the ADR 0033 opt-in contract):
   will need re-validation on other clips before any default flip.
 - bf16 GGUFs were staged during the search (`models/*bf16*`, ~4.2 GB) and are
   NOT used by the recipe — safe to delete if space matters.
+
+## Amendment (2026-07-02): the generalization gate found two engine defects
+
+Running the recipe unchanged on the two held-out fixtures (this ADR's
+required gate before any default talk) surfaced and fixed two defects —
+both invisible from the exports alone, because the engine fails soft:
+
+1. **Stream-folder paths break the sidecar.** llama-mtmd-cli's `--audio` is a
+   list flag that SPLITS ON COMMAS, and its C-level file open trips on
+   non-ASCII names — the Deddy control's stream folder ("... Tretan, Coki,
+   Adriano") killed all five variants ("Unable to open file ... Tretan"), the
+   render soft-failed to whisper captions, and the export looked fine. The
+   spawn now runs in the variant wav's directory and passes the bare
+   `_ens_N.wav` name (ours, pure ASCII), with exe/model paths absolutized.
+   Failure capture now reports the sidecar stderr's TAIL (llama.cpp puts the
+   fatal line last) — the original head-capture showed only load noise.
+2. **A hallucination-pile skeleton poisons the fusion.** On the eh-pile
+   fixture the vote replaced ~107 of whisper's 115 "eh" units, but fusion
+   still trusted the skeleton's few accidental matches as anchors and boxed
+   21 real words into a 0.12 s window (zero-width caption piles at two
+   instants). Fusion now measures skeleton trust ANCHOR-side — under 1/3 of
+   anchors claimed, the whole skeleton is dropped and every word places by
+   speech onsets — and `place_run` spreads a run across dense onsets (first-N
+   crammed the gap's head) or character-proportionally when onsets are too
+   scarce to structure it (words > 2x onsets). Word-side adoption is the
+   wrong trigger: edit-1 lookalikes ("deh"/"es" vs "eh") keep it high on
+   exactly this clip class.
+
+Gate outcome (YC_QWEN_ENS=1 renders, huge genre): eh-pile — 115 whisper units
+(the documented pile) -> 54 voted real-content units, fuzzy store transfer
+firing cross-engine ("buntor"->"guntur", "sakenyang"->"dah kenyang"), fallback
+log line `skeleton distrusted (17/230 anchors claimed)`, monotonic readable
+timing across the clip. Deddy control — all five variants decode (186–204
+words), vote -> 183 units on a trusted skeleton, no regression vs whisper's
+159-unit read. The operator's ear rules the final gate verdict on both
+exports (`clip-36-43 (2).mp4`, `clip-30-00 (4).mp4`).
