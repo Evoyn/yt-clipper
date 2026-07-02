@@ -840,31 +840,34 @@ impl eframe::App for App {
                     self.ui_moments(ui, working);
                 });
             });
+        // --- Nudge editor (ADR 0012): frame the prepared Clip before render ---
+        // Docked as a right panel (operator ask, 2026-07-02) so the preview
+        // uses the detail pane's spare width instead of floating over it — the
+        // Moment text stays readable while framing. Added BEFORE the central
+        // pane (egui panels claim space in insertion order; central takes the
+        // rest). Its own vscroll keeps the tall 9:16 composite + Render
+        // reachable at any window height; the editor's Cancel dismisses it, so
+        // no window chrome is needed.
+        let mut editor_action = editor::EditorAction::None;
+        if self.editor.is_some() {
+            egui::Panel::right("editor-panel")
+                .resizable(true)
+                .default_size(400.0)
+                .min_size(340.0)
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("editor").show(ui, |ui| {
+                        if let Some(ed) = &mut self.editor {
+                            editor_action = ed.show(ui, !working);
+                        }
+                    });
+                });
+        }
         egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
                 self.ui_detail(ui, working);
             });
         });
 
-        // --- Nudge editor (ADR 0012): frame the prepared Clip before render ---
-        // A floating, scrollable Window so the tall 9:16 composite and its
-        // Render button stay reachable over the central content (eframe's `ui`
-        // gives a non-scrolling central Ui).
-        let mut editor_action = editor::EditorAction::None;
-        let mut keep_open = true;
-        if let Some(ed) = &mut self.editor {
-            egui::Window::new("Frame the Clip")
-                .open(&mut keep_open)
-                .resizable(true)
-                .vscroll(true)
-                .default_size(egui::vec2(380.0, 720.0))
-                .show(ui.ctx(), |ui| {
-                    editor_action = ed.show(ui, !working);
-                });
-        }
-        if !keep_open {
-            self.editor = None;
-        }
         match editor_action {
             editor::EditorAction::Render(layout, caption_genre, placement) => {
                 // The editor's per-Clip pick wins; mirror it back to the app's
