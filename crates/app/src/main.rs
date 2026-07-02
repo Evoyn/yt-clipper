@@ -316,6 +316,8 @@ fn main() -> eframe::Result<()> {
                 status: Status::Idle,
                 editor: None,
                 pending_title: None,
+                opening_editor: false,
+                rendering: false,
                 batch_selected: HashSet::new(),
                 render_queue: Vec::new(),
                 queue_idx: 0,
@@ -524,6 +526,15 @@ struct App {
     /// The Moment title promoted into the editor (Prepare carries it to the
     /// worker; the editor toolbar shows it).
     pending_title: Option<String>,
+    /// True from clicking "Open in editor" until the Prepare finishes: the
+    /// detail pane shows a loading state (segment fetch + face detect +
+    /// filmstrip take a few seconds; silence read as a hang).
+    opening_editor: bool,
+    /// True while an NVENC render is in flight — gates ONLY the editor's
+    /// Export/Render actions. Transcribe / speaker analysis do NOT set this:
+    /// the operator keeps editing (and can even queue the render) while the
+    /// GPU pre-passes run.
+    rendering: bool,
     /// Moment ids checked for a batch render (M8 job-queue): "Render selected"
     /// renders them sequentially, each auto-framed (no editor).
     batch_selected: HashSet<u64>,
@@ -551,6 +562,11 @@ struct App {
 /// the animation at ~10 fps instead.
 pub(crate) fn throttled_spinner(ui: &mut egui::Ui) {
     let size = ui.style().spacing.interact_size.y;
+    throttled_spinner_sized(ui, size);
+}
+
+/// [`throttled_spinner`] at an explicit size — the loading hero draws it big.
+pub(crate) fn throttled_spinner_sized(ui: &mut egui::Ui, size: f32) {
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         let color = ui.visuals().strong_text_color();
@@ -742,6 +758,7 @@ impl eframe::App for App {
                     range,
                     faces,
                 } => {
+                    self.opening_editor = false;
                     // Batch render (M8): auto-render this clip with its auto-detected
                     // Layout (no editor); the Done handler advances the queue.
                     // `continue` skips the editor setup and drains the next message.
@@ -756,6 +773,7 @@ impl eframe::App for App {
                             camera: None,
                             transcript_override: None,
                         });
+                        self.rendering = true;
                         continue;
                     }
                     // Single clip: upload the preview frames to textures and open the
@@ -828,6 +846,7 @@ impl eframe::App for App {
                     // The render just persisted the rail's engine selection per
                     // Creator (ADR 0035); track it so the switch warn clears.
                     self.saved_engine = Some(self.caption_engine);
+                    self.rendering = false;
                     if self.render_queue.is_empty() {
                         self.status = Status::Done(p);
                     } else {
@@ -860,11 +879,15 @@ impl eframe::App for App {
                     // A cancel stops the whole batch, not just the in-flight clip.
                     self.render_queue.clear();
                     self.queue_idx = 0;
+                    self.opening_editor = false;
+                    self.rendering = false;
                     self.status = Status::Cancelled;
                 }
                 Progress::Failed(e) => {
                     self.render_queue.clear();
                     self.queue_idx = 0;
+                    self.opening_editor = false;
+                    self.rendering = false;
                     // A failure while the speaker analysis was in flight lands in
                     // the editor's Camera panel (retryable) as well as the bar.
                     if let Some(ed) = &mut self.editor {
@@ -906,7 +929,7 @@ impl eframe::App for App {
         if self.editor.is_some() {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 if let Some(ed) = &mut self.editor {
-                    editor_action = ed.show(ui, !working);
+                    editor_action = ed.show(ui, working, self.rendering);
                 }
             });
         } else {
@@ -955,6 +978,7 @@ impl eframe::App for App {
                     camera: spec.camera,
                     transcript_override: spec.transcript_override,
                 });
+                self.rendering = true;
                 self.status = Status::Working("Rendering".into());
             }
             editor::EditorAction::AnalyzeSpeakers => {
@@ -1029,15 +1053,26 @@ impl App {
 
     /// Left-rail section: the preflight tool/model check, collapsed once every
     /// sidecar + model is present (auto-expanded when something is missing).
+    /// Rows show only the name + a status dot (the operator's ask) — the full
+    /// path is a hover detail, not a wall of directories.
     fn ui_preflight(&mut self, ui: &mut egui::Ui) {
-        let row = |ui: &mut egui::Ui, ok: bool, text: String| {
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if ok { theme::OK } else { theme::ERR },
-                    if ok { "ok" } else { "MISSING" },
-                );
-                ui.label(text);
-            });
+        let row = |ui: &mut egui::Ui, ok: bool, name: &str, detail: String| {
+            let resp = ui
+                .horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        4.0,
+                        if ok { theme::OK } else { theme::ERR },
+                    );
+                    ui.label(name);
+                    if !ok {
+                        ui.colored_label(theme::ERR, "missing");
+                    }
+                })
+                .response;
+            resp.on_hover_text(detail);
         };
         let files = [
             ("ffmpeg", self.paths.ffmpeg()),
@@ -1052,13 +1087,24 @@ impl App {
         } else {
             "Diagnostics — something is missing"
         };
-        egui::CollapsingHeader::new(header).default_open(!all_ok).show(ui, |ui| {
-            for (name, p) in &files {
-                row(ui, p.exists(), format!("{name}: {}", p.display()));
-            }
-            match &self.deno_dir {
-                Some(d) => row(ui, true, format!("deno: {}", d.display())),
-                None => row(ui, false, "deno: not found (run fetch-sidecars.ps1 / winget)".into()),
+        // One flat row list (deno included) so every tool renders through the
+        // same path.
+        let mut rows: Vec<(bool, String, String)> = files
+            .iter()
+            .map(|(n, p)| (p.exists(), (*n).to_string(), p.display().to_string()))
+            .collect();
+        match &self.deno_dir {
+            Some(d) => rows.push((true, "deno".into(), d.display().to_string())),
+            None => rows.push((
+                false,
+                "deno".into(),
+                "not found — run fetch-sidecars.ps1 or `winget install DenoLand.Deno`".into(),
+            )),
+        }
+        let debug_open = std::env::var("YC_DIAG_OPEN").is_ok(); // capture aid
+        egui::CollapsingHeader::new(header).default_open(!all_ok || debug_open).show(ui, |ui| {
+            for (ok, name, detail) in rows {
+                row(ui, ok, &name, detail);
             }
         });
     }
@@ -1435,6 +1481,33 @@ impl App {
     }
 
     fn ui_detail(&mut self, ui: &mut egui::Ui, working: bool) {
+        // Opening the editor: Prepare runs a few seconds (segment fetch, face
+        // detect, filmstrip) — show a real loading state instead of a frozen
+        // library (the operator read the silent gap as a hang).
+        if self.opening_editor {
+            ui.add_space(ui.available_height() * 0.30);
+            ui.vertical_centered(|ui| {
+                throttled_spinner_sized(ui, 44.0);
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("OPENING THE EDITOR")
+                        .family(theme::display_family())
+                        .size(20.0)
+                        .color(egui::Color32::from_gray(210)),
+                );
+                ui.add_space(4.0);
+                let stage = match &self.status {
+                    Status::Working(s) => s.clone(),
+                    _ => "Preparing clip".into(),
+                };
+                ui.weak(format!("{stage}…"));
+                ui.weak("fetching the segment · detecting faces · building the preview");
+            });
+            // The spinner needs its ~10 fps tick even before `working` is set.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+
         // Caption review queue (ADR 0032): the Creator's harvested caption to-dos,
         // curated in-app. Creator-level, so it shows regardless of Moment selection.
         self.ui_review(ui, working);
@@ -1614,6 +1687,7 @@ impl App {
             {
                 self.editor = None;
                 self.pending_title = m.title.clone();
+                self.opening_editor = true;
                 let _ = self.to_worker.send(Job::Prepare {
                     range: m.range,
                     title: m.title.clone(),

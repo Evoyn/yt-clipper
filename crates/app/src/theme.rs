@@ -148,6 +148,12 @@ fn visuals() -> egui::Visuals {
     v.hyperlink_color = GOLD;
     v.warn_fg_color = GOLD;
     v.error_fg_color = ERR;
+    // Secondary text must stay READABLE on the dark surfaces: egui's derived
+    // weak colour (text tinted toward the fill) sank too close to the panels
+    // (operator: "some of darker text cannot be seen"), so pin an explicit
+    // muted slate; likewise raise the disabled fade above the default.
+    v.weak_text_color = Some(Color32::from_rgb(0x9E, 0xA6, 0xB6));
+    v.disabled_alpha = 0.65;
     // Accent the selection with a translucent gold + a gold edge.
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(0xFF, 0xD1, 0x00, 48);
     v.selection.stroke = Stroke::new(1.0, GOLD);

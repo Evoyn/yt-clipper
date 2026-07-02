@@ -354,38 +354,38 @@ impl EditorState {
 
     // ------------------------------------------------------------------ show --
 
-    /// Draw the whole Studio page and return the operator's action. `busy` is
-    /// true while a worker job runs (transcribe / speakers / render): playback
-    /// pauses (the 10 fps repaint throttle protecting whisper from the wgpu
-    /// loop must hold — the detect-hang scar) and job-starting buttons lock,
-    /// but framing, caption edits, and scrubbing stay live — the operator keeps
-    /// working while the GPU does.
-    pub fn show(&mut self, ui: &mut egui::Ui, busy: bool) -> EditorAction {
+    /// Draw the whole Studio page and return the operator's action.
+    ///
+    /// `busy` = any worker job in flight (transcribe / speakers / render):
+    /// playback KEEPS RUNNING — audio is CPU-side rodio — but its visual tick
+    /// drops to ~10 fps so the wgpu loop never competes with whisper for the
+    /// GPU (the detect-hang scar; 10 fps is the proven-safe cadence).
+    /// `rendering` = an export is in flight: it gates ONLY Export/Render, so
+    /// the operator can't stack renders — everything else stays editable and a
+    /// render started during the caption pre-pass simply queues behind it.
+    pub fn show(&mut self, ui: &mut egui::Ui, busy: bool, rendering: bool) -> EditorAction {
         let mut action = EditorAction::None;
 
-        // Advance the playhead while playing; a busy worker pauses playback.
+        // Advance the playhead while playing.
         let dur = self.range.duration_s();
         if let Some((anchor, offset)) = self.playing {
-            if busy {
+            self.playhead_s = offset + anchor.elapsed().as_secs_f64();
+            if self.playhead_s >= dur {
+                self.playhead_s = dur;
                 self.playing = None;
                 action = EditorAction::StopAudio;
             } else {
-                self.playhead_s = offset + anchor.elapsed().as_secs_f64();
-                if self.playhead_s >= dur {
-                    self.playhead_s = dur;
-                    self.playing = None;
-                    action = EditorAction::StopAudio;
-                } else {
-                    // ~30 fps visual tick; the filmstrip itself is coarser.
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-                }
+                // ~30 fps visual tick normally; ~10 fps while the GPU works
+                // (the throttle that protects whisper from the wgpu loop).
+                let tick = if busy { 100 } else { 33 };
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(tick));
             }
         }
 
         // Keyboard (only when no widget owns focus): space = play/pause,
         // arrows nudge the crop (Manual) or scrub, +/- zoom, 0 = reset framing.
         if ui.ctx().memory(|m| m.focused().is_none()) {
-            if let Some(a) = self.handle_keys(ui, busy) {
+            if let Some(a) = self.handle_keys(ui) {
                 action = a;
             }
         }
@@ -402,10 +402,11 @@ impl EditorState {
                 ui.label(egui::RichText::new(ellipsize(&title, 46)).strong());
                 ui.weak(format!("{:.1}s · 1080x1920", dur));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
-                        if theme::primary_button(ui, "Export…").clicked() {
-                            self.show_export = true;
-                        }
+                    ui.add_enabled_ui(!rendering, |ui| {
+                        theme::primary_button(ui, "Export…")
+                            .on_disabled_hover_text("A render is already in progress")
+                            .clicked()
+                            .then(|| self.show_export = true);
                     });
                     ui.add_space(6.0);
                     let safe = self.show_safe_area;
@@ -446,7 +447,7 @@ impl EditorState {
         egui::Panel::bottom("studio-timeline")
             .exact_size(150.0)
             .show_inside(ui, |ui| {
-                if let Some(a) = self.ui_timeline(ui, busy) {
+                if let Some(a) = self.ui_timeline(ui, busy, rendering) {
                     action = a;
                 }
             });
@@ -484,7 +485,7 @@ impl EditorState {
 
         // --- Export summary modal ---
         if self.show_export {
-            if let Some(a) = self.ui_export_modal(ui.ctx(), busy) {
+            if let Some(a) = self.ui_export_modal(ui.ctx(), rendering) {
                 action = a;
             }
         }
@@ -493,7 +494,7 @@ impl EditorState {
     }
 
     /// Keyboard shortcuts. Returns an action when one needs the app (play).
-    fn handle_keys(&mut self, ui: &egui::Ui, busy: bool) -> Option<EditorAction> {
+    fn handle_keys(&mut self, ui: &egui::Ui) -> Option<EditorAction> {
         let dur = self.range.duration_s();
         let (space, esc, left, right, up, down, plus, minus, zero, shift) = ui.input(|i| {
             (
@@ -516,7 +517,7 @@ impl EditorState {
             }
             return Some(EditorAction::Cancel);
         }
-        if space && !busy {
+        if space {
             return Some(self.toggle_play());
         }
         let crop_mode = self.view == ViewMode::Source && self.camera_mode == CameraMode::Manual;
@@ -693,7 +694,7 @@ impl EditorState {
                 &painter,
                 egui::pos2(canvas.left() + 8.0, canvas.bottom() - 26.0),
                 &format!("{} camera", camera_mode_label(self.camera_mode)),
-                Color32::from_gray(140),
+                Color32::from_gray(185),
             );
         }
     }
@@ -946,23 +947,35 @@ impl EditorState {
 
     /// The bottom strip: transport, ruler + scrub, caption blocks, speaker
     /// lanes, cut markers.
-    fn ui_timeline(&mut self, ui: &mut egui::Ui, busy: bool) -> Option<EditorAction> {
+    fn ui_timeline(&mut self, ui: &mut egui::Ui, busy: bool, rendering: bool) -> Option<EditorAction> {
         let mut action = None;
         let dur = self.range.duration_s().max(0.001);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let label = if self.playing.is_some() { "⏸" } else { "▶" };
             if ui
-                .add_enabled(!busy, egui::Button::new(egui::RichText::new(label).size(16.0)))
+                .add(egui::Button::new(egui::RichText::new(label).size(16.0)))
                 .on_hover_text("Space")
                 .clicked()
             {
                 action = Some(self.toggle_play());
             }
+            ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(dur)));
+            // Say WHAT the worker is doing — a mystery-disabled UI reads as a
+            // hang (operator feedback). Everything here stays usable meanwhile.
             if busy {
                 crate::throttled_spinner(ui);
+                let doing = if rendering {
+                    "Rendering the Short…"
+                } else if self.transcript.is_none() {
+                    "Transcribing captions…"
+                } else if self.speaker_job == SpeakerJob::Running {
+                    "Analyzing speakers…"
+                } else {
+                    "Working…"
+                };
+                ui.weak(doing);
             }
-            ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(dur)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(a) = &self.speakers {
                     for t in a.tracks.iter().rev() {
@@ -1004,7 +1017,7 @@ impl EditorState {
                 Align2::LEFT_TOP,
                 fmt_mmss(t),
                 FontId::monospace(9.5),
-                Color32::from_gray(140),
+                Color32::from_gray(175),
             );
             t += step;
         }
@@ -1299,11 +1312,16 @@ impl EditorState {
                 let selected = self.camera_mode == mode;
                 let label = match mode {
                     CameraMode::ActiveSpeaker => {
-                        format!("{}  (recommended for podcasts)", camera_mode_label(mode))
+                        format!("{}  ·  best for podcasts", camera_mode_label(mode))
                     }
                     _ => camera_mode_label(mode).to_string(),
                 };
-                if ui.selectable_label(selected, label).clicked() {
+                // Full-width rows: every mode the same size, nothing shifts.
+                let resp = ui.add_sized(
+                    [ui.available_width(), 26.0],
+                    egui::Button::selectable(selected, label),
+                );
+                if resp.clicked() {
                     self.camera_mode = mode;
                     if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group)
                         && self.speakers.is_none()
@@ -1363,12 +1381,16 @@ impl EditorState {
         theme::card().show(ui, |ui| {
             ui.add_enabled_ui(self.camera_mode == CameraMode::Manual, |ui| {
                 ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
                     for (kind, label) in [
                         (LayoutKind::Stacked, "Stacked"),
                         (LayoutKind::FullCam, "Full cam"),
                         (LayoutKind::FullGameplay, "Wide"),
                     ] {
-                        if ui.selectable_label(self.kind == kind, label).clicked() {
+                        if ui
+                            .add_sized([w, 26.0], egui::Button::selectable(self.kind == kind, label))
+                            .clicked()
+                        {
                             self.kind = kind;
                         }
                     }
@@ -1404,34 +1426,56 @@ impl EditorState {
         });
 
         // --- Caption style ---
-        theme::section(ui, "Caption style");
+        theme::section(ui, "Caption presets");
         theme::card().show(ui, |ui| {
-            ui.add_enabled_ui(true, |ui| {
-                // Preset chips, two rows of three.
-                let presets = caption_presets();
-                egui::Grid::new("preset-grid").num_columns(3).spacing([6.0, 6.0]).show(ui, |ui| {
-                    for (i, p) in presets.iter().enumerate() {
-                        if ui.selectable_label(self.preset == Some(i), &p.name).clicked() {
+            // Uniform 3-per-row chips: equal boxes read as "pick one card",
+            // and fixed sizes mean nothing can shift on hover or selection.
+            let presets = caption_presets();
+            let chip_w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+            for row in presets.chunks(3) {
+                ui.horizontal(|ui| {
+                    for p in row {
+                        let i = presets.iter().position(|q| q.name == p.name).unwrap_or(0);
+                        if ui
+                            .add_sized(
+                                [chip_w, 28.0],
+                                egui::Button::selectable(self.preset == Some(i), &p.name),
+                            )
+                            .clicked()
+                        {
                             self.style = p.clone();
                             self.preset = Some(i);
                             self.lines_dirty = true;
                             self.overlay_cache = None;
                         }
-                        if i % 3 == 2 {
-                            ui.end_row();
-                        }
                     }
                 });
-                ui.add_space(6.0);
+            }
+            ui.weak("Pick a starting look — everything below stays editable.");
+        });
+
+        // Customization is its own section so the preset cards above and the
+        // knobs below can't be mistaken for one another (operator feedback).
+        theme::section(ui, "Customize captions");
+        theme::card().show(ui, |ui| {
+            {
                 let before = self.style.clone();
                 ui.horizontal(|ui| {
                     ui.label("Animation");
+                    let w = ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0)
+                        .max(60.0);
                     for (genre, label) in [
                         (CaptionGenre::HugeWord, "Huge word"),
                         (CaptionGenre::RollingPop, "Rolling"),
                         (CaptionGenre::KaraokeFill, "Karaoke"),
                     ] {
-                        if ui.selectable_label(self.style.genre == genre, label).clicked() {
+                        if ui
+                            .add_sized(
+                                [w, 26.0],
+                                egui::Button::selectable(self.style.genre == genre, label),
+                            )
+                            .clicked()
+                        {
                             self.style.genre = genre;
                         }
                     }
@@ -1487,7 +1531,7 @@ impl EditorState {
                         ui.weak("Drag the caption on the preview to place it; scroll on it to resize.");
                     }
                 }
-            });
+            }
         });
 
         action
@@ -1496,7 +1540,9 @@ impl EditorState {
     // ------------------------------------------------------- export summary --
 
     /// The pre-render summary modal (focus: "Before rendering, show a summary").
-    fn ui_export_modal(&mut self, ctx: &egui::Context, busy: bool) -> Option<EditorAction> {
+    /// `rendering` gates only the Render button — reviewing the summary while
+    /// the caption pre-pass runs is fine (the render would queue behind it).
+    fn ui_export_modal(&mut self, ctx: &egui::Context, rendering: bool) -> Option<EditorAction> {
         let mut action = None;
         // Dim the page behind the modal.
         let screen = ctx.content_rect();
@@ -1564,9 +1610,13 @@ impl EditorState {
                 );
                 let est = estimate_render_s(dur, cached);
                 row(ui, "Estimated render time", format!("~{}", fmt_mmss(est)));
+                if self.transcript.is_none() {
+                    ui.add_space(4.0);
+                    ui.weak("Captions are still transcribing — rendering now simply waits for them.");
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!busy, |ui| {
+                    ui.add_enabled_ui(!rendering, |ui| {
                         if theme::primary_button(ui, "Render Short").clicked() {
                             self.show_export = false;
                             action = Some(EditorAction::Render(Box::new(self.render_spec())));
