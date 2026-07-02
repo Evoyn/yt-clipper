@@ -29,8 +29,8 @@ const RAISED: Color32 = Color32::from_rgb(0x24, 0x28, 0x33);
 const RAISED_HI: Color32 = Color32::from_rgb(0x2E, 0x33, 0x41);
 /// Hairline borders / separators.
 const HAIRLINE: Color32 = Color32::from_rgb(0x33, 0x39, 0x47);
-/// Primary text — a soft white, never pure white.
-const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE9, 0xF2);
+/// Primary text — just off pure white (pure white is reserved for `strong`).
+const TEXT: Color32 = Color32::from_rgb(0xEE, 0xF0, 0xF6);
 /// The one bold accent — the caption brand gold. Public so the UI can paint the
 /// brand heading with it (the signature element).
 pub const GOLD: Color32 = Color32::from_rgb(0xFF, 0xD1, 0x00);
@@ -151,8 +151,9 @@ fn visuals() -> egui::Visuals {
     // Secondary text must stay READABLE on the dark surfaces: egui's derived
     // weak colour (text tinted toward the fill) sank too close to the panels
     // (operator: "some of darker text cannot be seen"), so pin an explicit
-    // muted slate; likewise raise the disabled fade above the default.
-    v.weak_text_color = Some(Color32::from_rgb(0x9E, 0xA6, 0xB6));
+    // light slate — clearly quieter than body, never grey-on-grey; likewise
+    // raise the disabled fade above the default.
+    v.weak_text_color = Some(Color32::from_rgb(0xB0, 0xB8, 0xC6));
     v.disabled_alpha = 0.65;
     // Accent the selection with a translucent gold + a gold edge.
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(0xFF, 0xD1, 0x00, 48);
@@ -175,18 +176,25 @@ fn visuals() -> egui::Visuals {
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.inactive.corner_radius = r;
 
-    // Hovered: lift the fill, hint the gold on the edge.
+    // Hovered: lift the fill, hint the gold on the edge, brighten the label.
     v.widgets.hovered.bg_fill = RAISED_HI;
     v.widgets.hovered.weak_bg_fill = RAISED_HI;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, GOLD.gamma_multiply(0.55));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xF4, 0xF6, 0xFB));
     v.widgets.hovered.corner_radius = r;
 
-    // Active: pressed / on — the gold moment, with dark text on it.
+    // Active: pressed / on — the gold fill moment. fg is PURE WHITE, not ink:
+    // egui derives `strong_text_color()` from THIS state's text colour
+    // (style.rs), so an ink fg here silently rendered every `strong` label —
+    // VOD titles, "Transcript", the Studio toolbar title — near-black on the
+    // dark panels (operator's unreadable-text screenshots). White makes
+    // strong text pop above the soft-white body; the pressed-gold instant
+    // shows white-on-gold, and the primary CTA keeps its own explicit ink
+    // label (`primary_button`).
     v.widgets.active.bg_fill = GOLD;
     v.widgets.active.weak_bg_fill = GOLD_DEEP;
     v.widgets.active.bg_stroke = Stroke::new(1.0, GOLD);
-    v.widgets.active.fg_stroke = Stroke::new(1.5, INK);
+    v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     v.widgets.active.corner_radius = r;
 
     // Open: an expanded combo / menu.
