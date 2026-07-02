@@ -879,21 +879,24 @@ impl eframe::App for App {
         let working = matches!(self.status, Status::Working(_));
 
         // Top brand bar (W4 / ADR 0024 theme): the gold brand mark + an
-        // always-visible status, instead of a heading buried in the scroll and a
-        // status pinned to the very bottom. A proper app bar — the first step of the
-        // SaaS shell; the moments-rail / detail-pane split is the next slice.
-        egui::Panel::top("brandbar").show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD));
-                ui.add_space(12.0);
-                ui.weak("Turn long gaming VODs into vertical Shorts.");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.status_bar(ui);
+        // always-visible status. Ink-filled so it reads as the app's chrome,
+        // one step below the panels it caps.
+        egui::Panel::top("brandbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::INK)
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new("yt-clipper").color(theme::GOLD).size(24.0));
+                    ui.add_space(12.0);
+                    ui.weak("Turn long VODs into vertical Shorts.");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.status_bar(ui);
+                    });
                 });
             });
-            ui.add_space(4.0);
-        });
 
         // --- Two pages: the Library (import + Moments + detail) and, once a
         // Clip is promoted, the full-window Studio editor (focus 2026-07). The
@@ -911,6 +914,11 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size(380.0)
                 .min_size(300.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(12, 8)),
+                )
                 .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("rail").show(ui, |ui| {
                         self.ui_import(ui, working);
@@ -918,11 +926,17 @@ impl eframe::App for App {
                         self.ui_preflight(ui);
                     });
                 });
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
-                    self.ui_detail(ui, working);
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::WELL)
+                        .inner_margin(egui::Margin::symmetric(18, 12)),
+                )
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
+                        self.ui_detail(ui, working);
+                    });
                 });
-            });
         }
 
         match editor_action {
@@ -1498,10 +1512,36 @@ impl App {
         }
 
         let Some(id) = self.selected else {
-            ui.add_space(48.0);
+            // Empty state: a proper landing hero instead of a lone sentence —
+            // the pane is most of the window and must look intentional.
+            ui.add_space(ui.available_height() * 0.24);
             ui.vertical_centered(|ui| {
-                ui.weak("Select a Moment from the list to see its detail,");
-                ui.weak("or Detect Moments to begin.");
+                ui.label(
+                    egui::RichText::new("FROM VOD TO SHORT IN MINUTES")
+                        .family(theme::display_family())
+                        .size(28.0)
+                        .color(egui::Color32::from_gray(210)),
+                );
+                ui.add_space(14.0);
+                let step = |ui: &mut egui::Ui, n: &str, text: &str| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() * 0.5 - 170.0);
+                        ui.label(
+                            egui::RichText::new(n)
+                                .color(theme::GOLD)
+                                .strong()
+                                .size(15.0),
+                        );
+                        ui.label(egui::RichText::new(text).size(14.5).color(egui::Color32::from_gray(170)));
+                    });
+                };
+                step(ui, "1", "Import a VOD — a YouTube URL or a local file");
+                step(ui, "2", "Detect Moments — AI ranks the clip-worthy spans");
+                step(ui, "3", "Open in editor — frame, caption, and export the Short");
+                if self.imported.is_some() && !self.moments.is_empty() {
+                    ui.add_space(12.0);
+                    ui.weak("Select a Moment from the list on the left.");
+                }
             });
             return;
         };

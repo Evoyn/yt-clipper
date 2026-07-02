@@ -16,9 +16,11 @@ use egui::{Color32, CornerRadius, FontId, Margin, Stroke};
 // ---- the palette (4-6 values, named) ---------------------------------------
 
 /// Deepest background — a cool near-black, not pure black, not generic gray.
-const INK: Color32 = Color32::from_rgb(0x14, 0x16, 0x1B);
-/// Panels / window fill — one step up from the ink.
-const SURFACE: Color32 = Color32::from_rgb(0x1B, 0x1E, 0x26);
+/// Public: the app bar and primary-button text sit directly on/of it.
+pub const INK: Color32 = Color32::from_rgb(0x14, 0x16, 0x1B);
+/// Panels / window fill — one step up from the ink. Public: page-level panel
+/// frames pick between SURFACE (chrome/sidebar) and WELL (content bed).
+pub const SURFACE: Color32 = Color32::from_rgb(0x1B, 0x1E, 0x26);
 /// A faint striped/alternate fill.
 const SURFACE_ALT: Color32 = Color32::from_rgb(0x20, 0x24, 0x2E);
 /// Resting widget fill (buttons, combos).
@@ -71,6 +73,14 @@ pub fn display_family() -> egui::FontFamily {
 
 /// Apply the theme to `ctx` once at startup: install the display font (best
 /// effort), then set the palette, spacing, and type scale.
+///
+/// The midnight studio is the app's identity, not a preference: egui 0.34
+/// follows the OS light/dark setting by default and keeps SEPARATE dark/light
+/// styles — on a light-mode Windows the resolved theme flipped to Light and
+/// rendered the stock light style (our custom style had only landed in the
+/// dark slot). So: pin the theme preference to Dark, write our style into
+/// BOTH slots (no resolution path can ever reach stock light), and ask the OS
+/// for a dark window title bar to match.
 pub fn apply(ctx: &egui::Context, font_path: &Path) {
     let has_display = install_display_font(ctx, font_path);
 
@@ -79,11 +89,11 @@ pub fn apply(ctx: &egui::Context, font_path: &Path) {
 
     // Spacing: roomier than the default, so the dense pipeline UI breathes.
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.button_padding = egui::vec2(14.0, 7.0);
     style.spacing.window_margin = Margin::same(14);
     style.spacing.menu_margin = Margin::same(8);
     style.spacing.indent = 18.0;
-    style.spacing.interact_size.y = 26.0;
+    style.spacing.interact_size.y = 28.0;
 
     // Type scale: a clear hierarchy (heading >> body > small), body a touch larger
     // than egui's default for comfortable reading.
@@ -99,13 +109,19 @@ pub fn apply(ctx: &egui::Context, font_path: &Path) {
     style.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
     style.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
 
-    ctx.set_global_style(style);
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let style = std::sync::Arc::new(style);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+    // The native title bar follows the app, not the OS (Windows: the
+    // immersive dark-mode chrome).
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
 }
 
 /// The dark "midnight studio" [`egui::Visuals`].
 fn visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
-    let r = CornerRadius::same(6);
+    let r = CornerRadius::same(8);
 
     v.dark_mode = true;
     // No global text-color override: each widget's fg_stroke sets its colour, so the
@@ -113,7 +129,19 @@ fn visuals() -> egui::Visuals {
     v.panel_fill = SURFACE;
     v.window_fill = SURFACE;
     v.window_stroke = Stroke::new(1.0, HAIRLINE);
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.window_shadow = egui::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(140),
+    };
+    v.popup_shadow = egui::Shadow {
+        offset: [0, 4],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(120),
+    };
     v.extreme_bg_color = INK; // text-edit / scroll-area background
     v.faint_bg_color = SURFACE_ALT;
     v.code_bg_color = INK;
