@@ -245,6 +245,11 @@ pub enum Progress {
         /// editor uses the count to decide whether to auto-run the podcast
         /// speaker analysis (2+ visible people ≈ a podcast frame).
         faces: Vec<yc_frame::FaceCluster>,
+        /// The resolved render source + its in-source seek offset, so the
+        /// editor's live playback (streaming ffmpeg decode) reads the same
+        /// media the render will.
+        render_src: PathBuf,
+        seek_s: f64,
     },
     /// The podcast speaker analysis + the derived active-speaker camera plan
     /// (focus 2026-07): tracks, per-bin attribution, and cut-based shots for
@@ -412,6 +417,8 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 frame_fps,
                                 range: pc.range,
                                 faces,
+                                render_src: pc.render_src.clone(),
+                                seek_s: pc.seek_s,
                             });
                             prepared = Some(pc);
                         }

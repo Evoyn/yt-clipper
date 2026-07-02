@@ -29,6 +29,7 @@ use yc_frame::speaker::{track_label, SpeakerAnalysis};
 use yc_frame::FaceCluster;
 use yc_render::{preview_lines, resolve_placement, word_states, PreviewLine, WordState};
 
+use crate::player::PreviewPlayer;
 use crate::presets::caption_presets;
 use crate::theme;
 
@@ -110,6 +111,14 @@ pub struct EditorState {
     playhead_s: f64,
     /// `Some((anchor, offset))` while playing: playhead = offset + since(anchor).
     playing: Option<(Instant, f64)>,
+    /// Live playback decode (streaming ffmpeg → one texture, ~24 fps): the
+    /// motion upgrade over the 4 fps filmstrip, alive only while playing.
+    live: Option<PreviewPlayer>,
+    /// What the live player needs to spawn: the pinned ffmpeg, the resolved
+    /// render source, and the clip's in-source seek offset.
+    ffmpeg: std::path::PathBuf,
+    render_src: std::path::PathBuf,
+    seek_s: f64,
     /// The auto-detected seed, kept for "Reset to auto".
     auto_layout: Layout,
     kind: LayoutKind,
@@ -181,6 +190,9 @@ impl EditorState {
         caption_genre: CaptionGenre,
         caption_engine: CaptionEngine,
         faces: Vec<FaceCluster>,
+        ffmpeg: std::path::PathBuf,
+        render_src: std::path::PathBuf,
+        seek_s: f64,
     ) -> Self {
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
             seed_fields(&auto_layout, src_w, src_h);
@@ -197,6 +209,10 @@ impl EditorState {
             frame_fps: frame_fps.max(0.1),
             playhead_s: range.duration_s() * 0.5, // a representative middle frame
             playing: None,
+            live: None,
+            ffmpeg,
+            render_src,
+            seek_s,
             auto_layout,
             kind,
             seam,
@@ -383,6 +399,7 @@ impl EditorState {
             if self.playhead_s >= dur {
                 self.playhead_s = dur;
                 self.playing = None;
+                self.stop_video();
                 action = EditorAction::StopAudio;
             } else {
                 // ~30 fps visual tick normally; ~10 fps while the GPU works
@@ -559,6 +576,7 @@ impl EditorState {
                     (self.playhead_s + if right { step_s } else { -step_s }).clamp(0.0, dur);
                 if self.playing.is_some() {
                     self.playing = Some((Instant::now(), self.playhead_s));
+                    self.start_video();
                     return Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
                 }
             }
@@ -569,6 +587,7 @@ impl EditorState {
     fn toggle_play(&mut self) -> EditorAction {
         if self.playing.is_some() {
             self.playing = None;
+            self.stop_video();
             EditorAction::StopAudio
         } else {
             let dur = self.range.duration_s();
@@ -576,8 +595,32 @@ impl EditorState {
                 self.playhead_s = 0.0;
             }
             self.playing = Some((Instant::now(), self.playhead_s));
+            self.start_video();
             EditorAction::Play(self.play_range_from(self.playhead_s))
         }
+    }
+
+    /// Spawn the live decode at the current playhead (Play, or a seek while
+    /// playing). Failure is soft: the filmstrip keeps carrying playback.
+    fn start_video(&mut self) {
+        self.live = None; // kill any previous stream first
+        let abs = self.seek_s + self.playhead_s;
+        let remaining = (self.range.duration_s() - self.playhead_s).max(0.05);
+        match PreviewPlayer::spawn(
+            &self.ffmpeg,
+            &self.render_src,
+            abs,
+            remaining,
+            self.src_w,
+            self.src_h,
+        ) {
+            Ok(p) => self.live = Some(p),
+            Err(e) => tracing::warn!("live preview unavailable ({e}); filmstrip playback"),
+        }
+    }
+
+    fn stop_video(&mut self) {
+        self.live = None; // Drop kills the decoder
     }
 
     /// The Manual-mode crop the arrow keys / drag act on (the full-frame crop,
@@ -617,8 +660,17 @@ impl EditorState {
         }
     }
 
-    /// The frame texture nearest the playhead.
-    fn frame_tex(&self) -> egui::TextureId {
+    /// The frame texture to draw at the playhead: the LIVE stream while
+    /// playing (full-rate motion), else the filmstrip frame nearest the
+    /// playhead (paused / scrubbing / before the first live frame lands).
+    fn frame_tex(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        if self.playing.is_some() {
+            if let Some(live) = &mut self.live {
+                if let Some(id) = live.poll(ctx) {
+                    return id;
+                }
+            }
+        }
         let idx = ((self.playhead_s * self.frame_fps).round() as usize)
             .min(self.frames.len().saturating_sub(1));
         self.frames[idx].id()
@@ -627,7 +679,7 @@ impl EditorState {
     /// Output view: the composited 9:16 result at the playhead — panels,
     /// captions, safe area, tracking chip.
     fn draw_output(&mut self, ui: &mut egui::Ui, canvas: Rect) {
-        let tex = self.frame_tex();
+        let tex = self.frame_tex(ui.ctx());
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, CornerRadius::same(4), Color32::BLACK);
         let layout = self.effective_layout(self.playhead_s);
@@ -711,7 +763,7 @@ impl EditorState {
 
     /// Source view: the whole frame, the crop box tool, and face overlays.
     fn draw_source(&mut self, ui: &mut egui::Ui, frame_rect: Rect) {
-        let tex = self.frame_tex();
+        let tex = self.frame_tex(ui.ctx());
         let painter = ui.painter_at(frame_rect);
         painter.rect_filled(frame_rect, CornerRadius::same(4), Color32::BLACK);
         let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -1088,9 +1140,10 @@ impl EditorState {
                     .or(Some(t.units.len().saturating_sub(1)));
                 self.scroll_to_sel = true;
             }
-            // Same contract as the scrub: playing audio restarts at the jump.
+            // Same contract as the scrub: playing audio + video restart at the jump.
             if self.playing.is_some() {
                 self.playing = Some((Instant::now(), self.playhead_s));
+                self.start_video();
                 action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
             }
         }
@@ -1167,13 +1220,19 @@ impl EditorState {
                 if self.playing.is_some() {
                     self.playing = Some((Instant::now(), self.playhead_s));
                     if resp.clicked() {
+                        self.start_video();
                         action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                    } else {
+                        // Mid-drag: the filmstrip tracks the pointer (the live
+                        // stream would show the OLD position until release).
+                        self.stop_video();
                     }
                 }
             }
         }
         if resp.drag_stopped() && self.playing.is_some() {
             self.playing = Some((Instant::now(), self.playhead_s));
+            self.start_video();
             action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
         }
         action
@@ -1370,10 +1429,11 @@ impl EditorState {
         }
         if let Some(t) = seek {
             self.playhead_s = t.clamp(0.0, self.range.duration_s());
-            // Seeking during playback restarts the audio at the row's time —
-            // same contract as the timeline scrub.
+            // Seeking during playback restarts audio + video at the row's
+            // time — same contract as the timeline scrub.
             if self.playing.is_some() {
                 self.playing = Some((Instant::now(), self.playhead_s));
+                self.start_video();
                 action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
             }
         }
@@ -1688,6 +1748,10 @@ impl EditorState {
                     ui.add_enabled_ui(!rendering, |ui| {
                         if theme::primary_button(ui, "Render Short").clicked() {
                             self.show_export = false;
+                            // The app stops the audio for the render; stop our
+                            // side of playback too so they never desync.
+                            self.playing = None;
+                            self.stop_video();
                             action = Some(EditorAction::Render(Box::new(self.render_spec())));
                         }
                     });

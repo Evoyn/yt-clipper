@@ -67,10 +67,17 @@ override).
   camera-cut graph rendered + frame-inspected; GUI smoke-launched.
 - **Known limits**: speaker attribution is visual (overlap → the most
   animated mouth wins; off-screen voices hold the shot) — diarization is the
-  named upgrade path; preview playback is still the ~4 fps filmstrip (360p
-  for >60 s clips); per-Creator memory still stores genre only, not full
+  named upgrade path; per-Creator memory still stores genre only, not full
   custom styles; transcript edits don't feed the dialect store (per-clip
   fixes vs durable curation stay separate lanes).
+- **Same-day follow-up (operator review round)**: playback upgraded from the
+  4 fps filmstrip to a **live streaming decode** (ffmpeg `-re` → rgb24 pipe →
+  one reused texture, 24 fps @ 640p; filmstrip stays for paused/scrub) —
+  measured 120 frames / 5 s at 0.98x realtime; plus the review-round fixes
+  (theme pinned dark both-slots + white strong text, chip grid, scrub/seek
+  audio restarts, review-queue snapshot, clickable timeline captions,
+  engine-aware transcribe placeholder, editor loading state, path-free
+  diagnostics).
 
 ---
 

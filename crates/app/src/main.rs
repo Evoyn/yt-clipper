@@ -9,6 +9,7 @@
 
 mod editor;
 mod pipeline;
+mod player;
 mod presets;
 mod review_queue;
 mod theme;
@@ -757,6 +758,8 @@ impl eframe::App for App {
                     frame_fps,
                     range,
                     faces,
+                    render_src,
+                    seek_s,
                 } => {
                     self.opening_editor = false;
                     // Batch render (M8): auto-render this clip with its auto-detected
@@ -809,6 +812,9 @@ impl eframe::App for App {
                             self.caption_genre,
                             self.caption_engine,
                             faces,
+                            self.paths.ffmpeg(),
+                            render_src,
+                            seek_s,
                         );
                         // The editor workflow pre-passes (focus 2026-07): kick
                         // transcription now so captions are editable before any
