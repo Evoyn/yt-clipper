@@ -4,6 +4,21 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (session wrap) — full review done: 10 commits, and the next caption move is staged
+
+Session summary: the full-project review you asked for is complete — 8 fix/feature
+commits (all four backlog items + durability, cancel, and caption-pipeline bugs the
+sweep confirmed), ADR 0033 (WHY decode changes keep breaking your curated fixes), and
+the new direction committed to the roadmap: **trial Qwen3-ASR (open-sourced Jan 2026,
+Indonesian + English, music-robust) against whisper on your two ground-truthed hard
+clips + the Deddy podcast control — your ears judge, per language.** The 1.7B model +
+its audio encoder are already downloaded into `models\`; the workspace was deliberately
+NOT cleared (it holds the benchmark clips — fresh data from the new youtuber is
+additive, each streamer gets their own folder). Next session: open `nextprompt.md` and
+take the ⭐ item. 166 tests green, everything pushed.
+
+---
+
 ## 2026-07-02 (overnight 9) — Cancel now actually stops the render and the audio extract
 
 Hitting **Cancel** only ever killed downloads (yt-dlp). The two longest local
