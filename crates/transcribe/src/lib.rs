@@ -594,16 +594,22 @@ impl DialectLexicon {
 }
 
 /// Merge `overlay` corrections into `into`, **overlay wins** on a duplicate `wrong`
-/// (case-insensitive): an overlay entry replaces a matching base/earlier one, else
-/// it is appended. The layering primitive for [`DialectLexicon::load_layered`] —
-/// per-clip over per-Creator over base (ADR 0031). Pure, so it is unit-tested.
+/// (case-insensitive) *at the same moment*: a time-anchored (`at_s`) entry is a
+/// per-moment correction, so entries for the same `wrong` at different moments
+/// coexist (the measured case: three "blok on" pairs in one clip, one of them a
+/// different word), and an anchored entry never replaces a global one (they serve
+/// different passes). Else appended. The layering primitive for
+/// [`DialectLexicon::load_layered`] — per-clip over per-Creator over base
+/// (ADR 0031). Pure, so it is unit-tested.
 fn merge_corrections(into: &mut Vec<Correction>, overlay: Vec<Correction>) {
     for c in overlay {
         if c.wrong.is_empty() {
             continue;
         }
         let key = c.wrong.to_lowercase();
-        if let Some(existing) = into.iter_mut().find(|e| e.wrong.to_lowercase() == key) {
+        if let Some(existing) =
+            into.iter_mut().find(|e| e.wrong.to_lowercase() == key && e.at_s == c.at_s)
+        {
             // A blank-`right` overlay entry (an operator to-do) must NOT shadow a
             // confirmed fix from a lower layer: a stale per-clip to-do would otherwise
             // erase the per-Creator correction of the same word, which then `pairs()`
@@ -1536,6 +1542,45 @@ mod tests {
         assert!(note.contains("0.42"), "confidence in note: {note}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_corrections_at_s_entries_coexist_per_moment() {
+        // The Deddy gate case: three "blok on" pairs in one clip, one a
+        // different word. Keyed by wrong alone they collapse to the last;
+        // the moment is part of the identity.
+        let mut into = vec![Correction {
+            wrong: "blok on".into(),
+            right: "blo'on".into(),
+            at_s: Some(1846.8),
+            ..Default::default()
+        }];
+        merge_corrections(
+            &mut into,
+            vec![
+                // same wrong, different moment -> coexists
+                Correction {
+                    wrong: "blok on".into(),
+                    right: "goblok".into(),
+                    at_s: Some(1848.0),
+                    ..Default::default()
+                },
+                // same wrong + same moment -> overlay replaces
+                Correction {
+                    wrong: "blok on".into(),
+                    right: "blo'on".into(),
+                    note: "updated".into(),
+                    at_s: Some(1846.8),
+                    ..Default::default()
+                },
+                // same wrong, global (no anchor) -> coexists with anchored ones
+                Correction { wrong: "blok on".into(), right: "global".into(), ..Default::default() },
+            ],
+        );
+        assert_eq!(into.len(), 3);
+        assert_eq!(into[0].note, "updated");
+        assert_eq!(into[1].right, "goblok");
+        assert_eq!(into[2].right, "global");
     }
 
     #[test]

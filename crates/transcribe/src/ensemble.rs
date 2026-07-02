@@ -122,6 +122,7 @@ pub fn apply(
 
     // --- 1. decode variants (one-shot sidecar spawns; GPU-sequential) -------
     let mut decodes: Vec<Vec<String>> = Vec::new();
+    let mut onset_wav: Option<PathBuf> = None;
     for (i, v) in VARIANTS.iter().enumerate() {
         if v.atten.is_some() && cfg.deep_filter.is_none() {
             continue;
@@ -133,6 +134,14 @@ pub fn apply(
                 continue;
             }
         };
+        // The strongest no-pad denoised view doubles as the ONSET source:
+        // on a loud mix the raw RMS envelope never dips below the silence
+        // bar (no onsets -> uniform smear placement), while the cleaned
+        // audio exposes the real speech starts. No-pad only: a padded wav's
+        // clock is 5 s ahead of the clip's.
+        if v.atten.is_some() && !v.head_pad && onset_wav.is_none() {
+            onset_wav = Some(wav.clone());
+        }
         match decode_one(cfg, &wav, whisper.language, v.head_pad) {
             Ok(words) if !words.is_empty() => {
                 tracing::info!(
@@ -176,11 +185,24 @@ pub fn apply(
     apply_store_fuzzy(&mut merged, lexicon);
 
     // --- 4. fuse words onto the anchor skeleton + speech onsets -------------
+    // Onset source: the denoised no-pad variant when it exists (captured in
+    // the decode loop), else the mix samples the render already holds.
+    let onset_samples: Option<Vec<f32>> = onset_wav.and_then(|w| {
+        match wav_samples_f32(&cfg.ffmpeg, &w) {
+            Ok(s) if !s.is_empty() => Some(s),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("qwen ensemble: cleaned-onset read failed (mix onsets stand): {e:#}");
+                None
+            }
+        }
+    });
+    let onset_src: &[f32] = onset_samples.as_deref().unwrap_or(samples);
     let mut fused = fuse_onto_timing(
         &merged,
         whisper,
         timing_extra,
-        samples,
+        onset_src,
         sample_rate,
         range.duration_s(),
     );
@@ -199,7 +221,7 @@ pub fn apply(
         &mut fused,
         lexicon,
         range.start_s,
-        &rms_onsets(samples, sample_rate),
+        &rms_onsets(onset_src, sample_rate),
         range.duration_s(),
     );
     Ok(Transcript { language: whisper.language, units: fused })
@@ -243,6 +265,24 @@ fn variant_wav(
         .context("spawning deep-filter for ensemble variant")?;
     anyhow::ensure!(status.success(), "deep-filter failed ({status})");
     Ok(out_dir.join(cut.file_name().expect("cut has a name")))
+}
+
+/// Decode a wav to mono 16 kHz f32 samples via the bundled ffmpeg (the
+/// deep-filter output's sample format is its own business — ffmpeg
+/// normalizes it to the render's analysis format).
+fn wav_samples_f32(ffmpeg: &Path, wav: &Path) -> Result<Vec<f32>> {
+    let out = Command::new(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(wav)
+        .args(["-f", "f32le", "-ac", "1", "-ar", "16000", "-"])
+        .output()
+        .context("spawning ffmpeg for onset samples")?;
+    anyhow::ensure!(out.status.success(), "ffmpeg onset decode failed ({})", out.status);
+    Ok(out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
 }
 
 /// One one-shot llama-mtmd-cli decode -> normalized words. Head-padded
@@ -715,11 +755,10 @@ fn rms_onsets(samples: &[f32], sample_rate: u32) -> Vec<f64> {
 }
 
 /// Lay a run of words into [gap_start, gap_end]. With onsets to spare the run
-/// spreads across them in order; with a modest shortfall the first words snap
-/// to the onsets and the rest spread proportionally after; when onsets are too
-/// scarce to structure the run (words > 2x onsets) the whole run spreads
-/// character-proportionally through the gap. Each word ends where the next
-/// begins (the refine pass owns display durations).
+/// spreads across them in order; with more words than onsets the onsets
+/// delimit speech segments and the words distribute across segments by
+/// duration mass, char-proportionally within each. Each word ends where the
+/// next begins (the refine pass owns display durations).
 fn place_run(
     words: &[String],
     gap_start: f64,
@@ -744,29 +783,52 @@ fn place_run(
         for k in 0..n {
             starts.push(usable[if n == 1 { 0 } else { k * (m - 1) / (n - 1) }]);
         }
-    } else if m * 2 >= n && m > 0 {
-        // Modest overflow: onsets first, proportional tail after the last one.
-        starts.extend_from_slice(&usable);
-        let rem = &words[m..];
-        let from = *starts.last().expect("m > 0");
-        let total_chars: usize = rem.iter().map(|w| w.chars().count().max(1)).sum();
-        let mut t = from + 0.15;
-        let span = (gap_end - t).max(0.0);
-        for w in rem {
-            starts.push(t.min(gap_end));
-            t += span * (w.chars().count().max(1) as f64 / total_chars as f64);
-        }
     } else {
-        // Onsets too scarce to structure the run (a loud mix barely dips
-        // below the silence bar): snapping the first words to them stacks
-        // the rest against the gap's end — spread the WHOLE run
-        // character-proportionally instead.
-        let total_chars: usize = words.iter().map(|w| w.chars().count().max(1)).sum();
-        let span = (gap_end - gap_start).max(0.0);
-        let mut t = gap_start;
-        for w in words {
-            starts.push(t.min(gap_end));
-            t += span * (w.chars().count().max(1) as f64 / total_chars as f64);
+        // Fewer onsets than words: the onsets delimit speech segments —
+        // allocate words to segments by duration mass (largest remainder),
+        // then spread char-proportionally within each, so every burst opens
+        // with a word ON its onset. m == 0 degenerates to one segment (the
+        // whole-gap proportional spread). First-N-onto-onsets stacked the
+        // remainder against the gap's end (measured: 47 words into 1.85 s).
+        let mut bounds = Vec::with_capacity(m + 2);
+        bounds.push(gap_start);
+        bounds.extend_from_slice(&usable);
+        bounds.push(gap_end.max(gap_start));
+        let durs: Vec<f64> = bounds.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+        let total: f64 = durs.iter().sum();
+        let mut counts: Vec<usize> = if total > 0.0 {
+            durs.iter().map(|d| ((n as f64) * d / total).floor() as usize).collect()
+        } else {
+            vec![0; durs.len()]
+        };
+        let mut used: usize = counts.iter().sum();
+        let mut order: Vec<usize> = (0..durs.len()).collect();
+        order.sort_by(|&a, &b| {
+            let frac = |i: usize| {
+                if total > 0.0 { (n as f64) * durs[i] / total - counts[i] as f64 } else { 0.0 }
+            };
+            frac(b).total_cmp(&frac(a))
+        });
+        let mut oi = 0;
+        while used < n {
+            counts[order[oi % order.len()]] += 1;
+            used += 1;
+            oi += 1;
+        }
+        let mut wi = 0;
+        for (si, c) in counts.iter().enumerate() {
+            if *c == 0 {
+                continue;
+            }
+            let (s0, s1) = (bounds[si], bounds[si + 1]);
+            let seg = &words[wi..wi + c];
+            let total_chars: usize = seg.iter().map(|w| w.chars().count().max(1)).sum();
+            let mut t = s0;
+            for w in seg {
+                starts.push(t.min(s1));
+                t += (s1 - s0).max(0.0) * (w.chars().count().max(1) as f64 / total_chars as f64);
+            }
+            wi += c;
         }
     }
     // monotonic guard (onsets are sorted; the proportional tail could start
@@ -784,9 +846,11 @@ fn place_run(
 }
 
 /// Positional (time-anchored) store pass over the FUSED units: each `at_s`
-/// correction targets the single occurrence of its `wrong` token nearest that
-/// VOD moment (±3 s guard), replaces its text (a multi-word `right` expands to
-/// consecutive units; `wrong == right` is a pure timing pin), and PINS the
+/// correction targets the occurrence of its `wrong` token(s) nearest that
+/// VOD moment (±3 s guard) — a multi-word `wrong` matches consecutive units
+/// and collapses them into the first, donating their spans — replaces its
+/// text (a multi-word `right` expands to consecutive units; `wrong == right`
+/// is a pure timing pin), and PINS the
 /// first word's caption onto the speech onset closest to the moment (±1.5 s,
 /// else the moment itself). Units that would then overlap the pin from the
 /// left are re-placed briefly (0.3 s/word cap) so they stay readable — the
@@ -800,17 +864,22 @@ pub fn apply_store_positional(
     onsets: &[f64],
     clip_dur_s: f64,
 ) {
-    let mut pins: Vec<(f64, String, Vec<String>)> = lexicon
+    let mut pins: Vec<(f64, Vec<String>, Vec<String>)> = lexicon
         .corrections
         .iter()
         .filter(|c| !c.right.is_empty() && !c.context)
         .filter_map(|c| {
             let at = c.at_s?;
             let wrong = normalize(&c.wrong);
-            if wrong.len() != 1 {
+            if wrong.is_empty() {
                 return None;
             }
-            Some((at - range_start_s, wrong.into_iter().next().expect("len checked"), normalize(&c.right)))
+            // `right` verbatim by token: normalize() would split the
+            // operator's spelling at punctuation ("blo'on" -> "blo on") —
+            // their written form is the display truth, exactly as the dict
+            // path renders it.
+            let right: Vec<String> = c.right.split_whitespace().map(str::to_string).collect();
+            Some((at - range_start_s, wrong, right))
         })
         .collect();
     pins.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -818,34 +887,39 @@ pub fn apply_store_positional(
         if pin_t < 0.0 || pin_t > clip_dur_s {
             continue;
         }
-        // nearest occurrence of `wrong` to the moment. EXACT token matches
-        // outrank garble-similar ones — edit-2 "similarity" pairs absurdities
-        // on short words ("main"~"kan"), so it is only the fallback when the
-        // exact word is absent (the vote respelled the garble again).
+        // nearest occurrence of `wrong` (consecutive units for a multi-word
+        // wrong — "blok on" collapsing to "blo'on") to the moment. EXACT token
+        // matches outrank garble-similar ones — edit-2 "similarity" pairs
+        // absurdities on short words ("main"~"kan"), so it is only the
+        // fallback when the exact words are absent (the vote respelled the
+        // garble again).
         let nearest = |exact: bool| {
-            fused
-                .iter()
-                .enumerate()
-                .filter(|(_, u)| {
-                    if exact {
-                        u.text == wrong
-                    } else {
-                        similar_word(&u.text, &wrong)
-                    }
+            (0..(fused.len() + 1).saturating_sub(wrong.len()))
+                .filter(|&k| {
+                    wrong.iter().enumerate().all(|(i, w)| {
+                        if exact {
+                            &fused[k + i].text == w
+                        } else {
+                            similar_word(&fused[k + i].text, w)
+                        }
+                    })
                 })
-                .min_by(|(_, a), (_, b)| {
-                    (a.start_s - pin_t).abs().total_cmp(&(b.start_s - pin_t).abs())
+                .min_by(|&a, &b| {
+                    (fused[a].start_s - pin_t).abs().total_cmp(&(fused[b].start_s - pin_t).abs())
                 })
-                .map(|(k, _)| k)
         };
         let target = nearest(true).or_else(|| nearest(false));
         let Some(k) = target else {
-            tracing::warn!("qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s: no such word in the caption");
+            tracing::warn!(
+                "qwen ensemble: at_s pin \"{}\"@{pin_t:.1}s: no such word(s) in the caption",
+                wrong.join(" ")
+            );
             continue;
         };
         if (fused[k].start_s - pin_t).abs() > 3.0 {
             tracing::warn!(
-                "qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s: nearest occurrence is {:.1}s away - skipped",
+                "qwen ensemble: at_s pin \"{}\"@{pin_t:.1}s: nearest occurrence is {:.1}s away - skipped",
+                wrong.join(" "),
                 (fused[k].start_s - pin_t).abs()
             );
             continue;
@@ -861,12 +935,18 @@ pub fn apply_store_positional(
             .min_by(|a, b| (a - pin_t).abs().total_cmp(&(b - pin_t).abs()))
             .unwrap_or(pin_t);
         tracing::info!(
-            "qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s -> \"{}\" at {snap:.2}s (was {:.2}s)",
+            "qwen ensemble: at_s pin \"{}\"@{pin_t:.1}s -> \"{}\" at {snap:.2}s (was {:.2}s)",
+            wrong.join(" "),
             right.join(" "),
             fused[k].start_s
         );
+        // A multi-word wrong collapses: its trailing units are removed and
+        // donate their timeline to the first (the "blok on" pair becomes one
+        // "blo'on" spanning both words' time).
+        let collapsed_end = fused[k + wrong.len() - 1].end_s;
+        fused.drain(k + 1..k + wrong.len());
         // replace text (multi-word right expands into consecutive units)
-        let old_end = fused[k].end_s.max(snap + 0.15);
+        let old_end = fused[k].end_s.max(collapsed_end).max(snap + 0.15);
         fused[k].text = right[0].clone();
         fused[k].start_s = snap;
         fused[k].end_s = old_end.min(snap + 0.6);
@@ -1279,19 +1359,15 @@ mod tests {
     }
 
     #[test]
-    fn place_run_ignores_onsets_too_scarce_to_structure_the_run() {
-        // One late onset, eight words: snapping word 1 to it stacked the other
-        // seven into the last 0.85 s. The run must spread through the gap.
+    fn place_run_distributes_words_by_segment_mass_when_onsets_are_scarce() {
+        // One late onset, eight words: first-N snapping stacked seven words
+        // into the last 0.85 s. Segment allocation gives the 9 s head its
+        // seven and opens the burst at 9.0 with the eighth.
         let mut fused = Vec::new();
-        place_run(
-            &words("a b c d e f g h"),
-            0.0,
-            10.0,
-            &[9.0],
-            &mut fused,
-        );
+        place_run(&words("a b c d e f g h"), 0.0, 10.0, &[9.0], &mut fused);
         assert_eq!(fused.len(), 8);
         assert!(fused[0].start_s < 0.5, "run starts at the gap, got {}", fused[0].start_s);
+        assert_eq!(fused[7].start_s, 9.0, "the burst opens with a word on its onset");
         for u in &fused {
             assert!(
                 u.end_s - u.start_s > 0.5,
@@ -1299,6 +1375,20 @@ mod tests {
                 u.text,
                 u.end_s - u.start_s
             );
+        }
+    }
+
+    #[test]
+    fn place_run_opens_each_speech_burst_on_its_onset() {
+        // Bursts at 2.0 and 6.0 split the gap into 2s/4s/4s segments: five
+        // equal words allocate 1/2/2 and each burst starts ON its onset.
+        let mut fused = Vec::new();
+        place_run(&words("aa bb cc dd ee"), 0.0, 10.0, &[2.0, 6.0], &mut fused);
+        assert_eq!(fused.len(), 5);
+        assert_eq!(fused[1].start_s, 2.0);
+        assert_eq!(fused[3].start_s, 6.0);
+        for w in fused.windows(2) {
+            assert!(w[0].start_s <= w[1].start_s + 1e-9);
         }
     }
 
@@ -1481,6 +1571,66 @@ mod tests {
         // pin at clip 16s, occurrence at 2s -> 14s away -> skipped
         apply_store_positional(&mut fused, &pin_lex(&[("kreeng", "kreeng", 116.0)]), 100.0, &[], 30.0);
         assert_eq!(fused[0].start_s, 2.0);
+    }
+
+    #[test]
+    fn positional_pin_collapses_multiword_wrong_and_keeps_operator_spelling() {
+        // The Deddy gate ruling: the vote heard "blok on" where the speaker
+        // says "blo'on" — a multi-word wrong collapses both units into one,
+        // and the operator's apostrophe survives (normalize() would have
+        // split it back into "blo on").
+        let mut fused = vec![
+            CaptionUnit { text: "tapi".into(), start_s: 46.5, end_s: 46.7 },
+            CaptionUnit { text: "blok".into(), start_s: 46.78, end_s: 47.0 },
+            CaptionUnit { text: "on".into(), start_s: 47.06, end_s: 47.19 },
+            CaptionUnit { text: "tuh".into(), start_s: 47.19, end_s: 47.4 },
+        ];
+        apply_store_positional(
+            &mut fused,
+            &pin_lex(&[("blok on", "blo'on", 1846.8)]),
+            1800.0,
+            &[],
+            60.0,
+        );
+        let texts: Vec<&str> = fused.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, ["tapi", "blo'on", "tuh"]);
+        // the collapsed unit spans (capped) both source words' time
+        assert!((fused[1].start_s - 46.8).abs() < 1e-9);
+        assert!(fused[1].end_s > 47.1);
+        for w in fused.windows(2) {
+            assert!(w[0].start_s <= w[1].start_s + 1e-9);
+        }
+    }
+
+    #[test]
+    fn positional_pins_fix_each_pair_independently() {
+        // Three "blok on" pairs, the middle one is a different word — each
+        // pin targets its own occurrence by time.
+        let mut fused = Vec::new();
+        for (s, w) in [
+            (46.78, "blok"),
+            (47.06, "on"),
+            (47.5, "tuh"),
+            (47.96, "blok"),
+            (48.34, "on"),
+            (49.58, "blok"),
+            (49.76, "on"),
+        ] {
+            fused.push(CaptionUnit { text: w.into(), start_s: s, end_s: s + 0.15 });
+        }
+        apply_store_positional(
+            &mut fused,
+            &pin_lex(&[
+                ("blok on", "blo'on", 1846.8),
+                ("blok on", "goblok", 1848.0),
+                ("blok on", "blo'on", 1849.6),
+            ]),
+            1800.0,
+            &[],
+            60.0,
+        );
+        let texts: Vec<&str> = fused.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, ["blo'on", "tuh", "goblok", "blo'on"]);
     }
 
     #[test]
