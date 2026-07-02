@@ -106,6 +106,7 @@ pub fn apply(
     analysis_wav: &Path,
     range: TimeRange,
     whisper: &Transcript,
+    lexicon: &crate::DialectLexicon,
 ) -> Result<Transcript> {
     anyhow::ensure!(cfg.mtmd_cli.is_file(), "mtmd sidecar missing: {}", cfg.mtmd_cli.display());
     anyhow::ensure!(cfg.qwen_model.is_file(), "qwen model missing: {}", cfg.qwen_model.display());
@@ -160,7 +161,18 @@ pub fn apply(
         merged.len()
     );
 
-    // --- 3. fuse words onto whisper timing ----------------------------------
+    // --- 3. fuzzy store application (the curation-survives-engine-swap tier) ---
+    // The dialect store's `wrong` keys are whisper's exact garbles (ADR 0033),
+    // so they never literally match another engine's spelling of the SAME
+    // mishear (whisper "dijekat" vs the ensemble's "dijegat"). An edit-1
+    // tolerant match transfers the operator's existing confirmed corrections
+    // across engines — no new curation. Guards make it conservative: single-
+    // word wrongs of >=4 chars, never on a token that is a real dictionary
+    // word, context-sensitive pairs skipped (they need the LLM pass by design).
+    let mut merged = merged;
+    apply_store_fuzzy(&mut merged, lexicon);
+
+    // --- 4. fuse words onto whisper timing ----------------------------------
     let fused = fuse_onto_timing(&merged, whisper, range.duration_s());
     tracing::info!(
         "qwen ensemble: fused {} units (whisper had {})",
@@ -387,6 +399,65 @@ pub fn vote_merge(backbone: &[String], voters: &[Vec<String>]) -> Vec<String> {
     merged
 }
 
+/// Transfer the store's confirmed corrections onto the voted words with
+/// edit-1 tolerance (see the call site for why exact keys can't match across
+/// engines). Two tiers per single-word `wrong`: exact token match, or — only
+/// when the token is NOT a real dictionary word and the wrong is >=4 chars —
+/// an edit-1 match. `context: true` pairs are skipped (LLM-pass territory,
+/// ADR 0030); multi-word wrongs are skipped in this tier (whisper's
+/// multi-word garble shapes don't transfer across engines). `right` may be
+/// multi-word; it splices in normalized.
+pub fn apply_store_fuzzy(words: &mut Vec<String>, lexicon: &crate::DialectLexicon) {
+    let pairs: Vec<(String, Vec<String>)> = lexicon
+        .corrections
+        .iter()
+        .filter(|c| !c.right.is_empty() && !c.context)
+        .filter_map(|c| {
+            let wrong = normalize(&c.wrong);
+            if wrong.len() != 1 {
+                return None;
+            }
+            Some((wrong.into_iter().next().expect("len checked"), normalize(&c.right)))
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    for tok in words.iter() {
+        let exact = pairs.iter().find(|(w, _)| w == tok);
+        let hit = exact.or_else(|| {
+            if lexicon.dictionary.contains(tok.as_str()) {
+                return None;
+            }
+            pairs.iter().find(|(w, _)| w.chars().count() >= 4 && edit1(tok, w))
+        });
+        match hit {
+            Some((w, right)) if right != &[tok.clone()] => {
+                tracing::info!("qwen ensemble: store fuzzy \"{tok}\" (~\"{w}\") -> \"{}\"", right.join(" "));
+                out.extend(right.iter().cloned());
+            }
+            _ => out.push(tok.clone()),
+        }
+    }
+    *words = out;
+}
+
+/// True when `a` and `b` are within one edit (sub/ins/del) of each other.
+fn edit1(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (n, m) = (a.len(), b.len());
+    if n.abs_diff(m) > 1 {
+        return false;
+    }
+    if n == m {
+        return a.iter().zip(&b).filter(|(x, y)| x != y).count() <= 1;
+    }
+    let (long, short) = if n > m { (&a, &b) } else { (&b, &a) };
+    let mut i = 0;
+    while i < short.len() && long[i] == short[i] {
+        i += 1;
+    }
+    long[i + 1..] == short[i..]
+}
+
 /// Align the voted words onto whisper's timed units. Matched positions adopt
 /// whisper's span with the voted word; whisper-only units DROP (the
 /// hallucination class); voted-only runs are laid out character-proportionally
@@ -556,6 +627,44 @@ mod tests {
         assert_eq!(fused.len(), 3);
         assert!(fused[2].end_s <= 4.0 + 1e-9);
         assert!(fused[1].start_s >= 1.0 - 1e-9);
+    }
+
+    #[test]
+    fn store_fuzzy_transfers_correction_across_engine_spellings() {
+        // whisper's garble was curated as dijekat->dicegat; the ensemble
+        // spells the same mishear dijegat — edit-1 from the stored key.
+        let mut lex = crate::DialectLexicon::default();
+        lex.corrections.push(crate::Correction {
+            wrong: "dijekat".into(),
+            right: "dicegat".into(),
+            ..Default::default()
+        });
+        lex.dictionary.insert("dicegat".into());
+        let mut w = words("kau dijegat mana");
+        apply_store_fuzzy(&mut w, &lex);
+        assert_eq!(w, words("kau dicegat mana"));
+    }
+
+    #[test]
+    fn store_fuzzy_never_touches_real_dictionary_words_or_context_pairs() {
+        let mut lex = crate::DialectLexicon::default();
+        // context pair (LLM-only, ADR 0030) must not fire even on exact match
+        lex.corrections.push(crate::Correction {
+            wrong: "cowok".into(),
+            right: "cok".into(),
+            context: true,
+            ..Default::default()
+        });
+        // fuzzy would match maen~main, but maen is a real (dictionary) word
+        lex.corrections.push(crate::Correction {
+            wrong: "main".into(),
+            right: "kelamin".into(),
+            ..Default::default()
+        });
+        lex.dictionary.insert("maen".into());
+        let mut w = words("cowok maen");
+        apply_store_fuzzy(&mut w, &lex);
+        assert_eq!(w, words("cowok maen"));
     }
 
     #[test]

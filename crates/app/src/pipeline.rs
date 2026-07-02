@@ -1416,6 +1416,7 @@ fn do_render(
                     &session.analysis_wav,
                     range,
                     &transcript,
+                    &lexicon,
                 ) {
                     Ok(fused) => {
                         transcript = fused;

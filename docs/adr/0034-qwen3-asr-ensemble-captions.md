@@ -68,9 +68,19 @@ render provably unchanged when unset — the ADR 0033 opt-in contract):
   span, whisper-only units DROP (the outvoted hallucination class), voted-only
   runs get character-proportional spans inside the enclosing whisper gap.
   Downstream refine/ASS/karaoke are untouched.
-- **Store isolation**: the ensemble path neither reads nor writes dialect
-  stores; auto-harvest is skipped when it ran (candidates are whisper-keyed
-  and would misattribute). GPU stays sequential (whisper's one-shot load drops
+- **Fuzzy store transfer (curation survives the engine swap)**: after the
+  vote, the layered store's confirmed corrections apply to the voted words
+  with edit-1 tolerance — whisper's curated garble key ("dijekat") matches
+  the ensemble's spelling of the same mishear ("dijegat") even though the
+  exact strings differ. Conservative guards: single-word `wrong` of >=4
+  chars; the fuzzy tier never fires on a token that is a real dictionary
+  word; `context: true` pairs are skipped (ADR 0030's LLM-pass territory);
+  multi-word wrongs don't transfer (whisper's multi-word garble shapes are
+  engine-specific). This is the answer to ADR 0033's coupling for this path:
+  EXISTING curation transfers, no re-curation.
+- **Store write isolation**: the ensemble path never writes dialect stores;
+  auto-harvest is skipped when it ran (candidates are whisper-keyed and
+  would misattribute). GPU stays sequential (whisper's one-shot load drops
   before the sidecar spawns; the sidecar exits between variants).
 - Fails soft: any missing sidecar/model or stage error logs a warning and the
   whisper captions stand.
@@ -82,15 +92,12 @@ render provably unchanged when unset — the ADR 0033 opt-in contract):
   ~33/39 counting spelling-equivalent slang) with zero curation input — and
   costs ~5 extra sidecar decodes per clip (~60-90 s; operator accepted).
 - The six residual dialect words on the benchmark still need knowledge. The
-  existing per-Creator store carries several of them (dicegat, biadab anjing)
-  from prior curation — a fuzzy (edit-tolerant) store application on the
-  ensemble output is the natural follow-up, and the review queue remains the
-  path for the rest. "Zero curation" is measured to be ~85% of ground truth,
-  not 100%.
-- The dialect store's coupling (ADR 0033) does not extend to the ensemble
-  path: stores are keyed to whisper's garbles, and the ensemble output is not
-  store-corrected. A store curated FOR ensemble output would be a different
-  store — deferred until the operator judges the rendered result.
+  fuzzy transfer recovers those the operator already curated (dicegat on the
+  benchmark); the review queue remains the path for the rest (kreeng, ayok,
+  ngeri-at-one-position, anying — sounds measured absent from every engine's
+  posterior). "Zero NEW curation" is the honest contract: ~85% of ground
+  truth from the vote alone, plus whatever the Creator's existing store
+  transfers.
 - The vote/fusion core is pure and unit-tested (7 tests); the recipe constants
   (variant set, bias sentence, pad length) are the benchmark's winners and
   will need re-validation on other clips before any default flip.

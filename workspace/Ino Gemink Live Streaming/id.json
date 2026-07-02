@@ -208,25 +208,41 @@
       "clip_only": false
     },
     {
-      "wrong": "pancingan",
+      "wrong": "gusing",
+      "right": "pusing",
+      "note": "Diskusi biasa ground-truth (operator, 2026-07-02): 'pusing cok maen / pusing kan dibilang'. OOV garble - safe to promote.",
+      "status": "confirmed",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "Torbiante",
+      "right": "tur biadab",
+      "note": "Diskusi biasa ground-truth (operator, 2026-07-02): the scream-region smear of 'tur biadab' (three engines hear turbia*-shapes here). OOV garble - safe to promote.",
+      "status": "confirmed",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "Bacingan",
       "right": "bajingan",
-      "note": "Diskusi biasa ground-truth (operator-confirmed 2026-07-02): both 'pancingan' are the swear 'bajingan'. PER-CLIP scope - on THIS clip there is no real 'pancingan', so a deterministic single-word dict fix is correct + reliable (fixes both units, no LLM guessing). Kept OUT of the per-Creator store (real word - would corrupt other clips); the promote leak is undone after this render.",
+      "note": "Diskusi biasa ground-truth (operator, 2026-07-02): profanity-softened decode of 'bajingan'. OOV garble - safe to promote.",
       "status": "confirmed",
       "context": false,
       "clip_only": false
     },
     {
-      "wrong": "tadi luar",
-      "right": "dah cok",
-      "note": "Diskusi biasa ground-truth (operator-confirmed 2026-07-02): 'dah cok', not 'tadi luar'. Multi-word dict collapse (2 units -> 1, like dakenyang->'dah kenyang'). PER-CLIP scope (real phrase); promote leak undone after render.",
+      "wrong": "dijegan",
+      "right": "dicegat",
+      "note": "Diskusi biasa ground-truth (operator, 2026-07-02): same mishear family as dijekat/dijegat -> dicegat. OOV garble - safe to promote.",
       "status": "confirmed",
       "context": false,
       "clip_only": false
     },
     {
-      "wrong": "biasa kamu",
-      "right": "biadab anjing",
-      "note": "Diskusi biasa ground-truth (operator-confirmed 2026-07-02): 'biadab anjing', not 'biasa kamu'. Multi-word dict collapse (2 units -> 1). PER-CLIP scope (real phrase); promote leak undone after render.",
+      "wrong": "pereng",
+      "right": "kreeng",
+      "note": "Diskusi biasa ground-truth (operator, 2026-07-02): streamer mimicking a game SFX; every decode hears p/f/r-initial. OOV garble - safe to promote.",
       "status": "confirmed",
       "context": false,
       "clip_only": false
