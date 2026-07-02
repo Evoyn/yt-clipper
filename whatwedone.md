@@ -4,6 +4,34 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (Qwen3-ASR trial) — the A/B ran; your verdict is the only thing left
+
+The ⭐ item is done up to its designed stopping point. A new inspector
+(`asr_ab_diag`, commit `5f7d733`) puts **whisper raw / whisper as-it-renders-today /
+Qwen3-ASR-1.7B** side by side on your three benchmark clips, staging the GPU models
+strictly one-at-a-time and never touching a dialect store (ADR 0033 honored — a
+built-in check proves the whisper column reproduces your curated Diskusi render
+exactly: 23 units, `dicegat`). The Qwen runtime is a pinned llama.cpp sidecar
+(`sidecars\llama`, b9859, past the known Qwen3-ASR repetition bug;
+`scripts\fetch-llama-sidecar.ps1` re-fetches it deliberately).
+
+What the run showed, headline first: **on the eh-pile clip Qwen transcribed real
+speech across the whole window whisper fills with 107 "eh"s** — and its tail matches
+whisper's tail word-for-word, so the middle is almost certainly real. On Diskusi it
+recovered "bangke" and the 23–26s hole from the plain mix (what enh/suppress_nst
+recovered, without touching the decode), though raw it mislabeled the clip **Malay**;
+telling it "Indonesian" via a system hint fixed that AND moved `pancingan → bacingan`
+— one letter from your curated `bajingan`. On the clear Deddy control both engines are
+good; Qwen punctuates and catches the short interjections. **No word timestamps
+survive** this path (karaoke timing would need Qwen3-ForcedAligner or whisper kept for
+timing). English was deliberately skipped this session, per your call in the grill.
+
+Transcripts: `target\asr-ab\report.md` (also shown in-session). Your ears decide —
+the verdict branches are in `handoffs\2026-07-02-qwen3-asr-ab-trial-results.md`.
+166 tests green, pushed.
+
+---
+
 ## 2026-07-02 (session wrap) — full review done: 10 commits, and the next caption move is staged
 
 Session summary: the full-project review you asked for is complete — 8 fix/feature
