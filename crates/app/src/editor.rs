@@ -1109,19 +1109,27 @@ impl EditorState {
         );
         p.circle_filled(egui::pos2(px, rect.top() + 3.0), 4.0, theme::GOLD);
 
-        // Scrub: click or drag anywhere on the strip.
+        // Scrub: click or drag anywhere on the strip. While dragging, only the
+        // visuals track the pointer (restarting the sink every frame is a
+        // re-seek storm); the audio commits at the NEW time on click and on
+        // drag RELEASE. The release must be its own check: on that frame
+        // `dragged()` is already false, so a release branch nested under it
+        // can never run — the bug where dragging mid-playback moved the
+        // playhead while the audio kept playing from the old position.
         if resp.clicked() || resp.dragged() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.playhead_s = x_to_t(pos.x);
                 if self.playing.is_some() {
-                    if resp.drag_stopped() || resp.clicked() {
-                        self.playing = Some((Instant::now(), self.playhead_s));
+                    self.playing = Some((Instant::now(), self.playhead_s));
+                    if resp.clicked() {
                         action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
-                    } else {
-                        self.playing = Some((Instant::now(), self.playhead_s));
                     }
                 }
             }
+        }
+        if resp.drag_stopped() && self.playing.is_some() {
+            self.playing = Some((Instant::now(), self.playhead_s));
+            action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
         }
         action
     }
@@ -1132,7 +1140,7 @@ impl EditorState {
     /// add / delete / split / merge / censor; click seeks; edits update the
     /// preview immediately and the render burns them verbatim.
     fn ui_transcript_panel(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<EditorAction> {
-        let action = None;
+        let mut action = None;
         theme::section(ui, "Captions");
         let Some(transcript) = &mut self.transcript else {
             ui.add_space(6.0);
@@ -1311,6 +1319,12 @@ impl EditorState {
         }
         if let Some(t) = seek {
             self.playhead_s = t.clamp(0.0, self.range.duration_s());
+            // Seeking during playback restarts the audio at the row's time —
+            // same contract as the timeline scrub.
+            if self.playing.is_some() {
+                self.playing = Some((Instant::now(), self.playhead_s));
+                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+            }
         }
         action
     }
