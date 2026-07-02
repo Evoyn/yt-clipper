@@ -1403,7 +1403,9 @@ impl App {
     /// never races the worker's mid-render `promote_confirmed`.
     fn ui_review(&mut self, ui: &mut egui::Ui, working: bool) {
         let Some(review) = self.review.as_mut() else { return };
-        let n = review_queue::todo_count(&review.lexicon.corrections);
+        // The SNAPSHOT queue, not a live blank-`right` filter: rows must stay
+        // put while the operator types into them (they retire on Save).
+        let n = review.queue.len();
         let header = if n == 0 {
             "Caption review queue".to_string()
         } else {
@@ -1419,9 +1421,11 @@ impl App {
                 }
                 ui.weak("Fill the word whisper should have written, then Save. Confirmed fixes apply to every future clip of this Creator (ADR 0031).");
                 ui.add_space(4.0);
-                // Build the grouped view (owns its rows + source indices), then edit
-                // corrections[idx] in place — the group holds no borrow into the store.
-                let groups = review_queue::group_unverified(&review.lexicon.corrections);
+                // Build the grouped view from the snapshot (owns its rows + source
+                // indices), then edit corrections[idx] in place — the group holds no
+                // borrow into the store, and rows never vanish mid-edit.
+                let groups =
+                    review_queue::group_queue(&review.lexicon.corrections, &review.queue);
                 egui::ScrollArea::vertical().id_salt("review-rows").max_height(320.0).show(ui, |ui| {
                     for g in &groups {
                         ui.add_space(6.0);

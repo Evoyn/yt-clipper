@@ -35,22 +35,31 @@ fn is_todo(c: &Correction) -> bool {
     !c.wrong.is_empty() && c.right.is_empty()
 }
 
-/// Count of open to-dos in a store — the panel's header badge.
+/// Count of open to-dos in a store (test aid; the panel shows the snapshot).
+#[cfg(test)]
 pub fn todo_count(corrections: &[Correction]) -> usize {
     corrections.iter().filter(|c| is_todo(c)).count()
 }
 
-/// Group every *unverified* correction by the clip Title parsed from its note,
-/// preserving first-seen order among titled groups and sinking "Other" (untitled) to
-/// the bottom. Confirmed corrections are curation history, not to-dos, so they are
-/// skipped. The returned rows own their display data and carry the source `idx`, so
-/// the caller can iterate the groups while editing `corrections[idx]` in place.
-pub fn group_unverified(corrections: &[Correction]) -> Vec<TodoGroup> {
+/// The indices of the currently-open to-dos — the queue MEMBERSHIP SNAPSHOT.
+/// The panel must group by a snapshot taken at load/save, never by the live
+/// blank-`right` predicate: typing the first character into a row makes it
+/// non-blank, and a live filter yanks the row (and the very input being typed
+/// in) out of the UI mid-keystroke (operator bug report). A filled row leaves
+/// the queue on Save, as documented (CONTEXT.md: Review queue).
+pub fn open_todo_indices(corrections: &[Correction]) -> Vec<usize> {
+    corrections.iter().enumerate().filter(|(_, c)| is_todo(c)).map(|(i, _)| i).collect()
+}
+
+/// Group the snapshot `queue` rows by the clip Title parsed from each note,
+/// preserving first-seen order among titled groups and sinking "Other"
+/// (untitled) to the bottom. The returned rows own their display data and
+/// carry the source `idx`, so the caller edits `corrections[idx]` in place —
+/// rows stay put while the operator types into them.
+pub fn group_queue(corrections: &[Correction], queue: &[usize]) -> Vec<TodoGroup> {
     let mut groups: Vec<TodoGroup> = Vec::new();
-    for (idx, c) in corrections.iter().enumerate() {
-        if !is_todo(c) {
-            continue;
-        }
+    for &idx in queue {
+        let Some(c) = corrections.get(idx) else { continue };
         let note = parse_harvest_note(&c.note);
         let title = note.title.clone().unwrap_or_else(|| OTHER_GROUP.to_string());
         let row = TodoRow { idx, wrong: c.wrong.clone(), note };
@@ -62,6 +71,12 @@ pub fn group_unverified(corrections: &[Correction]) -> Vec<TodoGroup> {
     // Stable sort: titled groups keep first-seen order, "Other" sinks last.
     groups.sort_by_key(|g| g.title == OTHER_GROUP);
     groups
+}
+
+/// [`group_queue`] over a fresh live snapshot — the one-shot view (test aid).
+#[cfg(test)]
+pub fn group_unverified(corrections: &[Correction]) -> Vec<TodoGroup> {
+    group_queue(corrections, &open_todo_indices(corrections))
 }
 
 /// A YouTube deep-link to `at_s` in a VOD, so the operator can hear a garble in
@@ -81,6 +96,9 @@ pub struct ReviewState {
     /// The store, edited in place; `corrections[idx].right`/`.context` are the fields
     /// the panel writes.
     pub lexicon: DialectLexicon,
+    /// The queue membership snapshot ([`open_todo_indices`], taken at load and
+    /// refreshed on save): the rows the panel shows, stable while typing.
+    pub queue: Vec<usize>,
     /// Last load/save outcome, shown in the panel footer.
     pub status: String,
 }
@@ -115,13 +133,13 @@ impl ReviewState {
                 }
             }
         }
-        let n = todo_count(&lexicon.corrections);
-        let status = match n {
+        let queue = open_todo_indices(&lexicon.corrections);
+        let status = match queue.len() {
             0 => "No caption to-dos to curate.".to_string(),
             1 => "1 caption to-do to curate.".to_string(),
             n => format!("{n} caption to-dos to curate."),
         };
-        ReviewState { path, video_id, lexicon, status }
+        ReviewState { path, video_id, lexicon, queue, status }
     }
 
     /// Write the store back (ADR 0032), mirroring the crate's writer idiom
@@ -148,6 +166,9 @@ impl ReviewState {
         // Atomic (temp + rename): this file is the operator's curation; a torn
         // write would read back as an empty store and silently lose it all.
         yc_core::write_atomic(&self.path, &(s + "\n"))?;
+        // Refresh the snapshot: rows the operator just confirmed leave the
+        // queue NOW (on Save) — never mid-keystroke.
+        self.queue = open_todo_indices(&self.lexicon.corrections);
         Ok(confirmed)
     }
 }
@@ -215,19 +236,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("id.json");
-        let mut st = ReviewState {
-            path: path.clone(),
-            video_id: None,
-            lexicon: DialectLexicon {
-                corrections: vec![todo("buntur", "note"), todo("cimri", "note")],
-                ..Default::default()
-            },
-            status: String::new(),
+        let lexicon = DialectLexicon {
+            corrections: vec![todo("buntur", "note"), todo("cimri", "note")],
+            ..Default::default()
         };
+        let queue = open_todo_indices(&lexicon.corrections);
+        let mut st = ReviewState { path: path.clone(), video_id: None, lexicon, queue, status: String::new() };
         // Operator fills one (with stray whitespace), leaves the other blank.
         st.lexicon.corrections[0].right = "  Guntur  ".into();
+        // TYPING must not shrink the queue (the row + its input would vanish
+        // mid-keystroke); the snapshot still shows both rows...
+        assert_eq!(st.queue.len(), 2);
+        assert_eq!(group_queue(&st.lexicon.corrections, &st.queue).iter().map(|g| g.rows.len()).sum::<usize>(), 2);
         let n = st.save().unwrap();
         assert_eq!(n, 1);
+        // ...and SAVE is what retires the confirmed row from the queue.
+        assert_eq!(st.queue.len(), 1);
+        assert_eq!(st.lexicon.corrections[st.queue[0]].wrong, "cimri");
         // Reload from disk: the filled one is trimmed + confirmed, the blank stays a to-do.
         let reloaded: DialectLexicon =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
