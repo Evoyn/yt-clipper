@@ -28,8 +28,9 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout, LayoutPref, Moment,
-    NoConsole, Project, ReviewCache, Signals, TimeRange, Transcript, Vod, VodSource,
+    CaptionGenre, CaptionPlacement, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout,
+    LayoutPref, Moment, NoConsole, Project, ReviewCache, Signals, TimeRange, Transcript, Vod,
+    VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -112,8 +113,11 @@ pub enum Job {
     /// is the promoted Moment's LLM-generated title (ADR 0015), carried to the
     /// render to name the Short; `None` for a manually-marked / headless clip.
     /// `layout_pref` is the operator's explicit framing choice (ADR 0017): `Auto`
-    /// runs M6 auto-detect, the others force a Layout.
-    Prepare { range: TimeRange, title: Option<String>, layout_pref: LayoutPref },
+    /// runs M6 auto-detect, the others force a Layout. `preview` is whether an
+    /// editor will open on the result: headless/batch pass `false` and Prepare
+    /// skips the filmstrip extraction (ADR 0036) — 120 decoded frames would
+    /// otherwise be shipped and dropped per clip.
+    Prepare { range: TimeRange, title: Option<String>, layout_pref: LayoutPref, preview: bool },
     /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
     /// NVENC export. `caption_genre` selects the Caption Style animation (M7):
@@ -121,7 +125,15 @@ pub enum Job {
     /// `correct` requests the LLM caption-correction pass (ADR 0030/0031) for this
     /// render — the operator's per-render toggle (only effective in a `correct`
     /// build with the sidecar; `YC_CORRECT=0` is a global override).
-    Render { layout: Layout, caption_genre: CaptionGenre, correct: bool },
+    /// `placement` is the Clip's Caption placement (ADR 0036): where/how large the
+    /// captions draw, from the editor's drag/resize; `None` (always in headless)
+    /// keeps the built-in anchor, byte-identical to pre-placement output.
+    Render {
+        layout: Layout,
+        caption_genre: CaptionGenre,
+        correct: bool,
+        placement: Option<CaptionPlacement>,
+    },
 }
 
 /// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
@@ -178,10 +190,11 @@ pub enum Progress {
         timeline: Timeline,
     },
     /// Prepare finished (ADR 0012): the auto-detected seed Layout, the Segment's
-    /// source dimensions, and a handful of preview frames (raw rgb24, each
-    /// `frame_w` x `frame_h`) sampled across the clip range. The UI uploads the
-    /// frames to textures and opens the nudge editor seeded with `layout`;
-    /// headless echoes `layout` straight back as a `Render` (no nudging).
+    /// source dimensions, and the preview filmstrip (raw rgb24 frames, each
+    /// `frame_w` x `frame_h`, sampled at `frame_fps` across the clip range — ADR
+    /// 0036's playback strip; frame i sits at `i / frame_fps` seconds). The UI
+    /// uploads the frames to textures and opens the nudge editor seeded with
+    /// `layout`; headless echoes `layout` straight back as a `Render` (no nudging).
     Prepared {
         layout: Layout,
         src_w: f32,
@@ -189,8 +202,14 @@ pub enum Progress {
         frames: Vec<Vec<u8>>,
         frame_w: u32,
         frame_h: u32,
+        frame_fps: f64,
         range: TimeRange,
     },
+    /// The refined transcript a Render is about to burn (post-correction,
+    /// post-refine — exactly what `generate_ass` consumes), sent as soon as it is
+    /// known so the editor's caption preview shows the render's truth while NVENC
+    /// still runs (ADR 0036). Emitted on every Render, cached or not.
+    Captions { transcript: Transcript },
     /// A Clip rendered to this path.
     Done(PathBuf),
     Cancelled,
@@ -315,13 +334,13 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Prepare { range, title, layout_pref } => match &session {
+                Job::Prepare { range, title, layout_pref, preview } => match &session {
                     None => {
                         let _ = tx_prog
                             .send(Progress::Failed("import a VOD before making a clip".into()));
                     }
-                    Some(s) => match do_prepare(&paths, s, range, title, layout_pref, &worker_cancel, &tx_prog) {
-                        Ok((pc, frames, frame_w, frame_h)) => {
+                    Some(s) => match do_prepare(&paths, s, range, title, layout_pref, preview, &worker_cancel, &tx_prog) {
+                        Ok((pc, frames, frame_w, frame_h, frame_fps)) => {
                             let _ = tx_prog.send(Progress::Prepared {
                                 layout: pc.auto_layout.clone(),
                                 src_w: pc.src_w,
@@ -329,6 +348,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 frames,
                                 frame_w,
                                 frame_h,
+                                frame_fps,
                                 range: pc.range,
                             });
                             prepared = Some(pc);
@@ -338,9 +358,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Render { layout, caption_genre, correct } => match (&session, &mut prepared) {
+                Job::Render { layout, caption_genre, correct, placement } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, caption_genre, correct, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, caption_genre, correct, placement, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -978,15 +998,22 @@ fn run_llm_correct(
 
 // --- prepare + render (phase 2, split for the nudge editor - ADR 0012) ------
 
-/// Number of preview frames sampled across the clip range for the editor's
-/// scrub slider (ADR 0012). A handful is enough to see whether a static crop
-/// holds across a moving face.
-const PREVIEW_FRAMES: usize = 7;
-/// Longest preview-frame edge, in pixels. Crisp enough to place a face without
-/// the texture memory of a full-resolution frame; the editor stores Crops in
-/// source pixels and only normalizes at draw time, so this resolution is purely
-/// preview fidelity.
-const PREVIEW_LONG_EDGE: f32 = 1280.0;
+/// The preview filmstrip (ADR 0036, replacing the 7-frame scrub of ADR 0012):
+/// dense enough that scrubbing/playback reads as motion, capped so the texture
+/// budget stays bounded on the 8 GB card (`STRIP_MAX_FRAMES` frames at ~480p
+/// RGBA ≈ 200 MB). A clip longer than `STRIP_MAX_FRAMES / STRIP_FPS` seconds
+/// lowers its fps rather than growing the strip.
+const STRIP_MAX_FRAMES: usize = 120;
+/// Target strip density. Playback interpolates nothing — the playhead shows the
+/// nearest frame — so this is the visual "frame rate" of the preview.
+const STRIP_FPS: f64 = 4.0;
+/// Longest strip-frame edge, in pixels. The editor canvas draws at ≤360 egui
+/// points, so ~480p covers it (a zoomed facecam Crop previews slightly softer
+/// than the old 1280 — geometry, the thing being edited, is unaffected; the
+/// render reads the full-res Segment). The editor stores Crops in source pixels
+/// and only normalizes at draw time, so this resolution is purely preview
+/// fidelity.
+const PREVIEW_LONG_EDGE: f32 = 854.0;
 
 /// Aspect-preserving preview-frame dimensions (even, >= 2) with the longest edge
 /// at most [`PREVIEW_LONG_EDGE`]. Unlike the 320x240 detection pass (ADR 0011,
@@ -1014,9 +1041,10 @@ fn do_prepare(
     range: TimeRange,
     title: Option<String>,
     layout_pref: LayoutPref,
+    preview: bool,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32)> {
+) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32, f64)> {
     anyhow::ensure!(range.duration_s() > 0.0, "pick a range with end > start");
     let sc = paths.sidecars();
 
@@ -1045,19 +1073,26 @@ fn do_prepare(
     let _ = tx.send(Progress::Stage("Framing (face detect)"));
     let auto_layout = build_layout(paths, &render_src, seek_s, src_w, src_h, layout_pref);
 
-    // Sample preview frames across the clip range for the editor's scrub slider.
-    let _ = tx.send(Progress::Stage("Extracting preview frames"));
+    // Sample the preview filmstrip across the clip range (ADR 0036): STRIP_FPS,
+    // dropping to fit STRIP_MAX_FRAMES on a long clip, floored so a degenerate
+    // range still yields frames. Headless/batch open no editor (`preview` is
+    // false): skip the extraction instead of decoding 120 frames to drop them.
     let (frame_w, frame_h) = preview_dims(src_w, src_h);
-    let fps = (PREVIEW_FRAMES as f64 / range.duration_s()).max(0.1);
-    let frames = yc_ingest::extract_frames_rgb(
-        &paths.ffmpeg,
-        &render_src,
-        seek_s,
-        frame_w,
-        frame_h,
-        fps,
-        PREVIEW_FRAMES,
-    )?;
+    let fps = STRIP_FPS.min(STRIP_MAX_FRAMES as f64 / range.duration_s().max(0.1)).max(0.1);
+    let frames = if preview {
+        let _ = tx.send(Progress::Stage("Extracting preview frames"));
+        yc_ingest::extract_frames_rgb(
+            &paths.ffmpeg,
+            &render_src,
+            seek_s,
+            frame_w,
+            frame_h,
+            fps,
+            STRIP_MAX_FRAMES,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let prepared = PreparedClip {
         render_src,
@@ -1069,7 +1104,7 @@ fn do_prepare(
         transcript: None,
         title,
     };
-    Ok((prepared, frames, frame_w, frame_h))
+    Ok((prepared, frames, frame_w, frame_h, fps))
 }
 
 /// The 16 kHz-mono samples whisper captions from. With the `sep` feature and the
@@ -1321,6 +1356,7 @@ fn do_render(
     layout: Layout,
     caption_genre: CaptionGenre,
     correct: bool,
+    placement: Option<CaptionPlacement>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
@@ -1557,6 +1593,11 @@ fn do_render(
         prepared.transcript = Some(transcript);
     }
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
+    // The editor's caption preview draws exactly what this render burns (ADR
+    // 0036): ship the refined transcript now, so captions are on the operator's
+    // canvas while NVENC still runs. Every Render emits it (cached re-renders
+    // included) — the editor may have opened after the first one.
+    let _ = tx.send(Progress::Captions { transcript: transcript.clone() });
 
     // Captions: write the ASS into the data folder and the font into a fonts-only
     // `data/fonts/` subdir. ffmpeg runs in the data folder, so the relative
@@ -1565,7 +1606,7 @@ fn do_render(
     // analysis.wav / project.json a flat fontsdir tried (and failed) to open.
     let _ = tx.send(Progress::Stage("Generating captions"));
     let style = caption_style(caption_genre);
-    let ass = yc_render::generate_ass(transcript, &style);
+    let ass = yc_render::generate_ass(transcript, &style, placement);
     fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
     let fonts_dir = session.data_dir.join("fonts");
     fs::create_dir_all(&fonts_dir)
@@ -1581,7 +1622,7 @@ fn do_render(
 
     // Record the promoted Clip with the operator's Layout + its export path, then
     // render it.
-    let clip = build_clip(range, layout, &style.name, &out_path);
+    let clip = build_clip(range, layout, &style.name, placement, &out_path);
     persist_clip(&session.vod, &clip, &session.data_dir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
@@ -1689,7 +1730,13 @@ fn clip_id_for(range: TimeRange) -> u64 {
 
 /// A promoted range -> a Clip record (CONTEXT.md). The id is provisional; `persist_clip`
 /// relinks it to the detected Moment covering this range.
-fn build_clip(range: TimeRange, layout: Layout, caption_style: &str, export_path: &Path) -> Clip {
+fn build_clip(
+    range: TimeRange,
+    layout: Layout,
+    caption_style: &str,
+    caption_placement: Option<CaptionPlacement>,
+    export_path: &Path,
+) -> Clip {
     let id = clip_id_for(range);
     Clip {
         id,
@@ -1697,6 +1744,7 @@ fn build_clip(range: TimeRange, layout: Layout, caption_style: &str, export_path
         range,
         layout,
         caption_style: caption_style.to_string(),
+        caption_placement,
         segment_path: None,
         export_path: Some(export_path.to_path_buf()),
     }
@@ -1842,7 +1890,7 @@ fn detect_facecam_inner(
 /// word filling the width, the multi-word genres (rolling-pop / karaoke-fill) need
 /// a smaller size so a ~22-char line fits the 1080-wide canvas. The full per-Clip
 /// preset editor + per-Creator defaults are the rest of M7.
-fn caption_style(genre: CaptionGenre) -> CaptionStyle {
+pub(crate) fn caption_style(genre: CaptionGenre) -> CaptionStyle {
     let (name, font_size) = match genre {
         // Large: one word at a time, meant to read on a phone. ~15 Anton chars fit
         // the 1080-wide canvas at 150; longer words are rare (tune freely).
@@ -2059,7 +2107,7 @@ mod tests {
         // Render all three (the batch), each at its Moment's range.
         for start in [100.0_f64, 500.0, 900.0] {
             let r = TimeRange { start_s: start, end_s: start + 30.0 };
-            let clip = build_clip(r, lay(), "huge-word", &dir.join(format!("{start}.mp4")));
+            let clip = build_clip(r, lay(), "huge-word", None, &dir.join(format!("{start}.mp4")));
             persist_clip(&v, &clip, &dir).unwrap();
         }
         let p = Project::load(&dir.join("project.json")).unwrap();
@@ -2070,7 +2118,7 @@ mod tests {
 
         // A re-render of one Moment replaces its own record (still three, not four).
         let r2 = TimeRange { start_s: 500.0, end_s: 530.0 };
-        let clip2 = build_clip(r2, lay(), "karaoke", &dir.join("500b.mp4"));
+        let clip2 = build_clip(r2, lay(), "karaoke", None, &dir.join("500b.mp4"));
         persist_clip(&v, &clip2, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 3, "re-render replaces its own record");
@@ -2079,7 +2127,7 @@ mod tests {
 
         // A directly-promoted range with no detected Moment records its own Moment.
         let r4 = TimeRange { start_s: 2000.0, end_s: 2030.0 };
-        let clip4 = build_clip(r4, lay(), "huge-word", &dir.join("direct.mp4"));
+        let clip4 = build_clip(r4, lay(), "huge-word", None, &dir.join("direct.mp4"));
         persist_clip(&v, &clip4, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 4, "the direct promote adds a fourth Clip");

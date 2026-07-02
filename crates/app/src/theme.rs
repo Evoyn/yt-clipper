@@ -42,6 +42,13 @@ pub const ERR: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 /// The heading font family name, installed from the caption font when present.
 const HEADING_FAMILY: &str = "display";
 
+/// The display/caption egui font family. Always a valid family (when the caption
+/// TTF is absent it is aliased to the proportional stack), so callers — headings,
+/// the editor's caption overlay (ADR 0036) — can use it unconditionally.
+pub fn display_family() -> egui::FontFamily {
+    egui::FontFamily::Name(HEADING_FAMILY.into())
+}
+
 /// Apply the theme to `ctx` once at startup: install the display font (best
 /// effort), then set the palette, spacing, and type scale.
 pub fn apply(ctx: &egui::Context, font_path: &Path) {
@@ -139,21 +146,34 @@ fn visuals() -> egui::Visuals {
 }
 
 /// Install the caption display font (Anton) under [`HEADING_FAMILY`] so headings
-/// wear the same face as the burned captions. Best-effort: returns `false` if the
-/// font file is absent, and the theme falls back to the proportional heading.
+/// (and the editor's caption overlay, ADR 0036) wear the same face as the burned
+/// captions. Best-effort: returns `false` if the font file is absent — the family
+/// is then aliased to the proportional stack, so [`display_family`] still
+/// resolves and callers never need the fallback logic themselves.
 fn install_display_font(ctx: &egui::Context, font_path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(font_path) else {
-        return false;
-    };
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert(HEADING_FAMILY.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-    fonts
-        .families
-        .entry(egui::FontFamily::Name(HEADING_FAMILY.into()))
-        .or_default()
-        .insert(0, HEADING_FAMILY.to_owned());
+    let has_display = match std::fs::read(font_path) {
+        Ok(bytes) => {
+            fonts
+                .font_data
+                .insert(HEADING_FAMILY.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(egui::FontFamily::Name(HEADING_FAMILY.into()))
+                .or_default()
+                .insert(0, HEADING_FAMILY.to_owned());
+            true
+        }
+        Err(_) => {
+            let proportional = fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .cloned()
+                .unwrap_or_default();
+            fonts.families.insert(egui::FontFamily::Name(HEADING_FAMILY.into()), proportional);
+            false
+        }
+    };
     ctx.set_fonts(fonts);
-    true
+    has_display
 }

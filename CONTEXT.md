@@ -92,6 +92,10 @@ _Avoid_: selection, region, window
 A named preset describing how captions look and animate (font, colors, outline, animation genre — rolling-pop, huge-word, karaoke). Saved per Creator, overridable per Clip. The karaoke genre (enum `KaraokeFill`) highlights **per word as a whole, snapping** to the accent colour at each word's spoken onset (ASS `\k`, cumulative — ADR 0018), not a left-to-right fill.
 _Avoid_: theme, template, skin
 
+**Caption placement**:
+The per-Clip override of where the caption block sits on the canvas and how large its text draws — set by dragging/resizing the captions over the editor's preview playback (ADR 0036). Absent (the default, and always in headless), captions keep the built-in anchor and the Caption Style's size. Presentation data on the Clip — never curation: a placement says nothing about words.
+_Avoid_: caption position (underspecifies — placement also scales), caption style (that is the shared look/animation preset; placement is one Clip's geometry)
+
 **Caption engine**:
 The per-Creator choice of how a Clip's caption words are transcribed: **Whisper** (the single-decode default) or the **Qwen ensemble** (a five-variant vote with whisper as a voter, timing fused onto skeleton anchors and speech onsets — ADR 0034). A closed enum, not a model picker — the ensemble is a measured recipe, and a new model earns entry only through ADR 0034's gate. Remembered in the Creator store like Caption Style (ADR 0016); switching it for a curated Creator is a deliberate act (ADR 0033): the app states which of their existing corrections carry across (ADR 0035).
 _Avoid_: model picker (a recipe, not a GGUF choice), decoder (ambiguous with whisper's internal decode config), ASR toggle

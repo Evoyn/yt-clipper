@@ -20,7 +20,9 @@
 //!   fully highlighted by its end. JA character-chunk karaoke rides on the
 //!   deferred JA-chunking work.
 
-use yc_core::{CaptionGenre, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W};
+use yc_core::{
+    CaptionGenre, CaptionPlacement, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W,
+};
 
 /// Keep a completed line on screen this long after its last unit ends.
 const LINE_HOLD_S: f64 = 0.5;
@@ -30,10 +32,8 @@ const MAX_LINE_CHARS: usize = 22;
 /// spoken far apart never share one lingering line (which made captions appear
 /// long before their later words were actually spoken).
 const MAX_GAP_S: f64 = 1.0;
-/// Caption anchor as a fraction of canvas height: mid gameplay Panel (which
-/// ends at the Seam, 0.62) — above the facecam face below, and clear of any
-/// burned-in source subtitles that sit near the bottom of the gameplay.
-const CAPTION_Y_FRAC: f64 = 0.46;
+// The default caption anchor (`CAPTION_Y_FRAC`) lives in yc-core since ADR
+// 0036: `CaptionPlacement::default` and this generator must agree on it.
 /// Gap-fill caption timing (ADR 0013). whisper's DTW gives a precise word *onset*
 /// but a zero-width *end*, so [`refine_caption_timing`] synthesises each word's
 /// on-screen end by filling the gap to the next word's onset: capped at
@@ -110,6 +110,90 @@ fn ass_time(s: f64) -> String {
     )
 }
 
+/// One caption word as both the ASS emitters and the editor's preview overlay
+/// see it: text pre-uppercased (the burn-in is all-caps), clip-relative timing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewWord {
+    pub text: String,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+/// One on-screen caption line — the unit every genre renders (a huge-word line
+/// holds exactly one word). `start_s..end_s` are the Dialogue bounds with the
+/// hold and next-line clamp applied, so consecutive lines never overlap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewLine {
+    pub start_s: f64,
+    pub end_s: f64,
+    pub words: Vec<PreviewWord>,
+}
+
+/// The caption line model (ADR 0036): grouping + line timing for a transcript
+/// under a genre. The ASS emitters below and the editor's preview overlay both
+/// consume this, so the preview cannot drift from the render — they are the
+/// same code. Expects refine_caption_timing output (the render path's
+/// transcript), like `generate_ass` always has.
+pub fn preview_lines(transcript: &Transcript, genre: CaptionGenre) -> Vec<PreviewLine> {
+    match genre {
+        CaptionGenre::HugeWord => {
+            let units = &transcript.units;
+            units
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    // `end_s` is the word's gap-filled end (ADR 0013); show until
+                    // then, one word at a time. Floor first as a zero-duration
+                    // guard, then clamp to the next onset LAST — so the floor can
+                    // never push the end past the next word's start.
+                    let mut end = u.end_s.max(u.start_s + WORD_MIN_S);
+                    if let Some(next) = units.get(i + 1) {
+                        end = end.min(next.start_s);
+                    }
+                    PreviewLine {
+                        start_s: u.start_s,
+                        end_s: end,
+                        words: vec![PreviewWord {
+                            text: u.text.to_uppercase(),
+                            start_s: u.start_s,
+                            end_s: end,
+                        }],
+                    }
+                })
+                .collect()
+        }
+        CaptionGenre::RollingPop | CaptionGenre::KaraokeFill => {
+            let lines = group_lines(transcript, MAX_LINE_CHARS);
+            (0..lines.len())
+                .map(|li| {
+                    let line = &lines[li];
+                    let start = line.first().map_or(0.0, |u| u.start_s);
+                    // Hold after the last unit, but never past the next line's
+                    // start, so only one line is ever on screen.
+                    let mut end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
+                    if let Some(next_start) =
+                        lines.get(li + 1).and_then(|n| n.first()).map(|u| u.start_s)
+                    {
+                        end = end.min(next_start);
+                    }
+                    PreviewLine {
+                        start_s: start,
+                        end_s: end,
+                        words: line
+                            .iter()
+                            .map(|u| PreviewWord {
+                                text: u.text.to_uppercase(),
+                                start_s: u.start_s,
+                                end_s: u.end_s,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
 /// Group units into on-screen lines, each at most `max_chars` wide (counting a
 /// single space between adjacent units).
 fn group_lines<'a>(t: &'a Transcript, max_chars: usize) -> Vec<Vec<&'a CaptionUnit>> {
@@ -148,11 +232,88 @@ fn rolling_pop_tags(on_ms: i64) -> String {
     )
 }
 
+/// The effective anchor + font size a placement resolves to, shared by the ASS
+/// generator and the editor's preview overlay so both draw the same geometry
+/// (the overlay converts these PlayRes pixels to canvas points by one factor).
+/// `None` (and `Some(CaptionPlacement::default())`) is the built-in anchor:
+/// centered, `CAPTION_Y_FRAC`, unscaled. Defensive clamps bound a hand-edited
+/// project.json: the *anchor point* stays on-canvas and the scale inside the
+/// shared `CaptionPlacement` bounds — the block's extent around an extreme
+/// anchor (x 0 or 1, `\an5` centering) can still overhang the edge; the
+/// editor's drag clamps tighter margins for that.
+pub fn resolve_placement(
+    placement: Option<CaptionPlacement>,
+    font_size: u32,
+) -> (u32, u32, u32) {
+    let p = placement.unwrap_or_default();
+    let x = p.x_frac.clamp(0.0, 1.0) as f64;
+    let y = p.y_frac.clamp(0.0, 1.0) as f64;
+    let scale = p.scale.clamp(CaptionPlacement::SCALE_MIN, CaptionPlacement::SCALE_MAX);
+    let pos_x = (CANVAS_W as f64 * x).round() as u32;
+    let pos_y = (CANVAS_H as f64 * y).round() as u32;
+    let size = ((font_size as f32 * scale).round() as u32).max(1);
+    (pos_x, pos_y, size)
+}
+
+/// How one word of a [`PreviewLine`] presents at playhead `t` — the preview
+/// overlay's per-word state, defined HERE so the genre semantics live beside
+/// the ASS emitters that encode the same rules as tags (ADR 0036: the preview
+/// must not re-derive render semantics UI-side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordState {
+    /// Not yet revealed (rolling-pop before the word's onset): reserves its
+    /// space in the line (ASS lays the line out from the first frame) but is
+    /// invisible.
+    Hidden,
+    /// Visible in the base/primary colour.
+    Base,
+    /// Snapped to the accent ("sung") colour — karaoke at/after the word's
+    /// onset (ADR 0018's per-word snap).
+    Sung,
+}
+
+/// Per-word [`WordState`]s for `line` at playhead `t`, mirroring what the
+/// genre's ASS tags do at that instant: huge-word shows its one word;
+/// rolling-pop reveals each word at its onset (`\alpha` + `\t` reveal);
+/// karaoke-fill shows every word, snapping it to the accent at its onset
+/// (`\k` cumulative snap). One function, consumed by the editor overlay and
+/// pinned by tests against the emitters' tag timings.
+pub fn word_states(genre: CaptionGenre, line: &PreviewLine, t: f64) -> Vec<WordState> {
+    line.words
+        .iter()
+        .map(|w| match genre {
+            CaptionGenre::HugeWord => WordState::Base,
+            CaptionGenre::RollingPop => {
+                if w.start_s <= t {
+                    WordState::Base
+                } else {
+                    WordState::Hidden
+                }
+            }
+            CaptionGenre::KaraokeFill => {
+                if w.start_s <= t {
+                    WordState::Sung
+                } else {
+                    WordState::Base
+                }
+            }
+        })
+        .collect()
+}
+
 /// Generate a complete ASS document for a transcript under a Caption Style. The
 /// `genre` selects the animation builder; everything else about the style is data
-/// (ADR 0004), so colours/font/size flow into the shared Style line.
-pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
+/// (ADR 0004), so colours/font/size flow into the shared Style line. `placement`
+/// is the Clip's Caption placement (ADR 0036): `None` keeps the built-in anchor
+/// and size, byte-identical to pre-placement output.
+pub fn generate_ass(
+    transcript: &Transcript,
+    style: &CaptionStyle,
+    placement: Option<CaptionPlacement>,
+) -> String {
     let mut s = String::new();
+
+    let (pos_x, pos_y, font_size) = resolve_placement(placement, style.font_size);
 
     s.push_str("[Script Info]\n");
     s.push_str("ScriptType: v4.00+\n");
@@ -166,7 +327,7 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     s.push_str(&format!(
         "Style: Caption,{font},{size},{primary},{accent},&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,6,2,5,40,40,40,1\n\n",
         font = style.font_family,
-        size = style.font_size,
+        size = font_size,
         primary = ass_color(style.primary_color),
         accent = ass_color(style.accent_color),
     ));
@@ -174,40 +335,30 @@ pub fn generate_ass(transcript: &Transcript, style: &CaptionStyle) -> String {
     s.push_str("[Events]\n");
     s.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
 
-    let pos_x = CANVAS_W / 2;
-    let pos_y = (CANVAS_H as f64 * CAPTION_Y_FRAC).round() as u32;
-
+    let lines = preview_lines(transcript, style.genre);
     let events = match style.genre {
-        CaptionGenre::HugeWord => huge_word_events(transcript, pos_x, pos_y),
-        CaptionGenre::RollingPop => rolling_pop_events(transcript, pos_x, pos_y),
-        CaptionGenre::KaraokeFill => karaoke_fill_events(transcript, style, pos_x, pos_y),
+        CaptionGenre::HugeWord => huge_word_events(&lines, pos_x, pos_y),
+        CaptionGenre::RollingPop => rolling_pop_events(&lines, pos_x, pos_y),
+        CaptionGenre::KaraokeFill => karaoke_fill_events(&lines, style, pos_x, pos_y),
     };
     s.push_str(&events);
 
     s
 }
 
-/// One word per caption (huge-word): each unit is its own Dialogue event,
-/// appearing at its spoken onset and clearing before the next word (or after a
-/// short hold), so exactly one word is on screen and timing tracks speech.
-fn huge_word_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
+/// One word per caption (huge-word): each line is a single word's Dialogue
+/// event, appearing at its spoken onset and clearing before the next word, so
+/// exactly one word is on screen and timing tracks speech. Timing (floor +
+/// next-onset clamp, ADR 0013) is already applied by [`preview_lines`].
+fn huge_word_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
-    let units = &transcript.units;
-    for (i, u) in units.iter().enumerate() {
-        // `end_s` is the word's gap-filled end (set by refine_caption_timing, ADR
-        // 0013); show until then, one word at a time. Floor first as a zero-duration
-        // guard, then clamp to the next onset LAST — so the floor can never push the
-        // end past the next word's start (the brief overlap fixed in ADR 0013).
-        let mut end = u.end_s.max(u.start_s + WORD_MIN_S);
-        if let Some(next) = units.get(i + 1) {
-            end = end.min(next.start_s);
-        }
-        let text =
-            format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), u.text.to_uppercase());
+    for l in lines {
+        let Some(w) = l.words.first() else { continue };
+        let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), w.text);
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(u.start_s),
-            ass_time(end),
+            ass_time(l.start_s),
+            ass_time(l.end_s),
             text
         ));
     }
@@ -416,34 +567,26 @@ pub fn refine_caption_timing_keep_verified(
     transcript
 }
 
-/// Multi-word rolling-pop lines (M1): units grouped into <=MAX_LINE_CHARS lines,
-/// each line one Dialogue event in which every unit pops in at its onset.
-fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String {
+/// Multi-word rolling-pop lines (M1): each [`PreviewLine`] is one Dialogue
+/// event in which every word pops in at its onset (grouping + line bounds come
+/// from [`preview_lines`]).
+fn rolling_pop_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
-    let lines = group_lines(transcript, MAX_LINE_CHARS);
-    for (li, line) in lines.iter().enumerate() {
-        let line_start = line.first().map_or(0.0, |u| u.start_s);
-        // Hold after the last unit, but never past the next line's start, so
-        // only one line is ever on screen (consecutive lines were overlapping).
-        let mut line_end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
-        if let Some(next_start) = lines.get(li + 1).and_then(|n| n.first()).map(|u| u.start_s) {
-            line_end = line_end.min(next_start);
-        }
-
+    for l in lines {
         let mut text = format!("{{\\an5\\pos({pos_x},{pos_y})}}");
-        for (i, u) in line.iter().enumerate() {
-            let on_ms = ((u.start_s - line_start) * 1000.0).round() as i64;
+        for (i, w) in l.words.iter().enumerate() {
+            let on_ms = ((w.start_s - l.start_s) * 1000.0).round() as i64;
             text.push_str(&rolling_pop_tags(on_ms));
-            text.push_str(&u.text.to_uppercase());
-            if i + 1 < line.len() {
+            text.push_str(&w.text);
+            if i + 1 < l.words.len() {
                 text.push(' ');
             }
         }
 
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(line_start),
-            ass_time(line_end),
+            ass_time(l.start_s),
+            ass_time(l.end_s),
             text
         ));
     }
@@ -466,43 +609,34 @@ fn rolling_pop_events(transcript: &Transcript, pos_x: u32, pos_y: u32) -> String
 /// clamped to the next line's start). The function keeps its `_fill` name for
 /// `CaptionGenre::KaraokeFill` enum/serde stability.
 fn karaoke_fill_events(
-    transcript: &Transcript,
+    lines: &[PreviewLine],
     style: &CaptionStyle,
     pos_x: u32,
     pos_y: u32,
 ) -> String {
     let mut s = String::new();
-    let lines = group_lines(transcript, MAX_LINE_CHARS);
     let sung = ass_color_tag(style.accent_color); // \1c: filled / "sung" colour
     let unsung = ass_color_tag(style.primary_color); // \2c: unfilled / base colour
-    for (li, line) in lines.iter().enumerate() {
-        let line_start = line.first().map_or(0.0, |u| u.start_s);
-        // Hold after the last unit, but never past the next line's start, so only
-        // one line is on screen — and the hold leaves the line fully highlighted.
-        let mut line_end = line.last().map_or(0.0, |u| u.end_s) + LINE_HOLD_S;
-        if let Some(next_start) = lines.get(li + 1).and_then(|n| n.first()).map(|u| u.start_s) {
-            line_end = line_end.min(next_start);
-        }
-
+    for l in lines {
         let mut text = format!("{{\\an5\\pos({pos_x},{pos_y})\\1c{sung}\\2c{unsung}}}");
-        for (i, u) in line.iter().enumerate() {
+        for (i, w) in l.words.iter().enumerate() {
             // Karaoke dwell (centiseconds) before the next word snaps: to the next
             // word's onset, or — for the last word — its own gap-filled duration.
             // Floored at 1 cs so a zero-gap word still advances the cursor (and
             // `\k0` never stalls).
-            let next_on = line.get(i + 1).map_or(u.end_s, |n| n.start_s);
-            let dur_cs = (((next_on - u.start_s) * 100.0).round() as i64).max(1);
+            let next_on = l.words.get(i + 1).map_or(w.end_s, |n| n.start_s);
+            let dur_cs = (((next_on - w.start_s) * 100.0).round() as i64).max(1);
             text.push_str(&format!("{{\\k{dur_cs}}}"));
-            text.push_str(&u.text.to_uppercase());
-            if i + 1 < line.len() {
+            text.push_str(&w.text);
+            if i + 1 < l.words.len() {
                 text.push(' ');
             }
         }
 
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(line_start),
-            ass_time(line_end),
+            ass_time(l.start_s),
+            ass_time(l.end_s),
             text
         ));
     }
@@ -580,7 +714,7 @@ mod tests {
     #[test]
     fn one_dialogue_per_line_with_header() {
         let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
-        let ass = generate_ass(&t, &style());
+        let ass = generate_ass(&t, &style(), None);
         assert!(ass.contains("PlayResX: 1080"));
         assert!(ass.contains("PlayResY: 1920"));
         assert!(ass.contains("Anton"));
@@ -592,7 +726,7 @@ mod tests {
     #[test]
     fn first_unit_onset_is_zero() {
         // The first unit of each line pops at relative t=0.
-        let ass = generate_ass(&units(&["hello", "world"]), &style());
+        let ass = generate_ass(&units(&["hello", "world"]), &style(), None);
         assert!(ass.contains("\\t(0,40,\\alpha&H00&)"));
     }
 
@@ -600,7 +734,7 @@ mod tests {
     fn huge_word_emits_one_nonzero_event_per_word() {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
-        let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st);
+        let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st, None);
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 3); // one caption per word
         // Each event carries exactly its own word (uppercased), never the next.
@@ -617,7 +751,7 @@ mod tests {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
         // Words at 0.0 and 0.5; the first must end no later than 0.5.
-        let ass = generate_ass(&units(&["a", "b"]), &st);
+        let ass = generate_ass(&units(&["a", "b"]), &st, None);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
         assert_eq!(end, "0:00:00.40"); // shows for the word's own end, clearing before next
@@ -637,7 +771,7 @@ mod tests {
                 CaptionUnit { text: "b".into(), start_s: 0.50, end_s: 0.90 },
             ],
         };
-        let ass = generate_ass(&t, &st);
+        let ass = generate_ass(&t, &st, None);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
         assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.56
@@ -932,7 +1066,7 @@ mod tests {
     fn captions_are_uppercased() {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
-        let ass = generate_ass(&units(&["bocil", "gila"]), &st);
+        let ass = generate_ass(&units(&["bocil", "gila"]), &st, None);
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
     }
@@ -955,7 +1089,7 @@ mod tests {
     #[test]
     fn karaoke_snap_emits_k_per_word_with_inline_colours() {
         // "a b c" = 5 chars -> one line, one Dialogue, three \k snap chunks.
-        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None);
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 1);
         let d = dialogues[0];
@@ -972,7 +1106,7 @@ mod tests {
         // Onsets 0.0 / 0.5 / 1.0 -> each non-last word dwells the 0.5 s gap before
         // the next snaps (\k50); the last over its own gap-filled span (1.0->1.4 =
         // \k40). Same cursor maths as the old \kf sweep — only the visual changed.
-        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style());
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None);
         let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         assert_eq!(d.matches("\\k50").count(), 2); // a and b: onset-to-onset gaps
         assert!(d.contains("\\k40")); // c: its own duration 0.4 s
@@ -983,7 +1117,7 @@ mod tests {
         // Same character budget as rolling-pop: a long run splits into >1 line,
         // each its own Dialogue, and the count matches group_lines.
         let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
-        let ass = generate_ass(&t, &karaoke_style());
+        let ass = generate_ass(&t, &karaoke_style(), None);
         let dialogues = ass.lines().filter(|l| l.starts_with("Dialogue:")).count();
         assert_eq!(dialogues, group_lines(&t, MAX_LINE_CHARS).len());
         assert!(dialogues >= 2);
@@ -991,8 +1125,129 @@ mod tests {
 
     #[test]
     fn karaoke_fill_is_uppercased() {
-        let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style());
+        let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style(), None);
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
+    }
+
+    #[test]
+    fn no_placement_equals_default_placement_byte_for_byte() {
+        // The ADR 0036 golden guard: a Clip with no Caption placement (all
+        // pre-editor renders, all headless renders) must produce exactly the
+        // pre-placement document — Some(default) and None are the same anchor.
+        use yc_core::CaptionPlacement;
+        let t = units(&["satu", "dua", "tiga", "empat", "lima"]);
+        for genre in [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill] {
+            let mut st = style();
+            st.genre = genre;
+            let bare = generate_ass(&t, &st, None);
+            let defaulted = generate_ass(&t, &st, Some(CaptionPlacement::default()));
+            assert_eq!(bare, defaulted, "genre {genre:?} drifted");
+            // And the built-in anchor is what it always was: centered, 46%.
+            assert!(bare.contains("\\pos(540,883)"), "anchor moved: {bare}");
+        }
+    }
+
+    #[test]
+    fn placement_moves_the_anchor_and_scales_the_font() {
+        use yc_core::CaptionPlacement;
+        let p = CaptionPlacement { x_frac: 0.5, y_frac: 0.72, scale: 1.5 };
+        let ass = generate_ass(&units(&["halo"]), &style(), Some(p));
+        // 1920 * 0.72 = 1382.4 -> 1382; font 96 * 1.5 = 144 in the Style line.
+        assert!(ass.contains("\\pos(540,1382)"), "anchor: {ass}");
+        assert!(ass.contains("Style: Caption,Anton,144,"), "font size: {ass}");
+    }
+
+    #[test]
+    fn placement_is_clamped_against_hand_edited_json() {
+        // Off-canvas fractions and absurd scales (a hand-edited project.json)
+        // clamp instead of flinging the anchor away or the size to 0 — to the
+        // SHARED CaptionPlacement bounds, the same ones the editor's resize
+        // uses, so preview and burn-in can never disagree about size.
+        use yc_core::CaptionPlacement;
+        let (x, y, size) = resolve_placement(
+            Some(CaptionPlacement { x_frac: -3.0, y_frac: 9.0, scale: 0.0 }),
+            96,
+        );
+        assert_eq!((x, y), (0, 1920));
+        assert_eq!(size, (96.0_f32 * CaptionPlacement::SCALE_MIN).round() as u32);
+        let (_, _, size_hi) = resolve_placement(
+            Some(CaptionPlacement { x_frac: 0.5, y_frac: 0.5, scale: 99.0 }),
+            96,
+        );
+        assert_eq!(size_hi, (96.0_f32 * CaptionPlacement::SCALE_MAX).round() as u32);
+    }
+
+    #[test]
+    fn word_states_mirror_each_genres_tag_semantics() {
+        // Words at onsets 0.0 / 0.5 / 1.0. At t=0.6: rolling-pop has revealed
+        // words 0-1 (the \t alpha reveal fired) and not word 2; karaoke has
+        // snapped words 0-1 to the accent (\k cursor passed them) with word 2
+        // still base; huge-word lines are single-word and always Base.
+        let t = units(&["a", "b", "c"]);
+        let rolling = preview_lines(&t, CaptionGenre::RollingPop);
+        assert_eq!(
+            word_states(CaptionGenre::RollingPop, &rolling[0], 0.6),
+            vec![WordState::Base, WordState::Base, WordState::Hidden]
+        );
+        let karaoke = preview_lines(&t, CaptionGenre::KaraokeFill);
+        assert_eq!(
+            word_states(CaptionGenre::KaraokeFill, &karaoke[0], 0.6),
+            vec![WordState::Sung, WordState::Sung, WordState::Base]
+        );
+        let huge = preview_lines(&t, CaptionGenre::HugeWord);
+        assert_eq!(word_states(CaptionGenre::HugeWord, &huge[1], 0.6), vec![WordState::Base]);
+        // Before anything is spoken, rolling shows nothing, karaoke all-base.
+        assert_eq!(
+            word_states(CaptionGenre::RollingPop, &rolling[0], -0.1),
+            vec![WordState::Hidden; 3]
+        );
+        assert_eq!(
+            word_states(CaptionGenre::KaraokeFill, &karaoke[0], -0.1),
+            vec![WordState::Base; 3]
+        );
+    }
+
+    #[test]
+    fn preview_lines_match_the_emitted_dialogues() {
+        // The preview overlay and the ASS output consume the same model: line
+        // count equals Dialogue count and line bounds equal the Dialogue times,
+        // for every genre.
+        let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
+        for genre in [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill] {
+            let mut st = style();
+            st.genre = genre;
+            let lines = preview_lines(&t, genre);
+            let ass = generate_ass(&t, &st, None);
+            let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
+            assert_eq!(dialogues.len(), lines.len(), "genre {genre:?}");
+            for (line, d) in lines.iter().zip(&dialogues) {
+                let fields: Vec<&str> = d.split(',').collect();
+                assert_eq!(fields[1], ass_time(line.start_s), "start, genre {genre:?}");
+                assert_eq!(fields[2], ass_time(line.end_s), "end, genre {genre:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn preview_lines_never_overlap_and_are_uppercased() {
+        let t = units(&["bocil", "gila", "banget", "sumpah", "keren", "abis"]);
+        for genre in [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill] {
+            let lines = preview_lines(&t, genre);
+            assert!(!lines.is_empty());
+            for pair in lines.windows(2) {
+                assert!(
+                    pair[0].end_s <= pair[1].start_s + 1e-9,
+                    "lines overlap under {genre:?}: {:?} then {:?}",
+                    (pair[0].start_s, pair[0].end_s),
+                    (pair[1].start_s, pair[1].end_s)
+                );
+            }
+            let all_upper = lines
+                .iter()
+                .flat_map(|l| &l.words)
+                .all(|w| w.text.chars().all(|c| !c.is_lowercase()));
+            assert!(all_upper, "preview words carry the burn-in's uppercasing");
+        }
     }
 }

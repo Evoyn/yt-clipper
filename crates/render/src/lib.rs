@@ -10,7 +10,8 @@
 pub mod ass;
 pub mod export;
 pub use ass::{
-    generate_ass, refine_caption_timing, refine_caption_timing_keep_verified,
-    refine_caption_timing_traced, RefineTrace, UnitOutcome,
+    generate_ass, preview_lines, refine_caption_timing, refine_caption_timing_keep_verified,
+    refine_caption_timing_traced, resolve_placement, word_states, PreviewLine, PreviewWord,
+    RefineTrace, UnitOutcome, WordState,
 };
 pub use export::{build_filtergraph, export_args, run_export};

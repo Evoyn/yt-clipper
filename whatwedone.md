@@ -4,6 +4,41 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (night) — the editor grew eyes: caption preview playback + drag-anywhere placement
+
+You asked for it mid-ritual ("preview video and a captions editor…drag to
+move and change size") and it exists tonight — designed in an operator-AFK
+grill (every fork went to the recommended option; veto freely, the handoff
+lists them) and shipped as ADR 0036 slice 1:
+
+- **The nudge editor now plays the clip**: the 7-frame scrub became a ~480p
+  filmstrip with a real playhead — Play/Pause/scrub with the clip's actual
+  audio (the same rodio path Moment review uses), so you can *watch and hear*
+  the captions to catch the wrong ones.
+- **Captions draw over the composite from the render's own model**: the new
+  `preview_lines` + `word_states` in yc-render feed BOTH the ASS burn-in and
+  the egui overlay — grouping, timing, position, size, karaoke snap are the
+  same code, so the preview can't drift. (Glyphs/animation approximate; the
+  MP4 stays ground truth.)
+- **Drag the caption anywhere, scroll on it to resize** — center-snap guide,
+  gold hover box, per-Clip persistence (`Clip.caption_placement`). Headless
+  and old projects render byte-identical (`\pos(540,883)` verified on your
+  Deddy control fixture end-to-end); placement only exists once you drag.
+- An 8-angle review then hardened it in-session: no audio re-seek storm on
+  scrub, no 120-frame decode wasted on headless/batch runs, shared clamps so
+  preview size == burned size, galley caching for the 30 fps tick.
+- 201 fast tests green; release `correct,face` build green.
+
+**Slice 2 is designed, not built**: fixing a wrong word in the editor will
+write an `at_s`-pinned per-clip correction (editing = curating), "add a
+missing caption" becomes a clip-scoped insertion entry, harvested garbles
+highlight in the preview, and a Transcribe job gives you captions before the
+first render. **The ADR 0035 engine picker is still queued — untouched.**
+Your part: an interactive pass (drag/resize/play), then rule on the AFK
+decisions. Entry point as always: `nextprompt.md`.
+
+---
+
 ## 2026-07-02 (evening) — the gate ran, caught two real bugs, and your rulings now aim at moments
 
 The ADR 0034 generalization gate rendered both held-out clips and earned its

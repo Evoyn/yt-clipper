@@ -314,10 +314,52 @@ pub struct Clip {
     pub layout: Layout,
     /// Name of the Caption Style preset used.
     pub caption_style: String,
+    /// Where/how large this Clip's captions draw (ADR 0036). `None` — the
+    /// default, and always in headless — keeps the built-in anchor and the
+    /// style's size, so pre-editor renders are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_placement: Option<CaptionPlacement>,
     /// Padded video segment downloaded for this Clip (ADR 0001).
     pub segment_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
 }
+
+/// Caption placement (ADR 0036): the per-Clip override of where the caption
+/// block sits on the canvas and how large its text draws. Presentation data on
+/// the Clip — never curation (a placement says nothing about words). Fractions
+/// are of the canvas (`\an5` center anchor); `scale` multiplies the Caption
+/// Style's font size.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CaptionPlacement {
+    pub x_frac: f32,
+    pub y_frac: f32,
+    pub scale: f32,
+}
+
+impl CaptionPlacement {
+    /// The legal caption scale bounds, shared by the render's
+    /// `resolve_placement` and the editor's scroll-resize so the preview and
+    /// the burn-in can never disagree about how large a placement draws
+    /// (ADR 0036's "size exact" promise).
+    pub const SCALE_MIN: f32 = 0.3;
+    pub const SCALE_MAX: f32 = 3.0;
+}
+
+impl Default for CaptionPlacement {
+    /// The built-in anchor: centered, mid-gameplay height (`ass.rs`'s
+    /// `CAPTION_Y_FRAC`), unscaled — `Some(default)` renders identically to
+    /// `None`.
+    fn default() -> Self {
+        Self { x_frac: 0.5, y_frac: CAPTION_Y_FRAC, scale: 1.0 }
+    }
+}
+
+/// Caption anchor as a fraction of canvas height: mid gameplay Panel (which
+/// ends at the Seam, 0.62) — above the facecam face below, and clear of any
+/// burned-in source subtitles near the bottom of the gameplay. The single
+/// source of the default; `ass.rs` and [`CaptionPlacement::default`] both read
+/// it.
+pub const CAPTION_Y_FRAC: f32 = 0.46;
 
 /// The animation genre of a Caption Style. The ASS generator branches on
 /// this; everything else about a style is data (ADR 0004).
@@ -425,6 +467,44 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_without_placement_deserializes_and_stays_unstamped() {
+        // Pre-ADR-0036 project.json has no caption_placement key: it must load
+        // (serde default -> None) and re-serialize without inventing the key,
+        // so old projects round-trip byte-stable modulo unrelated fields.
+        let json = r#"{
+            "id": 1, "moment_id": 2,
+            "range": { "start_s": 0.0, "end_s": 10.0 },
+            "layout": { "kind": "full_frame", "crop": { "x": 0.0, "y": 0.0, "w": 1920.0, "h": 1080.0 } },
+            "caption_style": "Huge",
+            "segment_path": null, "export_path": null
+        }"#;
+        let clip: Clip = serde_json::from_str(json).expect("old project.json loads");
+        assert_eq!(clip.caption_placement, None);
+        let out = serde_json::to_string(&clip).unwrap();
+        assert!(!out.contains("caption_placement"), "None is skipped, not written: {out}");
+    }
+
+    #[test]
+    fn caption_placement_round_trips_and_defaults_to_the_builtin_anchor() {
+        let p = CaptionPlacement { x_frac: 0.5, y_frac: 0.72, scale: 1.4 };
+        let clip = Clip {
+            id: 1,
+            moment_id: 2,
+            range: TimeRange { start_s: 0.0, end_s: 10.0 },
+            layout: Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 } },
+            caption_style: "Huge".into(),
+            caption_placement: Some(p),
+            segment_path: None,
+            export_path: None,
+        };
+        let back: Clip = serde_json::from_str(&serde_json::to_string(&clip).unwrap()).unwrap();
+        assert_eq!(back.caption_placement, Some(p));
+        // Some(default) must mean exactly the built-in anchor.
+        let d = CaptionPlacement::default();
+        assert_eq!((d.x_frac, d.y_frac, d.scale), (0.5, CAPTION_Y_FRAC, 1.0));
+    }
 
     #[test]
     fn wait_killable_kills_a_running_child_on_cancel() {

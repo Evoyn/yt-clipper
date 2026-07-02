@@ -81,14 +81,20 @@ fn main() -> eframe::Result<()> {
                     // No detection in --headless, so no generated title; the
                     // render names the Short by timestamp (ADR 0015).
                     to_worker
-                        .send(Job::Prepare { range, title: None, layout_pref })
+                        .send(Job::Prepare { range, title: None, layout_pref, preview: false })
                         .expect("send prepare");
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
                     // preserving the old one-shot promote behavior (ADR 0012).
+                    // No editor means no Caption placement either (ADR 0036).
                     to_worker
-                        .send(Job::Render { layout, caption_genre, correct: correct_from_env() })
+                        .send(Job::Render {
+                            layout,
+                            caption_genre,
+                            correct: correct_from_env(),
+                            placement: None,
+                        })
                         .expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
@@ -104,6 +110,7 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(1);
                 }
                 Ok(Progress::Detected { .. }) => {} // not reachable in promote-only mode
+                Ok(Progress::Captions { .. }) => {} // preview-only (ADR 0036); no editor headless
                 Err(_) => std::process::exit(1),
             }
         }
@@ -158,6 +165,7 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(1);
                 }
                 Ok(Progress::Prepared { .. }) => {} // not reachable in detect-only mode
+                Ok(Progress::Captions { .. }) => {}
                 Ok(Progress::Done(_)) => {}
                 Err(_) => std::process::exit(1),
             }
@@ -201,7 +209,7 @@ fn main() -> eframe::Result<()> {
                     match queue.first().cloned() {
                         Some((range, title)) => {
                             to_worker
-                                .send(Job::Prepare { range, title, layout_pref })
+                                .send(Job::Prepare { range, title, layout_pref, preview: false })
                                 .expect("send prepare");
                         }
                         None => {
@@ -212,7 +220,12 @@ fn main() -> eframe::Result<()> {
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
                     to_worker
-                        .send(Job::Render { layout, caption_genre, correct: correct_from_env() })
+                        .send(Job::Render {
+                            layout,
+                            caption_genre,
+                            correct: correct_from_env(),
+                            placement: None,
+                        })
                         .expect("send render");
                 }
                 Ok(Progress::Done(p)) => {
@@ -221,7 +234,7 @@ fn main() -> eframe::Result<()> {
                     match queue.get(rendered).cloned() {
                         Some((range, title)) => {
                             to_worker
-                                .send(Job::Prepare { range, title, layout_pref })
+                                .send(Job::Prepare { range, title, layout_pref, preview: false })
                                 .expect("send prepare");
                         }
                         None => {
@@ -238,6 +251,7 @@ fn main() -> eframe::Result<()> {
                     eprintln!("FAILED: {e}");
                     std::process::exit(1);
                 }
+                Ok(Progress::Captions { .. }) => {} // preview-only (ADR 0036); no editor in batch
                 Err(_) => std::process::exit(1),
             }
         }
@@ -658,15 +672,26 @@ impl eframe::App for App {
                     self.timeline = Some(timeline);
                     self.status = Status::Idle;
                 }
-                Progress::Prepared { layout, src_w, src_h, frames, frame_w, frame_h, range } => {
+                Progress::Prepared {
+                    layout,
+                    src_w,
+                    src_h,
+                    frames,
+                    frame_w,
+                    frame_h,
+                    frame_fps,
+                    range,
+                } => {
                     // Batch render (M8): auto-render this clip with its auto-detected
                     // Layout (no editor); the Done handler advances the queue.
                     // `continue` skips the editor setup and drains the next message.
+                    // No editor also means no Caption placement (ADR 0036).
                     if !self.render_queue.is_empty() {
                         let _ = self.to_worker.send(Job::Render {
                             layout,
                             caption_genre: self.caption_genre,
                             correct: self.correct_captions,
+                            placement: None,
                         });
                         continue;
                     }
@@ -697,9 +722,18 @@ impl eframe::App for App {
                             src_h,
                             range,
                             textures,
+                            frame_fps,
                             self.caption_genre,
                         ));
                         self.status = Status::Idle;
+                    }
+                }
+                Progress::Captions { transcript } => {
+                    // The refined transcript this render burns (ADR 0036): hand it
+                    // to the editor so the caption overlay previews the render's
+                    // truth (arrives while NVENC still runs).
+                    if let Some(ed) = &mut self.editor {
+                        ed.set_captions(transcript);
                     }
                 }
                 Progress::Done(p) => {
@@ -711,7 +745,13 @@ impl eframe::App for App {
                         match self.render_queue.get(self.queue_idx).cloned() {
                             Some((range, title)) => {
                                 let n = self.render_queue.len();
-                                let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
+                                // Batch: no editor opens, so no filmstrip (ADR 0036).
+                                let _ = self.to_worker.send(Job::Prepare {
+                                    range,
+                                    title,
+                                    layout_pref: self.layout_pref,
+                                    preview: false,
+                                });
                                 self.status =
                                     Status::Working(format!("Rendering {}/{n}", self.queue_idx + 1));
                             }
@@ -797,18 +837,28 @@ impl eframe::App for App {
             self.editor = None;
         }
         match editor_action {
-            editor::EditorAction::Render(layout, caption_genre) => {
+            editor::EditorAction::Render(layout, caption_genre, placement) => {
                 // The editor's per-Clip pick wins; mirror it back to the app's
-                // selection so it stays the default for the next clip.
+                // selection so it stays the default for the next clip. Placement
+                // stays per-Clip (ADR 0036) — nothing global to mirror.
                 self.caption_genre = caption_genre;
+                self.stop_audio();
                 let _ = self.to_worker.send(Job::Render {
                     layout,
                     caption_genre,
                     correct: self.correct_captions,
+                    placement,
                 });
                 self.status = Status::Working("Rendering".into());
             }
-            editor::EditorAction::Cancel => self.editor = None,
+            editor::EditorAction::Cancel => {
+                self.stop_audio();
+                self.editor = None;
+            }
+            // Editor playback (ADR 0036): the same sink the Moment review uses,
+            // sliced from the whole-VOD analysis wav at the clip offset.
+            editor::EditorAction::Play(range) => self.play_range(range),
+            editor::EditorAction::StopAudio => self.stop_audio(),
             editor::EditorAction::None => {}
         }
 
@@ -1095,7 +1145,13 @@ impl App {
                     self.editor = None;
                     self.render_queue = queue;
                     self.queue_idx = 0;
-                    let _ = self.to_worker.send(Job::Prepare { range, title, layout_pref: self.layout_pref });
+                    // Batch: no editor opens, so no filmstrip (ADR 0036).
+                    let _ = self.to_worker.send(Job::Prepare {
+                        range,
+                        title,
+                        layout_pref: self.layout_pref,
+                        preview: false,
+                    });
                     self.status =
                         Status::Working(format!("Rendering 1/{}", self.render_queue.len()));
                 }
@@ -1343,6 +1399,7 @@ impl App {
                     range: m.range,
                     title: m.title.clone(),
                     layout_pref: self.layout_pref,
+                    preview: true, // the editor opens on this Prepare
                 });
                 self.status = Status::Working("Preparing clip".into());
             }
