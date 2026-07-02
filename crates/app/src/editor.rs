@@ -382,14 +382,21 @@ impl EditorState {
 
     /// Draw the whole Studio page and return the operator's action.
     ///
-    /// `busy` = any worker job in flight (transcribe / speakers / render):
-    /// playback KEEPS RUNNING — audio is CPU-side rodio — but its visual tick
-    /// drops to ~10 fps so the wgpu loop never competes with whisper for the
-    /// GPU (the detect-hang scar; 10 fps is the proven-safe cadence).
+    /// `busy` = any worker job in flight (gates job-starting buttons so they
+    /// can't double-queue). `gpu_busy` = that job holds the GPU (whisper /
+    /// NVENC / LLM): playback keeps running — audio is CPU-side rodio — but
+    /// its visual tick drops to ~10 fps so the wgpu loop never competes for
+    /// the card (the detect-hang scar); CPU jobs keep the full 60 fps.
     /// `rendering` = an export is in flight: it gates ONLY Export/Render, so
     /// the operator can't stack renders — everything else stays editable and a
     /// render started during the caption pre-pass simply queues behind it.
-    pub fn show(&mut self, ui: &mut egui::Ui, busy: bool, rendering: bool) -> EditorAction {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        busy: bool,
+        gpu_busy: bool,
+        rendering: bool,
+    ) -> EditorAction {
         let mut action = EditorAction::None;
 
         // Advance the playhead while playing.
@@ -402,9 +409,9 @@ impl EditorState {
                 self.stop_video();
                 action = EditorAction::StopAudio;
             } else {
-                // ~30 fps visual tick normally; ~10 fps while the GPU works
-                // (the throttle that protects whisper from the wgpu loop).
-                let tick = if busy { 100 } else { 33 };
+                // 60 fps visual tick normally (vsync-capped); ~10 fps only
+                // while the GPU is actually held.
+                let tick = if gpu_busy { 100 } else { 16 };
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(tick));
             }
         }

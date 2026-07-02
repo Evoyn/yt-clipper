@@ -668,6 +668,57 @@ fn parse_layout_pref(arg: Option<&str>) -> LayoutPref {
     }
 }
 
+/// Whether a worker stage string names GPU work (whisper / NVENC / the LLM
+/// judge / the Qwen ensemble). GPU stages get the protective ~10 fps repaint
+/// throttle (the detect-hang scar); everything else animates at 60 fps. The
+/// stage strings are in-repo constants (pipeline.rs `Progress::Stage` sends),
+/// so the substrings below are stable; a new GPU stage must mention its
+/// engine ("whisper" / "GPU" / "NVENC" / "LLM" / "Ensemble") to be throttled.
+fn stage_is_gpu(stage: &str) -> bool {
+    ["whisper", "GPU", "NVENC", "LLM", "Ensemble"].iter().any(|k| stage.contains(k))
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::stage_is_gpu;
+
+    /// Pin the classification of every `Progress::Stage` string pipeline.rs
+    /// sends: GPU stages must keep the protective 10 fps repaint throttle,
+    /// CPU/network stages must animate at 60 fps. If a stage string changes
+    /// in pipeline.rs, this list is the reminder to reclassify it.
+    #[test]
+    fn pipeline_stages_classify_correctly() {
+        for gpu in [
+            "Transcribing (whisper, GPU)",
+            "Refining moments (whisper, GPU)",
+            "Refining moments (LLM judgment, GPU)",
+            "Ensemble captions (Qwen3-ASR)",
+            "Correcting captions (LLM)",
+            "Rendering (NVENC)",
+        ] {
+            assert!(stage_is_gpu(gpu), "{gpu} must throttle");
+        }
+        for cpu in [
+            "Fetching metadata",
+            "Downloading audio",
+            "Fetching chat",
+            "Extracting audio",
+            "Detecting moments (chat + loudness)",
+            "Refining moments (arousal, CPU)",
+            "Fetching segment",
+            "Framing (face detect)",
+            "Extracting preview frames",
+            "Analyzing speakers (faces + voice)",
+            "Cleaning voice",
+            "Separating vocal stem",
+            "Generating captions",
+            "Captions ready",
+        ] {
+            assert!(!stage_is_gpu(cpu), "{cpu} must stay smooth");
+        }
+    }
+}
+
 /// The max Moment length (seconds) for headless/batch detection: `YC_MAX_CLIP_S`
 /// overrides, else the detector's default cap. Clamped downstream to the 180 s
 /// Shorts ceiling. The GUI exposes the same knob as a slider.
@@ -907,6 +958,10 @@ impl eframe::App for App {
             }
         }
         let working = matches!(self.status, Status::Working(_));
+        // Whether the CURRENT stage holds the GPU (whisper / NVENC / LLM /
+        // ensemble): those get the protective 10 fps repaint throttle; CPU and
+        // network stages animate at full rate.
+        let gpu_busy = matches!(&self.status, Status::Working(s) if stage_is_gpu(s));
 
         // Top brand bar (W4 / ADR 0024 theme): the gold brand mark + an
         // always-visible status. Ink-filled so it reads as the app's chrome,
@@ -936,7 +991,7 @@ impl eframe::App for App {
         if self.editor.is_some() {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 if let Some(ed) = &mut self.editor {
-                    editor_action = ed.show(ui, working, self.rendering);
+                    editor_action = ed.show(ui, working, gpu_busy, self.rendering);
                 }
             });
         } else {
@@ -1005,16 +1060,19 @@ impl eframe::App for App {
 
         // (Status lives in the top brand bar now — see `status_bar`.)
 
-        // While a GPU job runs, repaint at ~10 fps instead of unbounded: the
-        // continuous wgpu render loop otherwise competes with whisper for the
-        // single 8 GB card and starves it (the detect-hang scar). 10 fps still
-        // drains worker progress and animates the spinner smoothly. This only
-        // holds because nothing else requests an immediate repaint while working —
-        // egui's stock `ui.spinner()` does exactly that every frame (an animated
-        // widget), which silently overrode this throttle until 2026-07-02; the
-        // status bar draws [`throttled_spinner`] instead.
+        // Repaint cadence while a job runs. GPU stages (whisper / NVENC / the
+        // LLM judge / the Qwen ensemble) keep the ~10 fps throttle: the
+        // continuous wgpu render loop otherwise competes with them for the
+        // single 8 GB card and starves them (the detect-hang scar). CPU/network
+        // stages (import, segment fetch, face detect, speaker analysis) tick at
+        // 60 fps so spinners and progress read smoothly — wgpu repaints cost
+        // those stages nothing. This only holds because nothing else requests
+        // an immediate repaint while working — egui's stock `ui.spinner()` does
+        // exactly that every frame, which silently overrode this throttle until
+        // 2026-07-02; the status bar draws [`throttled_spinner`] instead.
         if working {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            let ms = if gpu_busy { 100 } else { 16 };
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
         }
     }
 }
@@ -1514,8 +1572,11 @@ impl App {
                 ui.weak(format!("{stage}…"));
                 ui.weak("fetching the segment · detecting faces · building the preview");
             });
-            // The spinner needs its ~10 fps tick even before `working` is set.
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            // Smooth 60 fps spinner: Prepare is CPU/network only (segment
+            // fetch, ffprobe, face detect, frame extraction) — the 10 fps
+            // GPU-protection throttle is about whisper/NVENC, which never run
+            // during this screen, so the loading animation can be fluid.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             return;
         }
 
