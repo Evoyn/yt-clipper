@@ -4,6 +4,38 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (caption-perfection loop) — the Diskusi clip now renders with the words whisper never heard
+
+You gave the ground truth and said don't stop. Here's where it landed
+(`79ddcf2` + `27d970b`, ADR 0034, 175 tests green, all pushed):
+
+**What's on screen now** (export `clip-31-22 (5).mp4`, rendered with the new
+opt-in `YC_QWEN_ENS=1`): *ENGGAK UDAH KEBUKA · NANTI DEPAN SANA KAU **DICEGAT** ·
+MANA · INI SATU · ANJING APA ITU · DEPAN SINI KAU YANG MAIN · KAU MAIN KAU MAIN
+DULU · **KREENG KATANYA** · **BAJINGAN BAJINGAN** · **BANGKE** · **MANA TADI COK** · ANJING
+**PUSING COK MAIN** · **PUSING KAN DIBILANG** · **ANJING NGERI BANGET BANGKE***. The old
+render had 23 caption units with `pancingan pancingan`, a 4-second phantom
+"pusing", and a hole; this one has 43 units and every swear right.
+
+**How**: ~30 measured decode experiments showed no single decode (either
+engine, any knob) gets the clip right — but different decode variants garble
+DIFFERENT regions, so a 5-variant Qwen3-ASR vote + whisper-as-voter recovers
+what no single decode holds (words), fused onto whisper's DTW spans (timing).
+Plus the new **fuzzy store transfer**: your existing curation now applies
+across engines (whisper's `dijekat→dicegat` caught the ensemble's `dijegat`),
+which is the answer to ADR 0033's "engine swap breaks curation". Your ground
+truth also filled 4 old review-queue to-dos and seeded 2 new corrections.
+
+**What still differs from your text, honestly**: the scream region ("tur
+biadab anjing / ayok" — scrambled repetition in every decode ever run), kau
+vs kamu, one anying-vs-anjing, maen-vs-main, and the opening "ENGGAK UDAH"
+(the engines may genuinely hear "nggak, udah kebuka" — your ear rules).
+Two caption clusters flash fast (inserted words squeezed between whisper
+anchors). Watch the export; details + next levers in
+`handoffs/2026-07-02-caption-perfection-loop.md`.
+
+---
+
 ## 2026-07-02 (Qwen3-ASR trial) — the A/B ran; your verdict is the only thing left
 
 The ⭐ item is done up to its designed stopping point. A new inspector
