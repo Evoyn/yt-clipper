@@ -37,6 +37,24 @@ if (Test-Path $vadOut) {
     if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE" }
 }
 
+# Qwen3-ASR 1.7B (official ggml-org GGUF conversion) for the ASR A/B trial
+# (ROADMAP "ASR engine upgrade"). MULTIMODAL: needs BOTH the text model and the
+# mmproj audio encoder, hosted by the pinned llama.cpp sidecar
+# (scripts/fetch-llama-sidecar.ps1) - NOT by whisper.cpp or yc-llm-judge.
+$qwenRepo = "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main"
+$qwenFiles = @("Qwen3-ASR-1.7B-Q8_0.gguf", "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf")
+foreach ($qf in $qwenFiles) {
+    $qOut = Join-Path $models $qf
+    if (Test-Path $qOut) {
+        $qgb = [math]::Round((Get-Item $qOut).Length / 1GB, 2)
+        Write-Host "$qf already present ($qgb GB) -- skipping. Delete it to re-fetch."
+    } else {
+        Write-Host "Downloading $qf from Hugging Face..."
+        & curl.exe -L --fail --progress-bar -o $qOut "$qwenRepo/$qf"
+        if ($LASTEXITCODE -ne 0) { throw "curl failed with exit code $LASTEXITCODE" }
+    }
+}
+
 Write-Host "Recording versions..."
 $gb = [math]::Round((Get-Item $out).Length / 1GB, 2)
 $versions = @(
@@ -45,6 +63,8 @@ $versions = @(
     "source: $uri",
     "vad model: $vad (Silero, opt-in YC_VAD=1 - ADR 0033)",
     "vad source: $vadUri",
+    "qwen3-asr: Qwen3-ASR-1.7B-Q8_0.gguf + mmproj (multimodal; ASR A/B trial - ROADMAP)",
+    "qwen3-asr source: $qwenRepo",
     "fetched: $(Get-Date -Format o)"
 )
 $versions | Out-File (Join-Path $models "VERSIONS.txt") -Encoding utf8
