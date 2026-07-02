@@ -4,6 +4,32 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (loop, final) — your timestamps became curation; the Diskusi export is word- and time-faithful
+
+Two more loop iterations after you watched the exports (`f884bd8..2956e41`,
+186 tests green, all pushed):
+
+- **Timing v2/v3**: the fusion no longer trusts whisper's (partly phantom)
+  spans — it aligns on a two-decode anchor skeleton with similarity gating,
+  places unanchored words on speech onsets, respreads flash-runs, and never
+  silence-drops a vote-verified word. Your "not the same word the streamer
+  said" complaint was the phantom-anchor bug; it has a regression test now.
+- **Time-anchored corrections (`at_s`)**: your watch feedback ("tur biadab
+  anjing is at 8s", "kreeng belongs at 16s"...) went straight into the
+  per-clip store as five pins — including INSERTING "tur biadab anjing",
+  words no engine ever heard. A correction with a timestamp now applies to
+  exactly the right occurrence and pins the caption to the speech. This is
+  the roadmap's "time-anchored curation" running for real (ADR 0034).
+- Final export: **`clip-31-22 (13).mp4`** — 45 units, every slang word right,
+  all five of your timing complaints fixed. Left for your ear: the
+  enggak-udah opening, kau/kamu, one anying, and BANGET's edge flash.
+
+Next session: watch `(13).mp4`, rule on the leftovers (a word + a rough time
+per ruling), then the generalization gate (eh-pile + Deddy through the
+ensemble). Entry point as always: `nextprompt.md`.
+
+---
+
 ## 2026-07-02 (caption-perfection loop) — the Diskusi clip now renders with the words whisper never heard
 
 You gave the ground truth and said don't stop. Here's where it landed
