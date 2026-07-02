@@ -1,32 +1,35 @@
-//! The nudge editor (M6 increment, ADR 0012): a manual escape hatch over the
-//! auto-detected framing. The operator drags/zooms the facecam (and gameplay)
-//! Crops, drags the Seam, and overrides the Layout type, watching a **live egui
-//! UV-composite** — each Panel is drawn as a UV sub-rectangle of one extracted
-//! source frame, which is pixel-exact for the render's crop/scale/vstack
-//! geometry (the only gap, subtitles, is immaterial to framing and appears on
-//! Render). This supersedes ADR 0005's ffmpeg-filtergraph preview for the
-//! framing editor: no ffmpeg per nudge, no GPU contention, 60 fps.
+//! The Studio — the full-window video preview editor a Promote opens into
+//! (focus 2026-07, growing the ADR 0012 nudge editor + ADR 0036 caption
+//! preview into a CapCut-style page for Shorts):
 //!
-//! All geometry is the pure, unit-tested `yc_frame` layer; this module is only
-//! the egui surface and the per-kind Crop bookkeeping.
+//! ```text
+//! ┌──────────────────── toolbar: back · title · view toggle · Export ──┐
+//! │ Captions        │        Video preview          │  Properties      │
+//! │ (transcript     │  Original: full frame +       │  Camera mode     │
+//! │  editor: edit / │  draggable 9:16 crop box,     │  Faces (A/B/C)   │
+//! │  add / split /  │  face overlays                │  Caption presets │
+//! │  merge / censor │  Preview: the 9:16 output +   │  + style knobs   │
+//! │  / delete)      │  captions + safe area         │  Export summary  │
+//! ├─────────────── timeline: ruler · captions · speakers · cuts ───────┤
+//! ```
 //!
-//! Since ADR 0036 the editor also carries the **caption preview + placement
-//! editor**: the frame scrub grew into a filmstrip playhead (with the Clip's
-//! real audio, played by the app on request), and once a Render has shipped its
-//! refined transcript (`Progress::Captions`) the active caption line draws over
-//! the composite — same grouping/timing as the burn-in (`yc_render`'s shared
-//! line model), egui-rasterized (approximate glyphs, exact layout). Dragging the
-//! caption moves it, scrolling over it resizes — the per-Clip Caption placement.
+//! All framing geometry stays the pure `yc_frame` layer; the speaker analysis
+//! and camera plan come from the worker (`Progress::Speakers`); the caption
+//! line model stays `yc_render`'s (the preview cannot drift from the burn-in,
+//! ADR 0036). This module is only the egui surface.
 
 use std::time::Instant;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind};
 use yc_core::{
-    CaptionGenre, CaptionPlacement, Crop, Layout, TimeRange, Transcript, CANVAS_H, CANVAS_W,
+    CameraMode, CameraPlan, CaptionGenre, CaptionPlacement, CaptionStyle, Crop, Layout, TimeRange,
+    Transcript, CANVAS_H, CANVAS_W,
 };
+use yc_frame::speaker::{track_label, SpeakerAnalysis};
+use yc_frame::FaceCluster;
 use yc_render::{preview_lines, resolve_placement, word_states, PreviewLine, WordState};
 
-use crate::pipeline::caption_style;
+use crate::presets::caption_presets;
 use crate::theme;
 
 /// Which of the three Layouts the operator has selected. `Layout::FullFrame`
@@ -40,15 +43,42 @@ enum LayoutKind {
     FullGameplay,
 }
 
+/// The preview's two sides of the Before/After toggle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// The 9:16 output as it will render (captions, safe area).
+    Output,
+    /// The full source frame with the crop box tools + face overlays.
+    Source,
+}
+
+/// Where the speaker analysis stands, for the Camera panel's status line.
+#[derive(Clone, PartialEq)]
+pub enum SpeakerJob {
+    NotRun,
+    Running,
+    Ready,
+    Failed(String),
+}
+
+/// Everything a Render needs from the editor, bundled so the action enum stays
+/// readable.
+pub struct RenderSpec {
+    pub layout: Layout,
+    pub style: CaptionStyle,
+    pub placement: Option<CaptionPlacement>,
+    /// The active-speaker cut plan — `Some` only in ActiveSpeaker mode.
+    pub camera: Option<CameraPlan>,
+    /// The operator's edited transcript — `Some` only when they touched it.
+    pub transcript_override: Option<Transcript>,
+}
+
 /// What `show` reports back to the app each frame.
 pub enum EditorAction {
     /// Nothing to do this frame.
     None,
-    /// The operator hit Render: composite this (nudged) Layout with this
-    /// per-Clip Caption Style genre (M7 — the editor overrides the global pick)
-    /// and this Caption placement (ADR 0036; `None` = never dragged = the
-    /// built-in anchor).
-    Render(Layout, CaptionGenre, Option<CaptionPlacement>),
+    /// The operator confirmed the export summary: render this spec.
+    Render(Box<RenderSpec>),
     /// The operator dismissed the editor without rendering.
     Cancel,
     /// Start clip-audio playback over this absolute VOD range (Play pressed, or
@@ -58,25 +88,27 @@ pub enum EditorAction {
     /// render started (playback pauses so the repaint throttle that protects
     /// whisper from the wgpu loop stays in force).
     StopAudio,
+    /// Run (or re-run) the podcast speaker analysis on the worker.
+    AnalyzeSpeakers,
 }
 
-/// The editable framing state. All four Crops stay resident so switching Layout
-/// kind never discards a nudge: e.g. toggling Stacked -> Full gameplay -> Stacked
-/// preserves the facecam the operator placed.
+/// The editable state. All four Crops stay resident so switching Layout kind
+/// never discards a nudge; the speaker analysis and camera plan arrive later
+/// and slot in without disturbing anything.
 pub struct EditorState {
     src_w: f32,
     src_h: f32,
     range: TimeRange,
+    /// The promoted Moment's generated Title (names the Short; toolbar text).
+    title: Option<String>,
     /// The preview filmstrip (ADR 0036): frames sampled at `frame_fps` across
     /// the clip range, as textures. Always non-empty (Prepare fails otherwise);
     /// the playhead shows the nearest frame.
     frames: Vec<egui::TextureHandle>,
     frame_fps: f64,
-    /// Clip-relative playhead (seconds) the filmstrip + caption preview draw at.
+    /// Clip-relative playhead (seconds) everything draws at.
     playhead_s: f64,
     /// `Some((anchor, offset))` while playing: playhead = offset + since(anchor).
-    /// Wall-clock-driven — the app's audio sink runs alongside; drift over a
-    /// clip-length span is inaudible.
     playing: Option<(Instant, f64)>,
     /// The auto-detected seed, kept for "Reset to auto".
     auto_layout: Layout,
@@ -86,49 +118,73 @@ pub struct EditorState {
     facecam: Crop,
     fullcam: Crop,
     fullgameplay: Crop,
-    /// Per-Clip Caption Style genre (M7). Seeded from the app's current selection
-    /// (which is the Creator-remembered default, ADR 0016) and overridable here.
-    caption_genre: CaptionGenre,
-    /// The refined transcript the last Render burned (`Progress::Captions`) —
-    /// the render's truth. `None` until the first Render of this Clip.
+    /// The full Caption Style for this Clip (preset pick + customization).
+    style: CaptionStyle,
+    /// Which preset chip is highlighted (`None` after any manual tweak).
+    preset: Option<usize>,
+    /// The refined transcript (`Progress::Captions` or the Transcribe
+    /// pre-pass) — the render's truth, editable here (focus task 2).
     transcript: Option<Transcript>,
-    /// `transcript` regrouped via the render's own line model
-    /// (`yc_render::preview_lines`) for `lines_genre` — lazily recomputed by
-    /// the overlay whenever the genre differs, so no mutation path can leave
-    /// it stale.
+    /// Set once the operator edits any unit: the render then burns the edited
+    /// transcript verbatim.
+    transcript_dirty: bool,
+    /// `transcript` regrouped via the render's own line model, lazily rebuilt
+    /// whenever the genre changes or an edit lands.
     lines: Vec<PreviewLine>,
     lines_genre: CaptionGenre,
+    lines_dirty: bool,
     /// The shaped caption galleys (text + shadow) for the overlay, keyed by
-    /// what they depend on — glyph shaping is the expensive part of egui text
-    /// and would otherwise run twice per frame at the 30 fps playback tick.
+    /// what they depend on.
     overlay_cache: Option<(OverlayKey, std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>)>,
-    /// Caption placement (ADR 0036): `None` until the operator drags/resizes —
-    /// the built-in anchor, and the Clip record stays unstamped. "Reset
-    /// placement" returns here.
+    /// Caption placement (ADR 0036): `None` until the operator drags/resizes.
     placement: Option<CaptionPlacement>,
-    /// Eye toggle: hide the overlay to reach panel pan/zoom underneath it.
+    /// Eye toggle: hide the caption overlay.
     show_captions: bool,
+    /// Safe-area guide overlay (Shorts/TikTok UI zones) in Output view.
+    show_safe_area: bool,
+    view: ViewMode,
+    camera_mode: CameraMode,
+    /// The Prepare pass's persistent face clusters (pre-analysis seed: the
+    /// AutoFace/Group modes work from these until the full analysis lands).
+    faces: Vec<FaceCluster>,
+    /// The podcast speaker analysis (worker), once run.
+    pub speakers: Option<SpeakerAnalysis>,
+    /// The active-speaker cut plan (worker seed, operator-overridable).
+    plan: Option<CameraPlan>,
+    pub speaker_job: SpeakerJob,
+    /// Selected caption row (click focuses + seeks).
+    sel_unit: Option<usize>,
+    /// Export-summary modal visibility.
+    show_export: bool,
 }
 
 impl EditorState {
     /// Seed the editor from the auto-detected Layout (ADR 0012). Crops the auto
     /// pick does not provide are seeded with sensible defaults so a Layout-type
     /// override has something to start from.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_seed(
         auto_layout: Layout,
         src_w: f32,
         src_h: f32,
         range: TimeRange,
+        title: Option<String>,
         frames: Vec<egui::TextureHandle>,
         frame_fps: f64,
         caption_genre: CaptionGenre,
+        faces: Vec<FaceCluster>,
     ) -> Self {
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
             seed_fields(&auto_layout, src_w, src_h);
+        let style = CaptionStyle::for_genre(caption_genre);
+        let preset = caption_presets().iter().position(|p| {
+            p.genre == style.genre && p.name == "Classic" && caption_genre == CaptionGenre::RollingPop
+        });
         Self {
             src_w,
             src_h,
             range,
+            title,
             frames,
             frame_fps: frame_fps.max(0.1),
             playhead_s: range.duration_s() * 0.5, // a representative middle frame
@@ -140,34 +196,62 @@ impl EditorState {
             facecam,
             fullcam,
             fullgameplay,
-            caption_genre,
+            style,
+            preset,
             transcript: None,
+            transcript_dirty: false,
             lines: Vec::new(),
             lines_genre: caption_genre,
+            lines_dirty: false,
             overlay_cache: None,
             placement: None,
             show_captions: true,
+            show_safe_area: false,
+            view: ViewMode::Output,
+            camera_mode: CameraMode::Manual,
+            faces,
+            speakers: None,
+            plan: None,
+            speaker_job: SpeakerJob::NotRun,
+            sel_unit: None,
+            show_export: false,
         }
     }
 
-    /// Receive the refined transcript a Render is burning (`Progress::Captions`,
-    /// ADR 0036) — from now on the overlay previews exactly those units.
+    /// Receive the refined transcript a Transcribe/Render produced
+    /// (`Progress::Captions`, ADR 0036). An operator-edited transcript is
+    /// never overwritten by a late worker echo of the same content.
     pub fn set_captions(&mut self, transcript: Transcript) {
-        self.lines = preview_lines(&transcript, self.caption_genre);
-        self.lines_genre = self.caption_genre;
+        if self.transcript_dirty {
+            return;
+        }
+        self.lines = preview_lines(&transcript, self.style.genre);
+        self.lines_genre = self.style.genre;
+        self.lines_dirty = false;
         self.overlay_cache = None;
         self.transcript = Some(transcript);
     }
 
-    /// Keep `lines` in step with the current genre (grouping is per-genre).
-    /// Lazy: called by the overlay each frame, so *any* path that changes the
-    /// genre is covered without manual invalidation.
+    /// Receive the speaker analysis + camera plan (`Progress::Speakers`).
+    pub fn set_speakers(&mut self, analysis: SpeakerAnalysis, plan: CameraPlan) {
+        // Auto-arm Active Speaker when the analysis proves multi-person and
+        // the operator hasn't chosen a mode deliberately (Manual = the seed).
+        if analysis.tracks.len() >= 2 && self.camera_mode == CameraMode::Manual {
+            self.camera_mode = CameraMode::ActiveSpeaker;
+        }
+        self.speakers = Some(analysis);
+        self.plan = Some(plan);
+        self.speaker_job = SpeakerJob::Ready;
+    }
+
+    /// Keep `lines` in step with the current genre and any operator edits.
     fn sync_lines(&mut self) {
-        if self.lines_genre != self.caption_genre {
+        if self.lines_genre != self.style.genre || self.lines_dirty {
             if let Some(t) = &self.transcript {
-                self.lines = preview_lines(t, self.caption_genre);
+                self.lines = preview_lines(t, self.style.genre);
             }
-            self.lines_genre = self.caption_genre;
+            self.lines_genre = self.style.genre;
+            self.lines_dirty = false;
             self.overlay_cache = None;
         }
     }
@@ -178,8 +262,8 @@ impl EditorState {
         TimeRange { start_s: self.range.start_s + offset_s, end_s: self.range.end_s }
     }
 
-    /// The Layout the operator's current edits describe.
-    fn current_layout(&self) -> Layout {
+    /// The static Layout the operator's manual edits describe.
+    fn manual_layout(&self) -> Layout {
         match self.kind {
             LayoutKind::Stacked => Layout::Stacked {
                 seam: self.seam,
@@ -188,6 +272,57 @@ impl EditorState {
             },
             LayoutKind::FullCam => Layout::FullFrame { crop: self.fullcam },
             LayoutKind::FullGameplay => Layout::FullFrame { crop: self.fullgameplay },
+        }
+    }
+
+    /// The Layout the preview shows at clip time `t` under the current camera
+    /// mode — and what a static-mode render exports.
+    fn effective_layout(&self, t: f64) -> Layout {
+        match self.camera_mode {
+            CameraMode::Manual => self.manual_layout(),
+            CameraMode::Center => Layout::FullFrame {
+                crop: yc_frame::centered_fullcam_crop(self.src_w, self.src_h),
+            },
+            CameraMode::AutoFace => match &self.speakers {
+                Some(a) if !a.tracks.is_empty() => {
+                    yc_frame::speaker::static_mode_layout(&a.tracks, self.src_w, self.src_h, false)
+                }
+                _ => match self.faces.first() {
+                    Some(f) => Layout::FullFrame {
+                        crop: yc_frame::speaker::solo_crop(&f.bbox, self.src_w, self.src_h),
+                    },
+                    None => Layout::FullFrame {
+                        crop: yc_frame::centered_fullcam_crop(self.src_w, self.src_h),
+                    },
+                },
+            },
+            CameraMode::ActiveSpeaker => match &self.plan {
+                Some(plan) => plan
+                    .shot_at(t)
+                    .map(|s| s.layout.clone())
+                    .unwrap_or_else(|| self.manual_layout()),
+                None => self.manual_layout(),
+            },
+            CameraMode::Group => match &self.speakers {
+                Some(a) if !a.tracks.is_empty() => {
+                    yc_frame::speaker::static_mode_layout(&a.tracks, self.src_w, self.src_h, true)
+                }
+                _ => {
+                    // Pre-analysis: group over Prepare's face clusters.
+                    let tracks: Vec<yc_frame::speaker::SpeakerTrack> = self
+                        .faces
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| yc_frame::speaker::SpeakerTrack {
+                            id: i,
+                            bbox: f.bbox,
+                            presence: f.persistence,
+                            activity: Vec::new(),
+                        })
+                        .collect();
+                    yc_frame::speaker::group_layout(&tracks, self.src_w, self.src_h)
+                }
+            },
         }
     }
 
@@ -202,23 +337,36 @@ impl EditorState {
         self.fullgameplay = fullgameplay;
     }
 
-    /// Draw the editor and return the operator's action. `enabled` is false while
-    /// a worker job runs (a render in flight): the composite still draws, but
-    /// interactions and the Render/Cancel buttons are inert.
-    pub fn show(&mut self, ui: &mut egui::Ui, enabled: bool) -> EditorAction {
-        let mut action = EditorAction::None;
-        ui.separator();
-        ui.strong(format!(
-            "Frame the Clip  ({:.1}s)   - drag to pan, scroll to zoom",
-            self.range.duration_s()
-        ));
+    /// The RenderSpec the current editor state describes.
+    fn render_spec(&self) -> RenderSpec {
+        let camera = match self.camera_mode {
+            CameraMode::ActiveSpeaker => self.plan.clone().filter(|p| !p.shots.is_empty()),
+            _ => None,
+        };
+        RenderSpec {
+            layout: self.effective_layout(self.playhead_s),
+            style: self.style.clone(),
+            placement: self.placement,
+            camera,
+            transcript_override: if self.transcript_dirty { self.transcript.clone() } else { None },
+        }
+    }
 
-        // Advance the playhead while playing. A render in flight (`!enabled`)
-        // pauses playback: the 10 fps repaint throttle that protects whisper
-        // from the wgpu loop must stay in force (the detect-hang scar).
+    // ------------------------------------------------------------------ show --
+
+    /// Draw the whole Studio page and return the operator's action. `busy` is
+    /// true while a worker job runs (transcribe / speakers / render): playback
+    /// pauses (the 10 fps repaint throttle protecting whisper from the wgpu
+    /// loop must hold — the detect-hang scar) and job-starting buttons lock,
+    /// but framing, caption edits, and scrubbing stay live — the operator keeps
+    /// working while the GPU does.
+    pub fn show(&mut self, ui: &mut egui::Ui, busy: bool) -> EditorAction {
+        let mut action = EditorAction::None;
+
+        // Advance the playhead while playing; a busy worker pauses playback.
         let dur = self.range.duration_s();
         if let Some((anchor, offset)) = self.playing {
-            if !enabled {
+            if busy {
                 self.playing = None;
                 action = EditorAction::StopAudio;
             } else {
@@ -234,190 +382,1208 @@ impl EditorState {
             }
         }
 
-        // Layout-type override (the three-way; ADR 0012).
-        ui.horizontal(|ui| {
-            ui.label("Layout:");
-            ui.add_enabled_ui(enabled, |ui| {
-                if ui.selectable_label(self.kind == LayoutKind::Stacked, "Stacked").clicked() {
-                    self.kind = LayoutKind::Stacked;
-                }
-                if ui.selectable_label(self.kind == LayoutKind::FullCam, "Full cam").clicked() {
-                    self.kind = LayoutKind::FullCam;
-                }
-                if ui
-                    .selectable_label(self.kind == LayoutKind::FullGameplay, "Full gameplay")
-                    .clicked()
-                {
-                    self.kind = LayoutKind::FullGameplay;
-                }
-            });
-        });
+        // Keyboard (only when no widget owns focus): space = play/pause,
+        // arrows nudge the crop (Manual) or scrub, +/- zoom, 0 = reset framing.
+        if ui.ctx().memory(|m| m.focused().is_none()) {
+            if let Some(a) = self.handle_keys(ui, busy) {
+                action = a;
+            }
+        }
 
-        // Per-Clip Caption Style override (M7): the animation genre for this Clip,
-        // seeded from the app's (Creator-remembered) pick and overridable here.
-        ui.horizontal(|ui| {
-            ui.label("Caption:");
-            ui.add_enabled_ui(enabled, |ui| {
-                for (genre, label) in [
-                    (CaptionGenre::HugeWord, "Huge word"),
-                    (CaptionGenre::RollingPop, "Rolling pop"),
-                    (CaptionGenre::KaraokeFill, "Karaoke fill"),
-                ] {
-                    if ui.selectable_label(self.caption_genre == genre, label).clicked() {
-                        self.caption_genre = genre; // overlay re-syncs lazily
+        // --- Toolbar ---
+        egui::Panel::top("studio-toolbar").show_inside(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("‹ Back").on_hover_text("Close the editor (Esc)").clicked() {
+                    action = EditorAction::Cancel;
+                }
+                ui.add_space(8.0);
+                let title = self.title.clone().unwrap_or_else(|| "Untitled clip".into());
+                ui.label(egui::RichText::new(ellipsize(&title, 46)).strong());
+                ui.weak(format!("{:.1}s · 1080x1920", dur));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if theme::primary_button(ui, "Export…").clicked() {
+                            self.show_export = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    let safe = self.show_safe_area;
+                    if ui
+                        .selectable_label(safe, "Safe area")
+                        .on_hover_text("Show the zones YouTube/TikTok UI covers")
+                        .clicked()
+                    {
+                        self.show_safe_area = !safe;
                     }
-                }
+                    let cap = self.show_captions;
+                    if ui
+                        .selectable_label(cap, "Captions")
+                        .on_hover_text("Show/hide the caption overlay")
+                        .clicked()
+                    {
+                        self.show_captions = !cap;
+                    }
+                    ui.add_space(10.0);
+                    // Before/After: the source ("Original") vs the framed
+                    // output ("Preview").
+                    if let Some(i) = theme::segmented(
+                        ui,
+                        match self.view {
+                            ViewMode::Output => 0,
+                            ViewMode::Source => 1,
+                        },
+                        &["Preview", "Original"],
+                    ) {
+                        self.view = if i == 0 { ViewMode::Output } else { ViewMode::Source };
+                    }
+                });
             });
+            ui.add_space(6.0);
         });
 
-        // The composite canvas: a 9:16 rectangle, panels drawn as UV sub-rects.
-        let canvas_w = ui.available_width().min(360.0).max(160.0);
-        let canvas_h = canvas_w * CANVAS_H as f32 / CANVAS_W as f32;
-        let (canvas_rect, _) =
-            ui.allocate_exact_size(egui::vec2(canvas_w, canvas_h), Sense::hover());
-        // The filmstrip frame nearest the playhead (frame i sits at i/fps).
-        let frame_idx = ((self.playhead_s * self.frame_fps).round() as usize)
-            .min(self.frames.len().saturating_sub(1));
-        let tex = self.frames[frame_idx].id();
-        let painter = ui.painter_at(canvas_rect);
-        painter.rect_filled(canvas_rect, CornerRadius::ZERO, Color32::BLACK);
+        // --- Timeline (bottom) ---
+        egui::Panel::bottom("studio-timeline")
+            .exact_size(150.0)
+            .show_inside(ui, |ui| {
+                if let Some(a) = self.ui_timeline(ui, busy) {
+                    action = a;
+                }
+            });
 
-        let (src_w, src_h) = (self.src_w, self.src_h);
+        // --- Transcript editor (left) ---
+        egui::Panel::left("studio-captions")
+            .resizable(true)
+            .default_size(310.0)
+            .size_range(240.0..=460.0)
+            .show_inside(ui, |ui| {
+                if let Some(a) = self.ui_transcript_panel(ui, true) {
+                    action = a;
+                }
+            });
+
+        // --- Properties (right) ---
+        egui::Panel::right("studio-props")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(250.0..=420.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
+                    if let Some(a) = self.ui_properties(ui, busy) {
+                        action = a;
+                    }
+                });
+            });
+
+        // --- Preview (center) ---
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::WELL).inner_margin(egui::Margin::same(10)))
+            .show_inside(ui, |ui| {
+                self.ui_preview(ui);
+            });
+
+        // --- Export summary modal ---
+        if self.show_export {
+            if let Some(a) = self.ui_export_modal(ui.ctx(), busy) {
+                action = a;
+            }
+        }
+
+        action
+    }
+
+    /// Keyboard shortcuts. Returns an action when one needs the app (play).
+    fn handle_keys(&mut self, ui: &egui::Ui, busy: bool) -> Option<EditorAction> {
+        let dur = self.range.duration_s();
+        let (space, esc, left, right, up, down, plus, minus, zero, shift) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                i.key_pressed(egui::Key::Minus),
+                i.key_pressed(egui::Key::Num0),
+                i.modifiers.shift,
+            )
+        });
+        if esc {
+            if self.show_export {
+                self.show_export = false;
+                return None;
+            }
+            return Some(EditorAction::Cancel);
+        }
+        if space && !busy {
+            return Some(self.toggle_play());
+        }
+        let crop_mode = self.view == ViewMode::Source && self.camera_mode == CameraMode::Manual;
+        let step = if shift { 20.0 } else { 4.0 };
+        let (sw, sh) = (self.src_w, self.src_h);
+        if crop_mode {
+            let (dx, dy) = (
+                (right as i8 - left as i8) as f32 * step,
+                (down as i8 - up as i8) as f32 * step,
+            );
+            if dx != 0.0 || dy != 0.0 {
+                let crop = self.active_crop_mut();
+                *crop = yc_frame::pan_crop(*crop, sw, sh, dx, dy);
+            }
+            if plus || minus {
+                let f = if plus { 0.92 } else { 1.0 / 0.92 };
+                let crop = self.active_crop_mut();
+                let (ax, ay) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
+                *crop = yc_frame::zoom_crop(*crop, sw, sh, f, ax, ay);
+            }
+            if zero {
+                self.reset_to_auto();
+            }
+        } else {
+            // Scrub the playhead.
+            let step_s = if shift { 5.0 } else { 1.0 };
+            if left || right {
+                self.playhead_s =
+                    (self.playhead_s + if right { step_s } else { -step_s }).clamp(0.0, dur);
+                if self.playing.is_some() {
+                    self.playing = Some((Instant::now(), self.playhead_s));
+                    return Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                }
+            }
+        }
+        None
+    }
+
+    fn toggle_play(&mut self) -> EditorAction {
+        if self.playing.is_some() {
+            self.playing = None;
+            EditorAction::StopAudio
+        } else {
+            let dur = self.range.duration_s();
+            if self.playhead_s >= dur {
+                self.playhead_s = 0.0;
+            }
+            self.playing = Some((Instant::now(), self.playhead_s));
+            EditorAction::Play(self.play_range_from(self.playhead_s))
+        }
+    }
+
+    /// The Manual-mode crop the arrow keys / drag act on (the full-frame crop,
+    /// or the facecam Panel of a stacked layout — the one people adjust).
+    fn active_crop_mut(&mut self) -> &mut Crop {
         match self.kind {
-            LayoutKind::Stacked => {
-                let top_h = (self.seam * canvas_h).clamp(8.0, canvas_h - 8.0);
-                let top = Rect::from_min_size(canvas_rect.min, egui::vec2(canvas_w, top_h));
+            LayoutKind::Stacked => &mut self.facecam,
+            LayoutKind::FullCam => &mut self.fullcam,
+            LayoutKind::FullGameplay => &mut self.fullgameplay,
+        }
+    }
+
+    // ------------------------------------------------------------- preview --
+
+    fn ui_preview(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_size();
+        match self.view {
+            ViewMode::Output => {
+                // A 9:16 canvas centered in the well.
+                let h = avail.y.min(avail.x * CANVAS_H as f32 / CANVAS_W as f32);
+                let w = h * CANVAS_W as f32 / CANVAS_H as f32;
+                let origin = ui.min_rect().min
+                    + egui::vec2((avail.x - w) * 0.5, (avail.y - h).max(0.0) * 0.5);
+                let canvas = Rect::from_min_size(origin, egui::vec2(w, h));
+                self.draw_output(ui, canvas);
+            }
+            ViewMode::Source => {
+                // The full source frame fit into the well.
+                let aspect = self.src_w / self.src_h.max(1.0);
+                let w = avail.x.min(avail.y * aspect);
+                let h = w / aspect;
+                let origin = ui.min_rect().min
+                    + egui::vec2((avail.x - w) * 0.5, (avail.y - h).max(0.0) * 0.5);
+                let frame_rect = Rect::from_min_size(origin, egui::vec2(w, h));
+                self.draw_source(ui, frame_rect);
+            }
+        }
+    }
+
+    /// The frame texture nearest the playhead.
+    fn frame_tex(&self) -> egui::TextureId {
+        let idx = ((self.playhead_s * self.frame_fps).round() as usize)
+            .min(self.frames.len().saturating_sub(1));
+        self.frames[idx].id()
+    }
+
+    /// Output view: the composited 9:16 result at the playhead — panels,
+    /// captions, safe area, tracking chip.
+    fn draw_output(&mut self, ui: &mut egui::Ui, canvas: Rect) {
+        let tex = self.frame_tex();
+        let painter = ui.painter_at(canvas);
+        painter.rect_filled(canvas, CornerRadius::same(4), Color32::BLACK);
+        let layout = self.effective_layout(self.playhead_s);
+        let manual = self.camera_mode == CameraMode::Manual;
+        match &layout {
+            Layout::Stacked { seam, gameplay, facecam } => {
+                let top_h = (seam * canvas.height()).clamp(8.0, canvas.height() - 8.0);
+                let top = Rect::from_min_size(canvas.min, egui::vec2(canvas.width(), top_h));
                 let bot = Rect::from_min_max(
-                    egui::pos2(canvas_rect.left(), canvas_rect.top() + top_h),
-                    canvas_rect.max,
+                    egui::pos2(canvas.left(), canvas.top() + top_h),
+                    canvas.max,
                 );
-                draw_panel(&painter, top, tex, &self.gameplay, src_w, src_h, "gameplay");
-                draw_panel(&painter, bot, tex, &self.facecam, src_w, src_h, "facecam");
-                if enabled {
-                    pan_zoom(ui, top, "gp", &mut self.gameplay, src_w, src_h);
-                    pan_zoom(ui, bot, "fc", &mut self.facecam, src_w, src_h);
-                    self.drag_seam(ui, canvas_rect, canvas_h);
+                draw_panel(&painter, top, tex, gameplay, self.src_w, self.src_h, "");
+                draw_panel(&painter, bot, tex, facecam, self.src_w, self.src_h, "");
+                if manual {
+                    pan_zoom(ui, top, "gp", &mut self.gameplay, self.src_w, self.src_h);
+                    pan_zoom(ui, bot, "fc", &mut self.facecam, self.src_w, self.src_h);
+                    self.drag_seam(ui, canvas, canvas.height());
                 }
-                // The Seam line.
-                let seam_y = canvas_rect.top() + self.seam * canvas_h;
+                let seam_y = canvas.top() + seam * canvas.height();
                 painter.line_segment(
-                    [egui::pos2(canvas_rect.left(), seam_y), egui::pos2(canvas_rect.right(), seam_y)],
-                    Stroke::new(2.0, Color32::from_rgb(255, 209, 0)),
+                    [egui::pos2(canvas.left(), seam_y), egui::pos2(canvas.right(), seam_y)],
+                    Stroke::new(2.0, theme::GOLD.gamma_multiply(if manual { 1.0 } else { 0.4 })),
                 );
             }
-            LayoutKind::FullCam => {
-                draw_panel(&painter, canvas_rect, tex, &self.fullcam, src_w, src_h, "cam");
-                if enabled {
-                    pan_zoom(ui, canvas_rect, "full", &mut self.fullcam, src_w, src_h);
-                }
-            }
-            LayoutKind::FullGameplay => {
-                draw_panel(&painter, canvas_rect, tex, &self.fullgameplay, src_w, src_h, "gameplay");
-                if enabled {
-                    pan_zoom(ui, canvas_rect, "full", &mut self.fullgameplay, src_w, src_h);
+            Layout::FullFrame { crop } => {
+                draw_panel(&painter, canvas, tex, crop, self.src_w, self.src_h, "");
+                if manual {
+                    let target = match self.kind {
+                        LayoutKind::FullCam => &mut self.fullcam,
+                        _ => &mut self.fullgameplay,
+                    };
+                    pan_zoom(ui, canvas, "full", target, self.src_w, self.src_h);
                 }
             }
         }
         painter.rect_stroke(
-            canvas_rect,
-            CornerRadius::ZERO,
-            Stroke::new(1.0, Color32::from_gray(90)),
+            canvas,
+            CornerRadius::same(4),
+            Stroke::new(1.0, Color32::from_gray(70)),
             StrokeKind::Inside,
         );
 
-        // The caption preview + placement overlay (ADR 0036), registered after
-        // the panel interactions so it wins the pointer where they overlap.
+        // Caption overlay (drag to move, scroll to resize).
         if self.show_captions {
-            self.caption_overlay(ui, canvas_rect, enabled);
+            self.caption_overlay(ui, canvas, true);
+        }
+        // Safe-area guides above everything.
+        if self.show_safe_area {
+            draw_safe_area(&painter, canvas);
+        }
+        // Tracking chip (Active Speaker): who the camera is on, how sure.
+        if self.camera_mode == CameraMode::ActiveSpeaker {
+            if let Some(a) = &self.speakers {
+                let text = match self
+                    .plan
+                    .as_ref()
+                    .and_then(|p| p.shot_at(self.playhead_s))
+                    .and_then(|s| s.track)
+                {
+                    Some(id) => format!(
+                        "Tracking {} · {:.0}%",
+                        track_label(id),
+                        (a.confidence_at(self.playhead_s) * 100.0).clamp(0.0, 100.0)
+                    ),
+                    None => "Group shot".to_string(),
+                };
+                chip(&painter, canvas.min + egui::vec2(8.0, 8.0), &text, theme::GOLD);
+            }
+        }
+        if !manual {
+            // A gentle reminder that the panels aren't hand-editable right now.
+            chip(
+                &painter,
+                egui::pos2(canvas.left() + 8.0, canvas.bottom() - 26.0),
+                &format!("{} camera", camera_mode_label(self.camera_mode)),
+                Color32::from_gray(140),
+            );
+        }
+    }
+
+    /// Source view: the whole frame, the crop box tool, and face overlays.
+    fn draw_source(&mut self, ui: &mut egui::Ui, frame_rect: Rect) {
+        let tex = self.frame_tex();
+        let painter = ui.painter_at(frame_rect);
+        painter.rect_filled(frame_rect, CornerRadius::same(4), Color32::BLACK);
+        let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex, frame_rect, full, Color32::WHITE);
+        painter.rect_stroke(
+            frame_rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, Color32::from_gray(70)),
+            StrokeKind::Inside,
+        );
+
+        let (sw, sh) = (self.src_w, self.src_h);
+        let to_screen = move |c: &Crop| -> Rect {
+            let sx = frame_rect.width() / sw;
+            let sy = frame_rect.height() / sh;
+            Rect::from_min_size(
+                frame_rect.min + egui::vec2(c.x * sx, c.y * sy),
+                egui::vec2(c.w * sx, c.h * sy),
+            )
+        };
+
+        // Dim everything outside the effective crop(s), so the kept region pops.
+        let layout = self.effective_layout(self.playhead_s);
+        let crops: Vec<(Crop, &str, Color32)> = match &layout {
+            Layout::Stacked { gameplay, facecam, .. } => vec![
+                (*gameplay, "Top panel", theme::INFO),
+                (*facecam, "Bottom panel", theme::GOLD),
+            ],
+            Layout::FullFrame { crop } => vec![(*crop, "9:16 crop", theme::GOLD)],
+        };
+        dim_outside(&painter, frame_rect, &crops.iter().map(|(c, ..)| to_screen(c)).collect::<Vec<_>>());
+        for (crop, label, color) in &crops {
+            let r = to_screen(crop);
+            painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.0, *color), StrokeKind::Inside);
+            thirds_grid(&painter, r, *color);
+            painter.text(
+                r.left_top() + egui::vec2(6.0, 4.0),
+                Align2::LEFT_TOP,
+                *label,
+                FontId::proportional(11.0),
+                color.gamma_multiply(0.9),
+            );
         }
 
-        // Playback: the timeline drives the filmstrip + caption preview; the
-        // Clip's real audio is the app's sink, started/stopped via the action.
-        ui.horizontal(|ui| {
-            let label = if self.playing.is_some() { "Pause" } else { "Play" };
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                if self.playing.is_some() {
-                    self.playing = None;
-                    action = EditorAction::StopAudio;
-                } else {
-                    if self.playhead_s >= dur {
-                        self.playhead_s = 0.0; // replay from the top
-                    }
-                    self.playing = Some((Instant::now(), self.playhead_s));
-                    action = EditorAction::Play(self.play_range_from(self.playhead_s));
+        // Manual mode: the crop boxes are direct-manipulation targets.
+        if self.camera_mode == CameraMode::Manual {
+            match self.kind {
+                LayoutKind::Stacked => {
+                    let (g, f) = (self.gameplay, self.facecam);
+                    self.crop_box_interaction(ui, frame_rect, to_screen(&g), "src-gp", CropTarget::Gameplay);
+                    self.crop_box_interaction(ui, frame_rect, to_screen(&f), "src-fc", CropTarget::Facecam);
+                }
+                LayoutKind::FullCam => {
+                    let c = self.fullcam;
+                    self.crop_box_interaction(ui, frame_rect, to_screen(&c), "src-cam", CropTarget::FullCam);
+                }
+                LayoutKind::FullGameplay => {
+                    let c = self.fullgameplay;
+                    self.crop_box_interaction(ui, frame_rect, to_screen(&c), "src-gpl", CropTarget::FullGameplay);
                 }
             }
-            let resp = ui.add_enabled(
-                enabled,
-                egui::Slider::new(&mut self.playhead_s, 0.0..=dur).show_value(false),
+        } else {
+            // In an AI mode a drag on the frame flips to Manual (CapCut-style:
+            // touching the framing takes control), seeding from the AI crop.
+            let resp = ui.interact(frame_rect, ui.id().with("src-takeover"), Sense::click_and_drag());
+            if resp.drag_started() || resp.double_clicked() {
+                if let Layout::FullFrame { crop } = layout {
+                    self.kind = LayoutKind::FullGameplay;
+                    self.fullgameplay = crop;
+                }
+                self.camera_mode = CameraMode::Manual;
+            }
+        }
+
+        // Face overlays: tracks (post-analysis) or Prepare's clusters, with
+        // labels; clicking one retargets the camera.
+        self.face_overlays(ui, &painter, frame_rect);
+    }
+
+    /// Drag body to move + corner handles to resize + scroll to zoom, for one
+    /// crop box in Source view.
+    fn crop_box_interaction(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame_rect: Rect,
+        screen: Rect,
+        id: &str,
+        target: CropTarget,
+    ) {
+        let (sw, sh) = (self.src_w, self.src_h);
+        let px = sw / frame_rect.width().max(1.0);
+        // Corner handles first (they win the pointer over the body).
+        let hs = 7.0;
+        let corners = [
+            (screen.left_top(), -1.0, -1.0),
+            (screen.right_top(), 1.0, -1.0),
+            (screen.left_bottom(), -1.0, 1.0),
+            (screen.right_bottom(), 1.0, 1.0),
+        ];
+        let mut resized = false;
+        for (i, (pos, sx, sy)) in corners.iter().enumerate() {
+            let hrect = Rect::from_center_size(*pos, egui::vec2(hs * 2.0, hs * 2.0));
+            let resp = ui.interact(hrect, ui.id().with((id, "corner", i)), Sense::drag());
+            ui.painter().rect_filled(
+                Rect::from_center_size(*pos, egui::vec2(hs, hs)),
+                CornerRadius::same(2),
+                if resp.hovered() || resp.dragged() { theme::GOLD } else { Color32::WHITE },
             );
-            if self.playing.is_some() {
-                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                    // Scrub settled (drag released / click-jump / keyboard):
-                    // restart the audio at the new offset.
-                    self.playing = Some((Instant::now(), self.playhead_s));
-                    action = EditorAction::Play(self.play_range_from(self.playhead_s));
-                } else if resp.changed() {
-                    // Mid-drag: track the playhead visually only — restarting
-                    // the sink every drag frame is a re-seek storm; the audio
-                    // catches up on release.
-                    self.playing = Some((Instant::now(), self.playhead_s));
+            if resp.dragged() {
+                resized = true;
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                let d = resp.drag_delta();
+                // Dragging a corner outward grows the box: project the delta on
+                // the outward diagonal, aspect-locked via zoom about the
+                // opposite corner.
+                let crop = self.crop_of_mut(target);
+                let grow = (d.x * sx + d.y * sy) * 0.5 * px;
+                let factor = ((crop.w + 2.0 * grow) / crop.w).clamp(0.25, 4.0);
+                let (ax, ay) = (
+                    crop.x + crop.w * (0.5 - sx * 0.5), // opposite corner stays put
+                    crop.y + crop.h * (0.5 - sy * 0.5),
+                );
+                *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
+            }
+        }
+        if resized {
+            return;
+        }
+        // Body: move.
+        let resp = ui.interact(screen, ui.id().with((id, "body")), Sense::click_and_drag());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+        }
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            let crop = self.crop_of_mut(target);
+            *crop = yc_frame::pan_crop(*crop, sw, sh, d.x * px, d.y * px);
+        }
+        // Scroll on the box: zoom about its center.
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                let factor = (-scroll * 0.0015).exp();
+                let crop = self.crop_of_mut(target);
+                let (ax, ay) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
+                *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
+        }
+    }
+
+    fn crop_of_mut(&mut self, target: CropTarget) -> &mut Crop {
+        match target {
+            CropTarget::Gameplay => &mut self.gameplay,
+            CropTarget::Facecam => &mut self.facecam,
+            CropTarget::FullCam => &mut self.fullcam,
+            CropTarget::FullGameplay => &mut self.fullgameplay,
+        }
+    }
+
+    /// Face boxes + labels over the Source view; click to retarget the camera.
+    fn face_overlays(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, frame_rect: Rect) {
+        let sx = frame_rect.width() / self.src_w;
+        let sy = frame_rect.height() / self.src_h;
+        let boxes: Vec<(usize, yc_frame::FaceBox, String)> = match &self.speakers {
+            Some(a) => a
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.bbox, track_label(t.id)))
+                .collect(),
+            None => self
+                .faces
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.bbox, track_label(i)))
+                .collect(),
+        };
+        let active = self
+            .plan
+            .as_ref()
+            .and_then(|p| p.shot_at(self.playhead_s))
+            .and_then(|s| s.track)
+            .filter(|_| self.camera_mode == CameraMode::ActiveSpeaker);
+        for (id, b, label) in &boxes {
+            let r = Rect::from_min_size(
+                frame_rect.min + egui::vec2(b.x * sx, b.y * sy),
+                egui::vec2(b.w * sx, b.h * sy),
+            );
+            let color = theme::track_color(*id);
+            let is_active = active == Some(*id);
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(4),
+                Stroke::new(if is_active { 3.0 } else { 1.5 }, color),
+                StrokeKind::Outside,
+            );
+            let tag = if is_active { format!("● {label}") } else { label.clone() };
+            chip(painter, r.left_top() - egui::vec2(0.0, 22.0), &tag, color);
+            let resp = ui.interact(r, ui.id().with(("face", *id)), Sense::click());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                self.click_face(*id);
+            }
+        }
+    }
+
+    /// Clicking a face: in Active Speaker mode, retarget the shot under the
+    /// playhead to that person (the manual override focus asks for); in the
+    /// static modes, frame that face.
+    fn click_face(&mut self, id: usize) {
+        let Some(track_bbox) = self
+            .speakers
+            .as_ref()
+            .and_then(|a| a.tracks.iter().find(|t| t.id == id).map(|t| t.bbox))
+            .or_else(|| self.faces.get(id).map(|f| f.bbox))
+        else {
+            return;
+        };
+        match self.camera_mode {
+            CameraMode::ActiveSpeaker => {
+                let (src_w, src_h) = (self.src_w, self.src_h);
+                if let Some(plan) = &mut self.plan {
+                    if let Some(shot) = plan.shot_at_mut(self.playhead_s) {
+                        shot.track = Some(id);
+                        shot.layout = Layout::FullFrame {
+                            crop: yc_frame::speaker::solo_crop(&track_bbox, src_w, src_h),
+                        };
+                    }
                 }
             }
-            ui.label(format!("{:.1}s / {dur:.1}s", self.playhead_s));
+            _ => {
+                // Frame this face, hand control to Manual (full-cam kind).
+                self.fullcam = yc_frame::speaker::solo_crop(&track_bbox, self.src_w, self.src_h);
+                self.kind = LayoutKind::FullCam;
+                self.camera_mode = CameraMode::Manual;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ timeline --
+
+    /// The bottom strip: transport, ruler + scrub, caption blocks, speaker
+    /// lanes, cut markers.
+    fn ui_timeline(&mut self, ui: &mut egui::Ui, busy: bool) -> Option<EditorAction> {
+        let mut action = None;
+        let dur = self.range.duration_s().max(0.001);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = if self.playing.is_some() { "⏸" } else { "▶" };
+            if ui
+                .add_enabled(!busy, egui::Button::new(egui::RichText::new(label).size(16.0)))
+                .on_hover_text("Space")
+                .clicked()
+            {
+                action = Some(self.toggle_play());
+            }
+            if busy {
+                crate::throttled_spinner(ui);
+            }
+            ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(dur)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(a) = &self.speakers {
+                    for t in a.tracks.iter().rev() {
+                        ui.label(
+                            egui::RichText::new(format!("■ {}", track_label(t.id)))
+                                .color(theme::track_color(t.id))
+                                .size(11.5),
+                        );
+                    }
+                    ui.weak("Speakers:");
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // The strip: ruler(16) + captions(22) + speakers(N*12) + cuts(10).
+        let n_tracks = self.speakers.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
+        let strip_h = 16.0 + 24.0 + (n_tracks as f32 * 13.0) + 12.0 + 8.0;
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_h.max(60.0)),
+            Sense::click_and_drag(),
+        );
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, CornerRadius::same(4), theme::WELL);
+        let t_to_x = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
+        let x_to_t = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * dur;
+
+        // Ruler ticks: a major every ~1/8 of the clip, rounded to a nice step.
+        let step = nice_step(dur / 8.0);
+        let mut t = 0.0;
+        while t <= dur + 1e-9 {
+            let x = t_to_x(t);
+            p.line_segment(
+                [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.top() + 12.0)],
+                Stroke::new(1.0, Color32::from_gray(90)),
+            );
+            p.text(
+                egui::pos2(x + 3.0, rect.top() + 1.0),
+                Align2::LEFT_TOP,
+                fmt_mmss(t),
+                FontId::monospace(9.5),
+                Color32::from_gray(140),
+            );
+            t += step;
+        }
+
+        // Caption blocks.
+        self.sync_lines();
+        let cap_y0 = rect.top() + 18.0;
+        for l in &self.lines {
+            let r = Rect::from_min_max(
+                egui::pos2(t_to_x(l.start_s), cap_y0),
+                egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), cap_y0 + 20.0),
+            );
+            p.rect_filled(r, CornerRadius::same(3), Color32::from_rgba_unmultiplied(255, 255, 255, 26));
+            p.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_gray(80)), StrokeKind::Inside);
+            if r.width() > 26.0 {
+                let text = l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+                p.text(
+                    r.left_center() + egui::vec2(4.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    ellipsize(&text, (r.width() / 7.0) as usize),
+                    FontId::proportional(10.5),
+                    Color32::from_gray(200),
+                );
+            }
+        }
+
+        // Speaker lanes.
+        let mut lane_y = cap_y0 + 26.0;
+        if let Some(a) = &self.speakers {
+            for tr in &a.tracks {
+                let color = theme::track_color(tr.id);
+                let mut i = 0usize;
+                while i < a.speaking.len() {
+                    if a.speaking[i] == Some(tr.id) {
+                        let t0 = i as f64 * a.bin_s;
+                        let mut j = i;
+                        while j < a.speaking.len() && a.speaking[j] == Some(tr.id) {
+                            j += 1;
+                        }
+                        let t1 = j as f64 * a.bin_s;
+                        p.rect_filled(
+                            Rect::from_min_max(
+                                egui::pos2(t_to_x(t0), lane_y),
+                                egui::pos2(t_to_x(t1), lane_y + 9.0),
+                            ),
+                            CornerRadius::same(2),
+                            color.gamma_multiply(0.75),
+                        );
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+                lane_y += 13.0;
+            }
+        }
+
+        // Camera cut markers (Active Speaker).
+        if self.camera_mode == CameraMode::ActiveSpeaker {
+            if let Some(plan) = &self.plan {
+                for s in plan.shots.iter().skip(1) {
+                    let x = t_to_x(s.start_s);
+                    p.line_segment(
+                        [egui::pos2(x, rect.top() + 14.0), egui::pos2(x, rect.bottom() - 2.0)],
+                        Stroke::new(1.0, theme::GOLD.gamma_multiply(0.6)),
+                    );
+                    p.text(
+                        egui::pos2(x + 2.0, rect.bottom() - 12.0),
+                        Align2::LEFT_TOP,
+                        "✂",
+                        FontId::proportional(9.0),
+                        theme::GOLD.gamma_multiply(0.8),
+                    );
+                }
+            }
+        }
+
+        // Playhead.
+        let px = t_to_x(self.playhead_s);
+        p.line_segment(
+            [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+            Stroke::new(2.0, theme::GOLD),
+        );
+        p.circle_filled(egui::pos2(px, rect.top() + 3.0), 4.0, theme::GOLD);
+
+        // Scrub: click or drag anywhere on the strip.
+        if resp.clicked() || resp.dragged() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                self.playhead_s = x_to_t(pos.x);
+                if self.playing.is_some() {
+                    if resp.drag_stopped() || resp.clicked() {
+                        self.playing = Some((Instant::now(), self.playhead_s));
+                        action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                    } else {
+                        self.playing = Some((Instant::now(), self.playhead_s));
+                    }
+                }
+            }
+        }
+        action
+    }
+
+    // ----------------------------------------------------- transcript panel --
+
+    /// The left panel: every caption, editable (focus task 2) — text, times,
+    /// add / delete / split / merge / censor; click seeks; edits update the
+    /// preview immediately and the render burns them verbatim.
+    fn ui_transcript_panel(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<EditorAction> {
+        let action = None;
+        theme::section(ui, "Captions");
+        let Some(transcript) = &mut self.transcript else {
+            ui.add_space(6.0);
+            ui.weak("Transcribing the clip…");
+            ui.weak("Captions appear here when whisper finishes; you can already frame and scrub meanwhile.");
+            return action;
+        };
+        if transcript.units.is_empty() {
+            ui.weak("No speech transcribed in this clip.");
+        }
+        if self.transcript_dirty {
+            ui.label(
+                egui::RichText::new("Edited — the render burns your text.")
+                    .color(theme::GOLD)
+                    .size(11.5),
+            );
+        }
+        ui.add_space(4.0);
+
+        let mut dirty = false;
+        let mut seek: Option<f64> = None;
+        let mut delete: Option<usize> = None;
+        let mut split: Option<usize> = None;
+        let mut merge: Option<usize> = None;
+        let mut censor: Option<usize> = None;
+        let playhead = self.playhead_s;
+        let n = transcript.units.len();
+
+        egui::ScrollArea::vertical().id_salt("caption-rows").auto_shrink([false, true]).show(ui, |ui| {
+            for i in 0..n {
+                let active = {
+                    let u = &transcript.units[i];
+                    u.start_s <= playhead && playhead < u.end_s.max(u.start_s + 0.2)
+                };
+                let row_bg = if self.sel_unit == Some(i) {
+                    theme::GOLD.gamma_multiply(0.12)
+                } else if active {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                egui::Frame::new()
+                    .fill(row_bg)
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(4, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Timestamp: editable mm:ss.cc (drag or type).
+                            let u = &mut transcript.units[i];
+                            let mut start = u.start_s;
+                            let resp = ui.add_enabled(
+                                enabled,
+                                egui::DragValue::new(&mut start)
+                                    .speed(0.02)
+                                    .range(0.0..=self.range.duration_s())
+                                    .custom_formatter(|v, _| fmt_mmss_cc(v))
+                                    .custom_parser(parse_mmss_cc),
+                            );
+                            if resp.changed() {
+                                let d = u.end_s - u.start_s;
+                                u.start_s = start;
+                                u.end_s = start + d.max(0.05);
+                                dirty = true;
+                            }
+                            if resp.clicked() || resp.gained_focus() {
+                                self.sel_unit = Some(i);
+                            }
+                            // Text.
+                            let text_resp = ui.add_enabled(
+                                enabled,
+                                egui::TextEdit::singleline(&mut u.text)
+                                    .desired_width(ui.available_width() - 108.0)
+                                    .font(egui::TextStyle::Body),
+                            );
+                            if text_resp.changed() {
+                                dirty = true;
+                            }
+                            if text_resp.gained_focus() {
+                                self.sel_unit = Some(i);
+                                seek = Some(u.start_s);
+                            }
+                            // Row actions, right-aligned and compact.
+                            ui.add_enabled_ui(enabled, |ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                                if ui.small_button("✂").on_hover_text("Split this caption").clicked() {
+                                    split = Some(i);
+                                }
+                                if i + 1 < n {
+                                    if ui.small_button("⇓").on_hover_text("Merge with the next caption").clicked() {
+                                        merge = Some(i);
+                                    }
+                                } else {
+                                    ui.add_enabled(false, egui::Button::new("⇓").small());
+                                }
+                                if ui.small_button("＊").on_hover_text("Censor this word (d***)").clicked() {
+                                    censor = Some(i);
+                                }
+                                if ui.small_button("🗑").on_hover_text("Delete this caption").clicked() {
+                                    delete = Some(i);
+                                }
+                            });
+                        });
+                    });
+            }
         });
 
-        // Caption overlay controls: nothing to preview before the first Render
-        // ships its transcript; after it, the eye toggle + placement readout.
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Captions:");
-            if self.transcript.is_none() {
-                ui.weak("appear here after the first Render");
-            } else {
-                ui.add_enabled_ui(enabled, |ui| {
-                    let eye = if self.show_captions { "Shown" } else { "Hidden" };
-                    if ui.selectable_label(self.show_captions, eye).clicked() {
-                        self.show_captions = !self.show_captions;
+            if ui
+                .add_enabled(enabled, egui::Button::new("＋ Add caption at playhead"))
+                .clicked()
+            {
+                let at = self.playhead_s;
+                let idx = transcript.units.iter().position(|u| u.start_s > at).unwrap_or(n);
+                transcript.units.insert(
+                    idx,
+                    yc_core::CaptionUnit { text: "text".into(), start_s: at, end_s: at + 0.8 },
+                );
+                self.sel_unit = Some(idx);
+                dirty = true;
+            }
+        });
+
+        // Apply the row actions after the loop (indices stay valid).
+        if let Some(i) = censor {
+            let u = &mut transcript.units[i];
+            u.text = censor_text(&u.text);
+            dirty = true;
+        }
+        if let Some(i) = split {
+            let u = transcript.units[i].clone();
+            if let Some((a, b)) = split_unit(&u) {
+                transcript.units[i] = a;
+                transcript.units.insert(i + 1, b);
+                dirty = true;
+            }
+        }
+        if let Some(i) = merge {
+            if i + 1 < transcript.units.len() {
+                let next = transcript.units.remove(i + 1);
+                let u = &mut transcript.units[i];
+                u.text = format!("{} {}", u.text.trim_end(), next.text.trim_start());
+                u.end_s = next.end_s.max(u.end_s);
+                dirty = true;
+            }
+        }
+        if let Some(i) = delete {
+            transcript.units.remove(i);
+            self.sel_unit = None;
+            dirty = true;
+        }
+        if dirty {
+            // Keep units start-ordered so grouping/preview stay sane even if a
+            // timestamp edit reordered them.
+            transcript
+                .units
+                .sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal));
+            self.transcript_dirty = true;
+            self.lines_dirty = true;
+        }
+        if let Some(t) = seek {
+            self.playhead_s = t.clamp(0.0, self.range.duration_s());
+        }
+        action
+    }
+
+    // ---------------------------------------------------------- properties --
+
+    fn ui_properties(&mut self, ui: &mut egui::Ui, busy: bool) -> Option<EditorAction> {
+        let mut action = None;
+
+        // --- Camera ---
+        theme::section(ui, "Camera");
+        theme::card().show(ui, |ui| {
+            for mode in [
+                CameraMode::Manual,
+                CameraMode::Center,
+                CameraMode::AutoFace,
+                CameraMode::ActiveSpeaker,
+                CameraMode::Group,
+            ] {
+                let selected = self.camera_mode == mode;
+                let label = match mode {
+                    CameraMode::ActiveSpeaker => {
+                        format!("{}  (recommended for podcasts)", camera_mode_label(mode))
                     }
-                    match self.placement {
-                        Some(p) => {
-                            ui.label(format!(
-                                "x {:.0}%  y {:.0}%  size {:.0}%",
+                    _ => camera_mode_label(mode).to_string(),
+                };
+                if ui.selectable_label(selected, label).clicked() {
+                    self.camera_mode = mode;
+                    if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group)
+                        && self.speakers.is_none()
+                        && self.speaker_job == SpeakerJob::NotRun
+                    {
+                        self.speaker_job = SpeakerJob::Running;
+                        action = Some(EditorAction::AnalyzeSpeakers);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            match &self.speaker_job {
+                SpeakerJob::NotRun => {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Detect speakers"))
+                        .on_hover_text("Track faces + attribute speech (CPU, ~10-30 s)")
+                        .clicked()
+                    {
+                        self.speaker_job = SpeakerJob::Running;
+                        action = Some(EditorAction::AnalyzeSpeakers);
+                    }
+                }
+                SpeakerJob::Running => {
+                    ui.weak("Analyzing speakers…");
+                }
+                SpeakerJob::Ready => {
+                    if let Some(a) = &self.speakers {
+                        for t in &a.tracks {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "■ {} · visible {:.0}%",
+                                    track_label(t.id),
+                                    t.presence * 100.0
+                                ))
+                                .color(theme::track_color(t.id))
+                                .size(12.0),
+                            );
+                        }
+                        if let Some(plan) = &self.plan {
+                            ui.weak(format!("{} camera cuts planned", plan.shots.len().saturating_sub(1)));
+                        }
+                        ui.weak("Click a face in Original view to override a shot.");
+                    }
+                }
+                SpeakerJob::Failed(e) => {
+                    ui.colored_label(theme::ERR, "Speaker analysis failed").on_hover_text(e);
+                    if ui.add_enabled(!busy, egui::Button::new("Retry")).clicked() {
+                        self.speaker_job = SpeakerJob::Running;
+                        action = Some(EditorAction::AnalyzeSpeakers);
+                    }
+                }
+            }
+        });
+
+        // --- Framing (manual) ---
+        theme::section(ui, "Framing");
+        theme::card().show(ui, |ui| {
+            ui.add_enabled_ui(self.camera_mode == CameraMode::Manual, |ui| {
+                ui.horizontal(|ui| {
+                    for (kind, label) in [
+                        (LayoutKind::Stacked, "Stacked"),
+                        (LayoutKind::FullCam, "Full cam"),
+                        (LayoutKind::FullGameplay, "Wide"),
+                    ] {
+                        if ui.selectable_label(self.kind == kind, label).clicked() {
+                            self.kind = kind;
+                        }
+                    }
+                });
+                if self.kind == LayoutKind::Stacked {
+                    ui.horizontal(|ui| {
+                        ui.label("Seam");
+                        let resp = ui.add(
+                            egui::Slider::new(&mut self.seam, 0.2..=0.85).show_value(false),
+                        );
+                        if resp.changed() {
+                            let (ga, fa) = yc_frame::stacked_panel_aspects(self.seam);
+                            self.gameplay = yc_frame::reaspect_keep_center(
+                                self.gameplay, ga, self.src_w, self.src_h,
+                            );
+                            self.facecam = yc_frame::reaspect_keep_center(
+                                self.facecam, fa, self.src_w, self.src_h,
+                            );
+                        }
+                    });
+                }
+                if ui.button("Reset to auto framing").clicked() {
+                    self.reset_to_auto();
+                }
+                ui.weak("Original view: drag the box, corners resize, scroll zooms, arrows nudge (Shift = big steps), 0 resets.");
+            });
+            if self.camera_mode != CameraMode::Manual {
+                ui.weak(format!(
+                    "{} mode frames automatically — switch to Manual (or drag in Original view) to take over.",
+                    camera_mode_label(self.camera_mode)
+                ));
+            }
+        });
+
+        // --- Caption style ---
+        theme::section(ui, "Caption style");
+        theme::card().show(ui, |ui| {
+            ui.add_enabled_ui(true, |ui| {
+                // Preset chips, two rows of three.
+                let presets = caption_presets();
+                egui::Grid::new("preset-grid").num_columns(3).spacing([6.0, 6.0]).show(ui, |ui| {
+                    for (i, p) in presets.iter().enumerate() {
+                        if ui.selectable_label(self.preset == Some(i), &p.name).clicked() {
+                            self.style = p.clone();
+                            self.preset = Some(i);
+                            self.lines_dirty = true;
+                            self.overlay_cache = None;
+                        }
+                        if i % 3 == 2 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                let before = self.style.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Animation");
+                    for (genre, label) in [
+                        (CaptionGenre::HugeWord, "Huge word"),
+                        (CaptionGenre::RollingPop, "Rolling"),
+                        (CaptionGenre::KaraokeFill, "Karaoke"),
+                    ] {
+                        if ui.selectable_label(self.style.genre == genre, label).clicked() {
+                            self.style.genre = genre;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    ui.add(egui::Slider::new(&mut self.style.font_size, 40..=220).suffix(" px"));
+                    ui.checkbox(&mut self.style.bold, "Bold");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Text");
+                    color_swatch(ui, &mut self.style.primary_color);
+                    ui.label("Accent");
+                    color_swatch(ui, &mut self.style.accent_color);
+                    ui.label("Outline");
+                    color_swatch(ui, &mut self.style.outline_color);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Outline");
+                    ui.add(egui::Slider::new(&mut self.style.outline, 0.0..=12.0).step_by(0.5));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Shadow");
+                    ui.add(egui::Slider::new(&mut self.style.shadow, 0.0..=10.0).step_by(0.5));
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.style.back_box, "Background box");
+                    if self.style.back_box {
+                        color_swatch(ui, &mut self.style.back_color);
+                    }
+                });
+                if self.style != before {
+                    self.preset = None; // customized: no chip is "the" preset
+                    self.lines_dirty = self.style.genre != before.genre || self.lines_dirty;
+                    self.overlay_cache = None;
+                }
+                ui.add_space(4.0);
+                match self.placement {
+                    Some(p) => {
+                        ui.horizontal(|ui| {
+                            ui.weak(format!(
+                                "Placement x {:.0}% · y {:.0}% · scale {:.0}%",
                                 p.x_frac * 100.0,
                                 p.y_frac * 100.0,
                                 p.scale * 100.0
                             ));
-                            if ui.button("Reset placement").clicked() {
+                            if ui.small_button("Reset").clicked() {
                                 self.placement = None;
                             }
-                        }
-                        None => {
-                            ui.weak("drag caption to move, scroll on it to resize");
-                        }
+                        });
                     }
-                });
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(enabled, |ui| {
-                if ui.button("Render").clicked() {
-                    action = EditorAction::Render(
-                        self.current_layout(),
-                        self.caption_genre,
-                        self.placement,
-                    );
-                }
-                if ui.button("Cancel").clicked() {
-                    action = EditorAction::Cancel;
-                }
-                if ui.button("Reset to auto").clicked() {
-                    self.reset_to_auto();
+                    None => {
+                        ui.weak("Drag the caption on the preview to place it; scroll on it to resize.");
+                    }
                 }
             });
         });
+
         action
     }
+
+    // ------------------------------------------------------- export summary --
+
+    /// The pre-render summary modal (focus: "Before rendering, show a summary").
+    fn ui_export_modal(&mut self, ctx: &egui::Context, busy: bool) -> Option<EditorAction> {
+        let mut action = None;
+        // Dim the page behind the modal.
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("export-dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    screen,
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+                );
+                // Swallow clicks behind the modal.
+                ui.allocate_rect(screen, Sense::click());
+            });
+        let mut open = true;
+        egui::Window::new("Export summary")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                let dur = self.range.duration_s();
+                let spec_camera = self.camera_mode == CameraMode::ActiveSpeaker
+                    && self.plan.as_ref().map(|p| !p.shots.is_empty()).unwrap_or(false);
+                let cached = self.transcript.is_some();
+                let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(k).weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(v);
+                        });
+                    });
+                };
+                row(ui, "Clip length", format!("{}  ({dur:.1}s)", fmt_mmss_cc(dur)));
+                row(ui, "Resolution", "1080 × 1920 (9:16)".into());
+                row(
+                    ui,
+                    "Captions",
+                    match (&self.transcript, self.transcript_dirty) {
+                        (None, _) => "on — transcribed during render".into(),
+                        (Some(t), true) => format!("on — {} lines (edited)", preview_lines(t, self.style.genre).len()),
+                        (Some(t), false) => format!("on — {} lines", preview_lines(t, self.style.genre).len()),
+                    },
+                );
+                row(ui, "Caption style", format!("{} · {}px", self.style.name, self.style.font_size));
+                row(
+                    ui,
+                    "Camera",
+                    if spec_camera {
+                        format!(
+                            "Active Speaker · {} cuts",
+                            self.plan.as_ref().map(|p| p.shots.len().saturating_sub(1)).unwrap_or(0)
+                        )
+                    } else {
+                        camera_mode_label(self.camera_mode).to_string()
+                    },
+                );
+                row(
+                    ui,
+                    "Speaker tracking",
+                    if spec_camera { "enabled".into() } else { "off".into() },
+                );
+                let est = estimate_render_s(dur, cached);
+                row(ui, "Estimated render time", format!("~{}", fmt_mmss(est)));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if theme::primary_button(ui, "Render Short").clicked() {
+                            self.show_export = false;
+                            action = Some(EditorAction::Render(Box::new(self.render_spec())));
+                        }
+                    });
+                    if ui.button("Back").clicked() {
+                        self.show_export = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_export = false;
+        }
+        action
+    }
+
+    // ------------------------------------------------------ caption overlay --
 
     /// Draw the caption line active at the playhead over the composite and run
     /// its drag/resize interaction (ADR 0036). Grouping/timing/colours come from
@@ -439,12 +1605,11 @@ impl EditorState {
             },
         };
 
-        let style = caption_style(self.caption_genre);
+        let style = &self.style;
         let place = self.placement.unwrap_or_default();
         // The SAME resolution the burn-in uses (anchor + font size in ASS
         // PlayRes pixels, clamps included — ADR 0036's geometry sharing), then
-        // one factor converts PlayRes pixels to canvas points. The canvas is
-        // aspect-true 9:16, so the x and y factors are identical.
+        // one factor converts PlayRes pixels to canvas points.
         let (ass_x, ass_y, ass_font) = resolve_placement(self.placement, style.font_size);
         let px = canvas_rect.width() / CANVAS_W as f32;
         let font_px = (ass_font as f32 * px).max(4.0);
@@ -455,17 +1620,11 @@ impl EditorState {
         };
         let primary = tint(style.primary_color);
         let accent = tint(style.accent_color);
+        let outline_c = tint(style.outline_color);
         let shadow_c = Color32::from_rgba_unmultiplied(0, 0, 0, (200.0 * mul) as u8);
 
-        // Per-word visibility/colour comes from the render crate's own
-        // word_states — the genre's ASS-tag semantics at this playhead (ADR
-        // 0036: never re-derived UI-side). A ghost line shows every word in
-        // the base colour (reveal/sung state would be meaningless in a gap).
-        let states = word_states(self.caption_genre, line, p);
+        let states = word_states(style.genre, line, p);
 
-        // Shaping is the expensive part of egui text; rebuild the galleys only
-        // when something they depend on changes (word states flip a few times
-        // a second during playback — far below the 30 fps repaint tick).
         let key = OverlayKey {
             line_start_bits: line.start_s.to_bits(),
             n_words: line.words.len(),
@@ -481,8 +1640,6 @@ impl EditorState {
                 job.wrap.max_width = f32::INFINITY;
                 let mut shadow_job = egui::text::LayoutJob::default();
                 shadow_job.wrap.max_width = f32::INFINITY;
-                // One pass builds both jobs, so the shadow can never fall out
-                // of lockstep with the glyphs it backs.
                 for (i, w) in line.words.iter().enumerate() {
                     let color = match if ghost { WordState::Base } else { states[i] } {
                         WordState::Hidden => Color32::TRANSPARENT, // reserves its space
@@ -500,7 +1657,7 @@ impl EditorState {
                         ..Default::default()
                     };
                     job.append(&text, 0.0, fmt(color));
-                    let sc = if color == Color32::TRANSPARENT { color } else { shadow_c };
+                    let sc = if color == Color32::TRANSPARENT { color } else { outline_c };
                     shadow_job.append(&text, 0.0, fmt(sc));
                 }
                 let g = painter.layout_job(job);
@@ -515,17 +1672,31 @@ impl EditorState {
         );
         let size = galley.size();
         let top_left = center - size / 2.0; // \an5: centered both axes
-        // Faux outline: four offset shadow passes stand in for libass's
-        // outline+shadow (ADR 0036's fidelity boundary: look approximate,
-        // position/size/timing exact).
-        let o = (2.0 * px * place.scale).clamp(1.0, 4.0);
-        for d in [
-            egui::vec2(-o, 0.0),
-            egui::vec2(o, 0.0),
-            egui::vec2(0.0, -o),
-            egui::vec2(0.0, o),
-        ] {
-            painter.galley(top_left + d, shadow.clone(), shadow_c);
+        // Background box (BorderStyle 3 approximation).
+        if style.back_box {
+            painter.rect_filled(
+                Rect::from_center_size(center, size + egui::vec2(18.0 * px, 12.0 * px)),
+                CornerRadius::same(3),
+                tint(style.back_color),
+            );
+        }
+        // Faux outline: four offset passes in the outline colour stand in for
+        // libass's outline (ADR 0036's fidelity boundary: look approximate,
+        // position/size/timing exact). Width follows the style's outline px.
+        if style.outline > 0.0 {
+            let o = (style.outline * px * place.scale).clamp(1.0, 6.0);
+            for d in [
+                egui::vec2(-o, 0.0),
+                egui::vec2(o, 0.0),
+                egui::vec2(0.0, -o),
+                egui::vec2(0.0, o),
+            ] {
+                painter.galley(top_left + d, shadow.clone(), outline_c);
+            }
+        }
+        if style.shadow > 0.0 {
+            let s = (style.shadow * px).clamp(1.0, 8.0);
+            painter.galley(top_left + egui::vec2(s, s), shadow.clone(), shadow_c);
         }
         painter.galley(top_left, galley, primary);
 
@@ -533,9 +1704,7 @@ impl EditorState {
             return;
         }
         // Drag to move, scroll on it to resize — the Crop verbs, applied to the
-        // caption block. Registered after the panel interactions, so the caption
-        // wins the pointer where they overlap (hide it via the eye toggle to
-        // reach the Panel underneath).
+        // caption block.
         let box_rect = Rect::from_center_size(center, size.max(egui::vec2(24.0, 16.0)));
         let resp = ui.interact(box_rect.expand(6.0), ui.id().with("caption-box"), Sense::drag());
         if resp.hovered() || resp.dragged() {
@@ -551,8 +1720,7 @@ impl EditorState {
             let d = resp.drag_delta();
             let mut x = place.x_frac + d.x / canvas_rect.width();
             let y = place.y_frac + d.y / canvas_rect.height();
-            // Snap X to the canvas centre (the burn-in's default) within 2%,
-            // with a guide line while snapped.
+            // Snap X to the canvas centre (the burn-in's default) within 2%.
             if (x - 0.5).abs() < 0.02 {
                 x = 0.5;
                 painter.line_segment(
@@ -571,17 +1739,12 @@ impl EditorState {
         } else if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                // Scroll up grows the text (direct manipulation), clamped to
-                // the shared CaptionPlacement bounds — the same constants
-                // resolve_placement clamps with, so preview == burn-in.
                 let factor = (scroll * 0.0015).exp();
                 self.placement = Some(CaptionPlacement {
                     scale: (place.scale * factor)
                         .clamp(CaptionPlacement::SCALE_MIN, CaptionPlacement::SCALE_MAX),
                     ..place
                 });
-                // Consume the wheel so the same gesture can't also scroll the
-                // editor window / zoom a Panel underneath.
                 ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
             }
         }
@@ -613,9 +1776,16 @@ impl EditorState {
     }
 }
 
-/// Everything the overlay's shaped galleys depend on (ADR 0036): the active
-/// line's identity, its per-word states at the playhead, ghost dimming, and the
-/// resolved font size. Equal key ⇒ the cached galleys are still exact.
+/// Which crop a Source-view interaction targets.
+#[derive(Clone, Copy)]
+enum CropTarget {
+    Gameplay,
+    Facecam,
+    FullCam,
+    FullGameplay,
+}
+
+/// Everything the overlay's shaped galleys depend on (ADR 0036).
 #[derive(PartialEq)]
 struct OverlayKey {
     line_start_bits: u64,
@@ -677,13 +1847,15 @@ fn draw_panel(
         egui::pos2((crop.x + crop.w) / src_w, (crop.y + crop.h) / src_h),
     );
     painter.image(tex, rect, uv, Color32::WHITE);
-    painter.text(
-        rect.left_top() + egui::vec2(4.0, 2.0),
-        Align2::LEFT_TOP,
-        label,
-        FontId::proportional(11.0),
-        Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-    );
+    if !label.is_empty() {
+        painter.text(
+            rect.left_top() + egui::vec2(4.0, 2.0),
+            Align2::LEFT_TOP,
+            label,
+            FontId::proportional(11.0),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 160),
+        );
+    }
 }
 
 /// Pan (drag) and zoom (scroll) a Crop within the source frame, in source
@@ -711,4 +1883,293 @@ fn pan_zoom(ui: &egui::Ui, rect: Rect, id: &str, crop: &mut Crop, src_w: f32, sr
             }
         }
     }
+}
+
+/// Dim the parts of `frame` outside every rect in `keep` (the crop-tool focus
+/// effect). Approximate: for one crop this is exact (4 side bands); for two it
+/// dims rows/columns not covered by either (cheap and close enough).
+fn dim_outside(painter: &egui::Painter, frame: Rect, keep: &[Rect]) {
+    let dim = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+    if keep.is_empty() {
+        return;
+    }
+    if keep.len() == 1 {
+        let k = keep[0];
+        let bands = [
+            Rect::from_min_max(frame.min, egui::pos2(frame.right(), k.top())),
+            Rect::from_min_max(egui::pos2(frame.left(), k.bottom()), frame.max),
+            Rect::from_min_max(egui::pos2(frame.left(), k.top()), egui::pos2(k.left(), k.bottom())),
+            Rect::from_min_max(egui::pos2(k.right(), k.top()), egui::pos2(frame.right(), k.bottom())),
+        ];
+        for b in bands {
+            if b.width() > 0.5 && b.height() > 0.5 {
+                painter.rect_filled(b.intersect(frame), CornerRadius::ZERO, dim);
+            }
+        }
+    } else {
+        // Multiple keeps: a light whole-frame veil, then re-brighten is not
+        // possible with plain painting — draw thin outlines instead of a veil.
+        // (Two-panel stacked layouts already read clearly from the strokes.)
+    }
+}
+
+/// Rule-of-thirds guides inside a crop rect.
+fn thirds_grid(painter: &egui::Painter, r: Rect, color: Color32) {
+    let c = color.gamma_multiply(0.35);
+    for f in [1.0 / 3.0, 2.0 / 3.0] {
+        painter.line_segment(
+            [
+                egui::pos2(r.left() + r.width() * f, r.top()),
+                egui::pos2(r.left() + r.width() * f, r.bottom()),
+            ],
+            Stroke::new(1.0, c),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(r.left(), r.top() + r.height() * f),
+                egui::pos2(r.right(), r.top() + r.height() * f),
+            ],
+            Stroke::new(1.0, c),
+        );
+    }
+}
+
+/// The Shorts/TikTok safe-area guide: darken the UI-covered zones (top bar,
+/// bottom title/actions, right-side buttons) and stroke the safe rect.
+fn draw_safe_area(painter: &egui::Painter, canvas: Rect) {
+    let dim = Color32::from_rgba_unmultiplied(255, 60, 60, 34);
+    let top = canvas.height() * 0.06;
+    let bottom = canvas.height() * 0.17;
+    let right = canvas.width() * 0.14;
+    painter.rect_filled(
+        Rect::from_min_size(canvas.min, egui::vec2(canvas.width(), top)),
+        CornerRadius::ZERO,
+        dim,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(egui::pos2(canvas.left(), canvas.bottom() - bottom), canvas.max),
+        CornerRadius::ZERO,
+        dim,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(
+            egui::pos2(canvas.right() - right, canvas.top() + top),
+            egui::pos2(canvas.right(), canvas.bottom() - bottom),
+        ),
+        CornerRadius::ZERO,
+        dim,
+    );
+    let safe = Rect::from_min_max(
+        egui::pos2(canvas.left() + canvas.width() * 0.04, canvas.top() + top),
+        egui::pos2(canvas.right() - right, canvas.bottom() - bottom),
+    );
+    painter.rect_stroke(
+        safe,
+        CornerRadius::same(6),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        safe.left_bottom() + egui::vec2(6.0, -14.0),
+        Align2::LEFT_TOP,
+        "safe area",
+        FontId::proportional(10.0),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+    );
+}
+
+/// A small filled label chip painted directly on a canvas.
+fn chip(painter: &egui::Painter, pos: egui::Pos2, text: &str, color: Color32) {
+    let font = FontId::proportional(11.0);
+    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
+    let r = Rect::from_min_size(pos, galley.size() + egui::vec2(10.0, 6.0));
+    painter.rect_filled(r, CornerRadius::same(4), Color32::from_rgba_unmultiplied(10, 12, 16, 210));
+    painter.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.0, color), StrokeKind::Inside);
+    painter.galley(pos + egui::vec2(5.0, 3.0), galley, Color32::WHITE);
+}
+
+/// egui color picker over an RGBA byte array (the CaptionStyle color type).
+fn color_swatch(ui: &mut egui::Ui, rgba: &mut [u8; 4]) {
+    let mut c = Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+    if egui::color_picker::color_edit_button_srgba(
+        ui,
+        &mut c,
+        egui::color_picker::Alpha::OnlyBlend,
+    )
+    .changed()
+    {
+        *rgba = [c.r(), c.g(), c.b(), c.a()];
+    }
+}
+
+pub(crate) fn camera_mode_label(mode: CameraMode) -> &'static str {
+    match mode {
+        CameraMode::Manual => "Manual",
+        CameraMode::Center => "Center",
+        CameraMode::AutoFace => "Auto face",
+        CameraMode::ActiveSpeaker => "Active Speaker",
+        CameraMode::Group => "Group",
+    }
+}
+
+/// `m:ss` for ruler ticks and rough durations.
+fn fmt_mmss(t: f64) -> String {
+    let s = t.max(0.0).round() as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// `m:ss.cc` — the transcript editor's timestamp format (focus task 2).
+fn fmt_mmss_cc(t: f64) -> String {
+    let cs = (t.max(0.0) * 100.0).round() as u64;
+    format!("{}:{:02}.{:02}", cs / 6000, (cs / 100) % 60, cs % 100)
+}
+
+/// Parse `m:ss.cc` (also accepts `ss.cc` or plain seconds) back to seconds.
+fn parse_mmss_cc(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Some((m, rest)) = s.split_once(':') {
+        let mins: f64 = m.trim().parse().ok()?;
+        let secs: f64 = rest.trim().parse().ok()?;
+        Some(mins * 60.0 + secs)
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// Censor a word for the burn-in: keep each word's first character, star the
+/// rest ("damn" -> "d***"). Multi-word units censor each word.
+fn censor_text(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => {
+                    let rest = chars.count();
+                    format!("{first}{}", "*".repeat(rest.max(1)))
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split one caption unit into two: at the space nearest the text midpoint
+/// when there is one, else at the character midpoint; times split
+/// proportionally to the text split. `None` when the unit is too short.
+fn split_unit(u: &yc_core::CaptionUnit) -> Option<(yc_core::CaptionUnit, yc_core::CaptionUnit)> {
+    let text = u.text.trim();
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    let mid = chars.len() / 2;
+    // Prefer the space nearest the midpoint.
+    let spaces: Vec<usize> =
+        chars.iter().enumerate().filter(|(_, c)| c.is_whitespace()).map(|(i, _)| i).collect();
+    let (a_text, b_text, frac) = match spaces.iter().min_by_key(|i| i.abs_diff(mid)) {
+        Some(&i) => {
+            let a: String = chars[..i].iter().collect();
+            let b: String = chars[i + 1..].iter().collect();
+            let frac = (i as f64 / chars.len() as f64).clamp(0.1, 0.9);
+            (a.trim().to_string(), b.trim().to_string(), frac)
+        }
+        None => {
+            let a: String = chars[..mid].iter().collect();
+            let b: String = chars[mid..].iter().collect();
+            (a, b, 0.5)
+        }
+    };
+    if a_text.is_empty() || b_text.is_empty() {
+        return None;
+    }
+    let split_t = u.start_s + (u.end_s - u.start_s).max(0.1) * frac;
+    Some((
+        yc_core::CaptionUnit { text: a_text, start_s: u.start_s, end_s: split_t },
+        yc_core::CaptionUnit { text: b_text, start_s: split_t, end_s: u.end_s },
+    ))
+}
+
+/// A rough wall-clock estimate for the export (the summary row): NVENC runs
+/// ~2.5x realtime on the 1080x1920 encode, whisper ~0.9x when the transcript
+/// is not already cached, plus fixed process overhead.
+fn estimate_render_s(dur_s: f64, transcript_cached: bool) -> f64 {
+    let encode = dur_s * 0.4 + 8.0;
+    let whisper = if transcript_cached { 0.0 } else { dur_s * 0.9 + 10.0 };
+    encode + whisper
+}
+
+/// Truncate to at most `max` characters with an ellipsis.
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max.max(1) {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yc_core::CaptionUnit;
+
+    #[test]
+    fn mmss_cc_formats_and_parses_round_trip() {
+        assert_eq!(fmt_mmss_cc(0.0), "0:00.00");
+        assert_eq!(fmt_mmss_cc(4.25), "0:04.25");
+        assert_eq!(fmt_mmss_cc(83.7), "1:23.70");
+        assert_eq!(parse_mmss_cc("1:23.70"), Some(83.7));
+        assert_eq!(parse_mmss_cc("0:04.25"), Some(4.25));
+        assert_eq!(parse_mmss_cc("12.5"), Some(12.5));
+        assert_eq!(parse_mmss_cc("garbage"), None);
+    }
+
+    #[test]
+    fn censor_keeps_first_letter_and_stars_the_rest() {
+        assert_eq!(censor_text("damn"), "d***");
+        assert_eq!(censor_text("two words"), "t** w****");
+        assert_eq!(censor_text("a"), "a*"); // even a 1-char word masks something
+    }
+
+    #[test]
+    fn split_unit_prefers_the_space_and_splits_times_proportionally() {
+        let u = CaptionUnit { text: "hello world".into(), start_s: 1.0, end_s: 2.0 };
+        let (a, b) = split_unit(&u).expect("splittable");
+        assert_eq!(a.text, "hello");
+        assert_eq!(b.text, "world");
+        assert!(a.start_s == 1.0 && b.end_s == 2.0);
+        assert!((a.end_s - b.start_s).abs() < 1e-9, "contiguous");
+        assert!(a.end_s > 1.2 && a.end_s < 1.8, "roughly proportional: {}", a.end_s);
+        // Single word splits at the char midpoint.
+        let w = CaptionUnit { text: "okay".into(), start_s: 0.0, end_s: 1.0 };
+        let (a, b) = split_unit(&w).expect("splittable");
+        assert_eq!((a.text.as_str(), b.text.as_str()), ("ok", "ay"));
+        // A 1-char unit does not split.
+        assert!(split_unit(&CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 1.0 }).is_none());
+    }
+
+    #[test]
+    fn render_estimate_charges_whisper_only_when_uncached() {
+        let cached = estimate_render_s(60.0, true);
+        let fresh = estimate_render_s(60.0, false);
+        assert!(fresh > cached + 30.0, "{fresh} vs {cached}");
+    }
+
+    #[test]
+    fn nice_steps_are_round() {
+        assert_eq!(nice_step(3.4), 5.0);
+        assert_eq!(nice_step(7.0), 10.0);
+        assert_eq!(nice_step(0.8), 1.0);
+        assert_eq!(nice_step(20.0), 30.0);
+    }
+}
+
+/// A round ruler step (1/2/5/10/15/30/60s ladder) at least `raw` long.
+fn nice_step(raw: f64) -> f64 {
+    for s in [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0] {
+        if raw <= s {
+            return s;
+        }
+    }
+    600.0
 }

@@ -42,7 +42,14 @@ Score 0-10 how clip-worthy the STREAMER'S OWN reaction is:
 
 CRITICAL: the transcript is the loudest voice in a MIXED game+microphone recording, so it may be scripted in-game dialogue or cutscene narration rather than the streamer. Score the STREAMER, not the game. A dramatic, emotional or shocking line that is clearly scripted game/cutscene narration is NOT clip-worthy on its own - score it low unless the streamer is audibly reacting to it. Use the provided signals to corroborate: high audience-chat and high vocal-arousal alongside reaction-like words point to a real streamer moment; dramatic words with flat arousal and no chat point to scripted game audio.
 
-Also write a catchy YouTube Shorts title for this moment: at most 60 characters, in the transcript's own language, punchy and specific to what happens - no hashtags, no surrounding quotes, no emoji.
+Also write a YouTube Shorts title for this moment, one a creator uploads without rewriting. Title rules:
+- At most 60 characters, in the transcript's own language.
+- Open with the hook: the single most surprising, funny or emotional beat of the moment, stated as concretely as the transcript allows (a specific detail out-performs a vague tease).
+- Create curiosity, but stay honest - never promise more than the clip shows, and never manufacture drama that is not there.
+- Strong verbs, present tense, natural capitalization; ALL-CAPS on at most one word.
+- BANNED generic filler (any language's equivalent): 'Epic', 'Insane', 'Crazy', 'Unbelievable', 'You Won't Believe', 'Gone Wrong', 'Must Watch', 'Wait For It', 'Watch Till The End'.
+- No hashtags, no surrounding quotes, no emoji, no trailing punctuation like '!!!'.
+Good shapes: a bold claim from the clip (\"He calls the boss fight in one guess\"), a charged quote that stands alone (\"That's the last time I trust chat\"), or a specific stake (\"One HP left and he still taunts\").
 
 Reply with ONLY a JSON object: {\"score\": <integer 0-10>, \"reason\": \"<at most 12 words>\", \"title\": \"<at most 60 characters>\"}.";
 
@@ -246,6 +253,15 @@ mod tests {
         // ADR 0015: the prompt must also request the generated Shorts title.
         assert!(SYSTEM.contains("\"title\""), "must request the JSON title field");
         assert!(s.contains("title"), "must ask for a title");
+        // Production-ready titles (focus 2026-07): the hook-first, specific,
+        // honest, no-generic-filler rules. Editing these away silently reverts
+        // titles to the vague clickbait the operator rejected.
+        assert!(s.contains("hook"), "must demand a hook-first title");
+        assert!(s.contains("60 characters"), "must keep the Shorts length ceiling");
+        assert!(s.contains("banned") || s.contains("never"), "must ban generic filler");
+        assert!(s.contains("insane") && s.contains("epic"), "must name banned filler words");
+        assert!(s.contains("honest"), "must forbid overpromising clickbait");
+        assert!(s.contains("no emoji") && s.contains("no hashtags"), "format bans survive");
     }
 
     #[test]

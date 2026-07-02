@@ -38,6 +38,26 @@ const GOLD_DEEP: Color32 = Color32::from_rgb(0xC9, 0xA4, 0x00);
 pub const OK: Color32 = Color32::from_rgb(0x5B, 0xD1, 0x7A);
 /// Error / missing — softened from pure red.
 pub const ERR: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
+/// Informational accent (links to nowhere, speaker B, chat overlays) — a calm
+/// sky blue that never competes with the gold.
+pub const INFO: Color32 = Color32::from_rgb(0x6C, 0xB2, 0xFF);
+/// Deep panel background one step *below* SURFACE — the editor's preview well
+/// and timeline bed, so the video reads as the brightest thing on screen.
+pub const WELL: Color32 = Color32::from_rgb(0x0F, 0x11, 0x15);
+
+/// Speaker-track colours (Person A, B, C, D) for face overlays and the speaker
+/// timeline: distinct at a glance, all softened to sit on the dark surface.
+pub const TRACKS: [Color32; 4] = [
+    GOLD,
+    Color32::from_rgb(0x6C, 0xB2, 0xFF), // B: sky
+    Color32::from_rgb(0x5B, 0xD1, 0x7A), // C: green
+    Color32::from_rgb(0xE8, 0x8B, 0xD0), // D: orchid
+];
+
+/// The colour for speaker track `i` (wraps past [`TRACKS`]).
+pub fn track_color(i: usize) -> Color32 {
+    TRACKS[i % TRACKS.len()]
+}
 
 /// The heading font family name, installed from the caption font when present.
 const HEADING_FAMILY: &str = "display";
@@ -143,6 +163,65 @@ fn visuals() -> egui::Visuals {
     v.widgets.open.corner_radius = r;
 
     v
+}
+
+// ---- widget helpers (one design system, used by every page) -----------------
+
+/// The primary call-to-action: dark text on the brand gold. One per view — the
+/// button the operator is *supposed* to press next.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let label = egui::RichText::new(text).color(INK).strong();
+    ui.add(egui::Button::new(label).fill(GOLD).corner_radius(CornerRadius::same(6)))
+}
+
+/// A section header: small-caps-feel kicker in gold over the quiet surface —
+/// the one place outside the brand mark the gold text appears.
+pub fn section(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(text.to_uppercase()).color(GOLD).size(11.5).strong());
+    ui.add_space(2.0);
+}
+
+/// A raised card frame for grouping a form section on a panel.
+pub fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(SURFACE_ALT)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(10))
+}
+
+/// A small status chip: coloured dot + label, for pipeline states.
+pub fn status_chip(ui: &mut egui::Ui, color: Color32, text: &str) {
+    egui::Frame::new()
+        .fill(RAISED)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(9, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, color);
+                ui.label(egui::RichText::new(text).size(12.5));
+            });
+        });
+}
+
+/// A segmented-control row over an enum-ish set: draws `options` as connected
+/// selectable segments, returns the clicked index.
+pub fn segmented(ui: &mut egui::Ui, selected: usize, options: &[&str]) -> Option<usize> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (i, label) in options.iter().enumerate() {
+            if ui.selectable_label(selected == i, *label).clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
 }
 
 /// Install the caption display font (Anton) under [`HEADING_FAMILY`] so headings

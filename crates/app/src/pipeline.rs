@@ -28,11 +28,12 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle, Clip, Creator, CreatorStore,
-    Language, Layout, LayoutPref, Moment, NoConsole, Project, ReviewCache, Signals, TimeRange,
-    Transcript, Vod, VodSource,
+    CameraPlan, CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle, Clip, Creator,
+    CreatorStore, Language, Layout, LayoutPref, Moment, NoConsole, Project, ReviewCache, Signals,
+    TimeRange, Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
+use yc_frame::speaker::SpeakerAnalysis;
 use yc_ingest::{CancelToken, Sidecars};
 
 /// Resolved inputs the worker needs, captured once at spawn.
@@ -106,7 +107,9 @@ pub enum Job {
     Import { source: ImportSource, language: Option<Language> },
     /// Run detection over the imported VOD (discover + refine), surfacing
     /// ranked candidate Moments (ADR 0007). Operates on the current session.
-    Detect,
+    /// `max_dur_s` caps the adaptive Moment window (clamped to the 180 s
+    /// YouTube-Shorts ceiling) — the operator's "Max clip length" setting.
+    Detect { max_dur_s: f64 },
     /// Phase-2a (ADR 0012): fetch the padded Segment, probe it, choose the seed
     /// Layout, and extract preview frames for the nudge editor. Leaves a
     /// [`PreparedClip`] the worker holds for the matching [`Job::Render`]. `title`
@@ -118,27 +121,49 @@ pub enum Job {
     /// skips the filmstrip extraction (ADR 0036) — 120 decoded frames would
     /// otherwise be shipped and dropped per clip.
     Prepare { range: TimeRange, title: Option<String>, layout_pref: LayoutPref, preview: bool },
+    /// Transcribe the held [`PreparedClip`]'s range ahead of any render (the
+    /// editor's caption pre-pass): runs exactly the render path's transcription
+    /// (engine resolution, ensemble, correction, harvest, timing refine) and
+    /// caches the result on the PreparedClip, emitting [`Progress::Captions`]
+    /// so the editor's transcript panel fills. The following Render reuses the
+    /// cache and is NVENC-only — the whisper cost just moves earlier.
+    Transcribe { correct: bool, caption_engine: Option<CaptionEngine> },
+    /// Analyze the held [`PreparedClip`] for podcast speakers (focus 2026-07):
+    /// track every visible face, measure per-face mouth activity against the
+    /// clip audio, attribute a speaker per time bin, and derive the cut-based
+    /// active-speaker [`CameraPlan`]. Emits [`Progress::Speakers`]. Needs the
+    /// `face` build + model; CPU-only (safe alongside nothing — the worker is
+    /// serial anyway).
+    AnalyzeSpeakers,
     /// Phase-2b (ADR 0012): render the operator's (possibly nudged) `layout`
     /// over the held [`PreparedClip`] - transcribe (once, then cached), caption,
-    /// NVENC export. `caption_genre` selects the Caption Style animation (M7):
-    /// huge-word / rolling-pop / karaoke-fill; the rest of the style is data.
-    /// `correct` requests the LLM caption-correction pass (ADR 0030/0031) for this
-    /// render — the operator's per-render toggle (only effective in a `correct`
-    /// build with the sidecar; `YC_CORRECT=0` is a global override).
-    /// `placement` is the Clip's Caption placement (ADR 0036): where/how large the
-    /// captions draw, from the editor's drag/resize; `None` (always in headless)
-    /// keeps the built-in anchor, byte-identical to pre-placement output.
-    /// `caption_engine` is the operator's Caption engine pick for this render
-    /// (ADR 0035): `Some` = the GUI rail's explicit selection (persisted per
-    /// Creator on success), `None` (headless/CLI) = the Creator's saved engine
-    /// from `creators.json`, Whisper for an unknown Creator. `YC_QWEN_ENS`
-    /// overrides the resolved engine either way (tri-state; never saved back).
+    /// NVENC export. `style` is the full Caption Style (genre + appearance —
+    /// the editor's preset/custom pick; the genre is what persists per
+    /// Creator). `correct` requests the LLM caption-correction pass (ADR
+    /// 0030/0031) for this render — the operator's per-render toggle (only
+    /// effective in a `correct` build with the sidecar; `YC_CORRECT=0` is a
+    /// global override). `placement` is the Clip's Caption placement (ADR
+    /// 0036): where/how large the captions draw, from the editor's
+    /// drag/resize; `None` (always in headless) keeps the built-in anchor,
+    /// byte-identical to pre-placement output. `caption_engine` is the
+    /// operator's Caption engine pick for this render (ADR 0035): `Some` = the
+    /// GUI's explicit selection (persisted per Creator on success), `None`
+    /// (headless/CLI) = the Creator's saved engine from `creators.json`,
+    /// Whisper for an unknown Creator. `YC_QWEN_ENS` overrides the resolved
+    /// engine either way (tri-state; never saved back). `camera` is a dynamic
+    /// active-speaker plan: `Some` renders the per-shot cut concat instead of
+    /// the static `layout`. `transcript_override` is the operator's edited
+    /// transcript from the editor's caption panel: it becomes the render's
+    /// truth verbatim (no whisper, no harvest, no re-timing — the operator's
+    /// words are not guesses to second-guess).
     Render {
         layout: Layout,
-        caption_genre: CaptionGenre,
+        style: CaptionStyle,
         correct: bool,
         placement: Option<CaptionPlacement>,
         caption_engine: Option<CaptionEngine>,
+        camera: Option<CameraPlan>,
+        transcript_override: Option<Transcript>,
     },
 }
 
@@ -216,7 +241,15 @@ pub enum Progress {
         frame_h: u32,
         frame_fps: f64,
         range: TimeRange,
+        /// The persistent face clusters the auto-framing found (M6) — the
+        /// editor uses the count to decide whether to auto-run the podcast
+        /// speaker analysis (2+ visible people ≈ a podcast frame).
+        faces: Vec<yc_frame::FaceCluster>,
     },
+    /// The podcast speaker analysis + the derived active-speaker camera plan
+    /// (focus 2026-07): tracks, per-bin attribution, and cut-based shots for
+    /// the editor's overlays, speaker timeline, and Active Speaker mode.
+    Speakers { analysis: SpeakerAnalysis, plan: CameraPlan },
     /// The refined transcript a Render is about to burn (post-correction,
     /// post-refine — exactly what `generate_ass` consumes), sent as soon as it is
     /// known so the editor's caption preview shows the render's truth while NVENC
@@ -224,6 +257,9 @@ pub enum Progress {
     Captions { transcript: Transcript },
     /// A Clip rendered to this path.
     Done(PathBuf),
+    /// A non-render job (Transcribe / AnalyzeSpeakers) finished: the UI
+    /// returns to Idle without a Done path.
+    JobDone,
     Cancelled,
     Failed(String),
 }
@@ -275,6 +311,10 @@ struct PreparedClip {
     /// engine between re-renders of the same Prepare must invalidate the cache
     /// and re-transcribe — unlike genre/placement, which only re-emit ASS.
     transcript_ens: bool,
+    /// Whether the cached `transcript` is the OPERATOR's edited truth (the
+    /// editor's caption panel). Operator words are never invalidated by an
+    /// engine flip and never re-timed/harvested — they are not whisper guesses.
+    transcript_operator: bool,
     /// The promoted Moment's LLM-generated title (ADR 0015), used to name the
     /// rendered Short. `None` for a manual / headless clip → render falls back to
     /// a timestamp name. Held here so a re-render after a nudge keeps the name.
@@ -336,12 +376,12 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     }
                 }
-                Job::Detect => match &session {
+                Job::Detect { max_dur_s } => match &session {
                     None => {
                         let _ = tx_prog
                             .send(Progress::Failed("import a VOD before detecting".into()));
                     }
-                    Some(s) => match do_detect(&paths, s, &worker_cancel, &tx_prog) {
+                    Some(s) => match do_detect(&paths, s, max_dur_s, &worker_cancel, &tx_prog) {
                         Ok((moments, transcripts, llm_reasons, timeline)) => {
                             let _ = tx_prog.send(Progress::Detected {
                                 moments,
@@ -361,7 +401,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             .send(Progress::Failed("import a VOD before making a clip".into()));
                     }
                     Some(s) => match do_prepare(&paths, s, range, title, layout_pref, preview, &worker_cancel, &tx_prog) {
-                        Ok((pc, frames, frame_w, frame_h, frame_fps)) => {
+                        Ok((pc, frames, frame_w, frame_h, frame_fps, faces)) => {
                             let _ = tx_prog.send(Progress::Prepared {
                                 layout: pc.auto_layout.clone(),
                                 src_w: pc.src_w,
@@ -371,6 +411,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 frame_h,
                                 frame_fps,
                                 range: pc.range,
+                                faces,
                             });
                             prepared = Some(pc);
                         }
@@ -379,9 +420,48 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Render { layout, caption_genre, correct, placement, caption_engine } => match (&session, &mut prepared) {
+                Job::Transcribe { correct, caption_engine } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, caption_genre, correct, placement, caption_engine, &worker_cancel, &tx_prog) {
+                        match ensure_transcript(&paths, s, pc, correct, caption_engine, &worker_cancel, &tx_prog) {
+                            Ok(_) => {
+                                let t = pc.transcript.clone().expect("set by ensure_transcript");
+                                let _ = tx_prog.send(Progress::Captions { transcript: t });
+                                // The pre-pass leaves the app Idle, not Done —
+                                // nothing was exported.
+                                let _ = tx_prog.send(Progress::Stage("Captions ready"));
+                                let _ = tx_prog.send(Progress::JobDone);
+                            }
+                            Err(e) => {
+                                let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = tx_prog
+                            .send(Progress::Failed("prepare a clip before transcribing".into()));
+                    }
+                },
+                Job::AnalyzeSpeakers => match (&session, &prepared) {
+                    (Some(s), Some(pc)) => {
+                        match do_analyze_speakers(&paths, s, pc, &worker_cancel, &tx_prog) {
+                            Ok((analysis, plan)) => {
+                                let _ = tx_prog.send(Progress::Speakers { analysis, plan });
+                                let _ = tx_prog.send(Progress::JobDone);
+                            }
+                            Err(e) => {
+                                let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = tx_prog.send(Progress::Failed(
+                            "prepare a clip before analyzing speakers".into(),
+                        ));
+                    }
+                },
+                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override } => match (&session, &mut prepared) {
+                    (Some(s), Some(pc)) => {
+                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -692,14 +772,19 @@ fn load_review(data_dir: &Path) -> (HashMap<u64, String>, HashMap<u64, String>) 
 /// transcribe each candidate once with a *resident* whisper model and score the
 /// excitement lexicon. Returns Moments ranked by final score; persists them to
 /// `project.json`.
+/// The hard Moment-length ceiling: YouTube Shorts allow up to 3 minutes.
+pub const MAX_CLIP_CEILING_S: f64 = 180.0;
+
 fn do_detect(
     paths: &PipelinePaths,
     session: &Session,
+    max_dur_s: f64,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<(Vec<Moment>, HashMap<u64, String>, HashMap<u64, String>, Timeline)> {
     anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
-    let params = DetectParams::default();
+    let mut params = DetectParams::default();
+    params.max_dur_s = max_dur_s.clamp(params.min_dur_s, MAX_CLIP_CEILING_S);
 
     // Discover: cheap, whole-VOD, no GPU. Read the bins here (rather than via
     // yc_detect::discover) so the same series feeds both the ranking and the
@@ -1042,24 +1127,31 @@ const STRIP_MAX_FRAMES: usize = 120;
 /// Target strip density. Playback interpolates nothing — the playhead shows the
 /// nearest frame — so this is the visual "frame rate" of the preview.
 const STRIP_FPS: f64 = 4.0;
-/// Longest strip-frame edge, in pixels. The editor canvas draws at ≤360 egui
-/// points, so ~480p covers it (a zoomed facecam Crop previews slightly softer
-/// than the old 1280 — geometry, the thing being edited, is unaffected; the
-/// render reads the full-res Segment). The editor stores Crops in source pixels
-/// and only normalizes at draw time, so this resolution is purely preview
-/// fidelity.
-const PREVIEW_LONG_EDGE: f32 = 854.0;
+/// Longest strip-frame edge, in pixels, by clip length: the editor canvas
+/// draws at modest size, so ~480p covers a short clip crisply; a long clip
+/// (the 180 s Shorts ceiling) drops to ~360p so the resident texture budget on
+/// the shared 8 GB card stays roughly constant (the strip is texture-resident
+/// through the whole edit + render). Geometry — the thing being edited — is
+/// stored in source pixels and unaffected; the render reads the full-res
+/// Segment.
+fn preview_long_edge(dur_s: f64) -> f32 {
+    if dur_s <= 60.0 {
+        854.0
+    } else {
+        640.0
+    }
+}
 
 /// Aspect-preserving preview-frame dimensions (even, >= 2) with the longest edge
-/// at most [`PREVIEW_LONG_EDGE`]. Unlike the 320x240 detection pass (ADR 0011,
-/// which tolerates aspect distortion), the editor preview must not distort.
-fn preview_dims(src_w: f32, src_h: f32) -> (u32, u32) {
+/// at most `long_edge`. Unlike the 320x240 detection pass (ADR 0011, which
+/// tolerates aspect distortion), the editor preview must not distort.
+fn preview_dims(src_w: f32, src_h: f32, long_edge: f32) -> (u32, u32) {
     let even = |v: f32| (((v.round().max(2.0)) as u32) / 2) * 2;
     if src_w >= src_h {
-        let w = src_w.min(PREVIEW_LONG_EDGE);
+        let w = src_w.min(long_edge);
         (even(w), even(w * src_h / src_w))
     } else {
-        let h = src_h.min(PREVIEW_LONG_EDGE);
+        let h = src_h.min(long_edge);
         (even(h * src_w / src_h), even(h))
     }
 }
@@ -1070,6 +1162,7 @@ fn preview_dims(src_w: f32, src_h: f32) -> (u32, u32) {
 /// preview frames across the clip range. CPU/network only - whisper is deferred
 /// to `do_render` so the editor opens fast. Returns the [`PreparedClip`] plus
 /// the preview frames and their dimensions for the UI to texture.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn do_prepare(
     paths: &PipelinePaths,
     session: &Session,
@@ -1079,7 +1172,7 @@ fn do_prepare(
     preview: bool,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32, f64)> {
+) -> Result<(PreparedClip, Vec<Vec<u8>>, u32, u32, f64, Vec<yc_frame::FaceCluster>)> {
     anyhow::ensure!(range.duration_s() > 0.0, "pick a range with end > start");
     let sc = paths.sidecars();
 
@@ -1106,13 +1199,16 @@ fn do_prepare(
     // forced kind overrides it (still using the detected Facecam when found).
     // The editor opens seeded with this and the operator nudges from there.
     let _ = tx.send(Progress::Stage("Framing (face detect)"));
-    let auto_layout = build_layout(paths, &render_src, seek_s, src_w, src_h, layout_pref);
+    let faces = detect_facecam(paths, &render_src, seek_s, src_w, src_h);
+    let auto_layout =
+        yc_frame::decide_layout_with_pref(layout_pref, &faces, src_w, src_h, yc_frame::SEAM_DEFAULT);
 
     // Sample the preview filmstrip across the clip range (ADR 0036): STRIP_FPS,
     // dropping to fit STRIP_MAX_FRAMES on a long clip, floored so a degenerate
     // range still yields frames. Headless/batch open no editor (`preview` is
     // false): skip the extraction instead of decoding 120 frames to drop them.
-    let (frame_w, frame_h) = preview_dims(src_w, src_h);
+    let (frame_w, frame_h) =
+        preview_dims(src_w, src_h, preview_long_edge(range.duration_s()));
     let fps = STRIP_FPS.min(STRIP_MAX_FRAMES as f64 / range.duration_s().max(0.1)).max(0.1);
     let frames = if preview {
         let _ = tx.send(Progress::Stage("Extracting preview frames"));
@@ -1138,9 +1234,10 @@ fn do_prepare(
         auto_layout,
         transcript: None,
         transcript_ens: false,
+        transcript_operator: false,
         title,
     };
-    Ok((prepared, frames, frame_w, frame_h, fps))
+    Ok((prepared, frames, frame_w, frame_h, fps, faces))
 }
 
 /// The 16 kHz-mono samples whisper captions from. With the `sep` feature and the
@@ -1380,23 +1477,23 @@ fn is_silent_clip(samples: &[f32]) -> bool {
     samples.iter().fold(0.0f32, |m, &s| m.max(s.abs())) < SILENT_CLIP_PEAK
 }
 
-/// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
-/// Segment. Transcribes the range once (whisper, GPU) and caches it on the
-/// `PreparedClip`, so a re-render after another nudge is NVENC-only. The
-/// transcript captions the Vocal stem when `sep` is built, else the mixed track
-/// (the loudest voice in it); see `caption_samples`.
-fn do_render(
+/// The render path's transcription, shared by [`Job::Render`] and the editor's
+/// [`Job::Transcribe`] pre-pass: resolve the Caption engine (ADR 0035),
+/// transcribe once (whisper GPU, optional Qwen ensemble, optional LLM
+/// correction, dialect harvest, timing refine) and cache the result on the
+/// `PreparedClip` — a later call reuses the cache, so a render after the
+/// pre-pass is NVENC-only. Returns the resolved engine SELECTION (what
+/// `remember_creator_render` persists). An operator-edited transcript
+/// (`transcript_operator`) is never invalidated or recomputed here.
+fn ensure_transcript(
     paths: &PipelinePaths,
     session: &Session,
     prepared: &mut PreparedClip,
-    layout: Layout,
-    caption_genre: CaptionGenre,
     correct: bool,
-    placement: Option<CaptionPlacement>,
     caption_engine: Option<CaptionEngine>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<PathBuf> {
+) -> Result<CaptionEngine> {
     anyhow::ensure!(paths.model.is_file(), "whisper model missing - run fetch-models.ps1");
     // `correct` gates the LLM caption-correction pass below; it is only read inside
     // the `#[cfg(feature = "correct")]` block, so silence the unused warning otherwise.
@@ -1419,7 +1516,11 @@ fn do_render(
     // Transcribe once, then reuse: re-rendering a nudged Layout skips whisper.
     // The cache is engine-derived, though — an engine flip between re-renders
     // of the same Prepare must re-transcribe, or the flip would silently no-op.
-    if prepared.transcript.is_some() && prepared.transcript_ens != use_ensemble {
+    // An operator-edited transcript is exempt: their words outrank any engine.
+    if prepared.transcript.is_some()
+        && !prepared.transcript_operator
+        && prepared.transcript_ens != use_ensemble
+    {
         tracing::info!(
             "caption engine changed since the cached transcript (ensemble {} -> {}); re-transcribing",
             prepared.transcript_ens,
@@ -1653,7 +1754,41 @@ fn do_render(
         };
         prepared.transcript = Some(transcript);
         prepared.transcript_ens = use_ensemble;
+        prepared.transcript_operator = false;
     }
+    Ok(engine)
+}
+
+/// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
+/// Segment. Transcription happens once via [`ensure_transcript`] (cached on the
+/// `PreparedClip`), so a re-render after another nudge — or after the editor's
+/// Transcribe pre-pass — is NVENC-only. `camera` switches the composite to the
+/// dynamic active-speaker cut plan; `transcript_override` burns the operator's
+/// edited captions verbatim.
+#[allow(clippy::too_many_arguments)]
+fn do_render(
+    paths: &PipelinePaths,
+    session: &Session,
+    prepared: &mut PreparedClip,
+    layout: Layout,
+    style: CaptionStyle,
+    correct: bool,
+    placement: Option<CaptionPlacement>,
+    caption_engine: Option<CaptionEngine>,
+    camera: Option<CameraPlan>,
+    transcript_override: Option<Transcript>,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<PathBuf> {
+    let range = prepared.range;
+    // The operator's edited transcript is the render's truth: cache it as
+    // operator-owned (no whisper, no harvest, no re-timing — these are not
+    // guesses to second-guess) and skip transcription entirely.
+    if let Some(t) = transcript_override {
+        prepared.transcript = Some(t);
+        prepared.transcript_operator = true;
+    }
+    let engine = ensure_transcript(paths, session, prepared, correct, caption_engine, cancel, tx)?;
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
     // The editor's caption preview draws exactly what this render burns (ADR
     // 0036): ship the refined transcript now, so captions are on the operator's
@@ -1667,7 +1802,6 @@ fn do_render(
     // filtergraph path escaping) while libass scans only fonts — not the sibling
     // analysis.wav / project.json a flat fontsdir tried (and failed) to open.
     let _ = tx.send(Progress::Stage("Generating captions"));
-    let style = caption_style(caption_genre);
     let ass = yc_render::generate_ass(transcript, &style, placement);
     fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
     let fonts_dir = session.data_dir.join("fonts");
@@ -1688,23 +1822,41 @@ fn do_render(
     persist_clip(&session.vod, &clip, &session.data_dir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
-    let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
     // The output is an absolute path (only the `subtitles=clip.ass` filter must
     // stay relative for libass); ffmpeg runs in data/ so the relative ASS + font
     // resolve, and writes the Short up at the stream-folder root.
     let out_name = out_path.to_string_lossy();
-    let args = yc_render::export_args(
-        &prepared.render_src,
-        prepared.seek_s,
-        range.duration_s(),
-        &filtergraph,
-        &out_name,
-    );
+    let args = match &camera {
+        // Active-speaker camera (focus 2026-07): the per-shot cut concat. The
+        // graph grows with the shot count, so it travels as a script file.
+        Some(plan) if !plan.shots.is_empty() => {
+            let graph = yc_render::build_camera_filtergraph(plan, "clip.ass");
+            fs::write(session.data_dir.join("camera.fg"), graph)
+                .context("writing camera filtergraph")?;
+            yc_render::export_args_script(
+                &prepared.render_src,
+                prepared.seek_s,
+                range.duration_s(),
+                "camera.fg",
+                &out_name,
+            )
+        }
+        _ => {
+            let filtergraph = yc_render::build_filtergraph(&clip.layout, "clip.ass");
+            yc_render::export_args(
+                &prepared.render_src,
+                prepared.seek_s,
+                range.duration_s(),
+                &filtergraph,
+                &out_name,
+            )
+        }
+    };
     yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args, &|| cancel.is_cancelled())?;
 
     // Remember this Creator's Caption Style + engine for the next import
     // (ADR 0016 / ADR 0035). `engine` is the resolved selection, pre-override.
-    remember_creator_render(&paths.workspace, &session.vod, caption_genre, engine);
+    remember_creator_render(&paths.workspace, &session.vod, style.genre, engine);
 
     Ok(out_path)
 }
@@ -1851,25 +2003,6 @@ fn persist_clip(vod: &Vod, clip: &Clip, data_dir: &Path) -> Result<()> {
 
 // --- auto-detect framing (M6, ADR 0011) -------------------------------------
 
-/// Choose the Clip's Layout (ADR 0017): detect the Facecam in the Segment's
-/// frames (M6/ADR 0011), then apply the operator's `pref`. `Auto` runs the
-/// three-way auto-decision (stacked / full-cam / full-frame gameplay); a forced
-/// kind overrides it, still using the detected Facecam Crop when one was found.
-/// Detection is best-effort - with no `face` feature, a missing model, or a
-/// detection error the Facecam is `None`, and the forced seeds (or Auto's
-/// full-frame fallback) apply.
-fn build_layout(
-    paths: &PipelinePaths,
-    render_src: &Path,
-    seek_s: f64,
-    src_w: f32,
-    src_h: f32,
-    pref: LayoutPref,
-) -> Layout {
-    let faces = detect_facecam(paths, render_src, seek_s, src_w, src_h);
-    yc_frame::decide_layout_with_pref(pref, &faces, src_w, src_h, yc_frame::SEAM_DEFAULT)
-}
-
 /// Detect the static Facecam(s) in the Segment (ADR 0011, multi-face ext) — one
 /// per cam, two for a co-stream cam — or an empty Vec when the `face` feature /
 /// model is absent, detection errors, or no face persists.
@@ -1945,30 +2078,119 @@ fn detect_facecam_inner(
     Ok(clusters)
 }
 
-/// The default Caption Style preset: one word per caption (huge-word), which
-/// keeps a single word on screen at its own spoken onset — tighter perceived
-/// The Caption Style for a chosen animation `genre` (M7). The genre is the only
-/// thing that varies the build; the rest is data (ADR 0004) — Anton, white text +
-/// gold accent. Font size is the one size-sensitive datum: huge-word is one big
-/// word filling the width, the multi-word genres (rolling-pop / karaoke-fill) need
-/// a smaller size so a ~22-char line fits the 1080-wide canvas. The full per-Clip
-/// preset editor + per-Creator defaults are the rest of M7.
-pub(crate) fn caption_style(genre: CaptionGenre) -> CaptionStyle {
-    let (name, font_size) = match genre {
-        // Large: one word at a time, meant to read on a phone. ~15 Anton chars fit
-        // the 1080-wide canvas at 150; longer words are rare (tune freely).
-        CaptionGenre::HugeWord => ("Huge Word", 150),
-        CaptionGenre::RollingPop => ("Rolling Pop", 96),
-        CaptionGenre::KaraokeFill => ("Karaoke Fill", 96),
-    };
-    CaptionStyle {
-        name: name.into(),
-        genre,
-        font_family: "Anton".into(),
-        font_size,
-        primary_color: [255, 255, 255, 255],
-        accent_color: [255, 209, 0, 255],
+// --- podcast speaker analysis (focus 2026-07) ---------------------------------
+
+/// Tracking-frame dimensions for the speaker pass: aspect-preserving, long edge
+/// ~640 (mouth motion needs more pixels than Ultraface's 320x240, far fewer
+/// than the source), even so the ffmpeg scaler never complains.
+#[cfg_attr(not(feature = "face"), allow(dead_code))]
+fn tracking_dims(src_w: f32, src_h: f32) -> (u32, u32) {
+    const LONG_EDGE: f32 = 640.0;
+    let even = |v: f32| (((v.round().max(2.0)) as u32) / 2) * 2;
+    if src_w >= src_h {
+        let w = src_w.min(LONG_EDGE);
+        (even(w), even(w * src_h / src_w))
+    } else {
+        let h = src_h.min(LONG_EDGE);
+        (even(h * src_w / src_h), even(h))
     }
+}
+
+/// Podcast speaker analysis over the prepared Segment (focus 2026-07): stream
+/// tracking frames at [`yc_frame::speaker::SPEAKER_FPS`], detect faces per
+/// frame (Ultraface, CPU), build persistent tracks with per-bin mouth
+/// activity, gate by the clip audio, attribute the speaker per bin, and derive
+/// the cut-based active-speaker [`CameraPlan`]. Memory stays one frame deep
+/// (streamed); a 60 s clip runs in roughly the time of its face inference.
+#[cfg(feature = "face")]
+fn do_analyze_speakers(
+    paths: &PipelinePaths,
+    session: &Session,
+    prepared: &PreparedClip,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<(SpeakerAnalysis, CameraPlan)> {
+    use yc_frame::speaker;
+    anyhow::ensure!(
+        paths.face_model.is_file(),
+        "face model missing - download version-RFB-320.onnx (fetch-models.ps1)"
+    );
+    let _ = tx.send(Progress::Stage("Analyzing speakers (faces + voice)"));
+    let dur = prepared.range.duration_s();
+    let fps = speaker::SPEAKER_FPS;
+    let max_frames = (dur * fps).ceil() as usize + 4;
+    let (tw, th) = tracking_dims(prepared.src_w, prepared.src_h);
+    let mut detector = yc_frame::Detector::load(&paths.face_model)?;
+    let mut builder =
+        speaker::TrackBuilder::new(prepared.src_w, prepared.src_h, tw as usize, th as usize);
+    let mut det_buf = vec![0u8; yc_frame::infer::DET_W * yc_frame::infer::DET_H * 3];
+    let mut detect_err: Option<anyhow::Error> = None;
+    let (src_w, src_h) = (prepared.src_w, prepared.src_h);
+    yc_ingest::stream_frames_rgb(
+        &paths.ffmpeg,
+        &prepared.render_src,
+        prepared.seek_s,
+        dur,
+        tw,
+        th,
+        fps,
+        max_frames,
+        &mut |rgb| {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            speaker::downscale_rgb(
+                rgb,
+                tw as usize,
+                th as usize,
+                &mut det_buf,
+                yc_frame::infer::DET_W,
+                yc_frame::infer::DET_H,
+            );
+            match detector.detect(&det_buf, src_w, src_h) {
+                Ok(faces) => {
+                    builder.observe(&faces, rgb);
+                    true
+                }
+                Err(e) => {
+                    detect_err = Some(e);
+                    false
+                }
+            }
+        },
+    )?;
+    if let Some(e) = detect_err {
+        return Err(e.context("face detection during speaker analysis"));
+    }
+    if cancel.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+    let tracks = builder.finish();
+    tracing::info!(tracks = tracks.len(), "speaker analysis: tracks built");
+
+    let samples = yc_ingest::read_range_samples(&session.analysis_wav, prepared.range)?;
+    let bin_s = 1.0 / fps;
+    let n_bins = (dur * fps).ceil().max(1.0) as usize;
+    let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
+    let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
+    let analysis = SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence };
+    let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur);
+    tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
+    Ok((analysis, plan))
+}
+
+/// Without the `face` feature there is no detector: speaker analysis cannot run.
+#[cfg(not(feature = "face"))]
+fn do_analyze_speakers(
+    _paths: &PipelinePaths,
+    _session: &Session,
+    _prepared: &PreparedClip,
+    _cancel: &CancelToken,
+    _tx: &Sender<Progress>,
+) -> Result<(SpeakerAnalysis, CameraPlan)> {
+    anyhow::bail!(
+        "speaker detection needs a `face` build (cargo --features face) and the face model"
+    )
 }
 
 // --- output organization (ADR 0015) -----------------------------------------

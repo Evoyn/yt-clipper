@@ -141,10 +141,11 @@ fn main() -> anyhow::Result<()> {
 
         // Arousal candidates: robust-z the whole-VOD arousal series, peak-detect +
         // NMS on the arousal grid (hop_s spacing), then lead-window each peak
-        // exactly like discovery (lead_s/dur_s) and take top_n by arousal-z.
+        // exactly like discovery (lead_s + the min-duration window) and take
+        // top_n by arousal-z.
         let az = score::robust_z(&series);
         let peaks = score::find_peaks(&az, params.min_z);
-        let min_gap = (params.dur_s / hop_s).round().max(1.0) as usize;
+        let min_gap = (params.min_dur_s / hop_s).round().max(1.0) as usize;
         let kept = score::nms(peaks, &az, min_gap);
         let arousal_cands: Vec<(f64, f64, f32, f32)> = kept // (start_s, end_s, arousal, loud)
             .into_iter()
@@ -152,7 +153,7 @@ fn main() -> anyhow::Result<()> {
             .map(|i| {
                 let center = starts[i] as f64 / sr + arousal::WINDOW_S / 2.0;
                 let start = (center - params.lead_s).max(0.0);
-                (start, start + params.dur_s, series[i], loud[i])
+                (start, start + params.min_dur_s, series[i], loud[i])
             })
             .collect();
 

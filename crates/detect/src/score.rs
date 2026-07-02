@@ -166,6 +166,119 @@ pub fn peak_to_range(peak_bin: usize, bin_s: f64, lead_s: f64, dur_s: f64, vod_d
     TimeRange { start_s, end_s }
 }
 
+/// Fraction of the peak's combined score below which the moment is considered
+/// "over" — the sustain walk in [`adaptive_range`] stops here. Floored at
+/// [`SUSTAIN_FLOOR_Z`] so a barely-over-threshold peak doesn't chase noise.
+const SUSTAIN_FRAC: f32 = 0.45;
+const SUSTAIN_FLOOR_Z: f32 = 0.5;
+/// Breathing room appended after the last elevated bin (the reaction's tail) and
+/// prepended before an early build-up, seconds.
+const TAIL_PAD_S: f64 = 2.0;
+const BUILDUP_PAD_S: f64 = 1.0;
+
+/// A peak bin -> a **naturally-sized** Moment range (the fix for "every clip is
+/// ~30 s"): instead of a fixed duration, the window grows to cover the span
+/// where the combined signal stays *elevated* — a sustained hype moment keeps
+/// its whole arc (40-60 s+), a sharp one-off stays tight — bounded by
+/// `[min_dur_s, max_dur_s]` and clamped to the VOD.
+///
+/// - **start**: the earlier of (peak − `lead_s`, the ADR 0020 signal-aware
+///   pre-roll, which stays the *minimum*) and the elevated region's left edge
+///   minus a small build-up pad.
+/// - **end**: the elevated region's right edge plus a tail pad, floored so the
+///   range is at least `min_dur_s` and capped at `max_dur_s` (the tail is
+///   trimmed first — the build-up and peak are what make the clip land).
+///
+/// Elevated = `combined >= max(SUSTAIN_FRAC * peak_value, SUSTAIN_FLOOR_Z)`,
+/// walked contiguously outward from the peak so an unrelated later spike never
+/// glues two moments together.
+pub fn adaptive_range(
+    combined: &[f32],
+    peak_bin: usize,
+    bin_s: f64,
+    lead_s: f64,
+    min_dur_s: f64,
+    max_dur_s: f64,
+    vod_dur_s: f64,
+) -> TimeRange {
+    let n = combined.len();
+    if n == 0 || peak_bin >= n {
+        return TimeRange { start_s: 0.0, end_s: min_dur_s.min(vod_dur_s) };
+    }
+    let peak_t = peak_bin as f64 * bin_s + bin_s / 2.0;
+    let sustain = (SUSTAIN_FRAC * combined[peak_bin]).max(SUSTAIN_FLOOR_Z);
+    // Bound each walk so a pathological flat-hot series can't scan the whole VOD.
+    let max_walk = (max_dur_s / bin_s).ceil() as usize;
+
+    let mut left = peak_bin;
+    while left > 0 && peak_bin - (left - 1) <= max_walk && combined[left - 1] >= sustain {
+        left -= 1;
+    }
+    let mut right = peak_bin;
+    while right + 1 < n && (right + 1) - peak_bin <= max_walk && combined[right + 1] >= sustain {
+        right += 1;
+    }
+
+    // Start: the ADR 0020 lead is the minimum pre-roll; an earlier build-up
+    // (elevation before the lead window) extends it, padded — but the build-up
+    // never takes more than ~a third of the duration budget, so the tail cap
+    // below can never push the peak itself out of the window.
+    let elev_start = left as f64 * bin_s - BUILDUP_PAD_S;
+    let max_buildup = (max_dur_s * 0.35).max(lead_s);
+    let mut start_s = (peak_t - lead_s).min(elev_start).max(peak_t - max_buildup).max(0.0);
+    // End: the elevation's tail plus breathing room, floored at min_dur_s.
+    let elev_end = (right + 1) as f64 * bin_s + TAIL_PAD_S;
+    let mut end_s = elev_end.max(start_s + min_dur_s);
+    // Cap: trim the tail first (never the build-up/peak), then clamp to the VOD.
+    if end_s - start_s > max_dur_s {
+        end_s = start_s + max_dur_s;
+    }
+    end_s = end_s.min(vod_dur_s.max(start_s));
+    // A peak near the VOD end can leave less than min_dur after clamping; pull
+    // the start back so short-but-real moments at the tail keep their floor.
+    if end_s - start_s < min_dur_s {
+        start_s = (end_s - min_dur_s).max(0.0);
+    }
+    TimeRange { start_s, end_s }
+}
+
+/// Overlap-suppress adaptive candidate ranges, strongest-first: a later
+/// (weaker) candidate is trimmed away from every already-kept range; if what
+/// remains is shorter than `min_dur_s` or no longer contains its peak, it is
+/// dropped. Returns the surviving `(peak_bin, range)`s in the input (strength)
+/// order. This replaces the fixed-gap NMS spacing guarantee now that ranges
+/// vary in length.
+pub fn suppress_overlaps(
+    candidates: Vec<(usize, TimeRange)>,
+    bin_s: f64,
+    min_dur_s: f64,
+) -> Vec<(usize, TimeRange)> {
+    let mut kept: Vec<(usize, TimeRange)> = Vec::new();
+    'cand: for (bin, mut range) in candidates {
+        let peak_t = bin as f64 * bin_s + bin_s / 2.0;
+        for (_, k) in &kept {
+            // No overlap with this kept range.
+            if range.end_s <= k.start_s || range.start_s >= k.end_s {
+                continue;
+            }
+            // Trim the side that intrudes; if the peak itself sits inside the
+            // kept range, this candidate is a shoulder of it — drop.
+            if peak_t >= k.start_s && peak_t < k.end_s {
+                continue 'cand;
+            }
+            if peak_t < k.start_s {
+                range.end_s = range.end_s.min(k.start_s);
+            } else {
+                range.start_s = range.start_s.max(k.end_s);
+            }
+        }
+        if range.duration_s() >= min_dur_s && peak_t >= range.start_s && peak_t < range.end_s {
+            kept.push((bin, range));
+        }
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +354,64 @@ mod tests {
         assert!((peak_lead_s(-0.5, 1.0, 3.0, 5.0, 10.0) - 5.0).abs() < 1e-6);
         // A very loud peak (above hi) is capped at the max lead.
         assert!((peak_lead_s(9.0, 1.0, 3.0, 5.0, 10.0) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adaptive_range_stays_tight_on_a_spike_and_grows_over_a_plateau() {
+        // A lone spike: nothing elevated around it -> the minimum window (lead
+        // pre-roll + min_dur floor), exactly the old fixed behaviour.
+        let mut spike = vec![0.0f32; 300];
+        spike[100] = 4.0;
+        let r = adaptive_range(&spike, 100, 1.0, 5.0, 15.0, 90.0, 300.0);
+        assert!((r.start_s - 95.5).abs() < 1e-6, "start {}", r.start_s); // peak_t 100.5 - lead 5
+        assert!((r.duration_s() - 15.0).abs() < 1e-6, "dur {}", r.duration_s());
+
+        // A 40 s sustained plateau (hype arc): the window covers the whole arc
+        // plus pads, well past the old fixed 30 s.
+        let mut plateau = vec![0.0f32; 300];
+        for v in plateau.iter_mut().skip(100).take(40) {
+            *v = 3.0;
+        }
+        plateau[110] = 4.0; // the peak inside the arc
+        let r = adaptive_range(&plateau, 110, 1.0, 5.0, 15.0, 90.0, 300.0);
+        assert!(r.start_s <= 99.0 + 1e-6, "covers the arc start, got {}", r.start_s);
+        assert!(r.end_s >= 140.0, "covers the arc tail, got {}", r.end_s);
+        assert!(r.duration_s() > 40.0 && r.duration_s() <= 90.0, "dur {}", r.duration_s());
+    }
+
+    #[test]
+    fn adaptive_range_caps_at_max_and_respects_the_vod_end() {
+        // A plateau far longer than the cap: trimmed to max_dur_s, tail first
+        // (the start keeps the build-up + peak).
+        let hot = vec![3.0f32; 600];
+        let r = adaptive_range(&hot, 300, 1.0, 5.0, 15.0, 60.0, 600.0);
+        assert!((r.duration_s() - 60.0).abs() < 1e-6, "dur {}", r.duration_s());
+        assert!(r.start_s <= 295.5 && 300.5 < r.end_s, "peak stays inside");
+
+        // A peak at the VOD tail: the end clamps to the VOD and the start pulls
+        // back to keep the min_dur floor.
+        let mut tail = vec![0.0f32; 100];
+        tail[98] = 4.0;
+        let r = adaptive_range(&tail, 98, 1.0, 5.0, 15.0, 90.0, 100.0);
+        assert!(r.end_s <= 100.0 + 1e-6);
+        assert!((r.duration_s() - 15.0).abs() < 1e-6, "dur {}", r.duration_s());
+    }
+
+    #[test]
+    fn suppress_overlaps_trims_weaker_and_drops_contained() {
+        let a = (50usize, TimeRange { start_s: 40.0, end_s: 100.0 }); // strongest
+        // Peak inside a's range -> a shoulder of the same moment, dropped.
+        let b = (60usize, TimeRange { start_s: 55.0, end_s: 120.0 });
+        // Overlapping tail but its own peak outside a -> trimmed to start at 100.
+        let c = (110usize, TimeRange { start_s: 90.0, end_s: 140.0 });
+        // Too little left after the trim (would be 100..104) -> dropped.
+        let d = (102usize, TimeRange { start_s: 95.0, end_s: 104.0 });
+        let kept = suppress_overlaps(vec![a, b, c, d], 1.0, 15.0);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].0, 50);
+        assert_eq!(kept[1].0, 110);
+        assert!((kept[1].1.start_s - 100.0).abs() < 1e-6, "trimmed to the kept edge");
+        assert!((kept[1].1.end_s - 140.0).abs() < 1e-6);
     }
 
     #[test]

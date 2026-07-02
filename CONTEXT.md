@@ -1,6 +1,6 @@
 # YT Clipper
 
-A Windows-first desktop app that turns long gaming VODs into vertical short-form clips — transcription, moment detection, framing, captioning, and export all happen on the user's own machine.
+A Windows-first desktop app that turns long VODs — gaming streams and podcasts — into vertical short-form clips: transcription, moment detection, framing, speaker tracking, captioning, and export all happen on the user's own machine.
 
 ## Language
 
@@ -99,6 +99,30 @@ _Avoid_: caption position (underspecifies — placement also scales), caption st
 **Caption engine**:
 The per-Creator choice of how a Clip's caption words are transcribed: **Whisper** (the single-decode default) or the **Qwen ensemble** (a five-variant vote with whisper as a voter, timing fused onto skeleton anchors and speech onsets — ADR 0034). A closed enum, not a model picker — the ensemble is a measured recipe, and a new model earns entry only through ADR 0034's gate. Remembered in the Creator store like Caption Style (ADR 0016); switching it for a curated Creator is a deliberate act (ADR 0033): the app states which of their existing corrections carry across (ADR 0035).
 _Avoid_: model picker (a recipe, not a GGUF choice), decoder (ambiguous with whisper's internal decode config), ASR toggle
+
+**Studio**:
+The full-window editor page a Promote opens into (ADR 0039): transcript editor left, Before/After video preview center (Original = source frame + crop tools + face overlays; Preview = the composited 9:16 output + captions + safe-area guide), properties right (Camera / Framing / Caption style), timeline bottom (captions, speaker lanes, cut markers, playhead). Prepare auto-queues the caption pre-pass (`Job::Transcribe`) so the transcript is editable before any render; Export shows a summary (length / resolution / captions / camera / estimated time) before rendering.
+_Avoid_: nudge editor (the old docked panel it replaced), preview window (it is a page, not a popup)
+
+**Camera mode**:
+How the Studio frames a Clip: **Manual** (the operator's own crops), **Center**, **Auto face** (a static crop on the most persistent face), **Active Speaker** (the cut-based plan following whoever talks — the podcast recommendation), or **Group** (everyone at once; 2 people = the stacked split screen). The AI modes derive framing from the Speaker analysis; dragging the frame in an AI mode flips to Manual.
+_Avoid_: layout preference (that is the pre-editor stacked/full choice, ADR 0017), tracking mode
+
+**Speaker track**:
+One tracked person in a podcast Clip (`yc_frame::speaker`): a persistent face position (podcast cameras are static), per-bin **mouth activity** (luma change over a fixed grid in the lower face box), and the "Person A/B/C" label (left-to-right). The **Speaker analysis** (ADR 0038) gates activity by an audio VAD and attributes a speaker per time bin with a switch margin + confirmation hold, giving the editor's face overlays, speaker timeline, and confidence chip.
+_Avoid_: diarization (that is the audio-embedding approach this deliberately isn't — yet), face cluster (that is M6's Facecam detection; a track adds time-series activity)
+
+**Camera plan**:
+The cut-based dynamic framing of an Active-Speaker Clip: contiguous **Shots**, each a clip-relative time span framed by one static Layout (solo 9:16 crop, or a split screen for a group shot). Cuts, not pans — human podcast editors cut; a virtual camera panning a static wide shot reads as amateur. Minimum shot length, flicker absorption, and rapid exchanges collapsing into a group shot keep it calm (ADR 0038). Rendered as a per-shot trim/crop concat in one ffmpeg pass (`camera.fg`), captions burned once over the joined stream. The operator overrides a shot by clicking another face at that time.
+_Avoid_: keyframes (nothing interpolates), camera path (implies motion inside a shot)
+
+**Caption preset**:
+A named, complete `CaptionStyle` bundle the Studio's Caption panel starts from — Classic, TikTok, Podcast, Minimal, Gaming, MrBeast — pure data over the extended style fields (outline width/colour, shadow, back box, bold; ADR 0004/0039). Picking one replaces the whole style; every field stays editable after, and any tweak deselects the chip. The Creator store still remembers only the *genre* (ADR 0016).
+_Avoid_: theme, template (both suggest something beyond field values)
+
+**Transcript override**:
+The operator's edited transcript from the Studio's caption panel (edit / add / delete / split / merge / censor, `m:ss.cc` timestamps), shipped with a Render and burned **verbatim** — no whisper, no harvest, no silence-drop, no re-timing (ADR 0039): the automated timing machinery exists to clean whisper's guesses, not the operator's words. Per-clip and immediate, unlike Dialect-store curation (durable per Creator, ADR 0031).
+_Avoid_: correction (that is the dialect/LLM pass over whisper output), custom captions
 
 **Offline**:
 The core constraint: all analysis and rendering happens on the local machine. The only permitted network use is user-initiated ingestion of a VOD.

@@ -14,4 +14,6 @@ pub use ass::{
     refine_caption_timing_traced, resolve_placement, word_states, PreviewLine, PreviewWord,
     RefineTrace, UnitOutcome, WordState,
 };
-pub use export::{build_filtergraph, export_args, run_export};
+pub use export::{
+    build_camera_filtergraph, build_filtergraph, export_args, export_args_script, run_export,
+};

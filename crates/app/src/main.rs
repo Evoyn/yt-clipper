@@ -9,6 +9,7 @@
 
 mod editor;
 mod pipeline;
+mod presets;
 mod review_queue;
 mod theme;
 
@@ -17,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress, Timeline};
-use yc_core::{CaptionEngine, CaptionGenre, Language, LayoutPref, Moment, Signals, TimeRange};
+use yc_core::{
+    CaptionEngine, CaptionGenre, CaptionStyle, Language, LayoutPref, Moment, Signals, TimeRange,
+};
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
@@ -93,10 +96,12 @@ fn main() -> eframe::Result<()> {
                     to_worker
                         .send(Job::Render {
                             layout,
-                            caption_genre,
+                            style: CaptionStyle::for_genre(caption_genre),
                             correct: correct_from_env(),
                             placement: None,
                             caption_engine: None,
+                            camera: None,
+                            transcript_override: None,
                         })
                         .expect("send render");
                 }
@@ -114,6 +119,8 @@ fn main() -> eframe::Result<()> {
                 }
                 Ok(Progress::Detected { .. }) => {} // not reachable in promote-only mode
                 Ok(Progress::Captions { .. }) => {} // preview-only (ADR 0036); no editor headless
+                Ok(Progress::Speakers { .. }) => {} // editor-only (podcast mode)
+                Ok(Progress::JobDone) => {}
                 Err(_) => std::process::exit(1),
             }
         }
@@ -135,16 +142,17 @@ fn main() -> eframe::Result<()> {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
-                    to_worker.send(Job::Detect).expect("send detect");
+                    to_worker.send(Job::Detect { max_dur_s: max_clip_s_from_env() }).expect("send detect");
                 }
                 Ok(Progress::Detected { moments, .. }) => {
                     println!("detected {} moments:", moments.len());
                     for m in &moments {
                         println!(
-                            "  #{:<2} {:>8}-{:<8} score {:5.2}  chat {} loud {} lex {} arou {} llm {}",
+                            "  #{:<2} {:>8}-{:<8} {:>4.0}s score {:5.2}  chat {} loud {} lex {} arou {} llm {}",
                             m.id,
                             fmt_clock(m.range.start_s),
                             fmt_clock(m.range.end_s),
+                            m.range.duration_s(),
                             m.score,
                             fmt_sig(m.signals.chat_rate),
                             fmt_sig(m.signals.loudness),
@@ -169,6 +177,8 @@ fn main() -> eframe::Result<()> {
                 }
                 Ok(Progress::Prepared { .. }) => {} // not reachable in detect-only mode
                 Ok(Progress::Captions { .. }) => {}
+                Ok(Progress::Speakers { .. }) => {}
+                Ok(Progress::JobDone) => {}
                 Ok(Progress::Done(_)) => {}
                 Err(_) => std::process::exit(1),
             }
@@ -204,7 +214,7 @@ fn main() -> eframe::Result<()> {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
-                    to_worker.send(Job::Detect).expect("send detect");
+                    to_worker.send(Job::Detect { max_dur_s: max_clip_s_from_env() }).expect("send detect");
                 }
                 Ok(Progress::Detected { moments, .. }) => {
                     queue = moments.iter().take(k).map(|m| (m.range, m.title.clone())).collect();
@@ -227,10 +237,12 @@ fn main() -> eframe::Result<()> {
                     to_worker
                         .send(Job::Render {
                             layout,
-                            caption_genre,
+                            style: CaptionStyle::for_genre(caption_genre),
                             correct: correct_from_env(),
                             placement: None,
                             caption_engine: None,
+                            camera: None,
+                            transcript_override: None,
                         })
                         .expect("send render");
                 }
@@ -258,6 +270,8 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(1);
                 }
                 Ok(Progress::Captions { .. }) => {} // preview-only (ADR 0036); no editor in batch
+                Ok(Progress::Speakers { .. }) => {}
+                Ok(Progress::JobDone) => {}
                 Err(_) => std::process::exit(1),
             }
         }
@@ -288,6 +302,7 @@ fn main() -> eframe::Result<()> {
                 saved_engine: None,
                 correct_captions: false, // opt-in (ADR 0031); off until the operator ticks it
                 layout_pref: LayoutPref::default(),
+                max_clip_s: yc_detect::DetectParams::default().max_dur_s,
                 imported: None,
                 moments: Vec::new(),
                 selected: None,
@@ -300,6 +315,7 @@ fn main() -> eframe::Result<()> {
                 volume: 1.0,
                 status: Status::Idle,
                 editor: None,
+                pending_title: None,
                 batch_selected: HashSet::new(),
                 render_queue: Vec::new(),
                 queue_idx: 0,
@@ -475,6 +491,10 @@ struct App {
     /// auto-detect, the others force stacked / full-cam / full-gameplay. A global
     /// session selection (the nudge editor can still override per-Clip).
     layout_pref: LayoutPref,
+    /// Ceiling for a detected Moment's adaptive length, seconds (30..=180, the
+    /// YouTube-Shorts maximum). The detector picks each Moment's natural length
+    /// below this.
+    max_clip_s: f64,
     imported: Option<ImportedInfo>,
     /// Candidate Moments from detection (and any manually-marked ones), ranked.
     moments: Vec<Moment>,
@@ -497,9 +517,13 @@ struct App {
     /// a quiet streamer in the mixed track (rodio amplifies linearly).
     volume: f32,
     status: Status,
-    /// The nudge editor, open from Prepare until the operator dismisses it or a
-    /// new Prepare/import replaces it (ADR 0012); persists across re-renders.
+    /// The Studio editor page, open from Prepare until the operator dismisses
+    /// it or a new Prepare/import replaces it (ADR 0012); persists across
+    /// re-renders.
     editor: Option<editor::EditorState>,
+    /// The Moment title promoted into the editor (Prepare carries it to the
+    /// worker; the editor toolbar shows it).
+    pending_title: Option<String>,
     /// Moment ids checked for a batch render (M8 job-queue): "Render selected"
     /// renders them sequentially, each auto-framed (no editor).
     batch_selected: HashSet<u64>,
@@ -525,7 +549,7 @@ struct App {
 /// paints the same arc (radius/points/stroke copied from egui 0.34
 /// `Spinner::paint_at`) and lets the throttle's `request_repaint_after` drive
 /// the animation at ~10 fps instead.
-fn throttled_spinner(ui: &mut egui::Ui) {
+pub(crate) fn throttled_spinner(ui: &mut egui::Ui) {
     let size = ui.style().spacing.interact_size.y;
     let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -627,6 +651,16 @@ fn parse_layout_pref(arg: Option<&str>) -> LayoutPref {
     }
 }
 
+/// The max Moment length (seconds) for headless/batch detection: `YC_MAX_CLIP_S`
+/// overrides, else the detector's default cap. Clamped downstream to the 180 s
+/// Shorts ceiling. The GUI exposes the same knob as a slider.
+fn max_clip_s_from_env() -> f64 {
+    std::env::var("YC_MAX_CLIP_S")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(yc_detect::DetectParams::default().max_dur_s)
+}
+
 /// Whether headless/batch renders should run the LLM caption-correction pass (ADR
 /// 0030/0031). Off by default (matching the GUI checkbox); opt in with `YC_CORRECT=1`
 /// (or on/true/yes). Only effective in a `correct` build with the sidecar present.
@@ -706,6 +740,7 @@ impl eframe::App for App {
                     frame_h,
                     frame_fps,
                     range,
+                    faces,
                 } => {
                     // Batch render (M8): auto-render this clip with its auto-detected
                     // Layout (no editor); the Done handler advances the queue.
@@ -714,15 +749,17 @@ impl eframe::App for App {
                     if !self.render_queue.is_empty() {
                         let _ = self.to_worker.send(Job::Render {
                             layout,
-                            caption_genre: self.caption_genre,
+                            style: CaptionStyle::for_genre(self.caption_genre),
                             correct: self.correct_captions,
                             placement: None,
                             caption_engine: Some(self.caption_engine),
+                            camera: None,
+                            transcript_override: None,
                         });
                         continue;
                     }
                     // Single clip: upload the preview frames to textures and open the
-                    // nudge editor seeded with the auto-detected Layout (ADR 0012).
+                    // Studio editor seeded with the auto-detected Layout (ADR 0012).
                     let ctx = ui.ctx().clone();
                     let expected = frame_w as usize * frame_h as usize * 3;
                     let textures: Vec<egui::TextureHandle> = frames
@@ -742,25 +779,50 @@ impl eframe::App for App {
                     if textures.is_empty() {
                         self.status = Status::Failed("no preview frames extracted".into());
                     } else {
-                        self.editor = Some(editor::EditorState::from_seed(
+                        let podcast_frame = faces.len() >= 2;
+                        let mut ed = editor::EditorState::from_seed(
                             layout,
                             src_w,
                             src_h,
                             range,
+                            self.pending_title.clone(),
                             textures,
                             frame_fps,
                             self.caption_genre,
-                        ));
-                        self.status = Status::Idle;
+                            faces,
+                        );
+                        // The editor workflow pre-passes (focus 2026-07): kick
+                        // transcription now so captions are editable before any
+                        // render (the render then reuses the cache, NVENC-only);
+                        // a 2+-face frame reads as a podcast, so the speaker
+                        // analysis queues right behind it (the worker is serial).
+                        let _ = self.to_worker.send(Job::Transcribe {
+                            correct: self.correct_captions,
+                            caption_engine: Some(self.caption_engine),
+                        });
+                        self.status = Status::Working("Transcribing captions".into());
+                        if podcast_frame {
+                            let _ = self.to_worker.send(Job::AnalyzeSpeakers);
+                            ed.speaker_job = editor::SpeakerJob::Running;
+                        }
+                        self.editor = Some(ed);
                     }
                 }
                 Progress::Captions { transcript } => {
-                    // The refined transcript this render burns (ADR 0036): hand it
-                    // to the editor so the caption overlay previews the render's
-                    // truth (arrives while NVENC still runs).
+                    // The refined transcript a Transcribe/Render produced (ADR
+                    // 0036): hand it to the editor so the caption panel + overlay
+                    // show the render's truth.
                     if let Some(ed) = &mut self.editor {
                         ed.set_captions(transcript);
                     }
+                }
+                Progress::Speakers { analysis, plan } => {
+                    if let Some(ed) = &mut self.editor {
+                        ed.set_speakers(analysis, plan);
+                    }
+                }
+                Progress::JobDone => {
+                    self.status = Status::Idle;
                 }
                 Progress::Done(p) => {
                     // The render just persisted the rail's engine selection per
@@ -803,6 +865,13 @@ impl eframe::App for App {
                 Progress::Failed(e) => {
                     self.render_queue.clear();
                     self.queue_idx = 0;
+                    // A failure while the speaker analysis was in flight lands in
+                    // the editor's Camera panel (retryable) as well as the bar.
+                    if let Some(ed) = &mut self.editor {
+                        if ed.speaker_job == editor::SpeakerJob::Running {
+                            ed.speaker_job = editor::SpeakerJob::Failed(e.clone());
+                        }
+                    }
                     self.status = Status::Failed(e);
                 }
             }
@@ -826,63 +895,57 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
-        // --- W4: two-pane clip workspace — a Moments rail (left) + a detail /
-        // preview pane (right), on the ADR 0024 theme. Each section is its own
-        // method so the panel structure stays legible. ---
-        egui::Panel::left("rail")
-            .resizable(true)
-            .default_size(380.0)
-            .min_size(300.0)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("rail").show(ui, |ui| {
-                    self.ui_preflight(ui);
-                    self.ui_import(ui, working);
-                    self.ui_moments(ui, working);
-                });
-            });
-        // --- Nudge editor (ADR 0012): frame the prepared Clip before render ---
-        // Docked as a right panel (operator ask, 2026-07-02) so the preview
-        // uses the detail pane's spare width instead of floating over it — the
-        // Moment text stays readable while framing. Added BEFORE the central
-        // pane (egui panels claim space in insertion order; central takes the
-        // rest). Its own vscroll keeps the tall 9:16 composite + Render
-        // reachable at any window height; the editor's Cancel dismisses it, so
-        // no window chrome is needed.
+        // --- Two pages: the Library (import + Moments + detail) and, once a
+        // Clip is promoted, the full-window Studio editor (focus 2026-07). The
+        // Studio owns the whole area below the brand bar — a promoted Clip is
+        // the operator's entire context until they Export or go Back. ---
         let mut editor_action = editor::EditorAction::None;
         if self.editor.is_some() {
-            egui::Panel::right("editor-panel")
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                if let Some(ed) = &mut self.editor {
+                    editor_action = ed.show(ui, !working);
+                }
+            });
+        } else {
+            egui::Panel::left("rail")
                 .resizable(true)
-                .default_size(400.0)
-                .min_size(340.0)
+                .default_size(380.0)
+                .min_size(300.0)
                 .show_inside(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("editor").show(ui, |ui| {
-                        if let Some(ed) = &mut self.editor {
-                            editor_action = ed.show(ui, !working);
-                        }
+                    egui::ScrollArea::vertical().id_salt("rail").show(ui, |ui| {
+                        self.ui_import(ui, working);
+                        self.ui_moments(ui, working);
+                        self.ui_preflight(ui);
                     });
                 });
-        }
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
-                self.ui_detail(ui, working);
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("detail").show(ui, |ui| {
+                    self.ui_detail(ui, working);
+                });
             });
-        });
+        }
 
         match editor_action {
-            editor::EditorAction::Render(layout, caption_genre, placement) => {
-                // The editor's per-Clip pick wins; mirror it back to the app's
-                // selection so it stays the default for the next clip. Placement
-                // stays per-Clip (ADR 0036) — nothing global to mirror.
-                self.caption_genre = caption_genre;
+            editor::EditorAction::Render(spec) => {
+                // The editor's per-Clip genre pick becomes the session default
+                // (and is what persists per Creator). Placement stays per-Clip
+                // (ADR 0036) — nothing global to mirror.
+                self.caption_genre = spec.style.genre;
                 self.stop_audio();
                 let _ = self.to_worker.send(Job::Render {
-                    layout,
-                    caption_genre,
+                    layout: spec.layout,
+                    style: spec.style,
                     correct: self.correct_captions,
-                    placement,
+                    placement: spec.placement,
                     caption_engine: Some(self.caption_engine),
+                    camera: spec.camera,
+                    transcript_override: spec.transcript_override,
                 });
                 self.status = Status::Working("Rendering".into());
+            }
+            editor::EditorAction::AnalyzeSpeakers => {
+                let _ = self.to_worker.send(Job::AnalyzeSpeakers);
+                self.status = Status::Working("Analyzing speakers".into());
             }
             editor::EditorAction::Cancel => {
                 self.stop_audio();
@@ -912,14 +975,13 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// The always-visible status painted into the top brand bar: a spinner + stage
-    /// + Cancel while a job runs, else a coloured outcome (full path / error on
-    /// hover). Rendered in a right-to-left layout, so the rightmost item is added
-    /// first.
+    /// The always-visible status painted into the top brand bar: a spinner +
+    /// stage + Cancel while a job runs, else a coloured chip (full path /
+    /// error on hover). Right-to-left layout — the rightmost item adds first.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         match &self.status {
             Status::Idle => {
-                ui.weak("Ready");
+                theme::status_chip(ui, egui::Color32::from_gray(120), "Ready");
             }
             Status::Working(stage) => {
                 if ui.button("Cancel").clicked() {
@@ -933,14 +995,20 @@ impl App {
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                ui.colored_label(theme::OK, format!("Done: {name}"))
-                    .on_hover_text(path.display().to_string());
+                let resp = ui.scope(|ui| {
+                    theme::status_chip(ui, theme::OK, &format!("Done · {}", ellipsize(&name, 36)));
+                });
+                resp.response.on_hover_text(path.display().to_string());
             }
             Status::Cancelled => {
-                ui.colored_label(theme::GOLD, "Cancelled");
+                theme::status_chip(ui, theme::GOLD, "Cancelled");
             }
             Status::Failed(err) => {
-                ui.colored_label(theme::ERR, "Failed").on_hover_text(err.clone());
+                let err = err.clone();
+                let resp = ui.scope(|ui| {
+                    theme::status_chip(ui, theme::ERR, "Failed");
+                });
+                resp.response.on_hover_text(err);
             }
         }
     }
@@ -1018,114 +1086,108 @@ impl App {
         ui.colored_label(theme::GOLD, text);
     }
 
-    /// Left-rail section: import a VOD — the per-clip defaults (language / caption /
-    /// layout) and the URL / local-file pickers.
+    /// Left-rail section: import a VOD — the URL / local-file pickers up top
+    /// (the first thing a new session needs), the per-import defaults below.
     fn ui_import(&mut self, ui: &mut egui::Ui, working: bool) {
-        ui.separator();
-        ui.strong("1 · Import a VOD");
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.label("Language");
-            egui::ComboBox::from_id_salt("lang")
-                .selected_text(match self.language {
-                    None => "Auto (Creator's saved)",
-                    Some(l) => lang_label(l),
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.language, None, "Auto (Creator's saved)");
-                    ui.selectable_value(&mut self.language, Some(Language::En), "English");
-                    ui.selectable_value(&mut self.language, Some(Language::Id), "Bahasa Indonesia");
-                    ui.selectable_value(&mut self.language, Some(Language::Ja), "Nihongo");
-                });
-            ui.weak("(streamer, not the game)");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Caption");
-            egui::ComboBox::from_id_salt("caption")
-                .selected_text(match self.caption_genre {
-                    CaptionGenre::HugeWord => "Huge Word",
-                    CaptionGenre::RollingPop => "Rolling Pop",
-                    CaptionGenre::KaraokeFill => "Karaoke",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::HugeWord, "Huge Word");
-                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
-                    ui.selectable_value(&mut self.caption_genre, CaptionGenre::KaraokeFill, "Karaoke");
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Engine");
-            egui::ComboBox::from_id_salt("engine")
-                .selected_text(match self.caption_engine {
-                    CaptionEngine::Whisper => "Whisper",
-                    CaptionEngine::QwenEnsemble => "Qwen ensemble",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.caption_engine, CaptionEngine::Whisper, "Whisper");
-                    ui.selectable_value(
-                        &mut self.caption_engine,
-                        CaptionEngine::QwenEnsemble,
-                        "Qwen ensemble",
-                    );
-                });
-            ui.weak("(saved per Creator; ensemble adds ~60-90 s)");
-        });
-        self.ui_engine_switch_warn(ui);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.correct_captions, "Correct captions (LLM)");
-            ui.weak("(curated slang/name fixes; needs a 'correct' build + sidecar)");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Layout");
-            egui::ComboBox::from_id_salt("layout")
-                .selected_text(match self.layout_pref {
-                    LayoutPref::Auto => "Auto-detect",
-                    LayoutPref::Stacked => "Stacked",
-                    LayoutPref::FullCam => "Full cam",
-                    LayoutPref::FullGameplay => "Full gameplay",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Auto, "Auto-detect");
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::Stacked, "Stacked (game + cam)");
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullCam, "Full cam");
-                    ui.selectable_value(&mut self.layout_pref, LayoutPref::FullGameplay, "Full gameplay");
-                });
-        });
-        ui.add_space(6.0);
-        ui.add_enabled_ui(!working, |ui| {
-            ui.label("YouTube URL");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.url)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("https://youtu.be/…"),
-            );
-            if ui.button("Import URL").clicked() && !self.url.trim().is_empty() {
-                self.start_import(ImportSource::YouTube(self.url.trim().to_string()));
-            }
-            ui.add_space(6.0);
-            ui.label("or a local file");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.video_path)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("path to a video / audio file"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Browse…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "video / audio",
-                            &["mp4", "mkv", "webm", "mov", "avi", "m4a", "mp3", "wav", "opus"],
-                        )
-                        .pick_file()
+        theme::section(ui, "Import a VOD");
+        theme::card().show(ui, |ui| {
+            ui.add_enabled_ui(!working, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.url)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://youtu.be/…"),
+                );
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, "Import URL").clicked()
+                        && !self.url.trim().is_empty()
                     {
-                        self.video_path = path.display().to_string();
-                        self.start_import(ImportSource::Local(path));
+                        self.start_import(ImportSource::YouTube(self.url.trim().to_string()));
                     }
-                }
-                if ui.button("Import file").clicked() && !self.video_path.trim().is_empty() {
-                    self.start_import(ImportSource::Local(PathBuf::from(self.video_path.trim())));
-                }
+                    ui.weak("or");
+                    if ui.button("Open a local file…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter(
+                                "video / audio",
+                                &["mp4", "mkv", "webm", "mov", "avi", "m4a", "mp3", "wav", "opus"],
+                            )
+                            .pick_file()
+                        {
+                            self.video_path = path.display().to_string();
+                            self.start_import(ImportSource::Local(path));
+                        }
+                    }
+                });
             });
+        });
+
+        theme::section(ui, "Defaults for this import");
+        theme::card().show(ui, |ui| {
+            egui::Grid::new("import-defaults").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Language");
+                egui::ComboBox::from_id_salt("lang")
+                    .selected_text(match self.language {
+                        None => "Auto (Creator's saved)",
+                        Some(l) => lang_label(l),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.language, None, "Auto (Creator's saved)");
+                        ui.selectable_value(&mut self.language, Some(Language::En), "English");
+                        ui.selectable_value(&mut self.language, Some(Language::Id), "Bahasa Indonesia");
+                        ui.selectable_value(&mut self.language, Some(Language::Ja), "Nihongo");
+                    });
+                ui.end_row();
+
+                ui.label("Caption style");
+                egui::ComboBox::from_id_salt("caption")
+                    .selected_text(match self.caption_genre {
+                        CaptionGenre::HugeWord => "Huge Word",
+                        CaptionGenre::RollingPop => "Rolling Pop",
+                        CaptionGenre::KaraokeFill => "Karaoke",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.caption_genre, CaptionGenre::HugeWord, "Huge Word");
+                        ui.selectable_value(&mut self.caption_genre, CaptionGenre::RollingPop, "Rolling Pop");
+                        ui.selectable_value(&mut self.caption_genre, CaptionGenre::KaraokeFill, "Karaoke");
+                    });
+                ui.end_row();
+
+                ui.label("Engine");
+                egui::ComboBox::from_id_salt("engine")
+                    .selected_text(match self.caption_engine {
+                        CaptionEngine::Whisper => "Whisper",
+                        CaptionEngine::QwenEnsemble => "Qwen ensemble",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.caption_engine, CaptionEngine::Whisper, "Whisper");
+                        ui.selectable_value(
+                            &mut self.caption_engine,
+                            CaptionEngine::QwenEnsemble,
+                            "Qwen ensemble",
+                        );
+                    })
+                    .response
+                    .on_hover_text("Saved per Creator; the ensemble adds ~60-90 s per clip (ADR 0035)");
+                ui.end_row();
+
+                ui.label("Layout");
+                egui::ComboBox::from_id_salt("layout")
+                    .selected_text(match self.layout_pref {
+                        LayoutPref::Auto => "Auto-detect",
+                        LayoutPref::Stacked => "Stacked",
+                        LayoutPref::FullCam => "Full cam",
+                        LayoutPref::FullGameplay => "Full gameplay",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.layout_pref, LayoutPref::Auto, "Auto-detect");
+                        ui.selectable_value(&mut self.layout_pref, LayoutPref::Stacked, "Stacked (game + cam)");
+                        ui.selectable_value(&mut self.layout_pref, LayoutPref::FullCam, "Full cam");
+                        ui.selectable_value(&mut self.layout_pref, LayoutPref::FullGameplay, "Full gameplay");
+                    });
+                ui.end_row();
+            });
+            ui.checkbox(&mut self.correct_captions, "LLM caption correction")
+                .on_hover_text("Apply curated slang/name fixes in context (needs a 'correct' build + sidecar; ADR 0030)");
+            self.ui_engine_switch_warn(ui);
         });
     }
 
@@ -1133,27 +1195,40 @@ impl App {
     /// list (pick one to see its detail on the right; check boxes for a batch
     /// render). The wide per-signal breakdown moved to the detail pane.
     fn ui_moments(&mut self, ui: &mut egui::Ui, working: bool) {
-        ui.separator();
         let enabled = !working;
+        theme::section(ui, "Moments");
         let Some((title, duration_s, language)) =
             self.imported.as_ref().map(|i| (i.title.clone(), i.duration_s, i.language))
         else {
-            ui.strong("2 · Moments");
             ui.weak("Import a VOD to detect Moments.");
             return;
         };
-        ui.strong("2 · Moments");
         // Show the resolved language so an Auto import's Creator default is visible.
-        ui.weak(format!("{title}  ({} · {})", fmt_duration(duration_s), lang_label(language)));
+        ui.label(egui::RichText::new(ellipsize(&title, 44)).strong());
+        ui.weak(format!("{} · {}", fmt_duration(duration_s), lang_label(language)));
+        ui.add_space(4.0);
         ui.add_enabled_ui(enabled, |ui| {
-            if ui.button("Detect Moments").clicked() {
-                self.moments.clear();
-                self.selected = None;
-                let _ = self.to_worker.send(Job::Detect);
-                self.status = Status::Working("Starting detection".into());
-            }
             ui.horizontal(|ui| {
-                ui.label("Manual:");
+                if theme::primary_button(ui, "Detect Moments").clicked() {
+                    self.moments.clear();
+                    self.selected = None;
+                    let _ = self.to_worker.send(Job::Detect { max_dur_s: self.max_clip_s });
+                    self.status = Status::Working("Starting detection".into());
+                }
+                ui.label("max");
+                ui.add(
+                    egui::Slider::new(&mut self.max_clip_s, 30.0..=180.0)
+                        .step_by(5.0)
+                        .suffix(" s"),
+                )
+                .on_hover_text(
+                    "Ceiling for a detected Moment. The detector picks the natural \
+                     length per moment (a sustained arc grows, a sharp one stays tight); \
+                     180 s is the YouTube Shorts maximum.",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.weak("Mark manually:");
                 ui.add(egui::DragValue::new(&mut self.start_s).speed(0.5).suffix("s"));
                 ui.label("→");
                 ui.add(egui::DragValue::new(&mut self.end_s).speed(0.5).suffix("s"));
@@ -1178,18 +1253,21 @@ impl App {
         let selected = self.selected;
         let mut to_select: Option<u64> = None;
         let mut batch_toggles: Vec<(u64, bool)> = Vec::new();
-        egui::ScrollArea::vertical().id_salt("moments").max_height(360.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("moments").max_height(380.0).show(ui, |ui| {
             for m in &self.moments {
                 ui.horizontal(|ui| {
                     let mut checked = self.batch_selected.contains(&m.id);
-                    if ui.add_enabled(enabled, egui::Checkbox::new(&mut checked, "")).changed() {
+                    if ui
+                        .add_enabled(enabled, egui::Checkbox::new(&mut checked, ""))
+                        .on_hover_text("Queue for a batch render")
+                        .changed()
+                    {
                         batch_toggles.push((m.id, checked));
                     }
                     let label = match m.title.as_deref().filter(|t| !t.is_empty()) {
-                        Some(t) => format!("#{}  {}", m.id, ellipsize(t, 30)),
+                        Some(t) => ellipsize(t, 30),
                         None => format!(
-                            "#{}  {}–{}",
-                            m.id,
+                            "{}–{}",
                             fmt_clock(m.range.start_s),
                             fmt_clock(m.range.end_s)
                         ),
@@ -1197,9 +1275,12 @@ impl App {
                     if ui.selectable_label(selected == Some(m.id), label).clicked() {
                         to_select = Some(m.id);
                     }
-                    if m.score > 0.0 {
-                        ui.weak(format!("{:.1}", m.score));
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if m.score > 0.0 {
+                            ui.weak(format!("{:.1}", m.score));
+                        }
+                        ui.weak(format!("{:.0}s", m.range.duration_s()));
+                    });
                 });
             }
         });
@@ -1428,30 +1509,38 @@ impl App {
             return;
         };
 
-        ui.horizontal(|ui| {
-            ui.heading(format!("Moment #{id}"));
-            ui.add_space(6.0);
-            ui.label(format!("{} – {}", fmt_clock(m.range.start_s), fmt_clock(m.range.end_s)));
-        });
         if let Some(t) = m.title.as_deref().filter(|t| !t.is_empty()) {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Title:");
-                ui.label(egui::RichText::new(t).color(theme::GOLD));
-            });
+            ui.heading(egui::RichText::new(t).color(theme::GOLD));
+        } else {
+            ui.heading(format!("Moment #{id}"));
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{} – {}",
+                fmt_clock(m.range.start_s),
+                fmt_clock(m.range.end_s)
+            ));
+            ui.weak(format!("· {:.0} s", m.range.duration_s()));
+            ui.weak(format!("· score {:.2}", m.score));
+        });
         // Per-signal breakdown (z-scores; a dash means the signal is absent).
         ui.horizontal_wrapped(|ui| {
             let sig = |ui: &mut egui::Ui, name: &str, v: Option<f32>| {
-                ui.label(format!(
+                let text = format!(
                     "{name} {}",
                     v.map(|x| format!("{x:+.1}")).unwrap_or_else(|| "—".into())
-                ));
+                );
+                let color = match v {
+                    Some(x) if x >= 1.0 => theme::OK,
+                    Some(x) if x <= -1.0 => theme::ERR,
+                    _ => egui::Color32::from_gray(150),
+                };
+                theme::status_chip(ui, color, &text);
             };
-            ui.weak(format!("score {:.2}  ·", m.score));
             sig(ui, "chat", m.signals.chat_rate);
             sig(ui, "loud", m.signals.loudness);
             sig(ui, "lex", m.signals.lexicon);
-            sig(ui, "arou", m.signals.arousal);
+            sig(ui, "arousal", m.signals.arousal);
             sig(ui, "llm", m.signals.llm);
         });
         if let Some(reason) = self.llm_reasons.get(&id) {
@@ -1478,11 +1567,13 @@ impl App {
                 }
             }
             ui.add_space(10.0);
-            if ui
-                .add_enabled(!working, egui::Button::new("Promote → Frame & Render"))
+            if theme::primary_button(ui, "Open in editor")
+                .on_hover_text("Frame, caption, and export this Moment as a Short")
                 .clicked()
+                && !working
             {
                 self.editor = None;
+                self.pending_title = m.title.clone();
                 let _ = self.to_worker.send(Job::Prepare {
                     range: m.range,
                     title: m.title.clone(),

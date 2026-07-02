@@ -25,12 +25,13 @@ fn main() -> anyhow::Result<()> {
 
     let params = DetectParams::default();
     println!(
-        "=== detect_diag: {} ===\nlead_s {} -> loud_lead_s {} (full at loudness z {}), dur_s {}, min_z {}",
+        "=== detect_diag: {} ===\nlead_s {} -> loud_lead_s {} (full at loudness z {}), dur {}..{} s, min_z {}",
         wav.display(),
         params.lead_s,
         params.loud_lead_s,
         params.loud_lead_full_z,
-        params.dur_s,
+        params.min_dur_s,
+        params.max_dur_s,
         params.min_z,
     );
     let moments = yc_detect::discover(chat.as_deref(), &wav, &params)?;

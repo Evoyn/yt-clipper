@@ -24,6 +24,7 @@ use yc_core::{Crop, Layout, LayoutPref, CANVAS_H, CANVAS_W};
 pub mod infer;
 #[cfg(feature = "face")]
 pub use infer::Detector;
+pub mod speaker;
 
 // ---- tunable constants (ADR 0011: seeded defaults, retune without re-arch) ----
 

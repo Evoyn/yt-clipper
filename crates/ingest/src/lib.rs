@@ -191,6 +191,76 @@ pub fn extract_frames_rgb(
     Ok(frames)
 }
 
+/// Like [`extract_frames_rgb`] but **streaming**: each decoded frame is handed
+/// to `on_frame` and its buffer reused, so memory stays one frame deep — the
+/// speaker-analysis pass reads 5 fps over a up-to-3-minute clip (~900 frames),
+/// which would be hundreds of MB collected. `-t dur_s` bounds the decode.
+/// `on_frame` returning `false` stops the stream early (cancellation).
+#[allow(clippy::too_many_arguments)]
+pub fn stream_frames_rgb(
+    ffmpeg: &Path,
+    video: &Path,
+    seek_s: f64,
+    dur_s: f64,
+    w: u32,
+    h: u32,
+    fps: f64,
+    max_frames: usize,
+    on_frame: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<usize> {
+    use std::io::Read;
+    let mut args = vec![
+        "-ss".to_string(),
+        format!("{seek_s:.3}"),
+        "-t".into(),
+        format!("{dur_s:.3}"),
+    ];
+    args.extend(extract_frames_args(video, 0.0, w, h, fps, max_frames).into_iter().skip(2));
+    let mut child = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    let mut stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
+    let frame_bytes = (w as usize) * (h as usize) * 3;
+    anyhow::ensure!(frame_bytes > 0, "zero frame size");
+    let mut buf = vec![0u8; frame_bytes];
+    let mut n_frames = 0usize;
+    let mut stopped = false;
+    'read: loop {
+        let mut filled = 0usize;
+        while filled < frame_bytes {
+            match stdout.read(&mut buf[filled..]) {
+                Ok(0) => break 'read, // EOF: a partial trailing frame is dropped
+                Ok(k) => filled += k,
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("reading ffmpeg frame stream");
+                }
+            }
+        }
+        n_frames += 1;
+        if !on_frame(&buf) {
+            stopped = true;
+            break;
+        }
+    }
+    if stopped {
+        // Early stop (cancel): kill the decoder rather than draining it.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(n_frames);
+    }
+    drop(stdout);
+    let status = child.wait().context("waiting on ffmpeg frame stream")?;
+    anyhow::ensure!(status.success(), "ffmpeg frame stream failed ({status})");
+    anyhow::ensure!(n_frames > 0, "ffmpeg produced no frames for {}", video.display());
+    Ok(n_frames)
+}
+
 /// Half-open sample bounds for `range` in a clip of `total` samples at `sr`.
 /// Clamped so `start <= end <= total`.
 fn sample_bounds(range: TimeRange, sr: u32, total: usize) -> (usize, usize) {

@@ -98,6 +98,17 @@ fn ass_color_tag(rgba: [u8; 4]) -> String {
     format!("&H{:02X}{:02X}{:02X}&", b, g, r)
 }
 
+/// An ASS pixel width: integral values print bare (`6`, matching the historical
+/// hardcoded Style line byte-for-byte), fractional ones with one decimal.
+fn fmt_px(v: f32) -> String {
+    let v = v.max(0.0);
+    if (v - v.round()).abs() < 1e-3 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
 /// Seconds -> ASS `H:MM:SS.cc` (centisecond precision).
 fn ass_time(s: f64) -> String {
     let cs = (s.max(0.0) * 100.0).round() as u64;
@@ -324,12 +335,23 @@ pub fn generate_ass(
 
     s.push_str("[V4+ Styles]\n");
     s.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
+    // BorderStyle 3 draws an opaque box (the style's back colour) behind each
+    // line; BorderStyle 1 is the classic outline+shadow. Outline/shadow widths
+    // and colours are style data since the editor's Caption panel (2026-07);
+    // the defaults reproduce the historical hardcoded `1,6,2` line exactly.
+    let border_style = if style.back_box { 3 } else { 1 };
     s.push_str(&format!(
-        "Style: Caption,{font},{size},{primary},{accent},&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,6,2,5,40,40,40,1\n\n",
+        "Style: Caption,{font},{size},{primary},{accent},{outline_c},{back_c},{bold},0,0,0,100,100,0,0,{bs},{outline},{shadow},5,40,40,40,1\n\n",
         font = style.font_family,
         size = font_size,
         primary = ass_color(style.primary_color),
         accent = ass_color(style.accent_color),
+        outline_c = ass_color(style.outline_color),
+        back_c = ass_color(style.back_color),
+        bold = if style.bold { -1 } else { 0 },
+        bs = border_style,
+        outline = fmt_px(style.outline),
+        shadow = fmt_px(style.shadow),
     ));
 
     s.push_str("[Events]\n");
@@ -651,11 +673,8 @@ mod tests {
     fn style() -> CaptionStyle {
         CaptionStyle {
             name: "Rolling".into(),
-            genre: CaptionGenre::RollingPop,
-            font_family: "Anton".into(),
-            font_size: 96,
-            primary_color: [255, 255, 255, 255],
             accent_color: [255, 215, 0, 255],
+            ..CaptionStyle::for_genre(CaptionGenre::RollingPop)
         }
     }
 
@@ -1128,6 +1147,37 @@ mod tests {
         let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style(), None);
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
+    }
+
+    #[test]
+    fn default_style_line_matches_the_historical_hardcoded_one() {
+        // The editor's appearance fields (outline/shadow/box/bold) default to
+        // the values that were hardcoded before it existed: a default style's
+        // Style line must stay byte-identical (`1,6,2` borders, black outline,
+        // the &H96000000 back colour).
+        let ass = generate_ass(&units(&["a"]), &style(), None);
+        let line = ass.lines().find(|l| l.starts_with("Style:")).unwrap();
+        assert!(
+            line.contains(",&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,6,2,5,40,40,40,1"),
+            "style line drifted: {line}"
+        );
+    }
+
+    #[test]
+    fn customized_style_line_carries_box_outline_and_bold() {
+        let mut st = style();
+        st.back_box = true;
+        st.back_color = [10, 20, 30, 255]; // opaque RGB(10,20,30)
+        st.outline = 3.5;
+        st.shadow = 0.0;
+        st.outline_color = [255, 0, 0, 255]; // red
+        st.bold = true;
+        let ass = generate_ass(&units(&["a"]), &st, None);
+        let line = ass.lines().find(|l| l.starts_with("Style:")).unwrap();
+        assert!(line.contains(",3,3.5,0,5,"), "BorderStyle 3 + widths: {line}");
+        assert!(line.contains("&H001E140A"), "back colour BGR: {line}");
+        assert!(line.contains("&H000000FF"), "outline colour red: {line}");
+        assert!(line.contains(",-1,0,0,0,"), "bold flag: {line}");
     }
 
     #[test]

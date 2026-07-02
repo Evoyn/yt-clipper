@@ -4,6 +4,76 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 — productization sweep: the Studio editor, Podcast Mode, natural clip lengths, better titles (focus.md, all 6 tasks)
+
+The focus.md session: park `nextprompt.md`, make the app feel like a product.
+Six tasks, one autonomous run (ADRs 0037/0038/0039; CONTEXT.md grew Studio /
+Camera mode / Speaker track / Camera plan / Caption preset / Transcript
+override).
+
+- **Why every clip was ~30 s (task 5)**: `DetectParams::dur_s = 30.0` — a
+  fixed window around every peak. Replaced with an **adaptive sustain window**
+  (ADR 0037): the range grows over the span where the combined signal stays
+  elevated (0.45×peak, floored at 0.5σ), pads the build-up + tail, floors at
+  15 s and caps at a configurable max — GUI slider 30–180 s (the Shorts
+  ceiling), `YC_MAX_CLIP_S` headless, default 90. Fixed-gap NMS became
+  overlap suppression (trim weaker windows, drop swallowed peaks). Sharp
+  spikes still read ~15–20 s; sustained arcs now surface at 40–90 s.
+- **Titles that upload as-is (task 6)**: the judge prompt's title section
+  rewritten — hook first and concrete, curiosity without overpromise, strong
+  verbs / present tense, one ALL-CAPS word max, a named ban list (Insane /
+  Epic / You Won't Believe / Gone Wrong / …), no hashtags/quotes/emoji, good
+  shapes shown. Prompt-guard tests pin the new clauses like the scripted-
+  cutscene mitigation.
+- **Podcast Mode (task 3, ADR 0038)**: `yc_frame::speaker` — face tracks from
+  streamed 5 fps frames (new `stream_frames_rgb`, one frame resident), per-bin
+  **mouth activity** (fixed-grid luma diff in the lower face box), an RMS
+  voice gate, and attribution with a 1.35× switch margin held 0.8 s. The
+  timeline becomes a **cut-based CameraPlan**: min shot 2.4 s, flickers
+  absorbed, rapid exchanges collapse into a group shot (2 people = stacked
+  split screen). Rendered as trim/crop/concat in one ffmpeg pass
+  (`camera.fg` via `-filter_complex_script`), captions burned once —
+  validated end-to-end on the pinned ffmpeg (solo → split → solo, 1080×1920,
+  frame-accurate cuts). `Job::AnalyzeSpeakers` auto-queues when Prepare sees
+  2+ faces; release builds now carry `--features face`.
+- **The Studio (tasks 1/2/4, ADR 0039)**: Promote opens a full-window editor
+  page — toolbar (Back · title · **Preview/Original** Before/After toggle ·
+  captions/safe-area · Export), **transcript editor** left (every caption a
+  row: `m:ss.cc` editable timestamps, text, split/merge/censor/delete,
+  add-at-playhead; edits burn **verbatim** via `transcript_override` — no
+  whisper, no re-timing over operator words), preview center (Original =
+  source frame + draggable/corner-resizable/scroll-zoom 9:16 crop box +
+  rule-of-thirds + face overlays with Person A/B/C labels + click-to-retarget;
+  Preview = composited 9:16 + caption overlay + safe-area guide + tracking
+  chip "Tracking Person B · 96%"), properties right (5 **Camera modes** —
+  Manual/Center/Auto face/**Active Speaker**/Group; framing; **6 caption
+  presets** — Classic/TikTok/Podcast/Minimal/Gaming/MrBeast — over the
+  extended CaptionStyle: outline width+colour, shadow, back box, bold, all
+  serde-defaulted so old styles render byte-identical), timeline bottom
+  (ruler, caption blocks, per-speaker lanes, cut markers, scrub +
+  keyboard: space/arrows/±/0). **Export opens a summary** (length,
+  resolution, captions, camera, tracking, estimated render time) before
+  rendering. Prepare auto-queues `Job::Transcribe`, so captions are editable
+  pre-render and the render is NVENC-only.
+- **Shell modernized (task 1)**: theme grew a design system (section kickers,
+  cards, primary/status-chip/segmented helpers, WELL/INFO/track colours);
+  the library page reorganized (import card up top, defaults grid, moments
+  list with duration+score badges, signal chips in the detail pane); status
+  is a coloured chip; preflight moved to the rail bottom.
+- **Validated**: 231 workspace tests green (29 new in `speaker`, adaptive-
+  range + overlap suppression, camera filtergraph, presets, mm:ss.cc
+  parsing, censor/split, ASS style-line byte-compat golden); headless
+  end-to-end render on a synthetic VOD through the reworked pipeline; the
+  camera-cut graph rendered + frame-inspected; GUI smoke-launched.
+- **Known limits**: speaker attribution is visual (overlap → the most
+  animated mouth wins; off-screen voices hold the shot) — diarization is the
+  named upgrade path; preview playback is still the ~4 fps filmstrip (360p
+  for >60 s clips); per-Creator memory still stores genre only, not full
+  custom styles; transcript edits don't feed the dialect store (per-clip
+  fixes vs durable curation stay separate lanes).
+
+---
+
 ## 2026-07-02 (late night) — the ensemble becomes a product feature: per-Creator Caption engine picker
 
 ADR 0035 slice 1 of 3 (picker → decode cache → harvest), the queued session you

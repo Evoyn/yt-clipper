@@ -403,8 +403,11 @@ pub enum CaptionGenre {
 }
 
 /// A named preset describing how captions look and animate.
-/// Saved per Creator, overridable per Clip. (Full parameter set lands at M6.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Saved per Creator, overridable per Clip in the editor's Caption panel.
+/// The appearance fields added for the editor (outline / shadow / back box /
+/// bold) default to the historical hardcoded ASS values, so a pre-editor
+/// serialized style renders byte-identically.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptionStyle {
     pub name: String,
     pub genre: CaptionGenre,
@@ -413,6 +416,119 @@ pub struct CaptionStyle {
     /// RGBA. Converted to ASS's BGR ordering inside the render crate only.
     pub primary_color: [u8; 4],
     pub accent_color: [u8; 4],
+    /// Text outline thickness in ASS PlayRes pixels (the historical value was a
+    /// hardcoded 6).
+    #[serde(default = "default_outline")]
+    pub outline: f32,
+    /// Drop-shadow depth in ASS PlayRes pixels (historically a hardcoded 2).
+    #[serde(default = "default_shadow")]
+    pub shadow: f32,
+    /// Outline colour, RGBA. The historical hardcoded outline was opaque black.
+    #[serde(default = "default_outline_color")]
+    pub outline_color: [u8; 4],
+    /// Draw an opaque-ish box behind each line (ASS BorderStyle 3) — the
+    /// TikTok/podcast "text on a card" look.
+    #[serde(default)]
+    pub back_box: bool,
+    /// The box colour (RGBA; alpha is the box opacity) when `back_box` is set.
+    #[serde(default = "default_back_color")]
+    pub back_color: [u8; 4],
+    /// Faux-bold the font (ASS `Bold`). Anton is single-weight, so this is the
+    /// weight control the editor exposes.
+    #[serde(default)]
+    pub bold: bool,
+}
+
+fn default_outline() -> f32 {
+    6.0
+}
+fn default_shadow() -> f32 {
+    2.0
+}
+fn default_outline_color() -> [u8; 4] {
+    [0, 0, 0, 255]
+}
+fn default_back_color() -> [u8; 4] {
+    // Opacity 105 -> the historical hardcoded ASS BackColour `&H96000000`
+    // (transparency 0x96 = 150), so a default style stays byte-identical.
+    [0, 0, 0, 105]
+}
+
+impl CaptionStyle {
+    /// The historical per-genre style (white text, brand-gold accent, Anton) —
+    /// the pre-editor defaults every genre rendered with.
+    pub fn for_genre(genre: CaptionGenre) -> Self {
+        let (name, font_size) = match genre {
+            CaptionGenre::HugeWord => ("Huge Word", 150),
+            CaptionGenre::RollingPop => ("Rolling Pop", 96),
+            CaptionGenre::KaraokeFill => ("Karaoke Fill", 96),
+        };
+        Self {
+            name: name.into(),
+            genre,
+            font_family: "Anton".into(),
+            font_size,
+            primary_color: [255, 255, 255, 255],
+            accent_color: [255, 209, 0, 255],
+            outline: default_outline(),
+            shadow: default_shadow(),
+            outline_color: default_outline_color(),
+            back_box: false,
+            back_color: default_back_color(),
+            bold: false,
+        }
+    }
+}
+
+/// How the editor frames a Clip (focus 2026-07 / podcast mode): who or what the
+/// camera follows. `Manual` is the operator's own crop; the AI modes derive the
+/// framing from detected faces and (for `ActiveSpeaker`) the speaker analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraMode {
+    /// The operator's own static crop (drag / resize / zoom in the editor).
+    #[default]
+    Manual,
+    /// A static centered 9:16 window.
+    Center,
+    /// A static crop framing the most persistent detected face.
+    AutoFace,
+    /// Follow whoever is talking: the speaker analysis drives a cut-based
+    /// camera plan (recommended for podcasts).
+    ActiveSpeaker,
+    /// Frame every detected face at once (2 faces: a stacked split screen).
+    Group,
+}
+
+/// One shot of a dynamic camera plan: a clip-relative time span framed by one
+/// static [`Layout`] (human editors *cut* between podcast speakers; panning a
+/// virtual camera across a static wide shot reads as amateur). `track` is the
+/// speaker-track id the shot follows (`None` = a group shot).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shot {
+    pub start_s: f64,
+    pub end_s: f64,
+    pub track: Option<usize>,
+    pub layout: Layout,
+}
+
+/// A cut-based dynamic camera plan for one Clip: contiguous [`Shot`]s covering
+/// `0..duration`. Rendered as a per-shot trim/crop concat (one ffmpeg pass).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CameraPlan {
+    pub shots: Vec<Shot>,
+}
+
+impl CameraPlan {
+    /// The shot covering clip-relative time `t`, if any.
+    pub fn shot_at(&self, t: f64) -> Option<&Shot> {
+        self.shots.iter().find(|s| s.start_s <= t && t < s.end_s)
+    }
+
+    /// Mutable [`Self::shot_at`], for the editor's click-to-retarget override.
+    pub fn shot_at_mut(&mut self, t: f64) -> Option<&mut Shot> {
+        self.shots.iter_mut().find(|s| s.start_s <= t && t < s.end_s)
+    }
 }
 
 /// Everything the app knows about one VOD: persisted as `project.json`
