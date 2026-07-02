@@ -158,6 +158,9 @@ pub struct EditorState {
     pub speaker_job: SpeakerJob,
     /// Selected caption row (click focuses + seeks).
     sel_unit: Option<usize>,
+    /// One-shot: scroll the transcript panel to `sel_unit` this frame (set by
+    /// clicking a caption block on the timeline).
+    scroll_to_sel: bool,
     /// Export-summary modal visibility.
     show_export: bool,
 }
@@ -220,6 +223,7 @@ impl EditorState {
             plan: None,
             speaker_job: SpeakerJob::NotRun,
             sel_unit: None,
+            scroll_to_sel: false,
             show_export: false,
         }
     }
@@ -1028,18 +1032,40 @@ impl EditorState {
             t += step;
         }
 
-        // Caption blocks.
+        // Caption blocks — clickable: jump the playhead to the line AND
+        // select + scroll to its row in the transcript panel (the timeline is
+        // the fastest way to LOCATE a caption; the panel is where you fix it).
         self.sync_lines();
         let cap_y0 = rect.top() + 18.0;
-        for l in &self.lines {
+        let mut clicked_line: Option<usize> = None;
+        for (li, l) in self.lines.iter().enumerate() {
             let r = Rect::from_min_max(
                 egui::pos2(t_to_x(l.start_s), cap_y0),
                 egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), cap_y0 + 20.0),
             );
-            p.rect_filled(r, CornerRadius::same(3), Color32::from_rgba_unmultiplied(255, 255, 255, 26));
-            p.rect_stroke(r, CornerRadius::same(3), Stroke::new(1.0, Color32::from_gray(80)), StrokeKind::Inside);
+            let text = l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            // Registered after the strip's scrub response, so blocks win the
+            // pointer for clicks; drags still fall through to the scrub.
+            let resp = ui.interact(r, ui.id().with(("cap-block", li)), Sense::click());
+            let hovered = resp.hovered();
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.on_hover_text(format!("{}  ·  {text}", fmt_mmss_cc(l.start_s))).clicked() {
+                clicked_line = Some(li);
+            }
+            p.rect_filled(
+                r,
+                CornerRadius::same(3),
+                Color32::from_rgba_unmultiplied(255, 255, 255, if hovered { 48 } else { 26 }),
+            );
+            p.rect_stroke(
+                r,
+                CornerRadius::same(3),
+                Stroke::new(1.0, if hovered { theme::GOLD } else { Color32::from_gray(80) }),
+                StrokeKind::Inside,
+            );
             if r.width() > 26.0 {
-                let text = l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
                 p.text(
                     r.left_center() + egui::vec2(4.0, 0.0),
                     Align2::LEFT_CENTER,
@@ -1047,6 +1073,25 @@ impl EditorState {
                     FontId::proportional(10.5),
                     Color32::from_gray(200),
                 );
+            }
+        }
+        if let Some(li) = clicked_line {
+            let start = self.lines[li].start_s;
+            self.playhead_s = start.clamp(0.0, dur);
+            // Locate the line's first word in the transcript rows and scroll
+            // the panel to it.
+            if let Some(t) = &self.transcript {
+                self.sel_unit = t
+                    .units
+                    .iter()
+                    .position(|u| u.start_s >= start - 1e-6)
+                    .or(Some(t.units.len().saturating_sub(1)));
+                self.scroll_to_sel = true;
+            }
+            // Same contract as the scrub: playing audio restarts at the jump.
+            if self.playing.is_some() {
+                self.playing = Some((Instant::now(), self.playhead_s));
+                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
             }
         }
 
@@ -1197,7 +1242,7 @@ impl EditorState {
                 } else {
                     Color32::TRANSPARENT
                 };
-                egui::Frame::new()
+                let row_resp = egui::Frame::new()
                     .fill(row_bg)
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(egui::Margin::symmetric(4, 3))
@@ -1260,8 +1305,14 @@ impl EditorState {
                             });
                         });
                     });
+                // A timeline caption-block click selects this row: bring it
+                // into view (one-shot).
+                if self.scroll_to_sel && self.sel_unit == Some(i) {
+                    row_resp.response.scroll_to_me(Some(egui::Align::Center));
+                }
             }
         });
+        self.scroll_to_sel = false;
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
