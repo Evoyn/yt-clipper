@@ -33,12 +33,24 @@ use std::process::Command;
 use anyhow::{Context as _, Result};
 use yc_core::{CaptionUnit, Language, TimeRange, Transcript};
 
-/// The opt-in knob. Read via helper so callers and future diags agree.
-pub fn enabled() -> bool {
-    matches!(
-        std::env::var("YC_QWEN_ENS").ok().as_deref().map(str::trim),
-        Some("1") | Some("true") | Some("on")
-    )
+/// The per-invocation engine override, tri-state since the per-Creator Caption
+/// engine landed (ADR 0035): `Some(true)` forces the ensemble, `Some(false)`
+/// forces whisper, `None` (unset / unrecognized) defers to the Creator's saved
+/// engine. Both directions exist so the headless gate fixtures (ADR 0034) can
+/// pin either engine regardless of how the operator has flipped a Creator —
+/// the override is per-run and is never written back to the Creator store.
+pub fn engine_override() -> Option<bool> {
+    override_from(std::env::var("YC_QWEN_ENS").ok().as_deref())
+}
+
+/// Pure parse of the `YC_QWEN_ENS` value, split out so the tri-state contract
+/// is unit-testable without touching process env.
+fn override_from(raw: Option<&str>) -> Option<bool> {
+    match raw.map(str::trim) {
+        Some("1") | Some("true") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("off") => Some(false),
+        _ => None,
+    }
 }
 
 /// Everything the ensemble needs from the caller (paths are derived by the
@@ -476,6 +488,66 @@ pub fn vote_merge(backbone: &[String], voters: &[Vec<String>]) -> Vec<String> {
         }
     }
     merged
+}
+
+/// How a Creator's confirmed corrections split across the engine boundary
+/// (ADR 0035 §2) — the numbers behind the GUI's engine-switch warn. Classes
+/// mirror the two ensemble appliers' filters EXACTLY (below /
+/// [`apply_store_positional`]); if those filters change, this must too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransferCounts {
+    /// Single-word, un-pinned: carry to the ensemble via the fuzzy tier
+    /// (exact or edit-1 token match).
+    pub single_word: usize,
+    /// `at_s`-pinned: carry via the positional pass (multi-word wrongs
+    /// included — they match consecutive fused units).
+    pub pinned: usize,
+    /// Multi-word, un-pinned: whisper's global dict only — a whisper garble
+    /// SHAPE that doesn't transfer across engines.
+    pub multi_word: usize,
+    /// Context-gated (ADR 0030): authored against whisper's confident
+    /// spellings; the ensemble's store passes skip them. (The opt-in LLM
+    /// pass still sees them on either engine, but per-occurrence judgment
+    /// there is the exception, not the transfer contract.)
+    pub context: usize,
+}
+
+impl TransferCounts {
+    /// Corrections that keep working after a flip to the ensemble.
+    pub fn carries(&self) -> usize {
+        self.single_word + self.pinned
+    }
+
+    /// Corrections that only fire on whisper renders.
+    pub fn stays(&self) -> usize {
+        self.multi_word + self.context
+    }
+
+    pub fn total(&self) -> usize {
+        self.carries() + self.stays()
+    }
+}
+
+/// Classify a store's CONFIRMED corrections for the engine-switch warn
+/// (ADR 0035 §2). Unverified entries (blank `right` — the review queue's
+/// to-dos) apply on no engine and are not counted.
+pub fn transfer_counts(corrections: &[crate::Correction]) -> TransferCounts {
+    let mut t = TransferCounts::default();
+    for c in corrections {
+        if c.right.is_empty() || normalize(&c.wrong).is_empty() {
+            continue;
+        }
+        if c.context {
+            t.context += 1;
+        } else if c.at_s.is_some() {
+            t.pinned += 1;
+        } else if normalize(&c.wrong).len() == 1 {
+            t.single_word += 1;
+        } else {
+            t.multi_word += 1;
+        }
+    }
+    t
 }
 
 /// Transfer the store's confirmed corrections onto the voted words with
@@ -1639,5 +1711,47 @@ mod tests {
             normalize("language Indonesian<asr_text>Mana? Ini satu."),
             words("mana ini satu")
         );
+    }
+
+    #[test]
+    fn engine_override_is_tri_state() {
+        // Force-on, force-off, and defer-to-Creator (ADR 0035): unset or an
+        // unrecognized value must NOT force whisper — it defers.
+        for on in ["1", "true", "on", " 1 "] {
+            assert_eq!(override_from(Some(on)), Some(true), "{on:?}");
+        }
+        for off in ["0", "false", "off", " 0 "] {
+            assert_eq!(override_from(Some(off)), Some(false), "{off:?}");
+        }
+        for defer in [None, Some(""), Some("yes-ish"), Some("2")] {
+            assert_eq!(override_from(defer), None, "{defer:?}");
+        }
+    }
+
+    #[test]
+    fn transfer_counts_mirror_the_applier_filters() {
+        let mk = |wrong: &str, right: &str, context: bool, at_s: Option<f64>| crate::Correction {
+            wrong: wrong.into(),
+            right: right.into(),
+            context,
+            at_s,
+            ..Default::default()
+        };
+        let corrections = vec![
+            mk("kreeng", "kirain", false, None),      // single-word -> fuzzy tier
+            mk("tiga", "tiga-tiga", false, Some(9.0)), // pinned -> positional pass
+            mk("blok on", "blo'on", false, Some(12.0)), // multi-word BUT pinned -> carries
+            mk("cepet cepet", "cepet-cepet", false, None), // multi-word -> whisper only
+            mk("cowok", "cok", true, None),           // context -> whisper only
+            mk("cowok", "cok", true, Some(3.0)),      // context wins over the pin (both passes skip it)
+            mk("harvested", "", false, None),         // unverified to-do -> not counted
+        ];
+        let t = transfer_counts(&corrections);
+        assert_eq!(
+            (t.single_word, t.pinned, t.multi_word, t.context),
+            (1, 2, 1, 2),
+            "{t:?}"
+        );
+        assert_eq!((t.carries(), t.stays(), t.total()), (3, 3, 6));
     }
 }

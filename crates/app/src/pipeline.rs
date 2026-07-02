@@ -28,9 +28,9 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use yc_core::{
-    CaptionGenre, CaptionPlacement, CaptionStyle, Clip, Creator, CreatorStore, Language, Layout,
-    LayoutPref, Moment, NoConsole, Project, ReviewCache, Signals, TimeRange, Transcript, Vod,
-    VodSource,
+    CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle, Clip, Creator, CreatorStore,
+    Language, Layout, LayoutPref, Moment, NoConsole, Project, ReviewCache, Signals, TimeRange,
+    Transcript, Vod, VodSource,
 };
 use yc_detect::DetectParams;
 use yc_ingest::{CancelToken, Sidecars};
@@ -128,11 +128,17 @@ pub enum Job {
     /// `placement` is the Clip's Caption placement (ADR 0036): where/how large the
     /// captions draw, from the editor's drag/resize; `None` (always in headless)
     /// keeps the built-in anchor, byte-identical to pre-placement output.
+    /// `caption_engine` is the operator's Caption engine pick for this render
+    /// (ADR 0035): `Some` = the GUI rail's explicit selection (persisted per
+    /// Creator on success), `None` (headless/CLI) = the Creator's saved engine
+    /// from `creators.json`, Whisper for an unknown Creator. `YC_QWEN_ENS`
+    /// overrides the resolved engine either way (tri-state; never saved back).
     Render {
         layout: Layout,
         caption_genre: CaptionGenre,
         correct: bool,
         placement: Option<CaptionPlacement>,
+        caption_engine: Option<CaptionEngine>,
     },
 }
 
@@ -165,6 +171,12 @@ pub enum Progress {
         language: Language,
         analysis_wav: PathBuf,
         caption_genre: Option<CaptionGenre>,
+        /// This Creator's saved Caption engine (ADR 0035), so the UI seeds its
+        /// engine picker and can warn when the operator flips it. `None` for an
+        /// unknown/new Creator — the picker then resets to Whisper (no default
+        /// flip; a previous session's ensemble pick must not leak onto a new
+        /// Creator).
+        caption_engine: Option<CaptionEngine>,
         moments: Vec<Moment>,
         transcripts: HashMap<u64, String>,
         llm_reasons: HashMap<u64, String>,
@@ -258,6 +270,11 @@ struct PreparedClip {
     range: TimeRange,
     auto_layout: Layout,
     transcript: Option<Transcript>,
+    /// Whether the cached `transcript` was REQUESTED from the ensemble path
+    /// (ADR 0035). The transcript is engine-derived, so flipping the Caption
+    /// engine between re-renders of the same Prepare must invalidate the cache
+    /// and re-transcribe — unlike genre/placement, which only re-emit ASS.
+    transcript_ens: bool,
     /// The promoted Moment's LLM-generated title (ADR 0015), used to name the
     /// rendered Short. `None` for a manual / headless clip → render falls back to
     /// a timestamp name. Held here so a re-render after a nudge keeps the name.
@@ -290,6 +307,10 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 language: s.vod.language,
                                 analysis_wav: s.analysis_wav.clone(),
                                 caption_genre: remembered_caption_genre(&paths.workspace, &s.vod),
+                                caption_engine: remembered_caption_engine(
+                                    &paths.workspace,
+                                    &s.vod,
+                                ),
                                 moments: s.moments.clone(),
                                 transcripts,
                                 llm_reasons,
@@ -358,9 +379,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         }
                     },
                 },
-                Job::Render { layout, caption_genre, correct, placement } => match (&session, &mut prepared) {
+                Job::Render { layout, caption_genre, correct, placement, caption_engine } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, caption_genre, correct, placement, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, caption_genre, correct, placement, caption_engine, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -573,11 +594,24 @@ fn remembered_caption_genre(workspace: &Path, vod: &Vod) -> Option<CaptionGenre>
         .and_then(|c| c.default_caption_genre)
 }
 
-/// Remember the Caption Style the operator just rendered with for this Creator
-/// (ADR 0016): upsert the Creator record (creating it if new), keeping its
-/// language current and recording `genre` as the new default. Best-effort — a
-/// store read/write failure logs and never fails the render.
-fn remember_creator_genre(workspace: &Path, vod: &Vod, genre: CaptionGenre) {
+/// This VOD's Creator's saved Caption engine (ADR 0035), if the store knows
+/// this Creator. `None` for an unknown/new Creator — callers treat that as
+/// Whisper (no default flip): a new Creator's first render must never inherit
+/// another Creator's ensemble choice.
+fn remembered_caption_engine(workspace: &Path, vod: &Vod) -> Option<CaptionEngine> {
+    CreatorStore::load(&creators_path(workspace))
+        .get(&vod.creator)
+        .map(|c| c.caption_engine)
+}
+
+/// Remember what the operator just rendered this Creator with (ADR 0016 /
+/// ADR 0035): upsert the Creator record (creating it if new), keeping its
+/// language current and recording `genre` + `engine` as the new defaults. The
+/// engine recorded is the render's SELECTION (rail pick or the store's own
+/// value) — never the `YC_QWEN_ENS` override, which is per-invocation by
+/// contract. Best-effort — a store read/write failure logs and never fails the
+/// render.
+fn remember_creator_render(workspace: &Path, vod: &Vod, genre: CaptionGenre, engine: CaptionEngine) {
     let path = creators_path(workspace);
     // Load-mutate-save on the GLOBAL store: a lossy load here would rewrite the
     // whole file with just this one Creator, silently wiping every other
@@ -588,7 +622,7 @@ fn remember_creator_genre(workspace: &Path, vod: &Vod, genre: CaptionGenre) {
         Err(e) if e.is_not_found() => CreatorStore::default(),
         Err(e) => {
             tracing::warn!(
-                "creators.json unreadable ({e}); NOT overwriting it - genre not remembered"
+                "creators.json unreadable ({e}); NOT overwriting it - render defaults not remembered"
             );
             return;
         }
@@ -599,6 +633,7 @@ fn remember_creator_genre(workspace: &Path, vod: &Vod, genre: CaptionGenre) {
         .unwrap_or_else(|| Creator::new(vod.creator.clone(), vod.language));
     creator.language = vod.language; // keep the recorded language current
     creator.default_caption_genre = Some(genre);
+    creator.caption_engine = engine;
     store.upsert(creator);
     if let Err(e) = store.save(&path) {
         tracing::warn!("creators.json save failed ({e})");
@@ -1102,6 +1137,7 @@ fn do_prepare(
         range,
         auto_layout,
         transcript: None,
+        transcript_ens: false,
         title,
     };
     Ok((prepared, frames, frame_w, frame_h, fps))
@@ -1357,6 +1393,7 @@ fn do_render(
     caption_genre: CaptionGenre,
     correct: bool,
     placement: Option<CaptionPlacement>,
+    caption_engine: Option<CaptionEngine>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
@@ -1367,7 +1404,29 @@ fn do_render(
     let _ = correct;
     let range = prepared.range;
 
+    // The Caption engine for this render (ADR 0035): the GUI rail's explicit
+    // pick when one was sent, else the Creator's saved engine (headless/CLI),
+    // Whisper for an unknown Creator. `YC_QWEN_ENS` then overrides the resolved
+    // selection in either direction (tri-state, per-invocation — the gate
+    // fixtures pin an engine with it regardless of how a Creator is flipped);
+    // only the SELECTION is saved back below, never the override.
+    let engine = caption_engine
+        .or_else(|| remembered_caption_engine(&paths.workspace, &session.vod))
+        .unwrap_or_default();
+    let use_ensemble = yc_transcribe::ensemble::engine_override()
+        .unwrap_or(engine == CaptionEngine::QwenEnsemble);
+
     // Transcribe once, then reuse: re-rendering a nudged Layout skips whisper.
+    // The cache is engine-derived, though — an engine flip between re-renders
+    // of the same Prepare must re-transcribe, or the flip would silently no-op.
+    if prepared.transcript.is_some() && prepared.transcript_ens != use_ensemble {
+        tracing::info!(
+            "caption engine changed since the cached transcript (ensemble {} -> {}); re-transcribing",
+            prepared.transcript_ens,
+            use_ensemble
+        );
+        prepared.transcript = None;
+    }
     if prepared.transcript.is_none() {
         // Captions read the Vocal stem when `sep` is built (music/SFX split off
         // the streamer's voice); otherwise the mixed analysis audio, as before.
@@ -1417,14 +1476,16 @@ fn do_render(
                     move || c.is_cancelled()
                 },
             )?;
-            // Qwen3-ASR ensemble captions (opt-in, YC_QWEN_ENS=1): words from a
+            // Qwen3-ASR ensemble captions (ADR 0034/0035): words from a
             // multi-decode vote, timing from the whisper transcript above (whose
             // one-shot model is already dropped — GPU staging stays sequential).
-            // Fails soft: whisper captions stand if the sidecar/models are absent
-            // or any stage errors. Defaults byte-identical (knob unset = this
-            // block never runs; ADR 0033's opt-in contract).
+            // Runs when the resolved Caption engine is the ensemble (Creator's
+            // saved engine / rail pick / YC_QWEN_ENS override). Fails soft:
+            // whisper captions stand if the sidecar/models are absent or any
+            // stage errors. Whisper Creators stay byte-identical (this block
+            // never runs; ADR 0033's opt-in contract, now at the Creator level).
             let mut ens_used = false;
-            if yc_transcribe::ensemble::enabled() {
+            if use_ensemble {
                 let _ = tx.send(Progress::Stage("Ensemble captions (Qwen3-ASR)"));
                 // Second whisper decode for the TIMING skeleton only: on masked
                 // clips the default decode's spans are as wrong as its words
@@ -1591,6 +1652,7 @@ fn do_render(
             }
         };
         prepared.transcript = Some(transcript);
+        prepared.transcript_ens = use_ensemble;
     }
     let transcript = prepared.transcript.as_ref().expect("transcript set above");
     // The editor's caption preview draws exactly what this render burns (ADR
@@ -1640,8 +1702,9 @@ fn do_render(
     );
     yc_render::run_export(&paths.ffmpeg, &session.data_dir, &args, &|| cancel.is_cancelled())?;
 
-    // Remember this Creator's Caption Style for the next import (ADR 0016).
-    remember_creator_genre(&paths.workspace, &session.vod, caption_genre);
+    // Remember this Creator's Caption Style + engine for the next import
+    // (ADR 0016 / ADR 0035). `engine` is the resolved selection, pre-override.
+    remember_creator_render(&paths.workspace, &session.vod, caption_genre, engine);
 
     Ok(out_path)
 }

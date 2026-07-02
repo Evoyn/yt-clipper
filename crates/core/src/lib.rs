@@ -19,13 +19,36 @@ pub enum Language {
     Ja,
 }
 
+/// The per-Creator choice of how a Clip's caption words are transcribed
+/// (ADR 0035): single-decode whisper, or the Qwen ensemble's five-variant vote
+/// (ADR 0034). A closed enum, deliberately NOT a model picker — the ensemble
+/// recipe's constants are measured winners for Qwen3-ASR-1.7B; a new model
+/// earns entry only through ADR 0034's gate. `Whisper` is the serde default so
+/// every pre-picker creators.json loads unchanged (ADR 0033's opt-in contract
+/// holds at the Creator level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionEngine {
+    #[default]
+    Whisper,
+    QwenEnsemble,
+}
+
+impl CaptionEngine {
+    /// Serde skip-guard: a Whisper (default) engine is not written, so a
+    /// never-flipped Creator's record stays byte-identical to pre-picker files.
+    pub fn is_default(&self) -> bool {
+        *self == Self::Whisper
+    }
+}
+
 /// A streamer whose VODs the operator clips with their permission. Carries
 /// defaults remembered across that Creator's VODs (ADR 0016), persisted in the
 /// global [`CreatorStore`]. Realizes the Creator scoping the per-stream output
-/// folders (ADR 0015) introduced on disk. Only `language` + `default_caption_genre`
-/// are applied today; the seam/crop defaults are recorded `Option`s reserved for
-/// the Creator-aware framing slice (they tangle with M6 per-Segment auto-framing,
-/// ADR 0011), and serialize only when set.
+/// folders (ADR 0015) introduced on disk. Only `language`, `default_caption_genre`
+/// and `caption_engine` are applied today; the seam/crop defaults are recorded
+/// `Option`s reserved for the Creator-aware framing slice (they tangle with M6
+/// per-Segment auto-framing, ADR 0011), and serialize only when set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Creator {
     pub name: String,
@@ -35,6 +58,13 @@ pub struct Creator {
     /// rendered with. `None` until they render a clip for this Creator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_caption_genre: Option<CaptionGenre>,
+    /// Caption engine for this Creator's renders (ADR 0035): whisper unless the
+    /// operator deliberately flips them to the ensemble (no default flip — new
+    /// Creators always start on Whisper). Seeds the import rail's picker and is
+    /// saved back on each render like the genre; `YC_QWEN_ENS` remains a
+    /// per-invocation override that is never written back here.
+    #[serde(default, skip_serializing_if = "CaptionEngine::is_default")]
+    pub caption_engine: CaptionEngine,
     /// Default Seam position for stacked Layouts (fraction of canvas height).
     /// Reserved — not applied yet (Creator-aware framing slice).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +83,7 @@ impl Creator {
             name,
             language,
             default_caption_genre: None,
+            caption_engine: CaptionEngine::default(),
             default_seam: None,
             default_gameplay_crop: None,
             default_facecam_crop: None,
@@ -623,6 +654,27 @@ mod tests {
         let back: CreatorStore = serde_json::from_str(partial).unwrap();
         let c = back.get("x").unwrap();
         assert!(c.default_caption_genre.is_none() && c.default_seam.is_none());
+    }
+
+    #[test]
+    fn caption_engine_defaults_to_whisper_and_only_serializes_when_flipped() {
+        // Pre-picker creators.json has no caption_engine key: it must load as
+        // Whisper (ADR 0035's no-default-flip) and re-serialize without
+        // inventing the key, so a never-flipped record stays byte-identical.
+        let partial = r#"{"creators":{"x":{"name":"x","language":"id"}}}"#;
+        let back: CreatorStore = serde_json::from_str(partial).unwrap();
+        assert_eq!(back.get("x").unwrap().caption_engine, CaptionEngine::Whisper);
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(!json.contains("caption_engine"), "whisper is skipped, not written: {json}");
+        // A flipped Creator round-trips the ensemble choice.
+        let mut store = CreatorStore::default();
+        let mut c = Creator::new("guntur".into(), Language::Id);
+        c.caption_engine = CaptionEngine::QwenEnsemble;
+        store.upsert(c);
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains("\"caption_engine\":\"qwen_ensemble\""), "json: {json}");
+        let back: CreatorStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.get("guntur").unwrap().caption_engine, CaptionEngine::QwenEnsemble);
     }
 
     #[test]

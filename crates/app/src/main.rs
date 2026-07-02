@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress, Timeline};
-use yc_core::{CaptionGenre, Language, LayoutPref, Moment, Signals, TimeRange};
+use yc_core::{CaptionEngine, CaptionGenre, Language, LayoutPref, Moment, Signals, TimeRange};
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
@@ -88,12 +88,15 @@ fn main() -> eframe::Result<()> {
                     // No GUI to nudge in: render the auto-detected Layout as-is,
                     // preserving the old one-shot promote behavior (ADR 0012).
                     // No editor means no Caption placement either (ADR 0036).
+                    // Engine `None`: the Creator's saved engine decides, with
+                    // YC_QWEN_ENS as the tri-state override (ADR 0035).
                     to_worker
                         .send(Job::Render {
                             layout,
                             caption_genre,
                             correct: correct_from_env(),
                             placement: None,
+                            caption_engine: None,
                         })
                         .expect("send render");
                 }
@@ -219,12 +222,15 @@ fn main() -> eframe::Result<()> {
                     }
                 }
                 Ok(Progress::Prepared { layout, .. }) => {
+                    // Engine `None`: per-Creator resolution + env override, as
+                    // in --headless above (ADR 0035).
                     to_worker
                         .send(Job::Render {
                             layout,
                             caption_genre,
                             correct: correct_from_env(),
                             placement: None,
+                            caption_engine: None,
                         })
                         .expect("send render");
                 }
@@ -278,6 +284,8 @@ fn main() -> eframe::Result<()> {
                 end_s: 30.0,
                 language: None, // Auto: the Creator's saved language (ADR 0016)
                 caption_genre: CaptionGenre::HugeWord,
+                caption_engine: CaptionEngine::Whisper,
+                saved_engine: None,
                 correct_captions: false, // opt-in (ADR 0031); off until the operator ticks it
                 layout_pref: LayoutPref::default(),
                 imported: None,
@@ -449,6 +457,16 @@ struct App {
     /// Caption animation for the next render (M7): huge-word / rolling-pop /
     /// karaoke-fill. A global selection for now; per-Clip override is later M7.
     caption_genre: CaptionGenre,
+    /// Caption engine for the next render (ADR 0035): whisper or the Qwen
+    /// ensemble. Seeded from the Creator's saved engine on import (reset to
+    /// Whisper for an unknown Creator — no default flip); the render persists
+    /// the selection back per Creator.
+    caption_engine: CaptionEngine,
+    /// The imported Creator's engine as saved in `creators.json` (`None` =
+    /// unknown Creator), kept to detect a flip: when the rail selection
+    /// differs, the import rail shows which curated corrections carry
+    /// (ADR 0035's switch warn). Updated when a render persists the selection.
+    saved_engine: Option<CaptionEngine>,
     /// Run the LLM caption-correction pass on the next render (ADR 0030/0031):
     /// applies the operator's curated slang/name overrides in context. Default off
     /// (opt-in) and only effective in a `correct` build with the sidecar present.
@@ -631,6 +649,7 @@ impl eframe::App for App {
                     language,
                     analysis_wav,
                     caption_genre,
+                    caption_engine,
                     moments,
                     transcripts,
                     llm_reasons,
@@ -653,6 +672,12 @@ impl eframe::App for App {
                     if let Some(genre) = caption_genre {
                         self.caption_genre = genre;
                     }
+                    // Seed the engine picker likewise (ADR 0035) — but unlike
+                    // genre, an UNKNOWN Creator resets it to Whisper: engine
+                    // flips are deliberate per-Creator acts, so a previous
+                    // session's ensemble pick must not leak onto a new Creator.
+                    self.caption_engine = caption_engine.unwrap_or_default();
+                    self.saved_engine = caption_engine;
                     // Restore a prior session's detected Moments + their review text
                     // from project.json / review.json (M8) so a re-import shows the
                     // full review (list + transcript panel + LLM reason, playable +
@@ -692,6 +717,7 @@ impl eframe::App for App {
                             caption_genre: self.caption_genre,
                             correct: self.correct_captions,
                             placement: None,
+                            caption_engine: Some(self.caption_engine),
                         });
                         continue;
                     }
@@ -737,6 +763,9 @@ impl eframe::App for App {
                     }
                 }
                 Progress::Done(p) => {
+                    // The render just persisted the rail's engine selection per
+                    // Creator (ADR 0035); track it so the switch warn clears.
+                    self.saved_engine = Some(self.caption_engine);
                     if self.render_queue.is_empty() {
                         self.status = Status::Done(p);
                     } else {
@@ -848,6 +877,7 @@ impl eframe::App for App {
                     caption_genre,
                     correct: self.correct_captions,
                     placement,
+                    caption_engine: Some(self.caption_engine),
                 });
                 self.status = Status::Working("Rendering".into());
             }
@@ -948,6 +978,43 @@ impl App {
         });
     }
 
+    /// The engine-switch warn (ADR 0035 §2): when the rail's engine selection
+    /// differs from the imported Creator's saved one, quantify — from the
+    /// per-Creator store the review queue already holds in memory — which of
+    /// their confirmed corrections carry across the flip. Inline and
+    /// non-blocking: nothing about a flip is destructive (corrections are never
+    /// deleted), and the operator's ear stays ground truth.
+    fn ui_engine_switch_warn(&self, ui: &mut egui::Ui) {
+        let Some(saved) = self.saved_engine else { return };
+        if saved == self.caption_engine {
+            return;
+        }
+        let Some(review) = &self.review else { return };
+        let t = yc_transcribe::ensemble::transfer_counts(&review.lexicon.corrections);
+        if t.total() == 0 {
+            return; // nothing curated yet -> nothing to quantify
+        }
+        let text = match self.caption_engine {
+            CaptionEngine::QwenEnsemble => format!(
+                "Engine flip: {} correction(s) carry to the ensemble ({} single-word + {} pinned); \
+                 {} stay whisper-only ({} multi-word + {} context).",
+                t.carries(),
+                t.single_word,
+                t.pinned,
+                t.stays(),
+                t.multi_word,
+                t.context
+            ),
+            CaptionEngine::Whisper => format!(
+                "Engine flip: {} pinned fix(es) go dormant (ensemble-only); \
+                 the other {} correction(s) apply on whisper as before.",
+                t.pinned,
+                t.total() - t.pinned
+            ),
+        };
+        ui.colored_label(theme::GOLD, text);
+    }
+
     /// Left-rail section: import a VOD — the per-clip defaults (language / caption /
     /// layout) and the URL / local-file pickers.
     fn ui_import(&mut self, ui: &mut egui::Ui, working: bool) {
@@ -983,6 +1050,24 @@ impl App {
                     ui.selectable_value(&mut self.caption_genre, CaptionGenre::KaraokeFill, "Karaoke");
                 });
         });
+        ui.horizontal(|ui| {
+            ui.label("Engine");
+            egui::ComboBox::from_id_salt("engine")
+                .selected_text(match self.caption_engine {
+                    CaptionEngine::Whisper => "Whisper",
+                    CaptionEngine::QwenEnsemble => "Qwen ensemble",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.caption_engine, CaptionEngine::Whisper, "Whisper");
+                    ui.selectable_value(
+                        &mut self.caption_engine,
+                        CaptionEngine::QwenEnsemble,
+                        "Qwen ensemble",
+                    );
+                });
+            ui.weak("(saved per Creator; ensemble adds ~60-90 s)");
+        });
+        self.ui_engine_switch_warn(ui);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.correct_captions, "Correct captions (LLM)");
             ui.weak("(curated slang/name fixes; needs a 'correct' build + sidecar)");

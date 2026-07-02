@@ -4,6 +4,50 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (late night) — the ensemble becomes a product feature: per-Creator Caption engine picker
+
+ADR 0035 slice 1 of 3 (picker → decode cache → harvest), the queued session you
+picked in a live grill (the detail forks then resolved AFK — veto in the
+handoff): the Qwen ensemble stops being an env secret and becomes a per-Creator
+choice the app remembers.
+
+- **`Caption engine` on the Creator** (`CaptionEngine::Whisper | QwenEnsemble`
+  in yc-core): serde-default Whisper and skipped when unflipped, so every
+  existing creators.json loads AND re-saves byte-identical. No default flip —
+  a new Creator always starts on Whisper, even if your last render was
+  ensemble.
+- **An Engine picker in the import rail** next to Caption Style: seeded from
+  the Creator store on import, saved back per Creator on each render (the
+  ADR 0016 pattern), explicit pick always wins.
+- **The switch warn, computed from the real appliers**: flip a curated
+  Creator's engine and an inline gold line quantifies what carries —
+  single-word + `at_s`-pinned corrections transfer, multi-word + context stay
+  whisper-only (and pinned fixes "go dormant" in the reverse direction). The
+  counts mirror the ensemble code's own filters, including the subtlety the
+  ADR prose missed: a multi-word wrong WITH a pin carries (your "blok on"
+  rulings). guntur69 today: 20 carry / 10 stay.
+- **`YC_QWEN_ENS` became tri-state** (AFK-sharpened into ADR 0035 §6): `1`
+  forces ensemble, `0` forces whisper, unset defers to the Creator — so the
+  whisper gate fixtures stay runnable after you flip Deddy for real. The
+  override is per-invocation and never saved back.
+- **Engine flips re-transcribe**: the per-Prepare transcript cache now knows
+  which engine made it, so picker-flip + Render actually changes words
+  (before, it would have silently reused the old transcript).
+- **Validated on the production path** (3 headless Deddy control renders):
+  env-unset whisper render byte-identical to last night's baseline (`fc /b`);
+  store-flipped Deddy ran the ensemble with NO env (your 4 at_s pins applied:
+  juga / blo'on ×2 / goblok) and save-back kept the flip + every other
+  Creator; `YC_QWEN_ENS=0` forced whisper over the flipped Creator and
+  reproduced the baseline byte-for-byte, without un-flipping the store.
+- 204 fast tests green (+3); release `correct,face` build green.
+
+**Your part**: flip guntur69 + Deddy to the ensemble yourself in the GUI (the
+picker now exists for exactly that), eyeball the warn numbers, and the still-
+pending interactive pass on last night's editor. Next queued: decode cache
+(~90 s → ~1 s re-renders), or editor slice 2. Entry point: `nextprompt.md`.
+
+---
+
 ## 2026-07-02 (night) — the editor grew eyes: caption preview playback + drag-anywhere placement
 
 You asked for it mid-ritual ("preview video and a captions editor…drag to

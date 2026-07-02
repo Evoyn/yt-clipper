@@ -58,7 +58,13 @@ decisions (operator, 2026-07-02 evening).
    chosen Creators to the ensemble once and the Creator store makes it stick.
    Engine changes are deliberate per-Creator acts (ADR 0033's conservatism);
    the ensemble is measured on Indonesian only (the EN axis remains open);
-   `YC_QWEN_ENS` stays as the headless/CLI override.
+   `YC_QWEN_ENS` stays as the headless/CLI override. *(Sharpened at
+   implementation, 2026-07-02, operator-AFK — logged for veto: the override is
+   **tri-state** — `1` forces the ensemble, `0` forces whisper, unset defers to
+   the Creator's engine — and is never written back to the Creator store. An
+   on-only override would have made the whisper gate fixtures (ADR 0034)
+   unrunnable against a Creator the operator has flipped without hand-editing
+   creators.json.)*
 
 Implementation lands one slice per session, in value order: **picker** (GUI
 citizenship + stickiness) → **decode cache** (fast deterministic curation
