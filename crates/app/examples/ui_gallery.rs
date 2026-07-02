@@ -31,51 +31,77 @@ struct Gallery {
 
 impl eframe::App for Gallery {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            theme::section(ui, "chip_row (current)");
-            theme::card().show(ui, |ui| {
-                if let Some(i) =
-                    theme::chip_row(ui, &[(self.sel == 0, "Stacked"), (self.sel == 1, "Full cam"), (self.sel == 2, "Wide")])
-                {
-                    self.sel = i;
-                }
-                if let Some(i) = theme::chip_row(
-                    ui,
-                    &[(self.preset == Some(0), "Classic"), (self.preset == Some(1), "TikTok"), (self.preset == Some(2), "Podcast")],
-                ) {
-                    self.preset = Some(i);
-                }
-                if let Some(i) = theme::chip_row(
-                    ui,
-                    &[(self.preset == Some(3), "Minimal"), (self.preset == Some(4), "Gaming"), (self.preset == Some(5), "MrBeast")],
-                ) {
-                    self.preset = Some(i + 3);
-                }
-            });
+        // Replicate the Studio's EXACT properties-panel structure (right side
+        // panel + scroll area + enabled_ui nesting) so panel-specific layout
+        // bugs reproduce here, not just bare rows in a central panel.
+        egui::Panel::right("gallery-props")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(250.0..=420.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
+                    theme::section(ui, "Framing");
+                    theme::card().show(ui, |ui| {
+                        ui.add_enabled_ui(true, |ui| {
+                            if let Some(i) = theme::chip_row(
+                                ui,
+                                &[
+                                    (self.sel == 0, "Stacked"),
+                                    (self.sel == 1, "Full cam"),
+                                    (self.sel == 2, "Wide"),
+                                ],
+                            ) {
+                                self.sel = i;
+                            }
+                            let _ =
+                                theme::wide_button(ui, egui::Button::new("Reset to auto framing"));
+                        });
+                    });
 
-            theme::section(ui, "min_size variant");
-            theme::card().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let gap = ui.spacing().item_spacing.x;
-                    let w = ((ui.available_width() - gap * 2.0) / 3.0).floor();
-                    for (i, label) in ["Classic", "TikTok", "Podcast"].iter().enumerate() {
-                        let _ = ui.add(
-                            theme::chip(self.preset == Some(i), label)
-                                .min_size(egui::vec2(w, theme::chip_h(ui))),
+                    theme::section(ui, "Caption presets");
+                    theme::card().show(ui, |ui| {
+                        if let Some(i) = theme::chip_row(
+                            ui,
+                            &[
+                                (self.preset == Some(0), "Classic"),
+                                (self.preset == Some(1), "TikTok"),
+                                (self.preset == Some(2), "Podcast"),
+                            ],
+                        ) {
+                            self.preset = Some(i);
+                        }
+                        if let Some(i) = theme::chip_row(
+                            ui,
+                            &[
+                                (self.preset == Some(3), "Minimal"),
+                                (self.preset == Some(4), "Gaming"),
+                                (self.preset == Some(5), "MrBeast"),
+                            ],
+                        ) {
+                            self.preset = Some(i + 3);
+                        }
+                        ui.weak("Pick a starting look — everything below stays editable.");
+                    });
+
+                    theme::section(ui, "Customize captions");
+                    theme::card().show(ui, |ui| {
+                        ui.label("Animation");
+                        let _ = theme::chip_row(
+                            ui,
+                            &[(true, "Huge word"), (false, "Rolling"), (false, "Karaoke")],
                         );
-                    }
+                        ui.horizontal(|ui| {
+                            ui.label("Size");
+                            let mut size = 150u32;
+                            ui.add(egui::Slider::new(&mut size, 40..=220).suffix(" px"));
+                            let mut bold = false;
+                            ui.checkbox(&mut bold, "Bold");
+                        });
+                    });
                 });
             });
-
-            theme::section(ui, "full-width rows");
-            theme::card().show(ui, |ui| {
-                for (i, label) in ["Manual", "Active Speaker  ·  best for podcasts"].iter().enumerate() {
-                    let _ = ui.add_sized(
-                        [ui.available_width(), theme::chip_h(ui)],
-                        theme::chip(self.sel == i, label),
-                    );
-                }
-            });
-        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::WELL))
+            .show_inside(ui, |_ui| {});
     }
 }

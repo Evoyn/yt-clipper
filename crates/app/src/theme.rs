@@ -273,19 +273,39 @@ pub fn chip_h(ui: &egui::Ui) -> f32 {
 /// (operator: hand-computed widths made the rows asymmetric). Chip `i` of `n`
 /// occupies the same column in every row of the same container. Returns the
 /// clicked index.
+///
+/// Sized via `Button::min_size`, NOT `add_sized`: the atom-layout button
+/// paints its frame at its own `frame_size` (content `.at_least(min_size)`),
+/// while `add_sized`'s justified wrapper distorts it — measured: the first
+/// chip rendered ~11 px wider than its siblings, none at the computed width.
 pub fn chip_row(ui: &mut egui::Ui, options: &[(bool, &str)]) -> Option<usize> {
     let mut clicked = None;
     let n = options.len().max(1) as f32;
+    let gap = ui.spacing().item_spacing.x;
     ui.horizontal(|ui| {
-        let gap = ui.spacing().item_spacing.x;
+        // Explicit gaps, zero automatic spacing: egui slipped a leading
+        // item_spacing before the first chip (measured: the whole row sat
+        // ~11 px right of the card's other content), so the row owns its
+        // geometry outright.
+        ui.spacing_mut().item_spacing.x = 0.0;
         let w = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
         for (i, (selected, label)) in options.iter().enumerate() {
-            if ui.add_sized([w, chip_h(ui)], chip(*selected, label)).clicked() {
+            if i > 0 {
+                ui.add_space(gap);
+            }
+            if ui.add(chip(*selected, label).min_size(egui::vec2(w, chip_h(ui)))).clicked() {
                 clicked = Some(i);
             }
         }
     });
     clicked
+}
+
+/// A full-width single button/chip row (camera modes, reset actions) — same
+/// `min_size` sizing as [`chip_row`] so it shares the grid's outer edges.
+pub fn wide_button(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
+    let w = ui.available_width();
+    ui.add(button.min_size(egui::vec2(w, chip_h(ui))))
 }
 
 /// A segmented-control row over an enum-ish set: draws `options` as connected

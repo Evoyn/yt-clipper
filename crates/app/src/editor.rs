@@ -1338,10 +1338,7 @@ impl EditorState {
                     _ => camera_mode_label(mode).to_string(),
                 };
                 // Full-width rows: every mode the same size, nothing shifts.
-                let resp = ui.add_sized(
-                    [ui.available_width(), theme::chip_h(ui)],
-                    theme::chip(selected, &label),
-                );
+                let resp = theme::wide_button(ui, theme::chip(selected, &label));
                 if resp.clicked() {
                     self.camera_mode = mode;
                     if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group)
@@ -1429,13 +1426,7 @@ impl EditorState {
                         }
                     });
                 }
-                if ui
-                    .add_sized(
-                        [ui.available_width(), theme::chip_h(ui)],
-                        egui::Button::new("Reset to auto framing"),
-                    )
-                    .clicked()
-                {
+                if theme::wide_button(ui, egui::Button::new("Reset to auto framing")).clicked() {
                     self.reset_to_auto();
                 }
                 ui.weak("Original view: drag the box, corners resize, scroll zooms, arrows nudge (Shift = big steps), 0 resets.");
