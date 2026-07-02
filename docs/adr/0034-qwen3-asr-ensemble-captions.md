@@ -85,6 +85,19 @@ render provably unchanged when unset — the ADR 0033 opt-in contract):
 - Fails soft: any missing sidecar/model or stage error logs a warning and the
   whisper captions stand.
 
+- **Time-anchored corrections (`at_s`, added after the operator's watch
+  feedback)**: a correction may carry a VOD-absolute moment. The ensemble path
+  applies it positionally — the occurrence of `wrong` nearest that moment,
+  pinned to the speech onset there (tight 0.75 s snap radius; their ear wins
+  past it), with neighbor repair (left compression with wide-donor sharing,
+  right shifting). `wrong == right` is a pure timing pin; a multi-word `right`
+  inserts words no engine's posterior contains (the benchmark's scream-masked
+  "tur biadab anjing"). The whisper dict path skips `at_s` entries — global
+  application would hit every occurrence, which the anchor exists to prevent.
+  This is the working seed of the ROADMAP's time-anchored-curation migration;
+  harvest notes already record the same timestamps (ADR 0022), so the review
+  queue can grow an "and it's at THIS moment" field later.
+
 ## Consequences
 
 - The operator gains a per-render lever that measurably beats the production
