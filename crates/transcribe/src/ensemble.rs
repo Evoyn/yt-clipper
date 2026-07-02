@@ -176,7 +176,7 @@ pub fn apply(
     apply_store_fuzzy(&mut merged, lexicon);
 
     // --- 4. fuse words onto the anchor skeleton + speech onsets -------------
-    let fused = fuse_onto_timing(
+    let mut fused = fuse_onto_timing(
         &merged,
         whisper,
         timing_extra,
@@ -189,6 +189,18 @@ pub fn apply(
         fused.len(),
         whisper.units.len(),
         timing_extra.map(|t| t.units.len()).unwrap_or(0)
+    );
+
+    // --- 5. positional (time-anchored) store pass ----------------------------
+    // Corrections with an `at_s` pin apply AFTER fusion, to the occurrence
+    // nearest their moment — the operator's ear as ground truth for WHERE a
+    // word belongs, not just what it is (the time-anchored-curation seed).
+    apply_store_positional(
+        &mut fused,
+        lexicon,
+        range.start_s,
+        &rms_onsets(samples, sample_rate),
+        range.duration_s(),
     );
     Ok(Transcript { language: whisper.language, units: fused })
 }
@@ -422,7 +434,9 @@ pub fn apply_store_fuzzy(words: &mut Vec<String>, lexicon: &crate::DialectLexico
     let pairs: Vec<(String, Vec<String>)> = lexicon
         .corrections
         .iter()
-        .filter(|c| !c.right.is_empty() && !c.context)
+        // at_s entries are positional: they run AFTER fusion, on the occurrence
+        // nearest their moment (apply_store_positional), never globally here.
+        .filter(|c| !c.right.is_empty() && !c.context && c.at_s.is_none())
         .filter_map(|c| {
             let wrong = normalize(&c.wrong);
             if wrong.len() != 1 {
@@ -708,6 +722,152 @@ fn place_run(
         let s = starts[k];
         let e = starts.get(k + 1).copied().unwrap_or(gap_end).max(s);
         fused.push(CaptionUnit { text: w.clone(), start_s: s, end_s: e.min(gap_end).max(s) });
+    }
+}
+
+/// Positional (time-anchored) store pass over the FUSED units: each `at_s`
+/// correction targets the single occurrence of its `wrong` token nearest that
+/// VOD moment (±3 s guard), replaces its text (a multi-word `right` expands to
+/// consecutive units; `wrong == right` is a pure timing pin), and PINS the
+/// first word's caption onto the speech onset closest to the moment (±1.5 s,
+/// else the moment itself). Units that would then overlap the pin from the
+/// left are re-placed briefly (0.3 s/word cap) so they stay readable — the
+/// measured case: stretched "cok main" anchors pushing "pusing kan dibilang"
+/// seconds late; the kan/dibilang pins pull the tail back and the stretched
+/// pair compresses to its true brief spans.
+pub fn apply_store_positional(
+    fused: &mut Vec<CaptionUnit>,
+    lexicon: &crate::DialectLexicon,
+    range_start_s: f64,
+    onsets: &[f64],
+    clip_dur_s: f64,
+) {
+    let mut pins: Vec<(f64, String, Vec<String>)> = lexicon
+        .corrections
+        .iter()
+        .filter(|c| !c.right.is_empty() && !c.context)
+        .filter_map(|c| {
+            let at = c.at_s?;
+            let wrong = normalize(&c.wrong);
+            if wrong.len() != 1 {
+                return None;
+            }
+            Some((at - range_start_s, wrong.into_iter().next().expect("len checked"), normalize(&c.right)))
+        })
+        .collect();
+    pins.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (pin_t, wrong, right) in pins {
+        if pin_t < 0.0 || pin_t > clip_dur_s {
+            continue;
+        }
+        // nearest occurrence of `wrong` to the moment. EXACT token matches
+        // outrank garble-similar ones — edit-2 "similarity" pairs absurdities
+        // on short words ("main"~"kan"), so it is only the fallback when the
+        // exact word is absent (the vote respelled the garble again).
+        let nearest = |exact: bool| {
+            fused
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| {
+                    if exact {
+                        u.text == wrong
+                    } else {
+                        similar_word(&u.text, &wrong)
+                    }
+                })
+                .min_by(|(_, a), (_, b)| {
+                    (a.start_s - pin_t).abs().total_cmp(&(b.start_s - pin_t).abs())
+                })
+                .map(|(k, _)| k)
+        };
+        let target = nearest(true).or_else(|| nearest(false));
+        let Some(k) = target else {
+            tracing::warn!("qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s: no such word in the caption");
+            continue;
+        };
+        if (fused[k].start_s - pin_t).abs() > 3.0 {
+            tracing::warn!(
+                "qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s: nearest occurrence is {:.1}s away - skipped",
+                (fused[k].start_s - pin_t).abs()
+            );
+            continue;
+        }
+        // Snap to the closest speech onset near the moment — but only a TIGHT
+        // match (0.75 s): on continuously-loud spans (scream + SFX) the nearest
+        // rising edge can sit a second before the pin, and honoring it would
+        // undo the operator's correction. Past the radius, their ear wins.
+        let snap = onsets
+            .iter()
+            .copied()
+            .filter(|t| (t - pin_t).abs() <= 0.75)
+            .min_by(|a, b| (a - pin_t).abs().total_cmp(&(b - pin_t).abs()))
+            .unwrap_or(pin_t);
+        tracing::info!(
+            "qwen ensemble: at_s pin \"{wrong}\"@{pin_t:.1}s -> \"{}\" at {snap:.2}s (was {:.2}s)",
+            right.join(" "),
+            fused[k].start_s
+        );
+        // replace text (multi-word right expands into consecutive units)
+        let old_end = fused[k].end_s.max(snap + 0.15);
+        fused[k].text = right[0].clone();
+        fused[k].start_s = snap;
+        fused[k].end_s = old_end.min(snap + 0.6);
+        for (extra_i, w) in right[1..].iter().enumerate() {
+            let s = fused[k + extra_i].end_s;
+            fused.insert(
+                k + extra_i + 1,
+                CaptionUnit { text: w.clone(), start_s: s, end_s: s + 0.15 },
+            );
+        }
+        // Left neighbors that overlap the pin compress into the space before
+        // it. When that space is too tight to keep the chain readable, WIDE
+        // predecessors join the chain as donors — the measured case: a
+        // stretched first "pusing" (anchor artifact) hogging 1.1 s while the
+        // words after it got 0.03 s each; re-placing the whole chain gives
+        // every word its share and shortens the stretched one to its real say.
+        let mut first_conflict = k;
+        while first_conflict > 0 && fused[first_conflict - 1].end_s > snap {
+            first_conflict -= 1;
+        }
+        while first_conflict > 0
+            && first_conflict < k
+            && ((snap - fused[first_conflict].start_s) / ((k - first_conflict) as f64))
+                < MIN_WORD_S
+            && fused[first_conflict - 1].end_s - fused[first_conflict - 1].start_s > 0.45
+        {
+            first_conflict -= 1;
+        }
+        if first_conflict < k {
+            let n_chain = k - first_conflict;
+            let chain_start = fused[first_conflict]
+                .start_s
+                .min(snap - n_chain as f64 * 0.3)
+                .max(if first_conflict == 0 { 0.0 } else { fused[first_conflict - 1].end_s })
+                .min(snap);
+            let span = snap - chain_start;
+            let total_chars: usize =
+                fused[first_conflict..k].iter().map(|u| u.text.chars().count().max(1)).sum();
+            let mut t = chain_start;
+            for u in fused[first_conflict..k].iter_mut() {
+                let w = span * (u.text.chars().count().max(1) as f64 / total_chars as f64);
+                u.start_s = t;
+                u.end_s = (t + w).min(snap);
+                t += w;
+            }
+        }
+        // right neighbors that the pin/insertions now overlap shift forward;
+        // non-overlapping units just advance the cursor (no early break — an
+        // inserted unit starts exactly at the cursor and units after it may
+        // still overlap).
+        let mut t = fused[k].end_s;
+        for u in fused[k + 1..].iter_mut() {
+            if u.start_s < t {
+                let w = (u.end_s - u.start_s).max(0.0);
+                u.start_s = t;
+                u.end_s = (t + w).min(clip_dur_s).max(t);
+            }
+            t = t.max(u.end_s);
+        }
     }
 }
 
@@ -1104,6 +1264,91 @@ mod tests {
         let mut w = words("cowok maen");
         apply_store_fuzzy(&mut w, &lex);
         assert_eq!(w, words("cowok maen"));
+    }
+
+    fn pin_lex(entries: &[(&str, &str, f64)]) -> crate::DialectLexicon {
+        let mut lex = crate::DialectLexicon::default();
+        for (w, r, at) in entries {
+            lex.corrections.push(crate::Correction {
+                wrong: (*w).into(),
+                right: (*r).into(),
+                at_s: Some(*at),
+                ..Default::default()
+            });
+        }
+        lex
+    }
+
+    #[test]
+    fn positional_pin_targets_nearest_occurrence_and_moves_it() {
+        // two "anjing"s; the pin at VOD 105s (clip 5s) must move ONLY the
+        // second one (4.6s away from the first, 0.4s from the second).
+        let mut fused = vec![
+            CaptionUnit { text: "anjing".into(), start_s: 1.0, end_s: 1.4 },
+            CaptionUnit { text: "mana".into(), start_s: 2.0, end_s: 2.4 },
+            CaptionUnit { text: "anjing".into(), start_s: 4.6, end_s: 4.8 },
+        ];
+        // pure pin (wrong == right), onset available at 5.2
+        apply_store_positional(&mut fused, &pin_lex(&[("anjing", "anjing", 105.0)]), 100.0, &[5.2], 10.0);
+        assert_eq!(fused[0].start_s, 1.0, "first occurrence untouched");
+        assert!((fused[2].start_s - 5.2).abs() < 1e-9, "second pinned to onset, got {}", fused[2].start_s);
+    }
+
+    #[test]
+    fn positional_pin_compresses_stretched_left_neighbors() {
+        // "cok main" stretched over 26.1-27.6 while "kan" belongs at 26.3:
+        // the pin pulls kan back and the pair compresses briefly before it.
+        let mut fused = vec![
+            CaptionUnit { text: "pusing".into(), start_s: 24.9, end_s: 26.1 },
+            CaptionUnit { text: "cok".into(), start_s: 26.1, end_s: 27.2 },
+            CaptionUnit { text: "main".into(), start_s: 27.2, end_s: 27.6 },
+            CaptionUnit { text: "kan".into(), start_s: 28.2, end_s: 28.5 },
+            CaptionUnit { text: "dibilang".into(), start_s: 28.7, end_s: 29.2 },
+        ];
+        apply_store_positional(&mut fused, &pin_lex(&[("kan", "kan", 126.3)]), 100.0, &[], 30.0);
+        assert!((fused[3].start_s - 26.3).abs() < 1e-9, "kan pinned, got {}", fused[3].start_s);
+        // cok+main compressed to end at the pin, each still visible
+        assert!(fused[2].end_s <= 26.3 + 1e-9);
+        assert!(fused[1].end_s <= fused[2].start_s + 1e-9);
+        assert!(fused[1].end_s - fused[1].start_s > 0.05);
+        assert!(fused[2].end_s - fused[2].start_s > 0.05);
+        // pusing keeps its place (no overlap with the compressed chain)
+        assert!(fused[0].end_s <= fused[1].start_s + 1e-9);
+    }
+
+    #[test]
+    fn positional_pin_expands_multiword_right_and_shifts_overlaps() {
+        // operator: "tur biadab anjing" is spoken at ~8s, right before
+        // "depan sini" - the insertion rides the depan occurrence nearest 8s.
+        let mut fused = vec![
+            CaptionUnit { text: "depan".into(), start_s: 1.2, end_s: 1.5 },
+            CaptionUnit { text: "satu".into(), start_s: 4.6, end_s: 4.8 },
+            CaptionUnit { text: "depan".into(), start_s: 7.5, end_s: 8.5 },
+            CaptionUnit { text: "sini".into(), start_s: 8.5, end_s: 9.3 },
+        ];
+        apply_store_positional(
+            &mut fused,
+            &pin_lex(&[("depan", "tur biadab anjing depan", 108.0)]),
+            100.0,
+            &[8.0],
+            12.0,
+        );
+        let texts: Vec<&str> = fused.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, ["depan", "satu", "tur", "biadab", "anjing", "depan", "sini"]);
+        assert!((fused[2].start_s - 8.0).abs() < 1e-9, "tur pinned at 8.0, got {}", fused[2].start_s);
+        // ordering monotonic, sini shifted past the inserted words
+        for w in fused.windows(2) {
+            assert!(w[0].start_s <= w[1].start_s + 1e-9);
+        }
+        assert!(fused[6].start_s >= fused[5].end_s - 1e-9);
+    }
+
+    #[test]
+    fn positional_pin_guard_skips_far_occurrences() {
+        let mut fused = vec![CaptionUnit { text: "kreeng".into(), start_s: 2.0, end_s: 2.5 }];
+        // pin at clip 16s, occurrence at 2s -> 14s away -> skipped
+        apply_store_positional(&mut fused, &pin_lex(&[("kreeng", "kreeng", 116.0)]), 100.0, &[], 30.0);
+        assert_eq!(fused[0].start_s, 2.0);
     }
 
     #[test]

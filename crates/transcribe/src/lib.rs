@@ -249,6 +249,17 @@ pub struct Correction {
     /// bajingan` on a single clip). Curated in the per-clip store, it stays there.
     #[serde(default)]
     pub clip_only: bool,
+    /// Time anchor (VOD-absolute seconds; the ROADMAP "time-anchored curation"
+    /// seed, 2026-07-02). When set, the ENSEMBLE caption path (ADR 0034)
+    /// applies this correction **positionally**: only to the token occurrence
+    /// nearest this moment (±3 s guard) — finally safe for words that appear
+    /// several times with only one occurrence needing the fix — and PINS the
+    /// corrected word's caption to the speech onset there (`wrong == right` is
+    /// a pure timing pin). The whisper dict path ignores it (no per-unit VOD
+    /// times at dict-application depth); harvest notes already record the same
+    /// timestamp (ADR 0022), so future curation can fill it from the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_s: Option<f64>,
 }
 
 /// `names.json` — the roster of viewer names the streamer reads aloud, loaded
@@ -389,7 +400,10 @@ impl DialectLexicon {
     fn pairs(&self) -> Vec<(String, &str)> {
         self.corrections
             .iter()
-            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty() && !c.context)
+            // `at_s` entries are positional (one occurrence at one moment,
+            // ensemble path only) — a global dict application would hit every
+            // occurrence, exactly what the time anchor exists to prevent.
+            .filter(|c| !c.wrong.is_empty() && !c.right.is_empty() && !c.context && c.at_s.is_none())
             .map(|c| (c.wrong.to_lowercase(), c.right.as_str()))
             .collect()
     }
@@ -491,6 +505,7 @@ impl DialectLexicon {
                     status: "unverified".into(),
                     context: false, // a harvested garble is a global fix-up, not a context override
                     clip_only: false, // and it promotes to the Creator once confirmed (ADR 0031)
+                    at_s: None, // the note carries the timestamp; the operator sets at_s when curating
                 });
                 added += 1;
             }
@@ -646,8 +661,9 @@ fn apply_multiword_corrections(
     lexicon: &DialectLexicon,
 ) {
     for c in &lexicon.corrections {
-        // Context-sensitive overrides (ADR 0030) are LLM-applied, never global.
-        if c.wrong.is_empty() || c.right.is_empty() || c.context {
+        // Context-sensitive overrides (ADR 0030) are LLM-applied, never global;
+        // time-anchored entries (at_s) are ensemble-positional, never global.
+        if c.wrong.is_empty() || c.right.is_empty() || c.context || c.at_s.is_some() {
             continue;
         }
         let words: Vec<String> =

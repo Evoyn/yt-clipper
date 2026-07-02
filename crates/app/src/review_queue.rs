@@ -162,18 +162,15 @@ mod tests {
             right: String::new(),
             note: note.into(),
             status: "unverified".into(),
-            context: false,
-            clip_only: false,
+            ..Default::default()
         }
     }
     fn confirmed(wrong: &str, right: &str) -> Correction {
         Correction {
             wrong: wrong.into(),
             right: right.into(),
-            note: String::new(),
             status: "confirmed".into(),
-            context: false,
-            clip_only: false,
+            ..Default::default()
         }
     }
 
