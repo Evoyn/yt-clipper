@@ -4,6 +4,43 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-02 (evening) — the gate ran, caught two real bugs, and your rulings now aim at moments
+
+The ADR 0034 generalization gate rendered both held-out clips and earned its
+keep twice over (`b229708` + `df97c7f`, ADR 0035, 70 transcribe tests green,
+all pushed):
+
+- **The Deddy control silently wasn't testing the ensemble at all**: its
+  stream folder ("… Tretan, Coki, Adriano") has commas, llama-mtmd-cli's
+  `--audio` flag SPLITS on commas, all five variants died, and the render
+  fell back to whisper looking perfectly fine. The sidecar now gets only our
+  own ASCII wav names. Any comma'd or emoji VOD title would have hit this.
+- **The eh-pile export exposed a fusion trap**: the vote correctly threw away
+  107 of whisper's 115 "eh"s, but fusion still trusted the junk skeleton's
+  accidental matches — 21 real words boxed into 0.12 s. The skeleton is now
+  dropped when <1/3 of its anchors get claimed, words place on speech onsets
+  read from the DENOISED audio (the loud mix has none), and each burst opens
+  on its onset. `clip-36-43 (3).mp4` shows real words with real timing where
+  the 107-eh pile used to be.
+- **Your four Deddy rulings** (tiga→juga, blok-on→blo'on ×2, blok-on→goblok)
+  shipped as time-anchored, clip-only corrections — and forced two new
+  mechanics: multi-word pins that COLLAPSE units (blok+on → one blo'on, your
+  apostrophe intact), and `at_s` as part of a correction's identity (three
+  same-`wrong` pairs in one clip coexist; before, only the last survived).
+  All four verified on `clip-30-00 (6).mp4`.
+- **The productization grill → ADR 0035**: Caption engine as a per-Creator
+  closed enum (Whisper | Qwen ensemble), shape-computed switch warnings,
+  contested-vote harvest born time-anchored, one-shot sidecar stays, per-clip
+  decode cache, no default flip. Implementation one slice per session:
+  **picker → cache → harvest**.
+- You closed the Diskusi benchmark loop: `clip-31-22 (13).mp4` is "almost
+  perfect" — residuals accepted.
+
+Next session: the engine picker slice (all decisions pre-made in ADR 0035).
+Entry point as always: `nextprompt.md`.
+
+---
+
 ## 2026-07-02 (loop, final) — your timestamps became curation; the Diskusi export is word- and time-faithful
 
 Two more loop iterations after you watched the exports (`f884bd8..2956e41`,
