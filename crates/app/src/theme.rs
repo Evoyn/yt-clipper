@@ -251,6 +251,23 @@ pub fn status_chip(ui: &mut egui::Ui, color: Color32, text: &str) {
         });
 }
 
+/// A choice chip: a selectable button that ALWAYS draws its resting frame.
+/// egui's `selectable_label` hides the frame until hover, so an unselected
+/// option looks like plain text and a full-height pill pops in around it on
+/// hover — which reads as the row expanding (operator bug report). With the
+/// resting frame permanent, hover only re-tints. Size chips with
+/// `ui.add_sized([w, chip_h(ui)], chip(..))` so heights always match the
+/// theme's button minimum (a smaller size makes the pill overflow the row).
+pub fn chip<'a>(selected: bool, text: &'a str) -> egui::Button<'a> {
+    egui::Button::selectable(selected, text).frame_when_inactive(true)
+}
+
+/// The exact height every chip must be sized to: the theme's minimum
+/// interactive height. Anything less and the button paints past the slot.
+pub fn chip_h(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
 /// A segmented-control row over an enum-ish set: draws `options` as connected
 /// selectable segments, returns the clicked index.
 pub fn segmented(ui: &mut egui::Ui, selected: usize, options: &[&str]) -> Option<usize> {
@@ -258,7 +275,7 @@ pub fn segmented(ui: &mut egui::Ui, selected: usize, options: &[&str]) -> Option
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (i, label) in options.iter().enumerate() {
-            if ui.selectable_label(selected == i, *label).clicked() {
+            if ui.add(chip(selected == i, label)).clicked() {
                 clicked = Some(i);
             }
         }

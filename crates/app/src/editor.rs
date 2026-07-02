@@ -417,7 +417,7 @@ impl EditorState {
                     ui.add_space(6.0);
                     let safe = self.show_safe_area;
                     if ui
-                        .selectable_label(safe, "Safe area")
+                        .add(theme::chip(safe, "Safe area"))
                         .on_hover_text("Show the zones YouTube/TikTok UI covers")
                         .clicked()
                     {
@@ -425,7 +425,7 @@ impl EditorState {
                     }
                     let cap = self.show_captions;
                     if ui
-                        .selectable_label(cap, "Captions")
+                        .add(theme::chip(cap, "Captions"))
                         .on_hover_text("Show/hide the caption overlay")
                         .clicked()
                     {
@@ -1339,8 +1339,8 @@ impl EditorState {
                 };
                 // Full-width rows: every mode the same size, nothing shifts.
                 let resp = ui.add_sized(
-                    [ui.available_width(), 26.0],
-                    egui::Button::selectable(selected, label),
+                    [ui.available_width(), theme::chip_h(ui)],
+                    theme::chip(selected, &label),
                 );
                 if resp.clicked() {
                     self.camera_mode = mode;
@@ -1409,7 +1409,7 @@ impl EditorState {
                         (LayoutKind::FullGameplay, "Wide"),
                     ] {
                         if ui
-                            .add_sized([w, 26.0], egui::Button::selectable(self.kind == kind, label))
+                            .add_sized([w, theme::chip_h(ui)], theme::chip(self.kind == kind, label))
                             .clicked()
                         {
                             self.kind = kind;
@@ -1459,8 +1459,8 @@ impl EditorState {
                         let i = presets.iter().position(|q| q.name == p.name).unwrap_or(0);
                         if ui
                             .add_sized(
-                                [chip_w, 28.0],
-                                egui::Button::selectable(self.preset == Some(i), &p.name),
+                                [chip_w, theme::chip_h(ui)],
+                                theme::chip(self.preset == Some(i), &p.name),
                             )
                             .clicked()
                         {
@@ -1492,8 +1492,8 @@ impl EditorState {
                     ] {
                         if ui
                             .add_sized(
-                                [w, 26.0],
-                                egui::Button::selectable(self.style.genre == genre, label),
+                                [w, theme::chip_h(ui)],
+                                theme::chip(self.style.genre == genre, label),
                             )
                             .clicked()
                         {
