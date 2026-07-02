@@ -268,6 +268,26 @@ pub fn chip_h(ui: &egui::Ui) -> f32 {
     ui.spacing().interact_size.y
 }
 
+/// One row of equal-width chips spanning the full available width — THE
+/// layout primitive for every choice row, so columns line up across sections
+/// (operator: hand-computed widths made the rows asymmetric). Chip `i` of `n`
+/// occupies the same column in every row of the same container. Returns the
+/// clicked index.
+pub fn chip_row(ui: &mut egui::Ui, options: &[(bool, &str)]) -> Option<usize> {
+    let mut clicked = None;
+    let n = options.len().max(1) as f32;
+    ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let w = ((ui.available_width() - gap * (n - 1.0)) / n).floor();
+        for (i, (selected, label)) in options.iter().enumerate() {
+            if ui.add_sized([w, chip_h(ui)], chip(*selected, label)).clicked() {
+                clicked = Some(i);
+            }
+        }
+    });
+    clicked
+}
+
 /// A segmented-control row over an enum-ish set: draws `options` as connected
 /// selectable segments, returns the clicked index.
 pub fn segmented(ui: &mut egui::Ui, selected: usize, options: &[&str]) -> Option<usize> {

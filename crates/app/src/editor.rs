@@ -1401,21 +1401,17 @@ impl EditorState {
         theme::section(ui, "Framing");
         theme::card().show(ui, |ui| {
             ui.add_enabled_ui(self.camera_mode == CameraMode::Manual, |ui| {
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
-                    for (kind, label) in [
-                        (LayoutKind::Stacked, "Stacked"),
-                        (LayoutKind::FullCam, "Full cam"),
-                        (LayoutKind::FullGameplay, "Wide"),
-                    ] {
-                        if ui
-                            .add_sized([w, theme::chip_h(ui)], theme::chip(self.kind == kind, label))
-                            .clicked()
-                        {
-                            self.kind = kind;
-                        }
-                    }
-                });
+                let kinds = [LayoutKind::Stacked, LayoutKind::FullCam, LayoutKind::FullGameplay];
+                if let Some(i) = theme::chip_row(
+                    ui,
+                    &[
+                        (self.kind == LayoutKind::Stacked, "Stacked"),
+                        (self.kind == LayoutKind::FullCam, "Full cam"),
+                        (self.kind == LayoutKind::FullGameplay, "Wide"),
+                    ],
+                ) {
+                    self.kind = kinds[i];
+                }
                 if self.kind == LayoutKind::Stacked {
                     ui.horizontal(|ui| {
                         ui.label("Seam");
@@ -1433,7 +1429,13 @@ impl EditorState {
                         }
                     });
                 }
-                if ui.button("Reset to auto framing").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), theme::chip_h(ui)],
+                        egui::Button::new("Reset to auto framing"),
+                    )
+                    .clicked()
+                {
                     self.reset_to_auto();
                 }
                 ui.weak("Original view: drag the box, corners resize, scroll zooms, arrows nudge (Shift = big steps), 0 resets.");
@@ -1449,28 +1451,22 @@ impl EditorState {
         // --- Caption style ---
         theme::section(ui, "Caption presets");
         theme::card().show(ui, |ui| {
-            // Uniform 3-per-row chips: equal boxes read as "pick one card",
-            // and fixed sizes mean nothing can shift on hover or selection.
+            // Uniform 3-per-row chips through the shared chip_row grid: equal
+            // boxes, columns aligned with every other choice row.
             let presets = caption_presets();
-            let chip_w = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0;
-            for row in presets.chunks(3) {
-                ui.horizontal(|ui| {
-                    for p in row {
-                        let i = presets.iter().position(|q| q.name == p.name).unwrap_or(0);
-                        if ui
-                            .add_sized(
-                                [chip_w, theme::chip_h(ui)],
-                                theme::chip(self.preset == Some(i), &p.name),
-                            )
-                            .clicked()
-                        {
-                            self.style = p.clone();
-                            self.preset = Some(i);
-                            self.lines_dirty = true;
-                            self.overlay_cache = None;
-                        }
-                    }
-                });
+            for (row_idx, row) in presets.chunks(3).enumerate() {
+                let opts: Vec<(bool, &str)> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(j, p)| (self.preset == Some(row_idx * 3 + j), p.name.as_str()))
+                    .collect();
+                if let Some(j) = theme::chip_row(ui, &opts) {
+                    let i = row_idx * 3 + j;
+                    self.style = presets[i].clone();
+                    self.preset = Some(i);
+                    self.lines_dirty = true;
+                    self.overlay_cache = None;
+                }
             }
             ui.weak("Pick a starting look — everything below stays editable.");
         });
@@ -1481,26 +1477,22 @@ impl EditorState {
         theme::card().show(ui, |ui| {
             {
                 let before = self.style.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Animation");
-                    let w = ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x) / 3.0)
-                        .max(60.0);
-                    for (genre, label) in [
-                        (CaptionGenre::HugeWord, "Huge word"),
-                        (CaptionGenre::RollingPop, "Rolling"),
-                        (CaptionGenre::KaraokeFill, "Karaoke"),
-                    ] {
-                        if ui
-                            .add_sized(
-                                [w, theme::chip_h(ui)],
-                                theme::chip(self.style.genre == genre, label),
-                            )
-                            .clicked()
-                        {
-                            self.style.genre = genre;
-                        }
-                    }
-                });
+                // Label on its own line so the genre chips join the SAME
+                // column grid as the preset/framing rows (inline labels made
+                // this one row narrower — the asymmetry the operator flagged).
+                ui.label("Animation");
+                let genres =
+                    [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill];
+                if let Some(i) = theme::chip_row(
+                    ui,
+                    &[
+                        (self.style.genre == CaptionGenre::HugeWord, "Huge word"),
+                        (self.style.genre == CaptionGenre::RollingPop, "Rolling"),
+                        (self.style.genre == CaptionGenre::KaraokeFill, "Karaoke"),
+                    ],
+                ) {
+                    self.style.genre = genres[i];
+                }
                 ui.horizontal(|ui| {
                     ui.label("Size");
                     ui.add(egui::Slider::new(&mut self.style.font_size, 40..=220).suffix(" px"));
