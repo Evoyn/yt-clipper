@@ -513,7 +513,7 @@ pub fn fuse_onto_timing(
     let anchor_tokens: Vec<String> = anchors.iter().map(|(_, _, t)| t.clone()).collect();
 
     let onsets = rms_onsets(samples, sample_rate);
-    let ops = align(&anchor_tokens, merged.to_vec().as_slice());
+    let ops = align_weighted(&anchor_tokens, merged);
 
     // First pass: which merged word adopts which anchor (similarity-gated).
     let mut adopted: Vec<Option<usize>> = vec![None; merged.len()]; // merged idx -> anchor idx
@@ -709,6 +709,71 @@ fn place_run(
         let e = starts.get(k + 1).copied().unwrap_or(gap_end).max(s);
         fused.push(CaptionUnit { text: w.clone(), start_s: s, end_s: e.min(gap_end).max(s) });
     }
+}
+
+/// Similarity-weighted alignment for TIMING fusion: equal 0.0 / similar-sub
+/// 0.5 / ins-or-del 1.0 / dissimilar-sub 2.2. A dissimilar substitution costs
+/// more than skip+insert, so the DP can never pair a word with a different
+/// word's anchor; a similar garble pairing beats skipping (0.5 < 2.0). This is
+/// what routes a REPEATED phrase to its own anchors — with uniform costs the
+/// clip's two "pusing ..." phrases tied, the backtrace picked the wrong slots,
+/// and the second phrase compressed against the clip edge (operator-heard).
+fn align_weighted(a: &[String], b: &[String]) -> Vec<(Op, Option<usize>, Option<usize>)> {
+    const SIM: f64 = 0.5;
+    const GAP: f64 = 1.0;
+    const DIS: f64 = 2.2;
+    let (n, m) = (a.len(), b.len());
+    let mut d = vec![vec![0.0_f64; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i as f64 * GAP;
+    }
+    for j in 0..=m {
+        d[0][j] = j as f64 * GAP;
+    }
+    let sub_cost = |x: &str, y: &str| {
+        if x == y {
+            0.0
+        } else if similar_word(x, y) {
+            SIM
+        } else {
+            DIS
+        }
+    };
+    for i in 1..=n {
+        for j in 1..=m {
+            let sub = d[i - 1][j - 1] + sub_cost(&a[i - 1], &b[j - 1]);
+            d[i][j] = sub.min(d[i - 1][j] + GAP).min(d[i][j - 1] + GAP);
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (n, m);
+    let eq = |x: f64, y: f64| (x - y).abs() < 1e-9;
+    // Tie-break order: diagonal, then INS, then DEL. Preferring Ins over Del
+    // at equal cost biases words toward LATER anchors — measured on the
+    // phantom-anchor case: [phantom-pusing, bangke] anchors vs
+    // [bangke, pusing] words costs 2.0 both ways, and the Del-first path
+    // adopts the phantom (the exact bug); the Ins-first path matches bangke
+    // to its real anchor and lets pusing fall to its later onset.
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && eq(d[i][j], d[i - 1][j - 1] + sub_cost(&a[i - 1], &b[j - 1])) {
+            let op = if a[i - 1] == b[j - 1] || similar_word(&a[i - 1], &b[j - 1]) {
+                Op::Ok
+            } else {
+                Op::Sub
+            };
+            ops.push((op, Some(i - 1), Some(j - 1)));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && eq(d[i][j], d[i][j - 1] + GAP) {
+            ops.push((Op::Ins, None, Some(j - 1)));
+            j -= 1;
+        } else {
+            ops.push((Op::Del, Some(i - 1), None));
+            i -= 1;
+        }
+    }
+    ops.reverse();
+    ops
 }
 
 /// "Same word, different garble": edit distance <= 2, or one is a prefix of
@@ -912,6 +977,37 @@ mod tests {
         let fused = fuse_onto_timing(&merged, &whisper, None, &silence(4.0), 16000, 4.0);
         assert_eq!(fused.len(), 1);
         assert_eq!((fused[0].start_s, fused[0].end_s), (2.1, 2.32));
+    }
+
+    #[test]
+    fn fuse_routes_a_repeated_phrase_to_its_own_anchors() {
+        // The clip has "pusing cok main" THEN "pusing kan dibilang"; with
+        // uniform alignment costs the two phrases tied and the second one
+        // compressed against the clip edge (operator-heard). Weighted costs
+        // route kan/dibilang onto their own anchors.
+        let whisper = Transcript {
+            language: Language::Id,
+            units: vec![
+                CaptionUnit { text: "pusing".into(), start_s: 24.5, end_s: 24.9 },
+                CaptionUnit { text: "main".into(), start_s: 25.1, end_s: 25.3 },
+                CaptionUnit { text: "kan".into(), start_s: 26.34, end_s: 26.5 },
+                CaptionUnit { text: "bilang".into(), start_s: 26.78, end_s: 27.0 },
+                CaptionUnit { text: "cimri".into(), start_s: 29.26, end_s: 29.46 },
+            ],
+        };
+        let merged = words("pusing cok main pusing kan dibilang");
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(30.0), 16000, 30.0);
+        assert_eq!(fused.len(), 6);
+        assert_eq!((fused[0].text.as_str(), fused[0].start_s), ("pusing", 24.5));
+        assert_eq!((fused[2].text.as_str(), fused[2].start_s), ("main", 25.1));
+        assert_eq!((fused[4].text.as_str(), fused[4].start_s), ("kan", 26.34));
+        assert_eq!((fused[5].text.as_str(), fused[5].start_s), ("dibilang", 26.78));
+        // the second pusing lands between its neighbors, not at the clip edge
+        assert!(
+            fused[3].start_s >= 25.3 && fused[3].start_s < 26.34,
+            "second pusing placed in its gap, got {}",
+            fused[3].start_s
+        );
     }
 
     #[test]

@@ -260,6 +260,23 @@ pub fn refine_caption_timing_traced(
     samples: &[f32],
     sr: u32,
 ) -> RefineTrace {
+    refine_traced_inner(transcript, samples, sr, true)
+}
+
+/// [`refine_caption_timing_traced`] with the silence-drop optionally disabled.
+/// The drop exists for WHISPER's failure mode — hallucinated tokens on
+/// silent/music windows (ADR 0007) — where a unit's words and times are one
+/// decoder's unverified guess. Ensemble captions (ADR 0034) invert that: every
+/// unit's word survived a multi-decoder vote, so a near-silent onset window is
+/// a *placement* artifact (fusion laid a verified word into a quiet span), and
+/// dropping it silently deletes real speech (measured: a quiet "mana"). Those
+/// callers keep every unit and still get the onset clamp + gap-fill re-timing.
+fn refine_traced_inner(
+    transcript: &Transcript,
+    samples: &[f32],
+    sr: u32,
+    drop_silent: bool,
+) -> RefineTrace {
     // Degenerate input: nothing to measure. Match refine_caption_timing's early
     // return — every unit is kept, unchanged, and no drop threshold applies.
     let keep_all_unchanged = || RefineTrace {
@@ -318,7 +335,7 @@ pub fn refine_caption_timing_traced(
         let k0 = k_of(dtw_start);
         let k_peak_end = k_of(dtw_start + PEAK_WINDOW_S).max(k0 + 1).min(n_env);
         let peak = env[k0..k_peak_end].iter().copied().fold(0.0_f32, f32::max);
-        if peak < silence_drop {
+        if drop_silent && peak < silence_drop {
             outcomes.push(UnitOutcome::Dropped { peak });
             continue;
         }
@@ -377,6 +394,25 @@ pub fn refine_caption_timing(mut transcript: Transcript, samples: &[f32], sr: u3
             UnitOutcome::Dropped { .. } => None,
         })
         .collect();
+    transcript
+}
+
+/// [`refine_caption_timing`] for VOTE-VERIFIED transcripts (the Qwen ensemble,
+/// ADR 0034): same onset clamp + gap-fill, but nothing is silence-dropped —
+/// see [`refine_traced_inner`] for why the drop is wrong for this input class.
+pub fn refine_caption_timing_keep_verified(
+    mut transcript: Transcript,
+    samples: &[f32],
+    sr: u32,
+) -> Transcript {
+    let trace = refine_traced_inner(&transcript, samples, sr, false);
+    for (u, outcome) in transcript.units.iter_mut().zip(trace.outcomes) {
+        // With drop_silent=false every outcome is Kept.
+        if let UnitOutcome::Kept { start_s, end_s } = outcome {
+            u.start_s = start_s;
+            u.end_s = end_s;
+        }
+    }
     transcript
 }
 

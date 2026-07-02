@@ -1541,7 +1541,18 @@ fn do_render(
             // clears when the sound drops, instead of huge-word's fixed hold.
             // (Recomputes the same pure trace as the harvest filter above — the two
             // can never disagree, and the envelope pass is trivial next to whisper.)
-            yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR)
+            // Ensemble transcripts keep every unit: their words are vote-verified
+            // across decoders, so a near-silent onset means fusion placed a real
+            // word into a quiet span — re-time it, don't delete it (ADR 0034).
+            if ens_used {
+                yc_render::refine_caption_timing_keep_verified(
+                    transcript,
+                    &samples,
+                    yc_ingest::WHISPER_SR,
+                )
+            } else {
+                yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR)
+            }
         };
         prepared.transcript = Some(transcript);
     }
