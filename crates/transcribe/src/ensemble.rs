@@ -106,6 +106,9 @@ pub fn apply(
     analysis_wav: &Path,
     range: TimeRange,
     whisper: &Transcript,
+    timing_extra: Option<&Transcript>,
+    samples: &[f32],
+    sample_rate: u32,
     lexicon: &crate::DialectLexicon,
 ) -> Result<Transcript> {
     anyhow::ensure!(cfg.mtmd_cli.is_file(), "mtmd sidecar missing: {}", cfg.mtmd_cli.display());
@@ -172,12 +175,20 @@ pub fn apply(
     let mut merged = merged;
     apply_store_fuzzy(&mut merged, lexicon);
 
-    // --- 4. fuse words onto whisper timing ----------------------------------
-    let fused = fuse_onto_timing(&merged, whisper, range.duration_s());
+    // --- 4. fuse words onto the anchor skeleton + speech onsets -------------
+    let fused = fuse_onto_timing(
+        &merged,
+        whisper,
+        timing_extra,
+        samples,
+        sample_rate,
+        range.duration_s(),
+    );
     tracing::info!(
-        "qwen ensemble: fused {} units (whisper had {})",
+        "qwen ensemble: fused {} units (whisper had {}, extra skeleton {})",
         fused.len(),
-        whisper.units.len()
+        whisper.units.len(),
+        timing_extra.map(|t| t.units.len()).unwrap_or(0)
     );
     Ok(Transcript { language: whisper.language, units: fused })
 }
@@ -458,66 +469,273 @@ fn edit1(a: &str, b: &str) -> bool {
     long[i + 1..] == short[i..]
 }
 
-/// Align the voted words onto whisper's timed units. Matched positions adopt
-/// whisper's span with the voted word; whisper-only units DROP (the
-/// hallucination class); voted-only runs are laid out character-proportionally
-/// inside the enclosing whisper gap (clip edges bound the outermost gaps).
+/// Align the voted words onto a TIMED ANCHOR skeleton and lay the rest onto
+/// speech-energy onsets.
+///
+/// The skeleton is the time-sorted union of the production whisper units and
+/// (when provided) a second whisper decode's units — on masked clips the
+/// default decode's spans are as unreliable as its words (a 4 s phantom unit
+/// over three real words, holes over real speech; ADR 0033's measurements),
+/// while the `suppress_nst` decode places units exactly where the default is
+/// blind. Its WORDS stay out of the vote (they re-garble, ADR 0033) — only
+/// its time grid is used.
+///
+/// Matching is similarity-gated: a DP substitution only adopts an anchor's
+/// span when the two tokens look like the same word (edit distance <= 2 or a
+/// prefix), otherwise the word falls through to onset placement — a text-blind
+/// substitution would drag a correct word onto a DIFFERENT word's (possibly
+/// phantom) anchor, which is exactly the "caption runs ahead of the streamer"
+/// bug this replaces. Unmatched anchors are skipped entirely (a phantom must
+/// not consume timeline). Inserted runs land on RMS onsets inside their gap
+/// (rising crossings of the ADR 0021 silence bar), falling back to
+/// character-proportional spread when the gap has fewer onsets than words.
 /// Zero-width results are fine downstream (DTW single-token units already are).
-pub fn fuse_onto_timing(merged: &[String], whisper: &Transcript, clip_dur_s: f64) -> Vec<CaptionUnit> {
-    let whisper_words: Vec<String> =
-        whisper.units.iter().map(|u| u.text.trim().to_lowercase()).collect();
-    // Whisper units can be multi-word after store corrections; align on the
-    // units' primary token for anchoring (fusion cares about time, not text).
-    let anchor_tokens: Vec<String> = whisper_words
+pub fn fuse_onto_timing(
+    merged: &[String],
+    whisper: &Transcript,
+    timing_extra: Option<&Transcript>,
+    samples: &[f32],
+    sample_rate: u32,
+    clip_dur_s: f64,
+) -> Vec<CaptionUnit> {
+    // --- anchor skeleton: union of both decodes' units, time-sorted ---------
+    let mut anchors: Vec<(f64, f64, String)> = whisper
+        .units
         .iter()
-        .map(|w| normalize(w).into_iter().next().unwrap_or_default())
+        .chain(timing_extra.map(|t| t.units.iter()).unwrap_or_default())
+        .map(|u| {
+            let tok = normalize(&u.text).into_iter().next().unwrap_or_default();
+            (u.start_s, u.end_s, tok)
+        })
+        .filter(|(_, _, t)| !t.is_empty())
         .collect();
+    anchors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let anchor_tokens: Vec<String> = anchors.iter().map(|(_, _, t)| t.clone()).collect();
+
+    let onsets = rms_onsets(samples, sample_rate);
     let ops = align(&anchor_tokens, merged.to_vec().as_slice());
-    let mut fused: Vec<CaptionUnit> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    let mut last_end = 0.0_f64;
-    let flush_pending = |fused: &mut Vec<CaptionUnit>,
-                         pending: &mut Vec<String>,
-                         gap_start: f64,
-                         gap_end: f64| {
-        if pending.is_empty() {
-            return;
-        }
-        let total_chars: usize = pending.iter().map(|w| w.chars().count().max(1)).sum();
-        let gap = (gap_end - gap_start).max(0.0);
-        let mut t = gap_start;
-        for w in pending.drain(..) {
-            let frac = w.chars().count().max(1) as f64 / total_chars as f64;
-            let d = gap * frac;
-            fused.push(CaptionUnit { text: w, start_s: t, end_s: (t + d).min(gap_end) });
-            t += d;
-        }
-    };
-    for (op, wi, mi) in ops {
+
+    // First pass: which merged word adopts which anchor (similarity-gated).
+    let mut adopted: Vec<Option<usize>> = vec![None; merged.len()]; // merged idx -> anchor idx
+    for (op, ai, mi) in &ops {
         match op {
-            Op::Ok | Op::Sub => {
-                let u = &whisper.units[wi.expect("anchored")];
-                flush_pending(&mut fused, &mut pending, last_end, u.start_s);
-                fused.push(CaptionUnit {
-                    text: merged[mi.expect("anchored")].clone(),
-                    start_s: u.start_s,
-                    end_s: u.end_s,
-                });
-                last_end = u.end_s;
+            Op::Ok => adopted[mi.expect("ok keeps merged index")] = Some(ai.expect("ok keeps anchor")),
+            Op::Sub => {
+                let (ai, mi) = (ai.expect("sub keeps anchor"), mi.expect("sub keeps merged"));
+                if similar_word(&anchor_tokens[ai], &merged[mi]) {
+                    adopted[mi] = Some(ai);
+                }
             }
-            Op::Del => {
-                // whisper-only unit: dropped (outvoted fabrication) — but its
-                // span still advances the gap cursor so inserted runs before
-                // and after it don't overlap.
-                let u = &whisper.units[wi.expect("del keeps whisper index")];
-                flush_pending(&mut fused, &mut pending, last_end, u.start_s);
-                last_end = last_end.max(u.end_s);
-            }
-            Op::Ins => pending.push(merged[mi.expect("ins keeps merged index")].clone()),
+            _ => {}
         }
     }
-    flush_pending(&mut fused, &mut pending, last_end, clip_dur_s.max(last_end));
+    // Enforce monotonic anchor starts across adoptions (two skeletons can
+    // interleave): a later word may not adopt an anchor that starts before a
+    // previously adopted one.
+    let mut last_start = f64::NEG_INFINITY;
+    for a in adopted.iter_mut() {
+        if let Some(ai) = *a {
+            if anchors[ai].0 < last_start {
+                *a = None;
+            } else {
+                last_start = anchors[ai].0;
+            }
+        }
+    }
+
+    // Second pass: place words — adopted ones on their anchor span, runs of
+    // unadopted ones onto onsets/proportional spread inside their gap.
+    let mut fused: Vec<CaptionUnit> = Vec::new();
+    let mut i = 0;
+    let mut prev_end = 0.0_f64;
+    while i < merged.len() {
+        if let Some(ai) = adopted[i] {
+            let (s, e, _) = anchors[ai];
+            let s = s.max(prev_end.min(clip_dur_s)).min(clip_dur_s);
+            fused.push(CaptionUnit { text: merged[i].clone(), start_s: s, end_s: e.max(s) });
+            prev_end = e.max(s);
+            i += 1;
+            continue;
+        }
+        // run of unadopted words [i, j)
+        let mut j = i;
+        while j < merged.len() && adopted[j].is_none() {
+            j += 1;
+        }
+        let gap_start = prev_end;
+        let gap_end = if j < merged.len() {
+            anchors[adopted[j].expect("loop bound")].0.max(gap_start)
+        } else {
+            clip_dur_s.max(gap_start)
+        };
+        place_run(&merged[i..j], gap_start, gap_end, &onsets, &mut fused);
+        prev_end = fused.last().map(|u| u.end_s).unwrap_or(gap_start).max(gap_start);
+        i = j;
+    }
+    respread_flashes(&mut fused, clip_dur_s);
     fused
+}
+
+/// Minimum readable width a fused word should get when its neighborhood has
+/// the room (the refine pass extends further, but only into room that exists —
+/// this pass CREATES the room by reclaiming unclaimed timeline).
+const MIN_WORD_S: f64 = 0.15;
+
+/// Redistribute flash-runs into their enclosing slack: when consecutive words
+/// got squeezed against an anchor (alignment ambiguity between two similar
+/// phrases can consume a later anchor and box the words in between) while
+/// unclaimed timeline sits right next to them, re-place the whole run evenly
+/// across the window between its timed neighbors. A run that is genuinely
+/// boxed (window no bigger than the run) is left alone.
+fn respread_flashes(fused: &mut [CaptionUnit], clip_dur_s: f64) {
+    let n = fused.len();
+    let mut i = 0;
+    while i < n {
+        if fused[i].end_s - fused[i].start_s >= MIN_WORD_S {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < n && fused[j].end_s - fused[j].start_s < MIN_WORD_S {
+            j += 1;
+        }
+        let win_start = if i == 0 { 0.0 } else { fused[i - 1].end_s };
+        let win_end = if j == n { clip_dur_s } else { fused[j].start_s };
+        let need = (j - i) as f64 * MIN_WORD_S;
+        if win_end - win_start > need {
+            // RIGHT-aligned in the window, capped per word: the squeeze always
+            // happens against the run's FOLLOWING anchor (that is where the
+            // words actually belong — DP boxed them there), so the run stays
+            // adjacent to it instead of drifting to the window's far start
+            // (measured: a lone squeezed word handed the whole 3.4 s window
+            // landed ~3 s before its speech).
+            let total = ((j - i) as f64 * 0.5).min(win_end - win_start);
+            let start = win_end - total;
+            let total_chars: usize =
+                fused[i..j].iter().map(|u| u.text.chars().count().max(1)).sum();
+            let mut t = start;
+            for u in fused[i..j].iter_mut() {
+                let frac = u.text.chars().count().max(1) as f64 / total_chars as f64;
+                let w = total * frac;
+                u.start_s = t;
+                u.end_s = (t + w).min(win_end);
+                t += w;
+            }
+        }
+        i = j;
+    }
+}
+
+/// Rising crossings of the caption silence bar over the clip's RMS envelope —
+/// where speech (or any voiced burst) begins. Same envelope constants as the
+/// caption timing pass (hop 20 ms, win 40 ms) and the ADR 0021 bar
+/// (min(10% of the loud reference, absolute floor 0.006) — here max'd with the
+/// absolute floor so pure-noise clips don't sprout onsets everywhere).
+fn rms_onsets(samples: &[f32], sample_rate: u32) -> Vec<f64> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let hop = (sample_rate as f64 * 0.02) as usize;
+    let win = (sample_rate as f64 * 0.04) as usize;
+    let mut env: Vec<f32> = Vec::with_capacity(samples.len() / hop.max(1) + 1);
+    let mut i = 0;
+    while i < samples.len() {
+        let e = (i + win).min(samples.len());
+        let w = &samples[i..e];
+        env.push((w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt());
+        i += hop;
+    }
+    let mut sorted = env.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
+    let bar = (0.10 * p95).max(0.006);
+    let mut onsets = Vec::new();
+    let mut last = f64::NEG_INFINITY;
+    for (k, w) in env.windows(2).enumerate() {
+        if w[0] < bar && w[1] >= bar {
+            let t = (k + 1) as f64 * 0.02;
+            if t - last >= 0.15 {
+                onsets.push(t);
+                last = t;
+            }
+        }
+    }
+    onsets
+}
+
+/// Lay a run of words into [gap_start, gap_end]: consecutive words snap to the
+/// gap's speech onsets in order; words beyond the available onsets spread
+/// character-proportionally through what remains. Each word ends where the
+/// next begins (the refine pass owns display durations).
+fn place_run(
+    words: &[String],
+    gap_start: f64,
+    gap_end: f64,
+    onsets: &[f64],
+    fused: &mut Vec<CaptionUnit>,
+) {
+    if words.is_empty() {
+        return;
+    }
+    let usable: Vec<f64> = onsets
+        .iter()
+        .copied()
+        .filter(|t| *t >= gap_start && *t < gap_end - 0.02)
+        .collect();
+    let mut starts: Vec<f64> = Vec::with_capacity(words.len());
+    let n_on = usable.len().min(words.len());
+    starts.extend_from_slice(&usable[..n_on]);
+    if n_on < words.len() {
+        // proportional tail from the last placed start (or the gap start)
+        let rem = &words[n_on..];
+        let from = starts.last().copied().unwrap_or(gap_start);
+        let total_chars: usize = rem.iter().map(|w| w.chars().count().max(1)).sum();
+        let mut t = if n_on == 0 { gap_start } else { from + 0.15 };
+        let span = (gap_end - t).max(0.0);
+        for w in rem {
+            starts.push(t.min(gap_end));
+            t += span * (w.chars().count().max(1) as f64 / total_chars as f64);
+        }
+    }
+    // monotonic guard (onsets are sorted; the proportional tail could start
+    // before an earlier onset only if the gap math degenerated)
+    for k in 1..starts.len() {
+        if starts[k] < starts[k - 1] {
+            starts[k] = starts[k - 1];
+        }
+    }
+    for (k, w) in words.iter().enumerate() {
+        let s = starts[k];
+        let e = starts.get(k + 1).copied().unwrap_or(gap_end).max(s);
+        fused.push(CaptionUnit { text: w.clone(), start_s: s, end_s: e.min(gap_end).max(s) });
+    }
+}
+
+/// "Same word, different garble": edit distance <= 2, or one is a prefix of
+/// the other (whisper's multi-word store collapses keep only the first token).
+fn similar_word(a: &str, b: &str) -> bool {
+    if a == b || a.starts_with(b) || b.starts_with(a) {
+        return true;
+    }
+    let (av, bv): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (n, m) = (av.len(), bv.len());
+    if n.abs_diff(m) > 2 {
+        return false;
+    }
+    // bounded Levenshtein (cap 2)
+    let mut prev: Vec<u32> = (0..=m as u32).collect();
+    for i in 1..=n {
+        let mut row = vec![i as u32; m + 1];
+        for j in 1..=m {
+            let sub = prev[j - 1] + u32::from(av[i - 1] != bv[j - 1]);
+            row[j] = sub.min(prev[j] + 1).min(row[j - 1] + 1);
+        }
+        if row.iter().min().copied().unwrap_or(u32::MAX) > 2 {
+            return false;
+        }
+        prev = row;
+    }
+    prev[m] <= 2
 }
 
 #[cfg(test)]
@@ -574,6 +792,23 @@ mod tests {
         assert_eq!(vote_merge(&backbone, &voters), words("kebuka"));
     }
 
+    /// n seconds of silence at 16 kHz (no onsets -> proportional placement).
+    fn silence(secs: f64) -> Vec<f32> {
+        vec![0.0; (16000.0 * secs) as usize]
+    }
+
+    /// Silence with 0.1-amplitude bursts at the given [start, end) second spans.
+    fn bursts(secs: f64, spans: &[(f64, f64)]) -> Vec<f32> {
+        let mut s = silence(secs);
+        for (a, b) in spans {
+            let (a, b) = ((a * 16000.0) as usize, ((b * 16000.0) as usize).min(s.len()));
+            for x in s[a..b].iter_mut() {
+                *x = 0.1;
+            }
+        }
+        s
+    }
+
     #[test]
     fn fuse_adopts_whisper_timing_for_matches_and_drops_whisper_only() {
         let whisper = Transcript {
@@ -585,7 +820,7 @@ mod tests {
             ],
         };
         let merged = words("mana bangke");
-        let fused = fuse_onto_timing(&merged, &whisper, 5.0);
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(5.0), 16000, 5.0);
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].text, "mana");
         assert_eq!((fused[0].start_s, fused[0].end_s), (1.0, 1.4));
@@ -604,7 +839,7 @@ mod tests {
         };
         // qwen recovered two words whisper missed inside the 2.0-6.0 hole
         let merged = words("keren mana dah banget");
-        let fused = fuse_onto_timing(&merged, &whisper, 8.0);
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(8.0), 16000, 8.0);
         assert_eq!(fused.len(), 4);
         assert_eq!(fused[1].text, "mana");
         assert_eq!(fused[2].text, "dah");
@@ -623,10 +858,118 @@ mod tests {
             units: vec![CaptionUnit { text: "mulai".into(), start_s: 0.5, end_s: 1.0 }],
         };
         let merged = words("mulai satu dua");
-        let fused = fuse_onto_timing(&merged, &whisper, 4.0);
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(4.0), 16000, 4.0);
         assert_eq!(fused.len(), 3);
         assert!(fused[2].end_s <= 4.0 + 1e-9);
         assert!(fused[1].start_s >= 1.0 - 1e-9);
+    }
+
+    #[test]
+    fn fuse_never_drags_a_word_onto_a_different_words_phantom_anchor() {
+        // The bug the operator heard: whisper's phantom 4 s "pusing" unit sits
+        // where "bangke" is actually said; a text-blind fusion adopted it and
+        // the caption ran ~5 s ahead of the streamer. With similarity gating
+        // neither word adopts a dissimilar anchor — both fall through to the
+        // speech onsets (bursts at 19.7 and 24.0).
+        let whisper = Transcript {
+            language: Language::Id,
+            units: vec![CaptionUnit { text: "pusing".into(), start_s: 19.5, end_s: 23.5 }],
+        };
+        let extra = Transcript {
+            language: Language::Id,
+            units: vec![CaptionUnit { text: "bangke".into(), start_s: 19.7, end_s: 19.9 }],
+        };
+        let samples = bursts(30.0, &[(19.7, 20.0), (24.0, 24.4)]);
+        let merged = words("bangke pusing");
+        let fused = fuse_onto_timing(&merged, &whisper, Some(&extra), &samples, 16000, 30.0);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].text, "bangke");
+        assert!(
+            (fused[0].start_s - 19.7).abs() < 0.15,
+            "bangke lands on its real onset, got {}",
+            fused[0].start_s
+        );
+        assert_eq!(fused[1].text, "pusing");
+        assert!(
+            (fused[1].start_s - 24.0).abs() < 0.15,
+            "pusing lands on the LATER onset, not the phantom anchor, got {}",
+            fused[1].start_s
+        );
+    }
+
+    #[test]
+    fn fuse_sub_adopts_anchor_only_for_the_same_garbled_word() {
+        // dijegat (voted) vs dijekat (whisper's spelling): same word, edit-1 -
+        // adopts the anchor span. A dissimilar pair must not.
+        assert!(similar_word("dijekat", "dijegat"));
+        assert!(similar_word("apaan", "apa")); // prefix
+        assert!(!similar_word("pusing", "bangke"));
+        let whisper = Transcript {
+            language: Language::Id,
+            units: vec![CaptionUnit { text: "dijekat".into(), start_s: 2.1, end_s: 2.32 }],
+        };
+        let merged = words("dicegat");
+        let fused = fuse_onto_timing(&merged, &whisper, None, &silence(4.0), 16000, 4.0);
+        assert_eq!(fused.len(), 1);
+        assert_eq!((fused[0].start_s, fused[0].end_s), (2.1, 2.32));
+    }
+
+    #[test]
+    fn respread_reclaims_unclaimed_timeline_for_flash_runs() {
+        // b and c got squeezed to (near-)zero width against d's anchor while
+        // 0.9 s of unclaimed timeline sits between a and d — the run respreads.
+        let mut fused = vec![
+            CaptionUnit { text: "a".into(), start_s: 1.0, end_s: 2.0 },
+            CaptionUnit { text: "bb".into(), start_s: 2.0, end_s: 2.0 },
+            CaptionUnit { text: "cc".into(), start_s: 2.0, end_s: 2.05 },
+            CaptionUnit { text: "d".into(), start_s: 2.9, end_s: 3.5 },
+        ];
+        respread_flashes(&mut fused, 4.0);
+        assert_eq!(fused[1].start_s, 2.0);
+        assert!((fused[1].end_s - 2.45).abs() < 1e-6);
+        assert!((fused[2].start_s - 2.45).abs() < 1e-6);
+        assert!((fused[2].end_s - 2.9).abs() < 1e-6);
+        // neighbors untouched
+        assert_eq!(fused[0].end_s, 2.0);
+        assert_eq!(fused[3].start_s, 2.9);
+    }
+
+    #[test]
+    fn respread_right_aligns_a_lone_squeezed_word_near_its_anchor() {
+        // A single flash word before an anchor gets up to 0.5 s ending AT the
+        // anchor — not the whole slack window (that dragged it seconds early).
+        let mut fused = vec![
+            CaptionUnit { text: "bangke".into(), start_s: 1.0, end_s: 2.0 },
+            CaptionUnit { text: "mana".into(), start_s: 5.36, end_s: 5.40 },
+            CaptionUnit { text: "tadi".into(), start_s: 5.40, end_s: 6.0 },
+        ];
+        respread_flashes(&mut fused, 8.0);
+        assert!((fused[1].start_s - 4.9).abs() < 1e-6, "got {}", fused[1].start_s);
+        assert!((fused[1].end_s - 5.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn respread_leaves_genuinely_boxed_runs_alone() {
+        let mut fused = vec![
+            CaptionUnit { text: "a".into(), start_s: 1.0, end_s: 2.0 },
+            CaptionUnit { text: "b".into(), start_s: 2.0, end_s: 2.05 },
+            CaptionUnit { text: "c".into(), start_s: 2.1, end_s: 2.2 },
+        ];
+        let before: Vec<(f64, f64)> = fused.iter().map(|u| (u.start_s, u.end_s)).collect();
+        // window after "a" to clip end is 2.0..2.2 via next... c is also <MIN so
+        // the run is b,c with window 2.0..2.2 (clip end) = 0.2 < 2*0.15 -> no-op
+        respread_flashes(&mut fused, 2.2);
+        let after: Vec<(f64, f64)> = fused.iter().map(|u| (u.start_s, u.end_s)).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn rms_onsets_find_burst_starts() {
+        let samples = bursts(4.0, &[(1.0, 1.2), (2.5, 2.7)]);
+        let onsets = rms_onsets(&samples, 16000);
+        assert_eq!(onsets.len(), 2, "got {onsets:?}");
+        assert!((onsets[0] - 1.0).abs() < 0.1);
+        assert!((onsets[1] - 2.5).abs() < 0.1);
     }
 
     #[test]

@@ -1390,6 +1390,43 @@ fn do_render(
             let mut ens_used = false;
             if yc_transcribe::ensemble::enabled() {
                 let _ = tx.send(Progress::Stage("Ensemble captions (Qwen3-ASR)"));
+                // Second whisper decode for the TIMING skeleton only: on masked
+                // clips the default decode's spans are as wrong as its words
+                // (phantom multi-second units, holes over real speech), while
+                // suppress_nst places units exactly where the default is blind
+                // (ADR 0033's measurement). Its words never enter the vote —
+                // they re-garble, which is why the knob stays off for caption
+                // TEXT — only its time grid feeds the fusion. Scoped env write:
+                // the knobs are env-based by design (ADR 0033) and renders are
+                // serialized, so save/restore keeps an operator-set value.
+                let timing_extra = {
+                    let prev = std::env::var("YC_SUPPRESS_NST").ok();
+                    std::env::set_var("YC_SUPPRESS_NST", "1");
+                    let r = yc_transcribe::transcribe_range(
+                        &paths.model,
+                        &samples,
+                        language,
+                        &yc_transcribe::DialectLexicon::default(),
+                        {
+                            let c = cancel.clone();
+                            move || c.is_cancelled()
+                        },
+                    );
+                    match prev {
+                        Some(v) => std::env::set_var("YC_SUPPRESS_NST", v),
+                        None => std::env::remove_var("YC_SUPPRESS_NST"),
+                    }
+                    match r {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!(
+                                "qwen ensemble: timing-skeleton decode failed \
+                                 (fusing on the default skeleton only): {e:#}"
+                            );
+                            None
+                        }
+                    }
+                };
                 let cfg = yc_transcribe::ensemble::EnsembleConfig {
                     mtmd_cli: paths
                         .deep_filter
@@ -1416,6 +1453,9 @@ fn do_render(
                     &session.analysis_wav,
                     range,
                     &transcript,
+                    timing_extra.as_ref(),
+                    &samples,
+                    yc_ingest::WHISPER_SR,
                     &lexicon,
                 ) {
                     Ok(fused) => {
