@@ -22,8 +22,8 @@ use std::time::Instant;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind};
 use yc_core::{
-    CameraMode, CameraPlan, CaptionGenre, CaptionPlacement, CaptionStyle, Crop, Layout, TimeRange,
-    Transcript, CANVAS_H, CANVAS_W,
+    CameraMode, CameraPlan, CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle, Crop,
+    Layout, TimeRange, Transcript, CANVAS_H, CANVAS_W,
 };
 use yc_frame::speaker::{track_label, SpeakerAnalysis};
 use yc_frame::FaceCluster;
@@ -122,6 +122,10 @@ pub struct EditorState {
     style: CaptionStyle,
     /// Which preset chip is highlighted (`None` after any manual tweak).
     preset: Option<usize>,
+    /// The Caption engine transcribing this Clip (ADR 0035) — shown while the
+    /// pre-pass runs so the operator knows WHAT is working and roughly how
+    /// long it takes (the ensemble adds ~60-90 s over plain whisper).
+    engine: CaptionEngine,
     /// The refined transcript (`Progress::Captions` or the Transcribe
     /// pre-pass) — the render's truth, editable here (focus task 2).
     transcript: Option<Transcript>,
@@ -172,6 +176,7 @@ impl EditorState {
         frames: Vec<egui::TextureHandle>,
         frame_fps: f64,
         caption_genre: CaptionGenre,
+        caption_engine: CaptionEngine,
         faces: Vec<FaceCluster>,
     ) -> Self {
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
@@ -198,6 +203,7 @@ impl EditorState {
             fullgameplay,
             style,
             preset,
+            engine: caption_engine,
             transcript: None,
             transcript_dirty: false,
             lines: Vec::new(),
@@ -1130,8 +1136,23 @@ impl EditorState {
         theme::section(ui, "Captions");
         let Some(transcript) = &mut self.transcript else {
             ui.add_space(6.0);
-            ui.weak("Transcribing the clip…");
-            ui.weak("Captions appear here when whisper finishes; you can already frame and scrub meanwhile.");
+            // Name the engine actually running (ADR 0035) — "whisper" here
+            // while the status bar said "Ensemble captions" read as two
+            // different mysteries (operator feedback).
+            match self.engine {
+                CaptionEngine::Whisper => {
+                    ui.weak("Transcribing with Whisper…");
+                    ui.weak("Usually well under a minute.");
+                }
+                CaptionEngine::QwenEnsemble => {
+                    ui.weak("Transcribing with the Qwen ensemble…");
+                    ui.weak(
+                        "Whisper decodes first, then five Qwen3-ASR passes vote on the words — \
+                         more accurate, adds ~60–90 s. (Engine is set per Creator on the import panel.)",
+                    );
+                }
+            }
+            ui.weak("You can frame, scrub, and play while it runs; captions appear here when it finishes.");
             return action;
         };
         if transcript.units.is_empty() {

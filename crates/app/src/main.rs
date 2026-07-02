@@ -807,6 +807,7 @@ impl eframe::App for App {
                             textures,
                             frame_fps,
                             self.caption_genre,
+                            self.caption_engine,
                             faces,
                         );
                         // The editor workflow pre-passes (focus 2026-07): kick
