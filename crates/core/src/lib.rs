@@ -456,8 +456,7 @@ mod tests {
             c.args(["/C", "exit 0"]);
             c
         } else {
-            let mut c = std::process::Command::new("true");
-            c
+            std::process::Command::new("true")
         };
         let mut child = quick.spawn().expect("spawn quick child");
         let status = wait_killable(&mut child, &|| false).expect("wait").expect("not cancelled");

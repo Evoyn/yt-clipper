@@ -19,6 +19,8 @@ use whisper_rs::{
 };
 use yc_core::{CaptionUnit, Language, Transcript};
 
+pub mod ensemble;
+
 mod correct;
 pub use correct::{
     apply_correction, build_correction_request, correction_topic, CorrectionContext,

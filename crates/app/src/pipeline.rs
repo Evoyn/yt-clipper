@@ -1371,7 +1371,6 @@ fn do_render(
                 &[creator_store.clone(), clip_store.clone()],
                 language,
             );
-            #[cfg_attr(not(feature = "correct"), allow(unused_mut))]
             let (mut transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
                 &paths.model,
                 &samples,
@@ -1382,6 +1381,51 @@ fn do_render(
                     move || c.is_cancelled()
                 },
             )?;
+            // Qwen3-ASR ensemble captions (opt-in, YC_QWEN_ENS=1): words from a
+            // multi-decode vote, timing from the whisper transcript above (whose
+            // one-shot model is already dropped — GPU staging stays sequential).
+            // Fails soft: whisper captions stand if the sidecar/models are absent
+            // or any stage errors. Defaults byte-identical (knob unset = this
+            // block never runs; ADR 0033's opt-in contract).
+            let mut ens_used = false;
+            if yc_transcribe::ensemble::enabled() {
+                let _ = tx.send(Progress::Stage("Ensemble captions (Qwen3-ASR)"));
+                let cfg = yc_transcribe::ensemble::EnsembleConfig {
+                    mtmd_cli: paths
+                        .deep_filter
+                        .parent()
+                        .unwrap_or_else(|| Path::new("sidecars"))
+                        .join("llama")
+                        .join("llama-mtmd-cli.exe"),
+                    qwen_model: paths
+                        .model
+                        .parent()
+                        .unwrap_or_else(|| Path::new("models"))
+                        .join("Qwen3-ASR-1.7B-Q8_0.gguf"),
+                    qwen_mmproj: paths
+                        .model
+                        .parent()
+                        .unwrap_or_else(|| Path::new("models"))
+                        .join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+                    ffmpeg: paths.ffmpeg.clone(),
+                    deep_filter: paths.deep_filter.is_file().then(|| paths.deep_filter.clone()),
+                    work_dir: session.data_dir.clone(),
+                };
+                match yc_transcribe::ensemble::apply(
+                    &cfg,
+                    &session.analysis_wav,
+                    range,
+                    &transcript,
+                ) {
+                    Ok(fused) => {
+                        transcript = fused;
+                        ens_used = true;
+                    }
+                    Err(e) => tracing::warn!(
+                        "qwen ensemble failed; keeping whisper captions: {e:#}"
+                    ),
+                }
+            }
             // Auto-promote (the operator's choice, ADR 0031): any correction they have
             // confirmed in this clip's store rises to the per-Creator store, so it
             // applies to every future clip of theirs. Best-effort.
@@ -1411,8 +1455,14 @@ fn do_render(
             // hallucinating into a silent/music window; recording it would send the
             // operator chasing a word that never appears in the caption (the trace
             // is 1:1 with pre-refine units, so `unit_index` addresses it directly).
-            // Best-effort, never sinks the render.
-            if lexicon.harvest {
+            // Best-effort, never sinks the render. Skipped when the ensemble
+            // replaced the words: harvest candidates are keyed to WHISPER's
+            // units (unit_index) and record whisper's garbles — indexing them
+            // into the fused transcript would misattribute, and harvesting
+            // garbles that no longer render would send the operator curating
+            // words the caption doesn't show (the ensemble path is store-free
+            // by design).
+            if lexicon.harvest && !ens_used {
                 let trace = yc_render::refine_caption_timing_traced(
                     &transcript,
                     &samples,
