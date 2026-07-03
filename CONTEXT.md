@@ -13,7 +13,7 @@ The long source recording a project is built around — a finished stream record
 _Avoid_: stream, video, source
 
 **Moment**:
-A scored candidate time range within a VOD, surfaced by analysis (or marked manually by the operator), awaiting review.
+A scored candidate time range within a VOD, surfaced by analysis (or marked manually by the operator), awaiting review. A detected Moment starts and ends on sentence boundaries, aiming for 45–180 s of real speech (shorter when speech runs dry — ADR 0040); a manually-marked Moment keeps its verbatim range, untouched.
 _Avoid_: highlight, candidate, event
 
 **Signal**:

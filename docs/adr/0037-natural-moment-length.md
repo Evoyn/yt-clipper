@@ -26,7 +26,9 @@ maximum up to the 180 s YouTube-Shorts ceiling.
   sentence boundaries would be nice, but discovery deliberately runs before
   any whisper pass (ADR 0007's cheap-signals phase); the sustain walk gets
   most of the benefit for none of the GPU cost. Revisit if trailing words get
-  clipped in practice.
+  clipped in practice. *(They did — ADR 0040 adds the snap at the refine
+  stage, which already holds each candidate's transcript, and the window is
+  now finalized there, not at discover.)*
 
 Overlap handling had to change with variable lengths: the fixed-gap NMS
 (`dur_s`-spaced peaks) became a light `min_dur_s`-spaced NMS plus explicit

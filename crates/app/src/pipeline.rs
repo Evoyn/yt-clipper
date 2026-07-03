@@ -792,11 +792,16 @@ fn load_review(data_dir: &Path) -> (HashMap<u64, String>, HashMap<u64, String>) 
 
 /// Detect candidate Moments over the imported VOD (ADR 0007). Discover with the
 /// cheap whole-VOD signals (chat-rate + loudness, no whisper), then refine:
-/// transcribe each candidate once with a *resident* whisper model and score the
-/// excitement lexicon. Returns Moments ranked by final score; persists them to
-/// `project.json`.
+/// transcribe each candidate once with a *resident* whisper model, snap its
+/// bounds to sentence start/end (ADR 0040), and score the excitement lexicon
+/// over the words the final clip actually contains. Returns Moments ranked by
+/// final score; persists them to `project.json`.
 /// The hard Moment-length ceiling: YouTube Shorts allow up to 3 minutes.
 pub const MAX_CLIP_CEILING_S: f64 = 180.0;
+/// How far past each side of a candidate's signal window refine transcribes
+/// (ADR 0040), so sentence snapping outward and adjacent-sentence context fill
+/// have material to work with.
+const SNAP_PAD_S: f64 = 15.0;
 
 fn do_detect(
     paths: &PipelinePaths,
@@ -829,8 +834,12 @@ fn do_detect(
     }
 
     // Refine: one model load for the whole candidate batch (the resident
-    // Transcriber), then lexicon-score each transcript. Keep each transcript's
-    // text for the review UI (and, later, M4's LLM).
+    // Transcriber). Each candidate transcribes a padded window, snaps its
+    // bounds to sentence start/end (ADR 0040 — no clip opens or closes on a
+    // half-spoken thought; word timestamps are heuristic here, which is noise
+    // at clip scale), then lexicon-scores the words INSIDE the final bounds.
+    // Manual Moments never reach this loop (they are not detect candidates),
+    // so their verbatim ranges stay untouched by construction.
     let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
     // Text-only (no DTW): the lexicon needs words, not word timing, and DTW
     // aborts on sparse music/SFX windows (see Transcriber::load_text_only).
@@ -838,21 +847,64 @@ fn do_detect(
     let transcriber = yc_transcribe::Transcriber::load_text_only(&paths.model)?;
     let mut densities = Vec::with_capacity(moments.len());
     let mut texts = Vec::with_capacity(moments.len());
-    for m in &moments {
+    for m in &mut moments {
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
         }
-        let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
+        let pad = TimeRange {
+            start_s: (m.range.start_s - SNAP_PAD_S).max(0.0),
+            end_s: m.range.end_s + SNAP_PAD_S, // read_range_samples clamps to the wav
+        };
+        let samples = yc_ingest::read_range_samples(&session.analysis_wav, pad)?;
         let transcript = transcriber.transcribe(&samples, session.vod.language, &lexicon, {
             let c = cancel.clone();
             move || c.is_cancelled()
         })?;
-        densities.push(yc_detect::lexicon::density(&transcript, session.vod.language));
-        texts.push(
-            transcript.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "),
+        // Unit times are window-relative; sentence snapping works in VOD time.
+        let abs_units: Vec<yc_core::CaptionUnit> = transcript
+            .units
+            .iter()
+            .map(|u| yc_core::CaptionUnit {
+                text: u.text.clone(),
+                start_s: u.start_s + pad.start_s,
+                end_s: u.end_s + pad.start_s,
+            })
+            .collect();
+        m.range = yc_detect::sentence::sentence_bounds(
+            &abs_units,
+            session.vod.language,
+            m.range,
+            params.min_dur_s,
+            params.max_dur_s,
         );
+        // The lexicon signal, the LLM judge, and the review pane must all read
+        // the words the FINAL clip contains — not the padded window's.
+        let kept = Transcript {
+            language: transcript.language,
+            units: abs_units
+                .into_iter()
+                .filter(|u| u.start_s >= m.range.start_s - 0.05 && u.end_s <= m.range.end_s + 0.05)
+                .collect(),
+        };
+        densities.push(yc_detect::lexicon::density(&kept, session.vod.language));
+        texts.push(kept.units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join(" "));
     }
     drop(transcriber); // free VRAM before any later GPU stage (M5 LLM)
+    // Snapped bounds can, rarely, share an edge sentence between two adjacent
+    // top candidates (both extended toward each other). Accepted residual —
+    // ADR 0040 — but worth a trace when it happens on a real VOD.
+    for i in 0..moments.len() {
+        for j in (i + 1)..moments.len() {
+            let (a, b) = (&moments[i].range, &moments[j].range);
+            if a.start_s < b.end_s && b.start_s < a.end_s {
+                tracing::debug!(
+                    "snapped Moments {} and {} overlap after sentence growth",
+                    moments[i].id,
+                    moments[j].id
+                );
+            }
+        }
+    }
     yc_detect::lexicon::apply(&mut moments, &densities, &params.weights);
 
     // Arousal (ADR 0008): a CPU speech-emotion model scores how emotionally

@@ -17,6 +17,7 @@ pub mod lexicon;
 pub mod llm;
 pub mod loudness;
 pub mod score;
+pub mod sentence;
 /// Vocal-stem separation (htdemucs vocals ONNX). Behind `sep` so the default
 /// detection build needs neither the `ort` binary nor the htdemucs model.
 #[cfg(feature = "sep")]
@@ -46,9 +47,12 @@ pub struct DetectParams {
     /// or below `min_z` (the peak threshold) it stays at the base `lead_s`. Linear
     /// between.
     pub loud_lead_full_z: f32,
-    /// Shortest Moment the ranker emits, seconds. The adaptive window
-    /// ([`score::adaptive_range`]) floors here so a sharp one-off spike still
-    /// yields a renderable Short.
+    /// Shortest Moment detection aims for, seconds (ADR 0040). The adaptive
+    /// window ([`score::adaptive_range`]) floors its *seed* here, and refine's
+    /// sentence snap ([`sentence::sentence_bounds`]) grows a trimmed clip back
+    /// toward it through adjacent real sentences — context fill, never dead-air
+    /// padding, so a clip ships shorter when speech runs dry. Manual Moments
+    /// are exempt (they never pass through detection).
     pub min_dur_s: f64,
     /// Longest Moment the ranker emits, seconds — the YouTube-Shorts ceiling is
     /// 180 s; the operator can tune below that. A sustained hype moment grows
@@ -87,12 +91,14 @@ impl Default for DetectParams {
             // loudness z 3.0, the base 5 s at/below the peak threshold (ADR 0020).
             loud_lead_s: 10.0,
             loud_lead_full_z: 3.0,
-            // Natural clip length (the "~30 s everywhere" fix): the window now
+            // Natural clip length (the "~30 s everywhere" fix): the window
             // follows the combined signal's elevated span, floored/capped here.
-            // 15 s keeps a sharp one-off renderable; 90 s default cap leaves the
-            // sustained-arc room the fixed 30 s never had (operator-tunable up
-            // to the 180 s Shorts ceiling).
-            min_dur_s: 15.0,
+            // The floor rose 15 -> 45 with ADR 0040 (sentence-boundary bounds):
+            // a Short under ~45 s rarely carries a full thought, and refine
+            // reaches the floor through *real adjacent sentences* (shipping
+            // shorter when speech runs dry) rather than dead air. 90 s default
+            // cap, operator-tunable up to the 180 s Shorts ceiling.
+            min_dur_s: 45.0,
             max_dur_s: 90.0,
             min_z: 1.0,
             top_n: 25,
@@ -199,7 +205,11 @@ pub fn rank_moments(
     // NMS (one peak per min_dur span) dedupes shoulder maxima; each survivor
     // then grows an *adaptive* window over the signal's elevated span (the
     // "every clip is ~30 s" fix), and overlap suppression trims/drops weaker
-    // windows against stronger ones since lengths now vary.
+    // windows against stronger ones since lengths now vary. Both deliberately
+    // inherit the 45 s min_dur (ADR 0040 retune): at the new duration scale two
+    // peaks within one minimum-clip span cover the same content, so spacing
+    // them at 45 s and dropping sub-45 s trim survivors is the same semantics
+    // the 15 s world had — one Moment per clip-length of VOD.
     let peaks = score::find_peaks(&combined, params.min_z);
     let min_gap = (params.min_dur_s / params.bin_s).round().max(1.0) as usize;
     let kept = score::nms(peaks, &combined, min_gap);
@@ -326,23 +336,26 @@ mod tests {
 
     #[test]
     fn loud_driven_peak_gets_a_longer_pre_roll_than_a_chat_driven_one() {
-        // ADR 0020: two non-overlapping peaks on a 120 s grid - a sharp LOUD spike
-        // at bin 30 (no chat) and a CHAT spike at bin 90 (baseline loudness). No
-        // smoothing (smooth_s = bin_s) so the peaks land on the spike bins.
-        let n = 120;
+        // ADR 0020: two non-overlapping peaks on a 300 s grid - a sharp LOUD spike
+        // at bin 60 (no chat) and a CHAT spike at bin 200 (baseline loudness). No
+        // smoothing (smooth_s = bin_s) so the peaks land on the spike bins. The
+        // grid leaves each peak room for the 45 s floor (ADR 0040) so the
+        // VOD-tail pull-back never distorts the leads this test pins.
+        let n = 300;
         let mut loud = vec![0.1f32; n];
-        loud[30] = 10.0; // a scream / jumpscare -> high loudness z
+        loud[60] = 10.0; // a scream / jumpscare -> high loudness z
         let mut chat = vec![0.0f32; n];
-        chat[90] = 20.0; // a chat burst with no loud reaction
+        chat[200] = 20.0; // a chat burst with no loud reaction
         let params = DetectParams { smooth_s: 1.0, min_z: 0.5, ..Default::default() };
         let moments = rank_moments(&loud, Some(&chat), &params);
 
-        let loud_m = moments.iter().find(|m| range_contains(&m.range, 30.0)).expect("loud Moment");
-        let chat_m = moments.iter().find(|m| range_contains(&m.range, 90.0)).expect("chat Moment");
-        // The loud peak (bin 30, peak_t 30.5) leads by ~loud_lead_s (10 s); the
-        // chat peak (bin 90, peak_t 90.5) keeps the base lead (~5 s).
-        let loud_lead = 30.5 - loud_m.range.start_s;
-        let chat_lead = 90.5 - chat_m.range.start_s;
+        let loud_m = moments.iter().find(|m| range_contains(&m.range, 60.0)).expect("loud Moment");
+        let chat_m =
+            moments.iter().find(|m| range_contains(&m.range, 200.0)).expect("chat Moment");
+        // The loud peak (bin 60, peak_t 60.5) leads by ~loud_lead_s (10 s); the
+        // chat peak (bin 200, peak_t 200.5) keeps the base lead (~5 s).
+        let loud_lead = 60.5 - loud_m.range.start_s;
+        let chat_lead = 200.5 - chat_m.range.start_s;
         assert!((loud_lead - 10.0).abs() < 0.75, "loud lead {loud_lead}");
         assert!((chat_lead - 5.0).abs() < 0.75, "chat lead {chat_lead}");
         assert!(loud_lead > chat_lead + 2.0, "loud must lead more: {loud_lead} vs {chat_lead}");

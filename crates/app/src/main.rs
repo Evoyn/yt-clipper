@@ -1442,14 +1442,15 @@ impl App {
                 }
                 ui.label("max");
                 ui.add(
-                    egui::Slider::new(&mut self.max_clip_s, 30.0..=180.0)
+                    egui::Slider::new(&mut self.max_clip_s, 45.0..=180.0)
                         .step_by(5.0)
                         .suffix(" s"),
                 )
                 .on_hover_text(
-                    "Ceiling for a detected Moment. The detector picks the natural \
-                     length per moment (a sustained arc grows, a sharp one stays tight); \
-                     180 s is the YouTube Shorts maximum.",
+                    "Ceiling for a detected Moment. Clips start and end on sentence \
+                     boundaries and aim for at least 45 s of real speech (shorter when \
+                     speech runs dry - never padded with dead air); 180 s is the \
+                     YouTube Shorts maximum. Manually marked Moments are untouched.",
                 );
             });
             ui.horizontal(|ui| {
