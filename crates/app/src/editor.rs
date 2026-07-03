@@ -383,10 +383,7 @@ impl EditorState {
     /// Draw the whole Studio page and return the operator's action.
     ///
     /// `busy` = any worker job in flight (gates job-starting buttons so they
-    /// can't double-queue). `gpu_busy` = that job holds the GPU (whisper /
-    /// NVENC / LLM): playback keeps running — audio is CPU-side rodio — but
-    /// its visual tick drops to ~10 fps so the wgpu loop never competes for
-    /// the card (the detect-hang scar); CPU jobs keep the full 60 fps.
+    /// can't double-queue).
     /// `rendering` = an export is in flight: it gates ONLY Export/Render, so
     /// the operator can't stack renders — everything else stays editable and a
     /// render started during the caption pre-pass simply queues behind it.
@@ -394,7 +391,6 @@ impl EditorState {
         &mut self,
         ui: &mut egui::Ui,
         busy: bool,
-        gpu_busy: bool,
         rendering: bool,
     ) -> EditorAction {
         let mut action = EditorAction::None;
@@ -409,10 +405,8 @@ impl EditorState {
                 self.stop_video();
                 action = EditorAction::StopAudio;
             } else {
-                // 60 fps visual tick normally (vsync-capped); ~10 fps only
-                // while the GPU is actually held.
-                let tick = if gpu_busy { 100 } else { 16 };
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(tick));
+                // 60 fps visual tick (vsync-capped).
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
 
