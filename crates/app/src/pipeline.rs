@@ -72,6 +72,12 @@ pub struct PipelinePaths {
     /// captions the mixed analysis audio. Only read by the `enh`-gated caption pass.
     #[cfg_attr(not(feature = "enh"), allow(dead_code))]
     pub deep_filter: PathBuf,
+    /// llama.cpp's multimodal CLI + the Qwen3-ASR GGUF pair for the ensemble
+    /// Caption engine (ADR 0034). May be absent: an ensemble-engine render then
+    /// falls back to the whisper transcript it already holds.
+    pub mtmd_cli: PathBuf,
+    pub qwen_model: PathBuf,
+    pub qwen_mmproj: PathBuf,
     /// Directory of per-language dialect/slang correction stores (`<lang>.json`,
     /// see `yc_transcribe::DialectLexicon`). Primes whisper + patches known
     /// mishears; a missing file just disables the fix-ups for that language.
@@ -1643,22 +1649,11 @@ fn ensure_transcript(
                     }
                 };
                 let cfg = yc_transcribe::ensemble::EnsembleConfig {
-                    mtmd_cli: paths
-                        .deep_filter
-                        .parent()
-                        .unwrap_or_else(|| Path::new("sidecars"))
-                        .join("llama")
-                        .join("llama-mtmd-cli.exe"),
-                    qwen_model: paths
-                        .model
-                        .parent()
-                        .unwrap_or_else(|| Path::new("models"))
-                        .join("Qwen3-ASR-1.7B-Q8_0.gguf"),
-                    qwen_mmproj: paths
-                        .model
-                        .parent()
-                        .unwrap_or_else(|| Path::new("models"))
-                        .join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+                    // Resolved once in AppPaths (the Diagnostics registry shows
+                    // the same paths) and carried here - never re-derived.
+                    mtmd_cli: paths.mtmd_cli.clone(),
+                    qwen_model: paths.qwen_model.clone(),
+                    qwen_mmproj: paths.qwen_mmproj.clone(),
                     ffmpeg: paths.ffmpeg.clone(),
                     deep_filter: paths.deep_filter.is_file().then(|| paths.deep_filter.clone()),
                     work_dir: session.data_dir.clone(),

@@ -45,6 +45,9 @@ fn main() -> eframe::Result<()> {
         face_model: paths.face_model(),
         sep_model: paths.sep_model(),
         deep_filter: paths.deep_filter(),
+        mtmd_cli: paths.mtmd_cli(),
+        qwen_model: paths.qwen_model(),
+        qwen_mmproj: paths.qwen_mmproj(),
         dialect_dir: paths.dialect_dir(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
@@ -433,6 +436,28 @@ impl AppPaths {
         self.sidecars.join("deep-filter.exe")
     }
 
+    /// llama.cpp's multimodal CLI for the Qwen ensemble Caption engine (ADR
+    /// 0034), pinned under `sidecars/llama/` (fetch-llama-sidecar.ps1).
+    fn mtmd_cli(&self) -> PathBuf {
+        self.sidecars.join("llama").join("llama-mtmd-cli.exe")
+    }
+
+    /// Qwen3-ASR GGUF pair for the ensemble Caption engine (fetch-models.ps1).
+    fn qwen_model(&self) -> PathBuf {
+        self.models.join("Qwen3-ASR-1.7B-Q8_0.gguf")
+    }
+
+    fn qwen_mmproj(&self) -> PathBuf {
+        self.models.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf")
+    }
+
+    /// Silero VAD ggml (whisper.cpp's pinned release) for the `YC_VAD=1` trial
+    /// decode knob (ADR 0033). yc-transcribe resolves it beside the whisper
+    /// model itself; this accessor exists for the Diagnostics registry.
+    fn silero_model(&self) -> PathBuf {
+        self.models.join("ggml-silero-v5.1.2.bin")
+    }
+
     /// Directory of per-language dialect/slang stores (`assets/dialect/<lang>.json`).
     fn dialect_dir(&self) -> PathBuf {
         self.assets.join("dialect")
@@ -441,6 +466,21 @@ impl AppPaths {
     fn font(&self) -> PathBuf {
         self.assets.join("fonts").join("Anton-Regular.ttf")
     }
+}
+
+/// One Diagnostics dependency: a tool or model the pipeline resolves. Every
+/// external binary/model the app can use is registered in
+/// [`App::dependency_registry`] so the Diagnostics section can never drift
+/// from what the code actually loads — add new AI tools/models THERE, nowhere
+/// else. The planned per-row Download action hangs off this same table.
+struct Dep {
+    /// Core flows (import / detect / caption / render) fail without it;
+    /// `false` = an optional capability degrades or is skipped instead.
+    required: bool,
+    name: &'static str,
+    path: PathBuf,
+    /// What it powers — the hover line beside the resolved path.
+    role: &'static str,
 }
 
 /// VOD facts shown after a successful import.
@@ -1071,60 +1111,128 @@ impl App {
         }
     }
 
+    /// Every tool/model the pipeline can resolve, required-first — THE single
+    /// registration point for the Diagnostics section (operator's ask,
+    /// 2026-07-03: the page must show new AI tools without a separate list to
+    /// remember). deno is the one non-file dependency and is handled beside
+    /// these in [`Self::ui_preflight`].
+    fn dependency_registry(&self) -> Vec<Dep> {
+        let p = &self.paths;
+        let dep = |required, name, path, role| Dep { required, name, path, role };
+        vec![
+            dep(true, "ffmpeg", p.ffmpeg(), "audio/video decode + every render"),
+            dep(true, "ffprobe", p.ffprobe(), "stream probing at import/promote"),
+            dep(true, "yt-dlp", p.ytdlp(), "YouTube VOD audio + Segment fetch"),
+            dep(true, "whisper model", p.model(), "transcription (captions + detect refine)"),
+            dep(true, "caption font", p.font(), "the burned caption face (Anton)"),
+            dep(
+                false,
+                "LLM judge",
+                p.llm_judge(),
+                "LLM judgment Signal + caption correction; detect renormalizes without it",
+            ),
+            dep(false, "judge model", p.llm_model(), "the judge's Qwen2.5-7B GGUF (~5.4 GB)"),
+            dep(
+                false,
+                "Qwen3-ASR model",
+                p.qwen_model(),
+                "ensemble Caption engine voter (ADR 0034)",
+            ),
+            dep(
+                false,
+                "Qwen3-ASR mmproj",
+                p.qwen_mmproj(),
+                "the ensemble voter's audio projector",
+            ),
+            dep(
+                false,
+                "llama-mtmd-cli",
+                p.mtmd_cli(),
+                "ensemble Caption engine decoder (pinned llama.cpp sidecar)",
+            ),
+            dep(
+                false,
+                "deep-filter",
+                p.deep_filter(),
+                "ensemble denoise variants + Cleaned-voice captions (ADR 0029)",
+            ),
+            dep(false, "Silero VAD", p.silero_model(), "YC_VAD=1 trial decode knob (ADR 0033)"),
+            dep(
+                false,
+                "face model",
+                p.face_model(),
+                "facecam auto-framing + podcast Speaker tracks (face builds)",
+            ),
+            dep(false, "SER model", p.ser_model(), "arousal Signal (ser builds, ADR 0008)"),
+        ]
+    }
+
     /// Left-rail section: the preflight tool/model check, collapsed once every
-    /// sidecar + model is present (auto-expanded when something is missing).
-    /// Rows show only the name + a status dot (the operator's ask) — the full
-    /// path is a hover detail, not a wall of directories.
+    /// REQUIRED sidecar + model is present (auto-expanded when one is missing).
+    /// Rows show only the name + a status dot (the operator's ask) — the
+    /// resolved path + role are hover detail, not a wall of directories.
+    /// Optional rows (feature models, alternate engines) show a neutral dot
+    /// when absent: nothing is wrong, the capability just isn't installed.
     fn ui_preflight(&mut self, ui: &mut egui::Ui) {
-        let row = |ui: &mut egui::Ui, ok: bool, name: &str, detail: String| {
+        let row = |ui: &mut egui::Ui, ok: bool, required: bool, name: &str, detail: String| {
             let resp = ui
                 .horizontal(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        4.0,
-                        if ok { theme::OK } else { theme::ERR },
-                    );
+                    let color = match (ok, required) {
+                        (true, _) => theme::OK,
+                        (false, true) => theme::ERR,
+                        (false, false) => egui::Color32::from_gray(0x60),
+                    };
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
                     ui.label(name);
                     if !ok {
-                        ui.colored_label(theme::ERR, "missing");
+                        if required {
+                            ui.colored_label(theme::ERR, "missing");
+                        } else {
+                            ui.weak("not installed");
+                        }
                     }
                 })
                 .response;
             resp.on_hover_text(detail);
         };
-        let files = [
-            ("ffmpeg", self.paths.ffmpeg()),
-            ("ffprobe", self.paths.ffprobe()),
-            ("yt-dlp", self.paths.ytdlp()),
-            ("whisper model", self.paths.model()),
-            ("caption font", self.paths.font()),
-        ];
-        let all_ok = self.deno_dir.is_some() && files.iter().all(|(_, p)| p.exists());
+        let deps = self.dependency_registry();
+        let deno_ok = self.deno_dir.is_some();
+        let all_ok =
+            deno_ok && deps.iter().filter(|d| d.required).all(|d| d.path.exists());
         let header = if all_ok {
             "Diagnostics — all tools ready"
         } else {
             "Diagnostics — something is missing"
         };
-        // One flat row list (deno included) so every tool renders through the
-        // same path.
-        let mut rows: Vec<(bool, String, String)> = files
-            .iter()
-            .map(|(n, p)| (p.exists(), (*n).to_string(), p.display().to_string()))
-            .collect();
-        match &self.deno_dir {
-            Some(d) => rows.push((true, "deno".into(), d.display().to_string())),
-            None => rows.push((
-                false,
-                "deno".into(),
-                "not found — run fetch-sidecars.ps1 or `winget install DenoLand.Deno`".into(),
-            )),
-        }
         let debug_open = std::env::var("YC_DIAG_OPEN").is_ok(); // capture aid
         egui::CollapsingHeader::new(header).default_open(!all_ok || debug_open).show(ui, |ui| {
-            for (ok, name, detail) in rows {
-                row(ui, ok, &name, detail);
+            for d in deps.iter().filter(|d| d.required) {
+                row(ui, d.path.exists(), true, d.name, format!("{} · {}", d.role, d.path.display()));
+            }
+            // deno resolves as a directory (sidecar or winget), not a file.
+            match &self.deno_dir {
+                Some(dir) => row(
+                    ui,
+                    true,
+                    true,
+                    "deno",
+                    format!("yt-dlp's JS runtime (nsig) · {}", dir.display()),
+                ),
+                None => row(
+                    ui,
+                    false,
+                    true,
+                    "deno",
+                    "not found — run fetch-sidecars.ps1 or `winget install DenoLand.Deno`"
+                        .into(),
+                ),
+            }
+            ui.add_space(4.0);
+            ui.weak("Optional (a capability degrades gracefully when absent):");
+            for d in deps.iter().filter(|d| !d.required) {
+                row(ui, d.path.exists(), false, d.name, format!("{} · {}", d.role, d.path.display()));
             }
         });
     }
