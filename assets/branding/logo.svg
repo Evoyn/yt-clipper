@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <!-- yt-clipper "Punch-out" mark, primary (dark-ground / outline) variant:
+       a vertical Short punched out of a wide VOD frame (ADR 0024 gold #FFD100
+       on Midnight-Studio ink #14161B). Master for the .ico, the window icon,
+       the brand bar, and the README hero. Keep geometry in sync with
+       scripts/render-brand.ps1 and theme::brand_mark. -->
+  <rect x="24" y="82" width="192" height="104" rx="16" fill="none" stroke="#FFD100" stroke-width="12"/>
+  <rect x="124" y="53" width="78" height="139" rx="16" fill="#FFD100" stroke="#14161B" stroke-width="10"/>
+  <polygon points="151,102 151,142 184,122" fill="#14161B"/>
+</svg>

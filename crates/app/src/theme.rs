@@ -61,6 +61,48 @@ pub fn track_color(i: usize) -> Color32 {
     TRACKS[i % TRACKS.len()]
 }
 
+/// The "Punch-out" brand mark (brand pass, 2026-07-03): a vertical Short
+/// punched out of a wide VOD frame — painted as vectors so the chrome ships no
+/// texture and stays crisp at any scale. Geometry mirrors the master
+/// `assets/branding/logo.svg` (240-unit box); keep the three in sync (SVG,
+/// `scripts/render-brand.ps1`, here).
+pub fn brand_mark(ui: &mut egui::Ui, height: f32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(height * 1.02, height), egui::Sense::hover());
+    let p = ui.painter();
+    let s = height / 240.0;
+    let o = rect.left_top() + egui::vec2((rect.width() - 240.0 * s) / 2.0, 0.0);
+    let r = |x: f32, y: f32, w: f32, h: f32| {
+        egui::Rect::from_min_size(o + egui::vec2(x * s, y * s), egui::vec2(w * s, h * s))
+    };
+    let round = |v: f32| CornerRadius::same((v * s).round().max(1.0) as u8);
+    // The wide VOD frame: gold outline.
+    p.rect_stroke(
+        r(24.0, 82.0, 192.0, 104.0),
+        round(16.0),
+        Stroke::new(12.0 * s, GOLD),
+        egui::StrokeKind::Middle,
+    );
+    // The Short punched out of it: gold fill, ink punch-out ring.
+    p.rect_filled(r(124.0, 53.0, 78.0, 139.0), round(16.0), GOLD);
+    p.rect_stroke(
+        r(124.0, 53.0, 78.0, 139.0),
+        round(16.0),
+        Stroke::new(10.0 * s, INK),
+        egui::StrokeKind::Middle,
+    );
+    // The play tip.
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            o + egui::vec2(151.0 * s, 102.0 * s),
+            o + egui::vec2(151.0 * s, 142.0 * s),
+            o + egui::vec2(184.0 * s, 122.0 * s),
+        ],
+        INK,
+        Stroke::NONE,
+    ));
+}
+
 /// The heading font family name, installed from the caption font when present.
 const HEADING_FAMILY: &str = "display";
 

@@ -33,6 +33,11 @@ ureq = "3"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Embeds assets/branding/yt-clipper.ico as the exe icon (brand pass); the
+# window/taskbar IconData is a raw-RGBA include, so no image decoder ships.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [features]
 # Speech-emotion (arousal) detection signal (ADR 0008): pulls `ort` via
 # yc-detect and reads the SER model. Off by default so the app builds without

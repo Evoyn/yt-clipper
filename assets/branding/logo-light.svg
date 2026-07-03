@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <!-- yt-clipper "Punch-out" mark, light-ground variant: the VOD frame goes
+       solid ink so the mark anchors on white (README light mode, docs). -->
+  <rect x="18" y="76" width="204" height="115" rx="18" fill="#17191F"/>
+  <rect x="124" y="53" width="78" height="139" rx="16" fill="#FFD100" stroke="#FFFFFF" stroke-width="10"/>
+  <polygon points="151,102 151,142 184,122" fill="#17191F"/>
+</svg>
