@@ -339,7 +339,17 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
         // Render(s) (ADR 0012). Invalidated by a new Import or Prepare.
         let mut prepared: Option<PreparedClip> = None;
         while let Ok(job) = rx_job.recv() {
-            // A cancel of the previous job must not bleed into this one.
+            // A cancel of the previous job must not bleed into this one - except
+            // into the pre-pass jobs queued behind it (Prepare chains Transcribe,
+            // then AnalyzeSpeakers): those belong to the editor session the cancel
+            // aimed at, so a still-set token flushes them instead of resetting
+            // into them. Deliberate jobs (Import/Detect/Prepare/Render) reset.
+            if worker_cancel.is_cancelled()
+                && matches!(job, Job::Transcribe { .. } | Job::AnalyzeSpeakers)
+            {
+                let _ = tx_prog.send(Progress::Cancelled);
+                continue;
+            }
             worker_cancel.reset();
             match job {
                 Job::Import { source, language } => {

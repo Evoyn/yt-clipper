@@ -939,6 +939,14 @@ impl eframe::App for App {
                     self.queue_idx = 0;
                     self.opening_editor = false;
                     self.rendering = false;
+                    // A cancelled speaker analysis must not leave the Camera
+                    // panel spinning (mirrors the Failed handler); NotRun
+                    // re-offers the run button.
+                    if let Some(ed) = &mut self.editor {
+                        if ed.speaker_job == editor::SpeakerJob::Running {
+                            ed.speaker_job = editor::SpeakerJob::NotRun;
+                        }
+                    }
                     self.status = Status::Cancelled;
                 }
                 Progress::Failed(e) => {
@@ -1049,6 +1057,13 @@ impl eframe::App for App {
             }
             editor::EditorAction::Cancel => {
                 self.stop_audio();
+                // Leaving the Studio abandons its pre-pass: cancel the in-flight
+                // auto job (Transcribe / AnalyzeSpeakers) instead of letting it
+                // burn the GPU for a clip nobody is editing. A deliberate Render
+                // is never touched - Back stays usable while one runs.
+                if matches!(self.status, Status::Working(_)) && !self.rendering {
+                    self.cancel.cancel();
+                }
                 self.editor = None;
             }
             // Editor playback (ADR 0036): the same sink the Moment review uses,
