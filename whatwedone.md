@@ -13,9 +13,12 @@ repros pinned the crawl: **WDDM VRAM oversubscription** — with the GPU free
 the same clip's full ensemble export takes ~100 s; an *idle* 2.5 GB VRAM
 holder changes nothing (WDDM evicts cold pages); an *active* one collapses
 even whisper ~20x, because CUDA silently spills to shared system memory
-instead of erroring. Something GPU-hungry was running alongside the incident;
-whisper (~3.5 GB) still fit, mtmd (~6.8 GB) spilled and crawled ~75x. Fixes
-(ADR 0034 amendment):
+instead of erroring. The incident's competitor: **the operator was watching a
+Discord livestream** — the exact profile the evidence bracketed (video decode
++ compositing touch their VRAM every frame so WDDM can't evict them, few
+hundred MB + hot dwm/overlay, near-zero compute), which is why whisper
+(~3.5 GB) still fit while mtmd (~6.8 GB peak, ~400 MB headroom on a quiet
+desktop) spilled and crawled ~75x. Fixes (ADR 0034 amendment):
 
 - **Cancel now reaches the ensemble.** All three child kinds (ffmpeg cut,
   deep-filter, llama-mtmd-cli) run under the cancel poll and are killed
