@@ -1757,6 +1757,9 @@ impl App {
                 .clicked()
                 && !working
             {
+                // Review audio must not play over the Studio (Back and Render
+                // already stop it; the promote path forgot).
+                self.stop_audio();
                 self.editor = None;
                 self.pending_title = m.title.clone();
                 self.opening_editor = true;
