@@ -162,7 +162,11 @@ pub fn parse_output(raw: &str) -> Judgment {
                     let field = |k: &str| {
                         v.get(k).and_then(|r| r.as_str()).unwrap_or("").trim().to_string()
                     };
-                    return Judgment { score: clamp(score), reason: field("reason"), title: field("title") };
+                    return Judgment {
+                        score: clamp(score),
+                        reason: field("reason"),
+                        title: normalize_title(field("title")),
+                    };
                 }
             }
         }
@@ -171,6 +175,18 @@ pub fn parse_output(raw: &str) -> Judgment {
         score: clamp(first_score(raw).unwrap_or(0.0)),
         reason: raw.trim().to_string(),
         title: String::new(),
+    }
+}
+
+/// App-wide punctuation rule (operator, 2026-07-03): no em/en dashes in
+/// user-visible text. Generated titles are the one place they can still enter
+/// (a 7B likes " — " in clickbait), and the title also names the rendered
+/// file — normalize to a plain hyphen at the parse boundary.
+fn normalize_title(t: String) -> String {
+    if t.contains(['—', '–']) {
+        t.replace(['—', '–'], "-")
+    } else {
+        t
     }
 }
 
@@ -287,6 +303,15 @@ mod tests {
         assert_eq!(j.score, 8.0);
         assert_eq!(j.reason, "big laugh");
         assert_eq!(j.title, "He LOST it on the final boss");
+    }
+
+    #[test]
+    fn parse_output_normalizes_dashes_in_titles() {
+        // Titles render in the UI and name the exported file; the app-wide
+        // no-em-dash rule (operator, 2026-07-03) is enforced at the parse
+        // boundary so no generation can smuggle one in.
+        let j = parse_output(r#"{"score": 7, "reason": "x", "title": "Boss fight — he LOST it – twice"}"#);
+        assert_eq!(j.title, "Boss fight - he LOST it - twice");
     }
 
     #[test]

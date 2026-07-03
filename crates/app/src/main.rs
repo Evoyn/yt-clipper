@@ -1239,9 +1239,9 @@ impl App {
         let all_ok =
             deno_ok && deps.iter().filter(|d| d.required).all(|d| d.path.exists());
         let header = if all_ok {
-            "Diagnostics — all tools ready"
+            "Diagnostics - all tools ready"
         } else {
-            "Diagnostics — something is missing"
+            "Diagnostics - something is missing"
         };
         let debug_open = std::env::var("YC_DIAG_OPEN").is_ok(); // capture aid
         egui::CollapsingHeader::new(header).default_open(!all_ok || debug_open).show(ui, |ui| {
@@ -1262,7 +1262,7 @@ impl App {
                     false,
                     true,
                     "deno",
-                    "not found — run fetch-sidecars.ps1 or `winget install DenoLand.Deno`"
+                    "not found - run fetch-sidecars.ps1 or `winget install DenoLand.Deno`"
                         .into(),
                 ),
             }
@@ -1472,7 +1472,7 @@ impl App {
         });
         ui.add_space(4.0);
         if self.moments.is_empty() {
-            ui.weak("No Moments yet — Detect, or add one manually.");
+            ui.weak("No Moments yet - Detect, or add one manually.");
             return;
         }
         let selected = self.selected;
@@ -1580,7 +1580,7 @@ impl App {
             .default_open(n > 0)
             .show(ui, |ui| {
                 if n == 0 {
-                    ui.weak("No caption to-dos — this Creator's captions are clean, or none harvested yet.");
+                    ui.weak("No caption to-dos - this Creator's captions are clean, or none harvested yet.");
                     return;
                 }
                 ui.weak("Fill the word whisper should have written, then Save. Confirmed fixes apply to every future clip of this Creator (ADR 0031).");
@@ -1625,7 +1625,7 @@ impl App {
                                     &mut review.lexicon.corrections[row.idx].context,
                                     "context",
                                 )
-                                .on_hover_text("Tick for a real word the streamer means as slang or a name — routes through the LLM pass in context, not the always-on global dict (ADR 0030).");
+                                .on_hover_text("Tick for a real word the streamer means as slang or a name - routes through the LLM pass in context, not the always-on global dict (ADR 0030).");
                             });
                         }
                     }
@@ -1638,7 +1638,7 @@ impl App {
                         .clicked()
                     {
                         review.status = match review.save() {
-                            Ok(k) => format!("Saved — {k} confirmed correction(s)."),
+                            Ok(k) => format!("Saved - {k} confirmed correction(s)."),
                             Err(e) => format!("Save failed: {e}"),
                         };
                     }
@@ -1780,9 +1780,9 @@ impl App {
                         ui.label(egui::RichText::new(text).size(14.5).color(egui::Color32::from_gray(170)));
                     });
                 };
-                step(ui, "1", "Import a VOD — a YouTube URL or a local file");
-                step(ui, "2", "Detect Moments — AI ranks the clip-worthy spans");
-                step(ui, "3", "Open in editor — frame, caption, and export the Short");
+                step(ui, "1", "Import a VOD - a YouTube URL or a local file");
+                step(ui, "2", "Detect Moments - AI ranks the clip-worthy spans");
+                step(ui, "3", "Open in editor - frame, caption, and export the Short");
                 if self.imported.is_some() && !self.moments.is_empty() {
                     ui.add_space(12.0);
                     ui.weak("Select a Moment from the list on the left.");
@@ -1813,7 +1813,7 @@ impl App {
             let sig = |ui: &mut egui::Ui, name: &str, v: Option<f32>| {
                 let text = format!(
                     "{name} {}",
-                    v.map(|x| format!("{x:+.1}")).unwrap_or_else(|| "—".into())
+                    v.map(|x| format!("{x:+.1}")).unwrap_or_else(|| "-".into())
                 );
                 let color = match v {
                     Some(x) if x >= 1.0 => theme::OK,
@@ -1884,7 +1884,7 @@ impl App {
                 ui.weak("(no speech transcribed for this Moment)");
             }
             None => {
-                ui.weak("(manual Moment — run Detect to transcribe)");
+                ui.weak("(manual Moment - run Detect to transcribe)");
             }
         }
     }

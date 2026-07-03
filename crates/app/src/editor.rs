@@ -1273,7 +1273,7 @@ impl EditorState {
         }
         if self.transcript_dirty {
             ui.label(
-                egui::RichText::new("Edited — the render burns your text.")
+                egui::RichText::new("Edited - the render burns your text.")
                     .color(theme::GOLD)
                     .size(11.5),
             );
@@ -1559,7 +1559,7 @@ impl EditorState {
             });
             if self.camera_mode != CameraMode::Manual {
                 ui.weak(format!(
-                    "{} mode frames automatically — switch to Manual (or drag in Original view) to take over.",
+                    "{} mode frames automatically - switch to Manual (or drag in Original view) to take over.",
                     camera_mode_label(self.camera_mode)
                 ));
             }
@@ -1585,7 +1585,7 @@ impl EditorState {
                     self.overlay_cache = None;
                 }
             }
-            ui.weak("Pick a starting look — everything below stays editable.");
+            ui.weak("Pick a starting look - everything below stays editable.");
         });
 
         // Customization is its own section so the preset cards above and the
@@ -1715,9 +1715,9 @@ impl EditorState {
                     ui,
                     "Captions",
                     match (&self.transcript, self.transcript_dirty) {
-                        (None, _) => "on — transcribed during render".into(),
-                        (Some(t), true) => format!("on — {} lines (edited)", preview_lines(t, self.style.genre).len()),
-                        (Some(t), false) => format!("on — {} lines", preview_lines(t, self.style.genre).len()),
+                        (None, _) => "on - transcribed during render".into(),
+                        (Some(t), true) => format!("on - {} lines (edited)", preview_lines(t, self.style.genre).len()),
+                        (Some(t), false) => format!("on - {} lines", preview_lines(t, self.style.genre).len()),
                     },
                 );
                 row(ui, "Caption style", format!("{} · {}px", self.style.name, self.style.font_size));
@@ -1742,7 +1742,7 @@ impl EditorState {
                 row(ui, "Estimated render time", format!("~{}", fmt_mmss(est)));
                 if self.transcript.is_none() {
                     ui.add_space(4.0);
-                    ui.weak("Captions are still transcribing — rendering now simply waits for them.");
+                    ui.weak("Captions are still transcribing - rendering now simply waits for them.");
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
