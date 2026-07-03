@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
-use yc_core::{CaptionUnit, Language, TimeRange, Transcript};
+use yc_core::{CaptionUnit, Language, NoConsole, TimeRange, Transcript};
 
 /// The per-invocation engine override, tri-state since the per-Creator Caption
 /// engine landed (ADR 0035): `Some(true)` forces the ensemble, `Some(false)`
@@ -251,6 +251,7 @@ fn variant_wav(
     let dur = range.end_s - start;
     let cut = cfg.work_dir.join(format!("_ens_{idx}.wav"));
     let status = Command::new(&cfg.ffmpeg)
+        .no_console()
         .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{start}"))
         .arg("-t")
@@ -268,6 +269,7 @@ fn variant_wav(
     let out_dir = cfg.work_dir.join(format!("_ens_df{idx}"));
     std::fs::create_dir_all(&out_dir)?;
     let status = Command::new(df)
+        .no_console()
         .arg("-a")
         .arg(atten.to_string())
         .arg("-o")
@@ -284,6 +286,7 @@ fn variant_wav(
 /// normalizes it to the render's analysis format).
 fn wav_samples_f32(ffmpeg: &Path, wav: &Path) -> Result<Vec<f32>> {
     let out = Command::new(ffmpeg)
+        .no_console()
         .args(["-v", "error", "-i"])
         .arg(wav)
         .args(["-f", "f32le", "-ac", "1", "-ar", "16000", "-"])
@@ -319,6 +322,7 @@ fn decode_one(
     };
     let name = wav.file_name().context("variant wav has no file name")?;
     let out = Command::new(std::path::absolute(&cfg.mtmd_cli)?)
+        .no_console()
         .current_dir(dir)
         .arg("-m")
         .arg(std::path::absolute(&cfg.qwen_model)?)
