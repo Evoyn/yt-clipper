@@ -4,6 +4,62 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-03 — operator bug batch: WYSIWYG caption size, 60 fps always, pre-pass cancel, full diagnostics, QoL
+
+The operator filed 6 bugs + a features list; the grill scoped one review-round
+batch (8 commits `77ef27e..c27a932`, 233 workspace tests green) and queued
+three follow-up sessions. Fixed:
+
+- **Exported captions no longer smaller than the preview** (top-filed bug),
+  measured root cause: libass sizes a face by its **OS/2 win cell** (VSFilter
+  compat), egui 0.34/skrifa by the **em square** — Anton (upem 2048, win cell
+  3550) drew **1.73×** bigger in the preview. A one-glyph burn through the
+  production ffmpeg proved the mapping (Fontsize 150 → 75 px cap height =
+  the win-cell prediction). Per ADR 0036 the burn is ground truth, so the
+  *preview* now multiplies by `upem/winCell`, unit-test-pinned against the
+  shipped TTF's own tables (ADR 0036 § Calibration). Captions in the editor
+  now look smaller — that's the render's truth; scroll-to-resize placement is
+  the size lever and carries to the export.
+- **60 fps everywhere**: the GPU-stage 10 fps repaint throttle is deleted
+  (operator's explicit call; measurement knowingly skipped) — spinners stay
+  fluid through whisper/NVENC/LLM/ensemble. If a detect ever crawls again
+  (the June-19 scar), the revert is one commit: `b60d39b`.
+- **Back/Esc from the Studio cancels the caption pre-pass**: stage-boundary
+  semantics — killable children (ensemble sidecars, ffmpeg, deep-filter) die
+  now, results are discarded, downstream stages skip; an in-flight in-process
+  whisper decode finishes invisibly and is thrown away (the June-19
+  abort-callback scar stands: installing the hook collapses CUDA-graph
+  throughput). The worker also flushes pre-pass jobs *queued behind* the
+  cancel (the top-bar Cancel had the same hole), and a cancelled speaker
+  analysis no longer leaves the Camera panel spinning forever.
+- **Diagnostics is now a dependency registry**: every external tool/model the
+  pipeline resolves — the Qwen3-ASR GGUF pair, llama-mtmd-cli, deep-filter,
+  Silero VAD, the LLM judge + its model, face/SER models — in one table
+  (`dependency_registry`) driving the page. Required rows go red when
+  missing; optional rows show a neutral "not installed". The ensemble's
+  mtmd/Qwen paths moved out of pipeline.rs's ad-hoc derivation into AppPaths
+  so the page and the render can't disagree. Session C hangs per-row
+  Download buttons off this same table.
+- **QoL sweep**: review audio stops when the editor opens (promote forgot
+  what Back/Render remembered); the ensemble's 4 spawn sites got
+  `no_console` (the "terminal window flashes during processing" report —
+  ensemble.rs postdated the ADR 0025 sweep); **Open / Folder buttons +
+  Ctrl+O** on the Done chip launch the exported Short; **no em dashes** in
+  any UI string, and generated Titles normalize em/en dashes to hyphens at
+  the parse boundary (test-pinned — titles also name the exported files).
+
+Grill decisions recorded for the queued follow-ups: **(B)** sentence-boundary
+clip bounds 45–180 s (ADR 0037's revisit clause fired; boundaries from
+whisper punctuation at refine via a padded window; grow through real speech
+only, accept shorter when it runs dry; 180 s cap drops the trailing
+incomplete sentence; manual marks stay verbatim), **(C)** in-app dependency
+downloads off the new registry (ureq + sha2 + zip, pinned official URLs;
+CONTEXT.md's "Offline" term already widened), **(D)** full brand pass
+(black/yellow logo → exe ico + window icon + top-bar wordmark + README hero,
+concepts to be brought as rendered SVG variants).
+
+Details: `handoffs/2026-07-03-operator-bug-batch.md`.
+
 ## 2026-07-02 — productization sweep: the Studio editor, Podcast Mode, natural clip lengths, better titles (focus.md, all 6 tasks)
 
 The focus.md session: park `nextprompt.md`, make the app feel like a product.
