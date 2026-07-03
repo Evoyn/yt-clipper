@@ -15,12 +15,13 @@ mod review_queue;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
 use pipeline::{ImportSource, Job, Progress, Timeline};
 use yc_core::{
-    CaptionEngine, CaptionGenre, CaptionStyle, Language, LayoutPref, Moment, Signals, TimeRange,
+    CaptionEngine, CaptionGenre, CaptionStyle, Language, LayoutPref, Moment, NoConsole, Signals,
+    TimeRange,
 };
 use yc_ingest::CancelToken;
 
@@ -706,6 +707,20 @@ fn parse_layout_pref(arg: Option<&str>) -> LayoutPref {
     }
 }
 
+/// Open a file with its Windows association (the default player, for a Short):
+/// `explorer <file>` is ShellExecute-equivalent and never shows a console.
+fn open_in_shell(path: &Path) {
+    let _ = std::process::Command::new("explorer").no_console().arg(path).spawn();
+}
+
+/// Reveal a file in Explorer with the file pre-selected. `/select,` and the
+/// path travel as ONE argument (Explorer's own parsing).
+fn reveal_in_explorer(path: &Path) {
+    let mut select = std::ffi::OsString::from("/select,");
+    select.push(path);
+    let _ = std::process::Command::new("explorer").no_console().arg(select).spawn();
+}
+
 /// The max Moment length (seconds) for headless/batch detection: `YC_MAX_CLIP_S`
 /// overrides, else the detector's default cap. Clamped downstream to the 180 s
 /// Shorts ceiling. The GUI exposes the same knob as a slider.
@@ -1097,6 +1112,28 @@ impl App {
                     theme::status_chip(ui, theme::OK, &format!("Done · {}", ellipsize(&name, 36)));
                 });
                 resp.response.on_hover_text(path.display().to_string());
+                // The post-export step is always "watch it": the Short is one
+                // click (or Ctrl+O) away, its folder one more.
+                let open = ui
+                    .button("Open")
+                    .on_hover_text("Play the exported Short (Ctrl+O)")
+                    .clicked()
+                    || ui.input_mut(|i| {
+                        i.consume_shortcut(&egui::KeyboardShortcut::new(
+                            egui::Modifiers::CTRL,
+                            egui::Key::O,
+                        ))
+                    });
+                if open {
+                    open_in_shell(path);
+                }
+                if ui
+                    .button("Folder")
+                    .on_hover_text("Reveal the exported Short in Explorer")
+                    .clicked()
+                {
+                    reveal_in_explorer(path);
+                }
             }
             Status::Cancelled => {
                 theme::status_chip(ui, theme::GOLD, "Cancelled");
