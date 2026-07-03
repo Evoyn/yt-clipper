@@ -1769,6 +1769,20 @@ impl EditorState {
 
     // ------------------------------------------------------ caption overlay --
 
+    /// ASS Fontsize -> egui font size, so the preview draws captions at the
+    /// burn's TRUE size (ADR 0036: the burn-in is ground truth). libass sizes
+    /// a face by its OS/2 win cell (usWinAscent+usWinDescent - the VSFilter-
+    /// compat FreeType REAL_DIM request); egui 0.34 (skrifa) sizes by the em
+    /// square - the same nominal size drew Anton 1.73x bigger in the preview
+    /// than in the export (the operator's "exported captions much smaller"
+    /// bug). MEASURED 2026-07-03 on the production ffmpeg+libass (one-glyph
+    /// ASS burn, ink-row count): Fontsize 150 -> 75 px cap height, exactly
+    /// the win-cell prediction 74.4 (hhea-span would be 85.6, em 128.9);
+    /// linear at 96 -> 48. Anton: upem 2048, winAsc 2876 + winDesc 674 =
+    /// 3550. The unit test pins this against the shipped TTF's own tables -
+    /// if the caption face ever changes, re-measure with a one-glyph burn.
+    const ASS_TO_EGUI_FONT: f32 = 2048.0 / 3550.0;
+
     /// Draw the caption line active at the playhead over the composite and run
     /// its drag/resize interaction (ADR 0036). Grouping/timing/colours come from
     /// the render's own line model; egui rasterizes the glyphs (approximate
@@ -1796,7 +1810,7 @@ impl EditorState {
         // one factor converts PlayRes pixels to canvas points.
         let (ass_x, ass_y, ass_font) = resolve_placement(self.placement, style.font_size);
         let px = canvas_rect.width() / CANVAS_W as f32;
-        let font_px = (ass_font as f32 * px).max(4.0);
+        let font_px = (ass_font as f32 * px * Self::ASS_TO_EGUI_FONT).max(4.0);
         let font_id = FontId::new(font_px, theme::display_family());
         let mul = if ghost { 0.35 } else { 1.0 };
         let tint = |c: [u8; 4]| {
@@ -2296,6 +2310,40 @@ fn ellipsize(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use yc_core::CaptionUnit;
+
+    #[test]
+    fn ass_to_egui_font_factor_matches_the_shipped_caption_face() {
+        // The calibration constant IS the shipped Anton's upem / OS/2 win
+        // cell: libass sizes a face by its win cell (VSFilter compat), egui
+        // 0.34/skrifa by the em square. Measured 2026-07-03 on the production
+        // ffmpeg+libass: Fontsize 150 burned a 75 px cap height (win-cell
+        // predicts 74.4; the em mapping would draw 128.9). If this fails the
+        // caption face changed - re-measure with a one-glyph burn and update
+        // ASS_TO_EGUI_FONT.
+        let ttf = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/fonts/Anton-Regular.ttf"),
+        )
+        .expect("shipped caption face");
+        let u16be = |o: usize| u16::from_be_bytes([ttf[o], ttf[o + 1]]);
+        let u32be = |o: usize| u32::from_be_bytes([ttf[o], ttf[o + 1], ttf[o + 2], ttf[o + 3]]);
+        let num_tables = u16be(4) as usize;
+        let table = |tag: &[u8; 4]| {
+            (0..num_tables)
+                .map(|i| 12 + 16 * i)
+                .find(|&rec| &ttf[rec..rec + 4] == tag)
+                .map(|rec| u32be(rec + 8) as usize)
+                .expect("metric table present")
+        };
+        let upem = u16be(table(b"head") + 18) as f32;
+        let os2 = table(b"OS/2");
+        let win_cell = (u16be(os2 + 74) + u16be(os2 + 76)) as f32;
+        assert_eq!((upem, win_cell), (2048.0, 3550.0), "Anton's tables moved");
+        assert!(
+            (EditorState::ASS_TO_EGUI_FONT - upem / win_cell).abs() < 1e-6,
+            "ASS_TO_EGUI_FONT must equal the shipped face's upem/winCell"
+        );
+    }
 
     #[test]
     fn mmss_cc_formats_and_parses_round_trip() {

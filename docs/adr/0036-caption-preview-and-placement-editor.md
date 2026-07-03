@@ -127,3 +127,25 @@ interact registered after panel pan/zoom wins the pointer) is the specific
 thing the operator's interactive pass should confirm, along with audio↔caption
 sync feel. Slice 2 (text fixes as curation + insertions + harvest highlighting
 + a Transcribe-without-render job) is queued.
+
+## Calibration (2026-07-03): ASS Fontsize ≠ egui font size
+
+The operator caught exported captions rendering **much smaller** than the
+preview. Root cause: the overlay converted ASS `Fontsize` to egui points by
+the canvas factor alone, but the two rasterizers disagree about what the
+number means — **libass sizes a face by its OS/2 win cell** (usWinAscent +
+usWinDescent, the VSFilter-compat FreeType `REAL_DIM` request), **egui 0.34
+(skrifa) by the em square**. For Anton (upem 2048, win cell 3550) the same
+nominal size draws 1.73× bigger in egui. Measured on the production
+ffmpeg+libass with a one-glyph ASS burn: Fontsize 150 → 75 px cap height,
+matching the win-cell prediction (74.4) and ruling out the hhea-span (85.6)
+and em (128.9) mappings; linear at 96 → 48.
+
+Per this ADR's own contract the burn-in is ground truth, so the **preview**
+was corrected: the overlay multiplies by `ASS_TO_EGUI_FONT = upem / win cell`
+(editor.rs, unit-tested against the shipped TTF's actual tables so a font
+swap fails loudly). Placement scale composes on top unchanged — after the
+factor, the operator's size lever is the existing scroll-to-resize. Known
+residual approximation: libass and egui still center slightly different line
+boxes on the anchor (win-cell vs hhea line heights), a few PlayRes pixels of
+vertical offset at caption sizes — spatial-drag territory, not a size bug.

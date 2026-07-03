@@ -125,5 +125,5 @@ The operator's edited transcript from the Studio's caption panel (edit / add / d
 _Avoid_: correction (that is the dialect/LLM pass over whisper output), custom captions
 
 **Offline**:
-The core constraint: all analysis and rendering happens on the local machine. The only permitted network use is user-initiated ingestion of a VOD.
-_Avoid_: air-gapped, local-only (both overstate it — ingestion may use the network)
+The core constraint: all analysis and rendering happens on the local machine. The only permitted network uses are user-initiated: ingesting a VOD, and fetching a missing tool or model from its pinned official source (the Diagnostics page's downloads).
+_Avoid_: air-gapped, local-only (both overstate it — ingestion and dependency fetches may use the network)
