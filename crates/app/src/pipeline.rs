@@ -171,6 +171,44 @@ pub enum Job {
         camera: Option<CameraPlan>,
         transcript_override: Option<Transcript>,
     },
+    /// Fetch missing dependencies from their pinned official sources (ADR
+    /// 0041): stream to a `.part` beside the destination, verify the pinned
+    /// SHA-256, then atomically rename (or unzip) into place. Runs on this
+    /// same serial worker — a download and a GPU job never race, and the
+    /// existing [`CancelToken`] aborts mid-stream. Needs no session.
+    Download { specs: Vec<DownloadSpec> },
+}
+
+/// One fetchable dependency artifact (ADR 0041): a pinned, version-stable URL,
+/// the SHA-256 the download must hash to, and how it installs. A single spec
+/// can satisfy several Diagnostics rows (the ffmpeg zip carries ffprobe too);
+/// the registry in `main.rs` maps rows to spec ids.
+#[derive(Debug, Clone)]
+pub struct DownloadSpec {
+    /// Stable key the registry rows reference.
+    pub id: &'static str,
+    /// Human label for progress ("whisper large-v3 model").
+    pub label: &'static str,
+    pub url: &'static str,
+    /// Lowercase-hex SHA-256 of the artifact the URL serves. Verified before
+    /// anything is installed; a mismatch (tampering, or an upstream that moved
+    /// under a stale pin) fails loudly and leaves nothing behind.
+    pub sha256: &'static str,
+    /// Pinned size, bytes — drives the progress fraction (a redirect chain
+    /// does not always carry Content-Length).
+    pub total_bytes: u64,
+    pub install: Install,
+}
+
+/// How a verified download lands on disk.
+#[derive(Debug, Clone)]
+pub enum Install {
+    /// The artifact *is* the file: rename the verified `.part` to this path.
+    File(PathBuf),
+    /// The artifact is a zip: extract entries whose (slash-normalized) name
+    /// ends with each pick's suffix to the paired path, plus optionally every
+    /// `*.dll` flat into a directory (the llama.cpp runtime layout).
+    Unzip { picks: Vec<(&'static str, PathBuf)>, dll_sweep_to: Option<PathBuf> },
 }
 
 /// Whole-VOD signal series for the review waveform, one value per `bin_s` bin
@@ -185,6 +223,9 @@ pub struct Timeline {
 /// Progress reported back to the UI thread.
 pub enum Progress {
     Stage(&'static str),
+    /// A dependency download's progress (ADR 0041): `frac` is 0..=1 of the
+    /// spec's pinned size. Drives the status bar's progress bar.
+    Download { label: &'static str, frac: f32 },
     /// Import finished; the VOD is ready to detect / promote ranges from.
     /// `analysis_wav` lets the review UI play a Moment's audio range.
     /// `caption_genre` is this Creator's remembered Caption Style (ADR 0016), if
@@ -340,6 +381,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
     let cancel = CancelToken::new();
     let worker_cancel = cancel.clone();
     thread::spawn(move || {
+        // Mutable only for `deno_dir`: a Download can materialize the deno
+        // sidecar after startup resolved it absent (ADR 0041).
+        let mut paths = paths;
         let mut session: Option<Session> = None;
         // The clip prepared for the nudge editor, held between Prepare and its
         // Render(s) (ADR 0012). Invalidated by a new Import or Prepare.
@@ -498,6 +542,25 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                             .send(Progress::Failed("prepare a clip before rendering".into()));
                     }
                 },
+                Job::Download { specs } => {
+                    match do_download(&specs, &worker_cancel, &tx_prog) {
+                        Ok(()) => {
+                            // A fresh deno sidecar changes the resolved dir the
+                            // ingest children get on their PATH — re-resolve now
+                            // rather than requiring a restart.
+                            if paths.deno_dir.is_none() {
+                                if let Some(sidecars) = paths.ytdlp.parent() {
+                                    paths.deno_dir = yc_ingest::resolve_deno_dir(sidecars);
+                                }
+                            }
+                            let _ = tx_prog.send(Progress::Stage("Downloads finished"));
+                            let _ = tx_prog.send(Progress::JobDone);
+                        }
+                        Err(e) => {
+                            let _ = tx_prog.send(fail_or_cancel(e, &worker_cancel));
+                        }
+                    }
+                }
             }
         }
     });
@@ -2257,6 +2320,204 @@ fn do_analyze_speakers(
     )
 }
 
+// --- dependency downloads (ADR 0041) -----------------------------------------
+
+/// Fetch each spec from its pinned official source: stream to a `.part` next
+/// to the destination (same volume, so the final rename is atomic), hash while
+/// streaming, verify the pinned SHA-256, then install. Any failure removes the
+/// partial and stops the batch — nothing unverified ever lands on a real path.
+fn do_download(specs: &[DownloadSpec], cancel: &CancelToken, tx: &Sender<Progress>) -> Result<()> {
+    anyhow::ensure!(!specs.is_empty(), "nothing to download");
+    let agent = download_agent();
+    for spec in specs {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let _ = tx.send(Progress::Download { label: spec.label, frac: 0.0 });
+        tracing::info!("downloading {} from {}", spec.label, spec.url);
+        let staging = staging_path(spec);
+        if let Some(dir) = staging.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+        }
+        if let Err(e) = fetch_verified(&agent, spec, &staging, cancel, tx) {
+            let _ = fs::remove_file(&staging);
+            return Err(e.context(format!("downloading {} from {}", spec.label, spec.url)));
+        }
+        install_download(&staging, &spec.install)
+            .with_context(|| format!("installing {}", spec.label))?;
+        let _ = tx.send(Progress::Download { label: spec.label, frac: 1.0 });
+    }
+    Ok(())
+}
+
+/// The downloads' HTTP agent: rustls, redirects followed (GitHub/HF assets
+/// live behind them), a bounded connect. No whole-body timeout — a model is
+/// gigabytes on an unknown line; the cancel token is the abort lever.
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into()
+}
+
+/// Where a spec's in-flight download stages: beside its (first) destination,
+/// so the verified rename never crosses a volume.
+fn staging_path(spec: &DownloadSpec) -> PathBuf {
+    let dest_dir = match &spec.install {
+        Install::File(dest) => dest.parent().map(Path::to_path_buf),
+        Install::Unzip { picks, dll_sweep_to } => picks
+            .first()
+            .and_then(|(_, to)| to.parent().map(Path::to_path_buf))
+            .or_else(|| dll_sweep_to.clone()),
+    };
+    dest_dir.unwrap_or_else(std::env::temp_dir).join(format!("{}.download.part", spec.id))
+}
+
+/// Stream the URL to `staging`, hashing as it goes; error (and leave the
+/// caller to clean up) unless the hash equals the spec's pin. Progress is
+/// throttled to ~1% / 4 MB steps so the channel is not flooded.
+fn fetch_verified(
+    agent: &ureq::Agent,
+    spec: &DownloadSpec,
+    staging: &Path,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<()> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+
+    let mut resp = agent.get(spec.url).call().context("request failed")?;
+    let total = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(spec.total_bytes)
+        .max(1);
+    let mut reader = resp.body_mut().as_reader();
+    let mut out = fs::File::create(staging)
+        .with_context(|| format!("creating {}", staging.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    let mut last_sent: u64 = 0;
+    loop {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let n = reader.read(&mut buf).context("reading response body")?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).context("writing download")?;
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        if done - last_sent >= (total / 100).max(4 * 1024 * 1024) {
+            last_sent = done;
+            let frac = (done as f64 / total as f64).min(1.0) as f32;
+            let _ = tx.send(Progress::Download { label: spec.label, frac });
+        }
+    }
+    out.flush().ok();
+    drop(out);
+    let got = hex_digest(hasher.finalize().as_slice());
+    anyhow::ensure!(
+        got == spec.sha256,
+        "SHA-256 mismatch: expected {}, got {got}. The pinned source may have \
+         changed since this build - nothing was installed.",
+        spec.sha256
+    );
+    Ok(())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Land a verified staging file: a plain file renames into place; a zip
+/// extracts its picked entries (each via its own `.part` + rename) and
+/// optionally sweeps every DLL flat into a dir, then the archive is removed.
+fn install_download(staging: &Path, install: &Install) -> Result<()> {
+    match install {
+        Install::File(dest) => replace_file(staging, dest),
+        Install::Unzip { picks, dll_sweep_to } => {
+            let res = extract_zip(staging, picks, dll_sweep_to.as_deref());
+            let _ = fs::remove_file(staging);
+            res
+        }
+    }
+}
+
+/// Move `from` over `dest` (Windows `rename` refuses an existing target, so
+/// the stale file goes first — `from` is already verified at this point).
+fn replace_file(from: &Path, dest: &Path) -> Result<()> {
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let _ = fs::remove_file(dest);
+    fs::rename(from, dest)
+        .with_context(|| format!("renaming {} to {}", from.display(), dest.display()))
+}
+
+/// Extract a pinned archive: entries are matched by slash-normalized,
+/// case-insensitive name *suffix* (release zips nest under a versioned root
+/// dir). Every pick must match — a miss means the upstream layout changed
+/// under the pin, which must fail loudly rather than half-install.
+fn extract_zip(
+    zip_path: &Path,
+    picks: &[(&'static str, PathBuf)],
+    dll_sweep_to: Option<&Path>,
+) -> Result<()> {
+    let file =
+        fs::File::open(zip_path).with_context(|| format!("opening {}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file).context("reading zip")?;
+    let mut matched = vec![false; picks.len()];
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context("reading zip entry")?;
+        if !entry.is_file() {
+            continue;
+        }
+        let raw = entry.name().replace('\\', "/");
+        let name = raw.to_ascii_lowercase();
+        let mut dest: Option<PathBuf> = None;
+        for (k, (suffix, to)) in picks.iter().enumerate() {
+            if !matched[k] && name.ends_with(&suffix.to_ascii_lowercase()) {
+                matched[k] = true;
+                dest = Some(to.clone());
+                break;
+            }
+        }
+        if dest.is_none() && name.ends_with(".dll") {
+            if let Some(dir) = dll_sweep_to {
+                let base = raw.rsplit('/').next().unwrap_or(&raw);
+                dest = Some(dir.join(base));
+            }
+        }
+        let Some(dest) = dest else { continue };
+        let part = dest.with_file_name(format!(
+            "{}.part",
+            dest.file_name().and_then(|s| s.to_str()).unwrap_or("dep")
+        ));
+        if let Some(dir) = part.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let mut out = fs::File::create(&part)
+            .with_context(|| format!("creating {}", part.display()))?;
+        std::io::copy(&mut entry, &mut out)
+            .with_context(|| format!("extracting {raw}"))?;
+        drop(out);
+        replace_file(&part, &dest)?;
+    }
+    if let Some(k) = matched.iter().position(|m| !m) {
+        anyhow::bail!(
+            "the archive holds no '{}' - the pinned zip's layout changed; not installing",
+            picks[k].0
+        );
+    }
+    Ok(())
+}
+
 // --- output organization (ADR 0015) -----------------------------------------
 
 #[cfg(test)]
@@ -2482,6 +2743,98 @@ mod tests {
         assert_eq!(p.clips.len(), 4, "the direct promote adds a fourth Clip");
         assert_eq!(p.moments.len(), 4, "and records a Moment for the un-detected range");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- dependency downloads (ADR 0041) --------------------------------------
+
+    /// Build a zip like a pinned release archive: entries nested under a
+    /// versioned root dir, stored (no compression feature needed to write).
+    fn test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = fs::File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_zip_picks_by_suffix_and_sweeps_dlls() {
+        let dir = std::env::temp_dir().join("yc_dl_extract");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("pkg.zip");
+        test_zip(
+            &zip_path,
+            &[
+                ("ffmpeg-9.9-essentials_build/bin/ffmpeg.exe", b"FF".as_slice()),
+                ("ffmpeg-9.9-essentials_build/bin/ffprobe.exe", b"PR".as_slice()),
+                ("ffmpeg-9.9-essentials_build/lib/helper.DLL", b"DL".as_slice()),
+                ("ffmpeg-9.9-essentials_build/README.txt", b"no".as_slice()),
+            ],
+        );
+        let picks = vec![
+            ("/bin/ffmpeg.exe", dir.join("out").join("ffmpeg.exe")),
+            ("/bin/ffprobe.exe", dir.join("out").join("ffprobe.exe")),
+        ];
+        extract_zip(&zip_path, &picks, Some(&dir.join("dlls"))).unwrap();
+        assert_eq!(fs::read(dir.join("out").join("ffmpeg.exe")).unwrap(), b"FF");
+        assert_eq!(fs::read(dir.join("out").join("ffprobe.exe")).unwrap(), b"PR");
+        // The sweep keeps the entry's own basename (case preserved) and the
+        // README is not extracted at all.
+        assert_eq!(fs::read(dir.join("dlls").join("helper.DLL")).unwrap(), b"DL");
+        assert!(!dir.join("out").join("README.txt").exists());
+        // Extraction replaces an existing (stale) install.
+        test_zip(&zip_path, &[("v2/bin/ffmpeg.exe", b"F2".as_slice()), ("v2/bin/ffprobe.exe", b"P2".as_slice())]);
+        extract_zip(&zip_path, &picks, None).unwrap();
+        assert_eq!(fs::read(dir.join("out").join("ffmpeg.exe")).unwrap(), b"F2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_zip_fails_loudly_when_a_pick_is_missing() {
+        let dir = std::env::temp_dir().join("yc_dl_missing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("pkg.zip");
+        test_zip(&zip_path, &[("root/bin/ffmpeg.exe", b"FF".as_slice())]);
+        let picks = vec![
+            ("/bin/ffmpeg.exe", dir.join("ffmpeg.exe")),
+            ("/bin/ffprobe.exe", dir.join("ffprobe.exe")),
+        ];
+        let err = extract_zip(&zip_path, &picks, None).unwrap_err();
+        assert!(err.to_string().contains("ffprobe"), "names the missing pick: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hex_digest_matches_known_sha256() {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(b"abc");
+        assert_eq!(
+            hex_digest(h.finalize().as_slice()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn replace_file_overwrites_an_existing_target() {
+        let dir = std::env::temp_dir().join("yc_dl_replace");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("new.part");
+        let dest = dir.join("tool.exe");
+        fs::write(&from, b"new").unwrap();
+        fs::write(&dest, b"old").unwrap();
+        replace_file(&from, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(!from.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

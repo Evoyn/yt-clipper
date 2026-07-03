@@ -84,6 +84,9 @@ fn main() -> eframe::Result<()> {
         loop {
             match from_worker.recv() {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(Progress::Download { label, frac }) => {
+                    tracing::info!("downloading {label}: {:.0}%", frac * 100.0)
+                }
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
                     // No detection in --headless, so no generated title; the
@@ -145,6 +148,9 @@ fn main() -> eframe::Result<()> {
         loop {
             match from_worker.recv() {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(Progress::Download { label, frac }) => {
+                    tracing::info!("downloading {label}: {:.0}%", frac * 100.0)
+                }
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
                     to_worker.send(Job::Detect { max_dur_s: max_clip_s_from_env() }).expect("send detect");
@@ -217,6 +223,9 @@ fn main() -> eframe::Result<()> {
         loop {
             match from_worker.recv() {
                 Ok(Progress::Stage(s)) => tracing::info!("stage: {s}"),
+                Ok(Progress::Download { label, frac }) => {
+                    tracing::info!("downloading {label}: {:.0}%", frac * 100.0)
+                }
                 Ok(Progress::Imported { title, duration_s, .. }) => {
                     tracing::info!("imported: {title} ({})", fmt_duration(duration_s));
                     to_worker.send(Job::Detect { max_dur_s: max_clip_s_from_env() }).expect("send detect");
@@ -319,6 +328,7 @@ fn main() -> eframe::Result<()> {
                 sink: None,
                 volume: 1.0,
                 status: Status::Idle,
+                download_frac: None,
                 editor: None,
                 pending_title: None,
                 opening_editor: false,
@@ -482,6 +492,10 @@ struct Dep {
     path: PathBuf,
     /// What it powers — the hover line beside the resolved path.
     role: &'static str,
+    /// Ids into [`App::download_specs`] that materialize this row (ADR 0041).
+    /// Usually one; the llama sidecar needs two archives; empty = not
+    /// downloadable in-app (`yc-llm-judge.exe` ships beside the app exe).
+    downloads: &'static [&'static str],
 }
 
 /// VOD facts shown after a successful import.
@@ -561,6 +575,9 @@ struct App {
     /// a quiet streamer in the mixed track (rodio amplifies linearly).
     volume: f32,
     status: Status,
+    /// Fraction (0..=1) of the in-flight dependency download (ADR 0041);
+    /// `None` outside a download. Drives the status bar's progress bar.
+    download_frac: Option<f32>,
     /// The Studio editor page, open from Prepare until the operator dismisses
     /// it or a new Prepare/import replaces it (ADR 0012); persists across
     /// re-renders.
@@ -746,7 +763,14 @@ impl eframe::App for App {
         // Drain worker messages.
         while let Ok(msg) = self.from_worker.try_recv() {
             match msg {
-                Progress::Stage(s) => self.status = Status::Working(s.to_string()),
+                Progress::Stage(s) => {
+                    self.status = Status::Working(s.to_string());
+                    self.download_frac = None;
+                }
+                Progress::Download { label, frac } => {
+                    self.status = Status::Working(format!("Downloading {label}"));
+                    self.download_frac = Some(frac);
+                }
                 Progress::Imported {
                     title,
                     duration_s,
@@ -901,6 +925,10 @@ impl eframe::App for App {
                 }
                 Progress::JobDone => {
                     self.status = Status::Idle;
+                    self.download_frac = None;
+                    // A finished download can materialize the deno sidecar; the
+                    // row reads this resolved dir, so refresh it (cheap).
+                    self.deno_dir = self.paths.deno_dir();
                 }
                 Progress::Done(p) => {
                     // The render just persisted the rail's engine selection per
@@ -950,6 +978,7 @@ impl eframe::App for App {
                         }
                     }
                     self.status = Status::Cancelled;
+                    self.download_frac = None;
                 }
                 Progress::Failed(e) => {
                     self.render_queue.clear();
@@ -964,6 +993,7 @@ impl eframe::App for App {
                         }
                     }
                     self.status = Status::Failed(e);
+                    self.download_frac = None;
                 }
             }
         }
@@ -1014,7 +1044,7 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().id_salt("rail").show(ui, |ui| {
                         self.ui_import(ui, working);
                         self.ui_moments(ui, working);
-                        self.ui_preflight(ui);
+                        self.ui_preflight(ui, working);
                     });
                 });
             egui::CentralPanel::default()
@@ -1101,6 +1131,15 @@ impl App {
                     self.cancel.cancel();
                 }
                 ui.label(stage.clone());
+                // A dependency download knows its size (the pin), so it gets a
+                // real bar (ADR 0041); pipeline stages keep the spinner.
+                if let Some(frac) = self.download_frac {
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(140.0)
+                            .show_percentage(),
+                    );
+                }
                 throttled_spinner(ui);
             }
             Status::Done(path) => {
@@ -1155,52 +1194,233 @@ impl App {
     /// these in [`Self::ui_preflight`].
     fn dependency_registry(&self) -> Vec<Dep> {
         let p = &self.paths;
-        let dep = |required, name, path, role| Dep { required, name, path, role };
+        let dep = |required, name, path, role, downloads| Dep { required, name, path, role, downloads };
         vec![
-            dep(true, "ffmpeg", p.ffmpeg(), "audio/video decode + every render"),
-            dep(true, "ffprobe", p.ffprobe(), "stream probing at import/promote"),
-            dep(true, "yt-dlp", p.ytdlp(), "YouTube VOD audio + Segment fetch"),
-            dep(true, "whisper model", p.model(), "transcription (captions + detect refine)"),
-            dep(true, "caption font", p.font(), "the burned caption face (Anton)"),
+            dep(true, "ffmpeg", p.ffmpeg(), "audio/video decode + every render", &["ffmpeg"][..]),
+            dep(true, "ffprobe", p.ffprobe(), "stream probing at import/promote", &["ffmpeg"]),
+            dep(true, "yt-dlp", p.ytdlp(), "YouTube VOD audio + Segment fetch", &["yt-dlp"]),
+            dep(
+                true,
+                "whisper model",
+                p.model(),
+                "transcription (captions + detect refine) (~3 GB)",
+                &["whisper-model"],
+            ),
+            dep(true, "caption font", p.font(), "the burned caption face (Anton)", &["caption-font"]),
             dep(
                 false,
                 "LLM judge",
                 p.llm_judge(),
-                "LLM judgment Signal + caption correction; detect renormalizes without it",
+                "LLM judgment Signal + caption correction; detect renormalizes without it \
+                 (built with the app - reinstall to restore)",
+                &[],
             ),
-            dep(false, "judge model", p.llm_model(), "the judge's Qwen2.5-7B GGUF (~5.4 GB)"),
+            dep(
+                false,
+                "judge model",
+                p.llm_model(),
+                "the judge's Qwen2.5-7B GGUF (~5.4 GB)",
+                &["judge-model"],
+            ),
             dep(
                 false,
                 "Qwen3-ASR model",
                 p.qwen_model(),
-                "ensemble Caption engine voter (ADR 0034)",
+                "ensemble Caption engine voter (ADR 0034) (~2.2 GB)",
+                &["qwen3-asr-model"],
             ),
             dep(
                 false,
                 "Qwen3-ASR mmproj",
                 p.qwen_mmproj(),
-                "the ensemble voter's audio projector",
+                "the ensemble voter's audio projector (~360 MB)",
+                &["qwen3-asr-mmproj"],
             ),
             dep(
                 false,
                 "llama-mtmd-cli",
                 p.mtmd_cli(),
-                "ensemble Caption engine decoder (pinned llama.cpp sidecar)",
+                "ensemble Caption engine decoder (pinned llama.cpp sidecar, ~550 MB with CUDA runtime)",
+                &["llama-bin", "llama-cudart"],
             ),
             dep(
                 false,
                 "deep-filter",
                 p.deep_filter(),
                 "ensemble denoise variants + Cleaned-voice captions (ADR 0029)",
+                &["deep-filter"],
             ),
-            dep(false, "Silero VAD", p.silero_model(), "YC_VAD=1 trial decode knob (ADR 0033)"),
+            dep(
+                false,
+                "Silero VAD",
+                p.silero_model(),
+                "YC_VAD=1 trial decode knob (ADR 0033)",
+                &["silero-vad"],
+            ),
             dep(
                 false,
                 "face model",
                 p.face_model(),
                 "facecam auto-framing + podcast Speaker tracks (face builds)",
+                &["face-model"],
             ),
-            dep(false, "SER model", p.ser_model(), "arousal Signal (ser builds, ADR 0008)"),
+            dep(
+                false,
+                "SER model",
+                p.ser_model(),
+                "arousal Signal (ser builds, ADR 0008) (~610 MB)",
+                &["ser-model"],
+            ),
+        ]
+    }
+
+    /// The pinned download table (ADR 0041): every fetchable dependency's
+    /// official source, version-stable URL, expected SHA-256, and install
+    /// shape. Pins mirror `scripts/fetch-*.ps1`; the hashes were taken from
+    /// the upstream release/LFS metadata and verified byte-identical against
+    /// the operator's working set on 2026-07-03. A pin that rots (gyan.dev
+    /// rotates versioned packages out; HF revisions never rot) fails the
+    /// SHA/404 check loudly — bump the URL *and* hash together, here only.
+    fn download_specs(&self) -> Vec<pipeline::DownloadSpec> {
+        use pipeline::{DownloadSpec, Install};
+        let p = &self.paths;
+        vec![
+            DownloadSpec {
+                id: "ffmpeg",
+                label: "ffmpeg + ffprobe",
+                url: "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",
+                sha256: "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
+                total_bytes: 109_728_040,
+                install: Install::Unzip {
+                    picks: vec![
+                        ("/bin/ffmpeg.exe", p.ffmpeg()),
+                        ("/bin/ffprobe.exe", p.ffprobe()),
+                    ],
+                    dll_sweep_to: None,
+                },
+            },
+            DownloadSpec {
+                id: "yt-dlp",
+                label: "yt-dlp",
+                url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp.exe",
+                sha256: "3a48cb955d55c8821b60ccbdbbc6f61bc958f2f3d3b7ad5eaf3d83a543293a27",
+                total_bytes: 18_202_192,
+                install: Install::File(p.ytdlp()),
+            },
+            DownloadSpec {
+                id: "deno",
+                label: "deno (yt-dlp's JS runtime)",
+                url: "https://github.com/denoland/deno/releases/download/v2.9.1/deno-x86_64-pc-windows-msvc.zip",
+                sha256: "ab310b4232cca207d40ffa41867e93aaf9f893802bc76756e74f486a6b21b371",
+                total_bytes: 42_707_941,
+                install: Install::Unzip {
+                    picks: vec![("deno.exe", p.sidecars.join("deno.exe"))],
+                    dll_sweep_to: None,
+                },
+            },
+            DownloadSpec {
+                id: "whisper-model",
+                label: "whisper large-v3 model",
+                url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3.bin",
+                sha256: "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
+                total_bytes: 3_095_033_483,
+                install: Install::File(p.model()),
+            },
+            DownloadSpec {
+                id: "caption-font",
+                label: "Anton caption font",
+                url: "https://raw.githubusercontent.com/google/fonts/e0a8124cf36bb7c32ca68e5d46d6acdbc3df866a/ofl/anton/Anton-Regular.ttf",
+                sha256: "a4ba3a92350ebb031da0cb47630ac49eb265082ca1bc0450442f4a83ab947cab",
+                total_bytes: 170_812,
+                install: Install::File(p.font()),
+            },
+            DownloadSpec {
+                id: "judge-model",
+                label: "judge model (Qwen2.5-7B Q5_K_M)",
+                url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/8911e8a47f92bac19d6f5c64a2e2095bd2f7d031/Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+                sha256: "2e998d7e181c8756c5ffc55231b9ee1cdc9d3acec4245d6e27d32bd8e738c474",
+                total_bytes: 5_444_831_936,
+                install: Install::File(p.llm_model()),
+            },
+            DownloadSpec {
+                id: "qwen3-asr-model",
+                label: "Qwen3-ASR model",
+                url: "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80/Qwen3-ASR-1.7B-Q8_0.gguf",
+                sha256: "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57",
+                total_bytes: 2_165_034_944,
+                install: Install::File(p.qwen_model()),
+            },
+            DownloadSpec {
+                id: "qwen3-asr-mmproj",
+                label: "Qwen3-ASR mmproj",
+                url: "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+                sha256: "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d",
+                total_bytes: 355_709_344,
+                install: Install::File(p.qwen_mmproj()),
+            },
+            DownloadSpec {
+                id: "llama-bin",
+                label: "llama.cpp b9859 binaries",
+                url: "https://github.com/ggml-org/llama.cpp/releases/download/b9859/llama-b9859-bin-win-cuda-13.3-x64.zip",
+                sha256: "5bab577d1ac05f049b80489ec3db37ec544bbf9b50793a7842b1f4fed1f9bbd1",
+                total_bytes: 161_363_100,
+                install: Install::Unzip {
+                    picks: vec![
+                        ("llama-mtmd-cli.exe", p.mtmd_cli()),
+                        ("llama-server.exe", p.sidecars.join("llama").join("llama-server.exe")),
+                    ],
+                    dll_sweep_to: Some(p.sidecars.join("llama")),
+                },
+            },
+            DownloadSpec {
+                id: "llama-cudart",
+                label: "llama.cpp CUDA runtime",
+                url: "https://github.com/ggml-org/llama.cpp/releases/download/b9859/cudart-llama-bin-win-cuda-13.3-x64.zip",
+                sha256: "1462a050eb4c684921ba51dcc4cc488a036674c3e73e9945ee705b854808d03e",
+                total_bytes: 390_970_417,
+                install: Install::Unzip {
+                    picks: Vec::new(),
+                    dll_sweep_to: Some(p.sidecars.join("llama")),
+                },
+            },
+            DownloadSpec {
+                id: "deep-filter",
+                label: "deep-filter",
+                url: "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-x86_64-pc-windows-msvc.exe",
+                sha256: "75e11fa16445f560cb6b021521ddb89e89270d13b83089705d98776f58fd7915",
+                total_bytes: 26_912_256,
+                install: Install::File(p.deep_filter()),
+            },
+            DownloadSpec {
+                id: "silero-vad",
+                label: "Silero VAD model",
+                url: "https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v5.1.2.bin",
+                sha256: "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf",
+                total_bytes: 885_098,
+                install: Install::File(p.silero_model()),
+            },
+            DownloadSpec {
+                id: "face-model",
+                label: "face model (Ultraface RFB-320)",
+                url: "https://raw.githubusercontent.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/0f9ca4a9fc80170fd505168fd1132b837141f7df/models/onnx/version-RFB-320.onnx",
+                sha256: "34cd7e60aeff28744c657de7a3dc64e872d506741de66987f3426f2b79f88017",
+                total_bytes: 1_270_727,
+                install: Install::File(p.face_model()),
+            },
+            DownloadSpec {
+                id: "ser-model",
+                label: "SER model (audeering w2v2)",
+                url: "https://zenodo.org/records/6221127/files/w2v2-L-robust-12.6bc4a7fd-1.1.0.zip?download=1",
+                sha256: "01813761eff4a74f9b809ca966224d26b3bd6064878bf4f6ade4918177b5e777",
+                total_bytes: 609_889_780,
+                install: Install::Unzip {
+                    picks: vec![
+                        ("model.onnx", p.ser_model()),
+                        ("model.yaml", p.models.join("w2v2-emotion").join("model.yaml")),
+                    ],
+                    dll_sweep_to: None,
+                },
+            },
         ]
     }
 
@@ -1210,8 +1430,17 @@ impl App {
     /// resolved path + role are hover detail, not a wall of directories.
     /// Optional rows (feature models, alternate engines) show a neutral dot
     /// when absent: nothing is wrong, the capability just isn't installed.
-    fn ui_preflight(&mut self, ui: &mut egui::Ui) {
-        let row = |ui: &mut egui::Ui, ok: bool, required: bool, name: &str, detail: String| {
+    fn ui_preflight(&mut self, ui: &mut egui::Ui, working: bool) {
+        // Per-row Download clicks accumulate spec ids here (ADR 0041); the job
+        // is sent once, after the section closes.
+        let mut clicked: Vec<&'static str> = Vec::new();
+        let row = |ui: &mut egui::Ui,
+                   clicked: &mut Vec<&'static str>,
+                   ok: bool,
+                   required: bool,
+                   name: &str,
+                   detail: String,
+                   downloads: &'static [&'static str]| {
             let resp = ui
                 .horizontal(|ui| {
                     let (rect, _) =
@@ -1228,6 +1457,14 @@ impl App {
                             ui.colored_label(theme::ERR, "missing");
                         } else {
                             ui.weak("not installed");
+                        }
+                        if !downloads.is_empty()
+                            && ui
+                                .add_enabled(!working, egui::Button::new("Download").small())
+                                .on_hover_text("Fetch from the pinned official source (ADR 0041)")
+                                .clicked()
+                        {
+                            clicked.extend_from_slice(downloads);
                         }
                     }
                 })
@@ -1246,32 +1483,94 @@ impl App {
         let debug_open = std::env::var("YC_DIAG_OPEN").is_ok(); // capture aid
         egui::CollapsingHeader::new(header).default_open(!all_ok || debug_open).show(ui, |ui| {
             for d in deps.iter().filter(|d| d.required) {
-                row(ui, d.path.exists(), true, d.name, format!("{} · {}", d.role, d.path.display()));
+                row(
+                    ui,
+                    &mut clicked,
+                    d.path.exists(),
+                    true,
+                    d.name,
+                    format!("{} · {}", d.role, d.path.display()),
+                    d.downloads,
+                );
             }
             // deno resolves as a directory (sidecar or winget), not a file.
             match &self.deno_dir {
                 Some(dir) => row(
                     ui,
+                    &mut clicked,
                     true,
                     true,
                     "deno",
                     format!("yt-dlp's JS runtime (nsig) · {}", dir.display()),
+                    &[],
                 ),
                 None => row(
                     ui,
+                    &mut clicked,
                     false,
                     true,
                     "deno",
-                    "not found - run fetch-sidecars.ps1 or `winget install DenoLand.Deno`"
-                        .into(),
+                    "yt-dlp's JS runtime (nsig) - or `winget install DenoLand.Deno`".into(),
+                    &["deno"],
                 ),
             }
             ui.add_space(4.0);
             ui.weak("Optional (a capability degrades gracefully when absent):");
             for d in deps.iter().filter(|d| !d.required) {
-                row(ui, d.path.exists(), false, d.name, format!("{} · {}", d.role, d.path.display()));
+                row(
+                    ui,
+                    &mut clicked,
+                    d.path.exists(),
+                    false,
+                    d.name,
+                    format!("{} · {}", d.role, d.path.display()),
+                    d.downloads,
+                );
+            }
+            // Everything missing in one go, sized so the operator knows what
+            // they are agreeing to before a multi-GB fetch starts.
+            let mut missing: Vec<&'static str> = deps
+                .iter()
+                .filter(|d| !d.path.exists())
+                .flat_map(|d| d.downloads.iter().copied())
+                .collect();
+            if !deno_ok {
+                missing.push("deno");
+            }
+            missing.dedup();
+            if !missing.is_empty() {
+                let total: u64 = self
+                    .download_specs()
+                    .iter()
+                    .filter(|s| missing.contains(&s.id))
+                    .map(|s| s.total_bytes)
+                    .sum();
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(
+                        !working,
+                        egui::Button::new(format!(
+                            "Download all missing ({:.1} GB)",
+                            total as f64 / 1e9
+                        )),
+                    )
+                    .clicked()
+                {
+                    clicked.extend(missing);
+                }
             }
         });
+        if !clicked.is_empty() {
+            clicked.sort();
+            clicked.dedup();
+            let specs: Vec<pipeline::DownloadSpec> = self
+                .download_specs()
+                .into_iter()
+                .filter(|s| clicked.contains(&s.id))
+                .collect();
+            let _ = self.to_worker.send(Job::Download { specs });
+            self.status = Status::Working("Starting downloads".into());
+        }
     }
 
     /// The engine-switch warn (ADR 0035 §2): when the rail's engine selection

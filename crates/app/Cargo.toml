@@ -26,6 +26,12 @@ serde_json.workspace = true
 rodio = "0.19"
 # Native file-open dialog for importing a local VOD.
 rfd = "0.15"
+# In-app dependency downloads (ADR 0041): pinned official URLs, streamed with
+# progress, SHA-256-verified, unzipped where the pin is an archive. rustls so
+# no OS TLS stack is assumed; deflate is the only compression release zips use.
+ureq = "3"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 # Speech-emotion (arousal) detection signal (ADR 0008): pulls `ort` via
