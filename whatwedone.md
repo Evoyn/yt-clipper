@@ -4,6 +4,53 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-03 (late) — B/C/D shipped: sentence-boundary clips, in-app downloads, the brand
+
+The three sessions grilled this afternoon, built in one sitting (commits
+`1879991..a53874b`, 249 workspace tests green):
+
+- **Sentence-boundary clip bounds, 45–180 s (ADR 0040)** — ADR 0037's revisit
+  clause fired: detected Moments cut words mid-sentence. Refine now
+  transcribes each candidate over a ±15 s padded window and snaps bounds to
+  sentence start/end (whisper punctuation en/id/ja, inter-word-pause
+  fallback). Mid-sentence edges snap *outward*; a trailing edge in dead air
+  retreats to the last complete sentence; a leading edge in silence keeps the
+  ADR 0020 pre-roll. The floor rose 15 → 45 s and is reached by pulling in
+  *adjacent real sentences* — when speech runs dry the shorter clip ships
+  (context over duration, never dead-air padding). The cap drops the crossing
+  sentence; a run-on falls back to a breath pause, then a word boundary —
+  never mid-word. NMS spacing + overlap survival inherit the 45 s floor
+  (the same "one Moment per clip-length" semantics, rescaled); the GUI
+  slider floor rose 30 → 45. Manual Moments are exempt by construction. New
+  pure module `yc_detect::sentence`, 12 synthetic-transcript tests.
+  **Operator still owes the real-detect ear-check.**
+- **In-app dependency downloads (ADR 0041)** — every missing Diagnostics row
+  now carries a **Download** button (+ "Download all missing (N GB)").
+  Downloads run on the serial worker: streamed to a `.part` beside the
+  destination, SHA-256-verified against the pin, then atomically renamed or
+  unzipped into place — a mismatch installs nothing and says why. A real
+  progress bar rides the status bar; Cancel aborts mid-stream; a fresh deno
+  re-resolves without a restart. All 14 pins (gyan ffmpeg 8.1.2, yt-dlp
+  2026.06.09, deno v2.9.1, HF revision-pinned whisper/Silero/Qwen3-ASR pair,
+  bartowski's Qwen2.5-7B Q5_K_M — the judge GGUF's true origin, found by
+  hash — llama.cpp b9859 pair, deep-filter v0.5.6, Anton, Ultraface, zenodo
+  w2v2) were cross-verified byte-identical against the operator's working
+  set. New deps: ureq (rustls), sha2, zip.
+- **The brand: "Punch-out" (concept A of four rendered)** — the operator
+  picked from an artifact page of four directions (punch-out / spike /
+  clipped-play / YC monogram, each on light + ink + gold, with lockups and
+  taskbar-size tests). A vertical Short punched out of a wide VOD frame,
+  gold on ink: master SVGs in `assets/branding/`, a GDI+ raster script
+  (`scripts/render-brand.ps1`) producing the multi-res `.ico` (embedded into
+  the exe via new `build.rs` + winresource) and a raw-RGBA window/taskbar
+  icon (no image decoder ships), a vector-painted `theme::brand_mark` in the
+  brand bar beside the wordmark — now **YT CLIPPER** in Anton gold — and the
+  README hero.
+- **README rewritten to current reality** — Studio, Podcast Mode, ensemble
+  captions, the dependency registry + in-app downloads, the brand hero
+  (dark/light `<picture>`), and build docs that offer Diagnostics →
+  Download as the script-free path.
+
 ## 2026-07-03 — operator bug batch: WYSIWYG caption size, 60 fps always, pre-pass cancel, full diagnostics, QoL
 
 The operator filed 6 bugs + a features list; the grill scoped one review-round
