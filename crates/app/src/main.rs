@@ -1092,7 +1092,16 @@ impl eframe::App for App {
                     transcript_override: spec.transcript_override,
                 });
                 self.rendering = true;
-                self.status = Status::Working("Rendering".into());
+                // While a pre-pass job still runs, this Render only QUEUES
+                // behind it on the serial worker — say so instead of claiming
+                // NVENC is running (the 2026-07-03 report: "Rendering" shown
+                // over a crawling ensemble pre-pass). The render's own Stage
+                // messages take the label over once it actually starts.
+                self.status = Status::Working(if matches!(self.status, Status::Working(_)) {
+                    "Render queued — waiting for captions".into()
+                } else {
+                    "Rendering".into()
+                });
             }
             editor::EditorAction::AnalyzeSpeakers => {
                 let _ = self.to_worker.send(Job::AnalyzeSpeakers);

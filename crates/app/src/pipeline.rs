@@ -562,6 +562,19 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                     }
                 }
             }
+            // A cancel aims at everything the operator had in flight — the job
+            // it interrupted AND whatever was already queued behind it. The
+            // measured case (2026-07-03): a Render clicked during a crawling
+            // ensemble pre-pass sat in this channel, and the moment the
+            // cancelled job returned it would RESET the token above and start
+            // a fresh full transcribe+render — right after the operator hit
+            // Cancel. Drain what is queued NOW; a job sent after this instant
+            // is new intent and proceeds normally.
+            if worker_cancel.is_cancelled() {
+                while rx_job.try_recv().is_ok() {
+                    let _ = tx_prog.send(Progress::Cancelled);
+                }
+            }
         }
     });
     (tx_job, rx_prog, cancel)
@@ -1615,6 +1628,27 @@ fn is_silent_clip(samples: &[f32]) -> bool {
     samples.iter().fold(0.0f32, |m, &s| m.max(s.abs())) < SILENT_CLIP_PEAK
 }
 
+/// Per-decode ensemble stage labels for the status bar. [`Progress::Stage`]
+/// deliberately carries `&'static str` (no allocation on the progress
+/// channel), so the labels are a fixed table — the variant set is a
+/// compile-time constant of five. Falls back to a countless label if the set
+/// ever grows without this table following.
+fn ens_stage_label(i: usize, n: usize) -> &'static str {
+    const LABELS: [&str; 5] = [
+        "Qwen ensemble — decode 1/5",
+        "Qwen ensemble — decode 2/5",
+        "Qwen ensemble — decode 3/5",
+        "Qwen ensemble — decode 4/5",
+        "Qwen ensemble — decode 5/5",
+    ];
+    if n == LABELS.len() {
+        if let Some(l) = LABELS.get(i.wrapping_sub(1)) {
+            return l;
+        }
+    }
+    "Qwen ensemble — decoding"
+}
+
 /// The render path's transcription, shared by [`Job::Render`] and the editor's
 /// [`Job::Transcribe`] pre-pass: resolve the Caption engine (ADR 0035),
 /// transcribe once (whisper GPU, optional Qwen ensemble, optional LLM
@@ -1715,6 +1749,10 @@ fn ensure_transcript(
                     move || c.is_cancelled()
                 },
             )?;
+            // The in-process whisper poll only aborts at its coarse
+            // checkpoints — make the stage boundary explicit so a cancel never
+            // rolls on into the (long) ensemble below.
+            anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
             // Qwen3-ASR ensemble captions (ADR 0034/0035): words from a
             // multi-decode vote, timing from the whisper transcript above (whose
             // one-shot model is already dropped — GPU staging stays sequential).
@@ -1772,6 +1810,20 @@ fn ensure_transcript(
                     ffmpeg: paths.ffmpeg.clone(),
                     deep_filter: paths.deep_filter.is_file().then(|| paths.deep_filter.clone()),
                     work_dir: session.data_dir.clone(),
+                    // Cancel + progress plumbing (the 2026-07-03 hang report:
+                    // the ensemble's children ignored Cancel entirely, and one
+                    // static stage label sat unchanged over the app's longest
+                    // stage — indistinguishable from a freeze).
+                    should_cancel: Box::new({
+                        let c = cancel.clone();
+                        move || c.is_cancelled()
+                    }),
+                    on_stage: Box::new({
+                        let tx = tx.clone();
+                        move |i, n| {
+                            let _ = tx.send(Progress::Stage(ens_stage_label(i, n)));
+                        }
+                    }),
                 };
                 match yc_transcribe::ensemble::apply(
                     &cfg,
@@ -1787,9 +1839,23 @@ fn ensure_transcript(
                         transcript = fused;
                         ens_used = true;
                     }
-                    Err(e) => tracing::warn!(
-                        "qwen ensemble failed; keeping whisper captions: {e:#}"
-                    ),
+                    // A cancel mid-ensemble must abort the whole job
+                    // (fail_or_cancel reports Cancelled) — falling back to
+                    // whisper captions here would go on to render a clip the
+                    // operator just told us to stop.
+                    Err(e) if cancel.is_cancelled() => return Err(e),
+                    Err(e) => {
+                        // The watchdog class gets a visible notice: the
+                        // operator sees WHY the export continues with whisper
+                        // words (GPU-contention crawl, 2026-07-03), not just a
+                        // silent quality drop.
+                        if e.downcast_ref::<yc_transcribe::ensemble::DecodeTimeout>().is_some() {
+                            let _ = tx.send(Progress::Stage(
+                                "Ensemble timed out (GPU busy?) — continuing with whisper captions",
+                            ));
+                        }
+                        tracing::warn!("qwen ensemble failed; keeping whisper captions: {e:#}");
+                    }
                 }
             }
             // Auto-promote (the operator's choice, ADR 0031): any correction they have
@@ -2524,6 +2590,17 @@ fn extract_zip(
 mod tests {
     use super::*;
     use yc_core::VodSource;
+
+    #[test]
+    fn ens_stage_labels_count_the_variants() {
+        assert_eq!(ens_stage_label(1, 5), "Qwen ensemble — decode 1/5");
+        assert_eq!(ens_stage_label(5, 5), "Qwen ensemble — decode 5/5");
+        // Out-of-table shapes (variant set grew, or a zero index) fall back to
+        // the countless label instead of panicking mid-render.
+        assert_eq!(ens_stage_label(6, 5), "Qwen ensemble — decoding");
+        assert_eq!(ens_stage_label(0, 5), "Qwen ensemble — decoding");
+        assert_eq!(ens_stage_label(3, 7), "Qwen ensemble — decoding");
+    }
 
     fn vod(creator: &str, title: &str) -> Vod {
         Vod {

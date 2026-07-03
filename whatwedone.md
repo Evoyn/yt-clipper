@@ -4,6 +4,45 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-03 (night) — the ensemble hang: diagnosed to WDDM VRAM spill, Cancel made real, watchdog fallback
+
+The operator caught it live: an ensemble caption pre-pass "stuck" (one decode
+ran **18 minutes**; healthy is 10–15 s), a Render queued blind behind it, and
+a Cancel that did nothing. Forensics from the stream folder + three controlled
+repros pinned the crawl: **WDDM VRAM oversubscription** — with the GPU free
+the same clip's full ensemble export takes ~100 s; an *idle* 2.5 GB VRAM
+holder changes nothing (WDDM evicts cold pages); an *active* one collapses
+even whisper ~20x, because CUDA silently spills to shared system memory
+instead of erroring. Something GPU-hungry was running alongside the incident;
+whisper (~3.5 GB) still fit, mtmd (~6.8 GB) spilled and crawled ~75x. Fixes
+(ADR 0034 amendment):
+
+- **Cancel now reaches the ensemble.** All three child kinds (ffmpeg cut,
+  deep-filter, llama-mtmd-cli) run under the cancel poll and are killed
+  mid-run (`wait_killable` semantics; mtmd waits on a 50 ms `try_wait` loop
+  over piped, thread-drained stdio). `apply` polls between stages; a cancelled
+  child aborts the job as Cancelled instead of soft-falling into a render.
+- **A cancel also drains the queue.** The incident's queued Render would have
+  reset the token and started a fresh full transcribe+render seconds after
+  Cancel; the worker now flushes everything queued behind a cancelled job.
+- **Watchdog on every decode** (30 s + 1.5x audio, floor 120 s ≈ 6–10x
+  healthy): the first timeout aborts the WHOLE ensemble (typed
+  `DecodeTimeout` — the conditions would hold for all remaining variants) and
+  the export continues on whisper captions, with the reason in the status bar
+  — bounded ~2–4 min worst case instead of a 90-minute crawl.
+- **The longest stage now shows progress**: "Qwen ensemble — decode 2/5" per
+  variant in the status bar; the editor's Captions panel says to watch it.
+  A Render clicked while the pre-pass runs now reads "Render queued — waiting
+  for captions" instead of claiming NVENC is running.
+
+252 workspace tests green (3 new). In-process whisper decodes still have no
+watchdog (June-19 scar: the abort callback collapses CUDA-graph throughput) —
+under heavy contention whisper can still crawl, but Cancel now bites at every
+stage boundary and the ensemble can no longer anchor a pile-up. **Operator
+verification owed:** Cancel mid-ensemble in the GUI, and the practical rule —
+close/pause GPU-hungry apps (games, active encodes) before an ensemble
+export.
+
 ## 2026-07-03 (late) — B/C/D shipped: sentence-boundary clips, in-app downloads, the brand
 
 The three sessions grilled this afternoon, built in one sitting (commits

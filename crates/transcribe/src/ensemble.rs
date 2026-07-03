@@ -28,10 +28,11 @@
 //! sidecar spawns (llama-mtmd-cli exits between variants).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use yc_core::{CaptionUnit, Language, NoConsole, TimeRange, Transcript};
+use yc_core::{wait_killable, CaptionUnit, Language, NoConsole, TimeRange, Transcript};
 
 /// The per-invocation engine override, tri-state since the per-Creator Caption
 /// engine landed (ADR 0035): `Some(true)` forces the ensemble, `Some(false)`
@@ -67,6 +68,51 @@ pub struct EnsembleConfig {
     pub deep_filter: Option<PathBuf>,
     /// Scratch directory for the variant wavs (the session's data dir).
     pub work_dir: PathBuf,
+    /// Polled between stages and ~20x/s while any child runs; a `true` return
+    /// kills the running child and aborts with a "cancelled" error. Before
+    /// this existed the operator's Cancel was a NO-OP for the whole ensemble —
+    /// every child ran to completion under a dead button, measured at 18 min
+    /// per decode under GPU contention (2026-07-03).
+    pub should_cancel: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called as `(variant_number, variant_total)` right before each sidecar
+    /// decode, so the UI can show "decode 2/5" instead of one static label
+    /// over the longest stage the app has.
+    pub on_stage: Box<dyn Fn(usize, usize) + Send + Sync>,
+}
+
+/// A sidecar decode that exceeded its wall-clock budget. Typed (not just a
+/// message) so [`apply`] can tell it from an ordinary variant failure: one
+/// timeout aborts the WHOLE ensemble, because the budget only trips when the
+/// GPU is oversubscribed (WDDM silently demotes CUDA allocations to system
+/// RAM and a ~12 s decode measures 18 minutes — 2026-07-03) and those
+/// conditions hold for every remaining variant too. The caller then falls
+/// back to whisper captions instead of crawling for an hour.
+#[derive(Debug)]
+pub struct DecodeTimeout {
+    pub budget_s: u64,
+}
+
+impl std::fmt::Display for DecodeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decode exceeded its {} s budget (is the GPU busy with something else?)", self.budget_s)
+    }
+}
+
+impl std::error::Error for DecodeTimeout {}
+
+/// Spawn a stdio-inheriting child and wait killably: `cfg.should_cancel` is
+/// polled ~20x/s and flipping it kills the child mid-run (the ffmpeg cuts and
+/// deep-filter passes used to be waited on with a plain `.status()`, immune to
+/// Cancel).
+fn run_killable(cfg: &EnsembleConfig, cmd: &mut Command, what: &str) -> Result<()> {
+    let mut child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    let status = wait_killable(&mut child, &*cfg.should_cancel)
+        .with_context(|| format!("waiting on {what}"))?;
+    let Some(status) = status else {
+        anyhow::bail!("cancelled");
+    };
+    anyhow::ensure!(status.success(), "{what} failed ({status})");
+    Ok(())
 }
 
 /// Seconds of leading audio context prepended to the clip range for the padded
@@ -123,6 +169,9 @@ pub fn apply(
     sample_rate: u32,
     lexicon: &crate::DialectLexicon,
 ) -> Result<Transcript> {
+    // Cancel check FIRST — a cancel that landed during the preceding whisper
+    // decodes must not even touch the filesystem here.
+    anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
     anyhow::ensure!(cfg.mtmd_cli.is_file(), "mtmd sidecar missing: {}", cfg.mtmd_cli.display());
     anyhow::ensure!(cfg.qwen_model.is_file(), "qwen model missing: {}", cfg.qwen_model.display());
     anyhow::ensure!(
@@ -132,6 +181,14 @@ pub fn apply(
     );
     std::fs::create_dir_all(&cfg.work_dir)?;
 
+    // Watchdog budget per decode: healthy runs measure 3-5x realtime on this
+    // class of GPU (a ~60 s clip decodes in 10-20 s), so 1.5x the audio plus
+    // 30 s of load grace is ~6-10x healthy — it only trips the pathological
+    // class (VRAM-oversubscription crawl, ~75x measured 2026-07-03).
+    let budget = Duration::from_secs_f64(
+        (30.0 + 1.5 * (range.duration_s() + HEAD_PAD_S)).max(120.0),
+    );
+
     // --- 1. decode variants (one-shot sidecar spawns; GPU-sequential) -------
     let mut decodes: Vec<Vec<String>> = Vec::new();
     let mut onset_wav: Option<PathBuf> = None;
@@ -139,9 +196,14 @@ pub fn apply(
         if v.atten.is_some() && cfg.deep_filter.is_none() {
             continue;
         }
+        anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+        (cfg.on_stage)(i + 1, VARIANTS.len());
         let wav = match variant_wav(cfg, analysis_wav, range, v, i) {
             Ok(w) => w,
             Err(e) => {
+                // A killed child surfaces as an ordinary error — distinguish
+                // the operator's cancel from a real prep failure.
+                anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
                 tracing::warn!("qwen ensemble: variant {i} audio prep failed: {e:#}");
                 continue;
             }
@@ -154,7 +216,7 @@ pub fn apply(
         if v.atten.is_some() && !v.head_pad && onset_wav.is_none() {
             onset_wav = Some(wav.clone());
         }
-        match decode_one(cfg, &wav, whisper.language, v.head_pad) {
+        match decode_one(cfg, &wav, whisper.language, budget) {
             Ok(words) if !words.is_empty() => {
                 tracing::info!(
                     "qwen ensemble: variant {i} (atten={:?} pad={}) -> {} words",
@@ -165,7 +227,16 @@ pub fn apply(
                 decodes.push(words);
             }
             Ok(_) => tracing::warn!("qwen ensemble: variant {i} produced no words"),
-            Err(e) => tracing::warn!("qwen ensemble: variant {i} decode failed: {e:#}"),
+            Err(e) if e.downcast_ref::<DecodeTimeout>().is_some() => {
+                // One crawl means they'd ALL crawl — abort the ensemble now
+                // (the caller falls back to whisper) instead of burning the
+                // budget four more times.
+                return Err(e.context(format!("variant {i} decode timed out; aborting the ensemble")));
+            }
+            Err(e) => {
+                anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+                tracing::warn!("qwen ensemble: variant {i} decode failed: {e:#}");
+            }
         }
     }
     anyhow::ensure!(decodes.len() >= 2, "qwen ensemble: <2 variants decoded, vote impossible");
@@ -250,8 +321,8 @@ fn variant_wav(
     let start = if v.head_pad { (range.start_s - HEAD_PAD_S).max(0.0) } else { range.start_s };
     let dur = range.end_s - start;
     let cut = cfg.work_dir.join(format!("_ens_{idx}.wav"));
-    let status = Command::new(&cfg.ffmpeg)
-        .no_console()
+    let mut cmd = Command::new(&cfg.ffmpeg);
+    cmd.no_console()
         .args(["-y", "-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{start}"))
         .arg("-t")
@@ -259,25 +330,21 @@ fn variant_wav(
         .arg("-i")
         .arg(analysis_wav)
         .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
-        .arg(&cut)
-        .status()
-        .context("spawning ffmpeg for ensemble cut")?;
-    anyhow::ensure!(status.success(), "ffmpeg ensemble cut failed ({status})");
+        .arg(&cut);
+    run_killable(cfg, &mut cmd, "ffmpeg (ensemble cut)")?;
     let Some(atten) = v.atten else { return Ok(cut) };
     let df = cfg.deep_filter.as_ref().expect("checked by caller");
     // deep-filter keeps the input basename in the output dir.
     let out_dir = cfg.work_dir.join(format!("_ens_df{idx}"));
     std::fs::create_dir_all(&out_dir)?;
-    let status = Command::new(df)
-        .no_console()
+    let mut cmd = Command::new(df);
+    cmd.no_console()
         .arg("-a")
         .arg(atten.to_string())
         .arg("-o")
         .arg(&out_dir)
-        .arg(&cut)
-        .status()
-        .context("spawning deep-filter for ensemble variant")?;
-    anyhow::ensure!(status.success(), "deep-filter failed ({status})");
+        .arg(&cut);
+    run_killable(cfg, &mut cmd, "deep-filter (ensemble variant)")?;
     Ok(out_dir.join(cut.file_name().expect("cut has a name")))
 }
 
@@ -300,7 +367,8 @@ fn wav_samples_f32(ffmpeg: &Path, wav: &Path) -> Result<Vec<f32>> {
         .collect())
 }
 
-/// One one-shot llama-mtmd-cli decode -> normalized words. Head-padded
+/// One one-shot llama-mtmd-cli decode -> normalized words, under the cancel
+/// poll and a wall-clock `budget` (see [`DecodeTimeout`]). Head-padded
 /// variants keep their extra leading words: the vote's strict-majority insert
 /// rule outvotes pad bleed, and the timing fusion drops anything whisper's
 /// range has no anchor or gap for.
@@ -308,7 +376,7 @@ fn decode_one(
     cfg: &EnsembleConfig,
     wav: &Path,
     language: Language,
-    _head_pad: bool,
+    budget: Duration,
 ) -> Result<Vec<String>> {
     // The sidecar cannot be handed the wav's full path: `--audio` is a list
     // flag that SPLITS ON COMMAS, and stream folders carry VOD-title text
@@ -321,7 +389,7 @@ fn decode_one(
         _ => Path::new("."),
     };
     let name = wav.file_name().context("variant wav has no file name")?;
-    let out = Command::new(std::path::absolute(&cfg.mtmd_cli)?)
+    let mut child = Command::new(std::path::absolute(&cfg.mtmd_cli)?)
         .no_console()
         .current_dir(dir)
         .arg("-m")
@@ -332,20 +400,57 @@ fn decode_one(
         .arg(name)
         .args(["--temp", "0", "-ngl", "99", "-p", "Transcribe the audio."])
         .args(["-sys", bias_context(language)])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("spawning llama-mtmd-cli")?;
-    if !out.status.success() {
+    // Both pipes are drained on threads so the child can never block on a full
+    // pipe buffer while this thread only polls (llama.cpp writes its whole
+    // load log to stderr — more than a pipe holds). After a kill the pipes
+    // close and the readers finish on their own.
+    let mut out_pipe = child.stdout.take().expect("stdout piped above");
+    let mut err_pipe = child.stderr.take().expect("stderr piped above");
+    let out_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out_pipe, &mut buf);
+        buf
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
+        buf
+    });
+    let started = Instant::now();
+    let status = loop {
+        if (cfg.should_cancel)() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("cancelled");
+        }
+        if started.elapsed() >= budget {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::Error::new(DecodeTimeout { budget_s: budget.as_secs() }));
+        }
+        match child.try_wait().context("waiting on llama-mtmd-cli")? {
+            Some(s) => break s,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    if !status.success() {
         // llama.cpp logs load noise first and any fatal line last — report the tail.
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = String::from_utf8_lossy(&stderr);
         let skip = err.chars().count().saturating_sub(600);
         anyhow::bail!(
             "llama-mtmd-cli failed ({}): {}",
-            out.status,
+            status,
             err.chars().skip(skip).collect::<String>()
         );
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(normalize(&stdout))
+    Ok(normalize(&String::from_utf8_lossy(&stdout)))
 }
 
 /// Lowercased word tokens; strips Qwen's `language X<asr_text>` header and all
@@ -1183,6 +1288,47 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn apply_bails_before_any_io_when_already_cancelled() {
+        // A cancel that landed during the preceding whisper decode: apply must
+        // return "cancelled" without touching the (bogus) paths — the check
+        // sits before the file ensures, which is what makes this test need no
+        // fixtures.
+        let cfg = EnsembleConfig {
+            mtmd_cli: PathBuf::from("nonexistent-mtmd.exe"),
+            qwen_model: PathBuf::from("nonexistent-model.gguf"),
+            qwen_mmproj: PathBuf::from("nonexistent-mmproj.gguf"),
+            ffmpeg: PathBuf::from("nonexistent-ffmpeg.exe"),
+            deep_filter: None,
+            work_dir: PathBuf::from("."),
+            should_cancel: Box::new(|| true),
+            on_stage: Box::new(|_, _| {}),
+        };
+        let whisper = Transcript { language: Language::Id, units: Vec::new() };
+        let err = apply(
+            &cfg,
+            Path::new("nonexistent.wav"),
+            TimeRange { start_s: 0.0, end_s: 10.0 },
+            &whisper,
+            None,
+            &[],
+            16000,
+            &crate::DialectLexicon::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "got: {err:#}");
+    }
+
+    #[test]
+    fn decode_timeout_survives_context_wrapping() {
+        // apply() aborts the whole ensemble on the watchdog class by downcast;
+        // the caller distinguishes it the same way through added context.
+        let e = anyhow::Error::new(DecodeTimeout { budget_s: 120 })
+            .context("variant 0 decode timed out; aborting the ensemble");
+        assert!(e.downcast_ref::<DecodeTimeout>().is_some());
+        assert!(e.root_cause().to_string().contains("120 s budget"));
     }
 
     #[test]

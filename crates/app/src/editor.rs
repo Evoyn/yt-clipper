@@ -1261,7 +1261,8 @@ impl EditorState {
                     ui.weak("Transcribing with the Qwen ensemble…");
                     ui.weak(
                         "Whisper decodes first, then five Qwen3-ASR passes vote on the words — \
-                         more accurate, adds ~60–90 s. (Engine is set per Creator on the import panel.)",
+                         more accurate, adds ~60–90 s. The status bar up top counts each decode \
+                         (1/5 … 5/5). (Engine is set per Creator on the import panel.)",
                     );
                 }
             }

@@ -152,3 +152,36 @@ timing across the clip. Deddy control — all five variants decode (186–204
 words), vote -> 183 units on a trusted skeleton, no regression vs whisper's
 159-unit read. The operator's ear rules the final gate verdict on both
 exports (`clip-36-43 (2).mp4`, `clip-30-00 (4).mp4`).
+
+## Amendment (2026-07-03): cancellable children + a per-decode watchdog
+
+The operator hit the ensemble's worst case live: an export pre-pass whose
+first `llama-mtmd-cli` decode ran **18 minutes** (healthy: 10–15 s on the same
+clip), with a Render queued blind behind it and a Cancel button that did
+nothing. Three separate defects compounded, all fixed:
+
+1. **Ensemble children ignored Cancel.** The ffmpeg cuts and deep-filter
+   passes were waited on with plain `.status()`, the mtmd decode with
+   `.output()` — none killable, none polling the token. All three now run
+   under the cancel poll (`yc_core::wait_killable` semantics; the mtmd wait is
+   a 50 ms `try_wait` loop over piped, thread-drained stdio), `apply` polls
+   between stages, and a cancelled child aborts the job as `Cancelled` instead
+   of soft-falling into a render the operator just stopped.
+2. **No progress during the app's longest stage.** One static label covered
+   all five decodes; the status bar now counts them ("Qwen ensemble — decode
+   2/5") via an `on_stage` callback on `EnsembleConfig`.
+3. **The crawl itself: WDDM VRAM oversubscription.** Measured on the incident
+   box: with the GPU otherwise free the decode runs 3–5x realtime; an **idle**
+   2.5 GB VRAM holder changes nothing (WDDM evicts cold pages); an **active**
+   one collapses even whisper ~20x — CUDA silently spills to shared system
+   memory rather than failing. No code bug, so no code can prevent it; a
+   **watchdog budget** (`30 s + 1.5x audio`, floor 120 s, ~6–10x healthy) now
+   bounds the damage: the first timed-out decode aborts the whole ensemble
+   (typed `DecodeTimeout` — conditions would hold for every remaining
+   variant), the export continues on whisper captions, and the status bar says
+   why ("Ensemble timed out (GPU busy?)"). The fail-soft contract above is
+   unchanged; the watchdog only ADDS a bounded exit from the crawl class.
+
+Also fixed at the worker: a cancel now drains every job already queued behind
+the cancelled one — the incident's queued Render would otherwise have reset
+the token and started a fresh full transcribe+render seconds after Cancel.
