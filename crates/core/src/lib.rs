@@ -274,6 +274,20 @@ impl Crop {
             Crop { x: self.x, y: self.y + (self.h - h) / 2.0, w: self.w, h }
         }
     }
+
+    /// Linear blend toward `other` by `f` in `[0, 1]`. The active-speaker
+    /// follow pan glides a same-sized crop's origin across a shot; the render
+    /// (`camera.fg` crop expression) and the Studio preview both step through
+    /// this one definition, so they cannot disagree on the motion.
+    pub fn lerp(&self, other: &Crop, f: f32) -> Crop {
+        let f = f.clamp(0.0, 1.0);
+        Crop {
+            x: self.x + (other.x - self.x) * f,
+            y: self.y + (other.y - self.y) * f,
+            w: self.w + (other.w - self.w) * f,
+            h: self.h + (other.h - self.h) * f,
+        }
+    }
 }
 
 /// The arrangement of a Clip's 1080×1920 canvas.
@@ -501,15 +515,21 @@ pub enum CameraMode {
 }
 
 /// One shot of a dynamic camera plan: a clip-relative time span framed by one
-/// static [`Layout`] (human editors *cut* between podcast speakers; panning a
-/// virtual camera across a static wide shot reads as amateur). `track` is the
-/// speaker-track id the shot follows (`None` = a group shot).
+/// [`Layout`]. **Cuts** remain the grammar between speakers (human editors cut;
+/// hopping a virtual camera across a static wide shot reads as amateur), but
+/// **within** a solo shot the subject may drift: `pan_to` then glides the
+/// same-sized crop from `layout`'s position to this closing position across
+/// the shot — a slow follow instead of losing the face off the crop's edge.
+/// `None` (the common case, behind a dead-zone) is a perfectly static shot.
+/// `track` is the speaker-track id the shot follows (`None` = a group shot).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shot {
     pub start_s: f64,
     pub end_s: f64,
     pub track: Option<usize>,
     pub layout: Layout,
+    #[serde(default)]
+    pub pan_to: Option<Crop>,
 }
 
 /// A cut-based dynamic camera plan for one Clip: contiguous [`Shot`]s covering
@@ -528,6 +548,23 @@ impl CameraPlan {
     /// Mutable [`Self::shot_at`], for the editor's click-to-retarget override.
     pub fn shot_at_mut(&mut self, t: f64) -> Option<&mut Shot> {
         self.shots.iter_mut().find(|s| s.start_s <= t && t < s.end_s)
+    }
+}
+
+impl Shot {
+    /// The Layout to show at clip-relative time `t`. A static shot returns its
+    /// `layout` unchanged; a solo shot with a `pan_to` glides its crop linearly
+    /// from `layout` to `pan_to` across the shot — the same motion the render
+    /// bakes into `camera.fg`, so the Studio preview matches the export.
+    pub fn layout_at(&self, t: f64) -> Layout {
+        match (&self.layout, &self.pan_to) {
+            (Layout::FullFrame { crop }, Some(to)) => {
+                let span = (self.end_s - self.start_s).max(1e-6);
+                let f = ((t - self.start_s) / span) as f32;
+                Layout::FullFrame { crop: crop.lerp(to, f) }
+            }
+            _ => self.layout.clone(),
+        }
     }
 }
 
@@ -833,5 +870,35 @@ mod tests {
         assert!((c.h - 50.0).abs() < 0.01); // 100 / 2
         assert_eq!(c.x, 10.0);
         assert!((c.y - (20.0 + (400.0 - 50.0) / 2.0)).abs() < 0.01); // centred vertically
+    }
+
+    #[test]
+    fn crop_lerp_blends_and_clamps() {
+        let a = Crop { x: 0.0, y: 10.0, w: 100.0, h: 200.0 };
+        let b = Crop { x: 40.0, y: 10.0, w: 100.0, h: 200.0 };
+        let mid = a.lerp(&b, 0.5);
+        assert_eq!(mid.x, 20.0);
+        assert_eq!(mid.w, 100.0, "a same-size pan keeps the size");
+        // f is clamped to [0,1], so before/after the shot hold the endpoints.
+        assert_eq!(a.lerp(&b, -1.0).x, 0.0);
+        assert_eq!(a.lerp(&b, 2.0).x, 40.0);
+    }
+
+    #[test]
+    fn shot_layout_at_glides_a_follow_pan() {
+        let shot = Shot {
+            start_s: 2.0,
+            end_s: 6.0,
+            track: Some(0),
+            layout: Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 100.0, h: 200.0 } },
+            pan_to: Some(Crop { x: 80.0, y: 0.0, w: 100.0, h: 200.0 }),
+        };
+        // Quarter of the way through the shot -> quarter of the pan.
+        let Layout::FullFrame { crop } = shot.layout_at(3.0) else { panic!() };
+        assert_eq!(crop.x, 20.0);
+        // A static shot (no pan_to) returns its layout unchanged at any t.
+        let stat = Shot { pan_to: None, ..shot.clone() };
+        let Layout::FullFrame { crop } = stat.layout_at(4.0) else { panic!() };
+        assert_eq!(crop.x, 0.0);
     }
 }

@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use yc_core::{NoConsole, TimeRange};
 
+pub mod align;
 pub mod youtube;
+pub use align::{measure_segment_anchor, tail_shortfall_s, SegmentAnchor};
 pub use youtube::{
     fetch_segment, in_segment_offset, pad_range, probe_segment, resolve_deno_dir, youtube_fetch_audio,
     youtube_fetch_chat, youtube_metadata, CancelToken, SegmentProbe, Sidecars, SEGMENT_PAD_S,

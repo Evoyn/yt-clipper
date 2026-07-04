@@ -4,6 +4,158 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-04 — two P1 bugs: caption/audio desync root-caused to a segment-fetch snap; Active Speaker made production-ready
+
+Two operator-reported P1s, both fixed at the root, no rendering (operator tests
+the exports). Diagnosed with the `diagnose` skill: built an envelope
+cross-correlation harness (throwaway, deleted) that gave a sub-10 ms,
+0.99-correlation pass/fail signal against the real workspace media.
+
+**P1-1 — captions drift out of sync (Leon Hartono / ANTITESA, not Guru Gembul).**
+Not a gradual drift and not in the caption machinery: a **constant ~5.84 s
+offset** (measured flat across the whole clip, corr 0.99). Root cause: the
+promote path *assumed* a fetched Segment's timeline starts at the requested
+section start (`in_segment_offset`), but yt-dlp's HLS `--download-sections`
+snaps to a stream **fragment boundary** — on the Leon VOD the Segment actually
+began **5.84 s early** (and ended that much short), while Guru's landed
+sample-exact. Captions are cut from `analysis.wav` at the true VOD range, so the
+snap shifted video+audio under fixed captions. It looked per-video because the
+snap is per-VOD. **Fix:** a new `yc_ingest::align::measure_segment_anchor` —
+cross-correlate the Segment's audio envelope against `analysis.wav`, two
+independent windows that must agree (no false lock on repetitive audio), and
+read the true VOD anchor; `resolve_segment` (pipeline) seeks the **measured**
+offset and, when the snapped section leaves the clip's tail uncovered (the Leon
+case also truncated the export ~4 s), **refetches once** with the request
+widened. No confident lock falls back to today's assumption. Validated on both
+real Segments: Leon delta **+5.844 s** (now corrected), Guru **+0.000 s**
+(unchanged). This same snap was also desyncing the **speaker analysis** (video
+frames at the wrong offset vs. audio VAD at the true range), so the fix directly
+helps P1-2's "camera on a non-speaker" on affected VODs.
+
+**P1-2 — Active Speaker tracking (cuts off movers, frames non-speakers, jumpy).**
+Root cause was framing every shot from a **whole-clip** face position with no
+motion inside a shot (ADR 0038 refinement). Three fixes in `yc_frame::speaker`:
+(1) tracks match on **last-seen** position, not all-time mean, so a person who
+leans/shifts stays one track instead of shedding a phantom; (2) each shot frames
+its subject from that track's **path over the shot's own bins** (median + P10–P90
+center band, crop grown to contain the band), so it frames where they *are
+during that shot* and a bob never crops the face — AutoFace sized over the whole
+path likewise; (3) a subject who **drifts** past a 12 %-of-crop dead-zone gets a
+`Shot::pan_to` — a bounded within-shot **follow** that glides the same-sized crop
+(render: one time-expression `crop` filter in `camera.fg`; preview: the same
+`Crop::lerp`, so ADR 0036 holds). Cuts stay the grammar *between* speakers; a
+short first run folds into the next shot so the camera never opens on a flash.
+Recorded as an ADR 0038 refinement + CONTEXT glossary update.
+
+**P1-2 follow-up — multicam sources + prop faces (same day).** Operator retest
+on ANTITESA surfaced the real root: that VOD's *source is already a multicam
+edit* (cuts between a one-person camera on each guest, never a shared wide
+shot), plus a framed **photo on the set** that Ultraface tracked as a third
+speaker. A production diagnostic (`speaker_diag`, real segment) proved it:
+3 tracks incl. a 61×76 "face" at the table, mean 1.2 faces/bin. Two fixes in
+`yc_frame::speaker`: (a) **reject printed-face props** in `finish` — a track
+both much smaller than the tallest AND far less lively than the liveliest
+(relative motion bar; codec-noise shimmer measured ~1/4 of a real mouth cleared
+an absolute floor); (b) **detect the source regime** by `mean_visible_faces` —
+a static wide shot (≈ track count in frame) keeps the attribution plan; a
+multicam/solo source (≈1 face) uses the new `plan_follow_visible`, which ignores
+audio (the source already cut to its subject) and frames the *largest visible
+face* per bin, mirroring the source's cuts so the crop is never parked on an
+off-screen position (the empty-crop screenshot). Re-verified on the real
+segment: book dropped (2 clean tracks A/B), regime = multicam, each person
+framed on their own position. ADR 0038 + CONTEXT updated.
+
+**P1-2 follow-up 2 — source-shot framing (same day, after a render retest).**
+Watching the render, the operator caught three more: a ~1 s blank right after
+each cut, the crop not re-centering when the source cut to a wider framing, and
+left/right jitter. A production diagnostic (per-bin face position + cut/jitter
+dump) on the real segment showed the source cuts every 2–6 s between **four
+camera framings** of the two guests, with brief wide two-shots — and my
+follow-visible plan was framing from *leading-edge* positions (lagging each cut
+~1 s) and picking the *largest* face per bin (flickering when two were visible).
+Reworked `plan_follow_visible`: (a) **static median framing per source shot** —
+correct from frame 1, no leading-edge pan, no per-bin jitter; (b) subject =
+**one face → follow it, two+ → a `Group` split** (show everyone the source
+shows) instead of a largest-face contest, so wide shots split cleanly and never
+flicker; (c) `group_layout_span` splits only the people *on screen in that
+shot*, not every framing of them. Re-verified on the real segment: 10 clean
+shots matching the source's cuts, the wide stretch now a two-person split.
+
+**P1-2 follow-up 3 — the blank crop was dropped tracks, not detection (same day).**
+A third render retest (the 69 s rebalance clip) still showed a ~1 s blank at
+cuts and a wide two-shot that didn't re-center. The operator asked for
+"detection every second, quality over speed" — but a production diagnostic
+proved detection was already perfect: at the blank stretch the detector returns
+both faces at **p=1.00** (5 fps). The faces were *found then discarded*: each
+multicam camera framing of a person is its own position track, and track
+survival was gated on **20 % of the clip** — a 10 s wide-shot inside a 90 s clip
+is ~11 %, so those tracks were dropped and the camera had nothing to follow
+there (it held the previous single-cam crop over empty space → the blank). Fixed
+by gating survival on **absolute on-screen time** (1.5 s) instead of a clip
+fraction, raising `MAX_TRACKS` to 6, and adding a **hard size floor** to the prop
+filter (a set photo that catches passing hands was beating the relative-motion
+test). Result on the real 85 s segment: 4 clean tracks (book gone), the wide
+two-shot now a proper two-person split, every solo shot on the right person —
+no blanks. Detection rate untouched (the fix was track retention).
+
+**P1-2 follow-up 4 — frame-accurate cuts + clean splits (same day).** A fourth
+retest: a 1-5 frame blank at every cut, and the wide shot sometimes a three-way
+column / empty-panel split. Diagnosis: (a) the **5 fps analysis grid quantized
+cuts to 0.2 s**, so the render held the old crop up to ~5 frames past the source
+cut (the blank) — fixed by raising **`SPEAKER_FPS` 5 → 24** (frame-accurate cuts;
+~8 s analysis for this clip; all downstream windows derive from the one rate; the
+frame tests made fps-agnostic via an `nbins` helper); (b) **`group_layout_span`
+counted any track with a single frame in the span**, so a person's second camera
+framing (multicam → multiple position tracks per person) inflated a two-person
+split into a column — fixed with a **40 % presence bar** so a split shows only
+the people actually in the shot. Re-verified on the real 85 s segment: cuts land
+frame-accurately (0.75, 2.50, 7.96 s… not 0.2 s multiples), wide shot a clean
+two-person split.
+
+**P1-2 follow-up 5 — the source's real cut frames as shot boundaries (same day).**
+Even at 24 fps a ~2-frame blank lingered at cuts: any fixed sample rate
+quantizes a cut to a bin, and the source rate needn't match the grid. The
+frame-precise fix: stop inferring cuts from sampled detections and read the
+source's **own cut frames** — `do_analyze_speakers` runs one cheap ffmpeg pass
+(`select='gt(scene,0.2)',metadata=print`, pixel-level scene detection, no model)
+for the exact clip-relative time of every hard cut, and the multicam
+`plan_by_scene_cuts` makes each inter-cut span one shot (framed on whoever is on
+screen, a split when 2+ share it, adjacent same-subject spans merged). Every cut
+now lands on the exact source frame regardless of sample/source rate — 100 % cut
+accuracy. Verified on the real segment: shot boundaries are the detected cuts
+themselves (0.751, 2.502, 7.966, 9.551…), wide shot a clean two-person split.
+`plan_follow_visible` stays the fallback when no cuts are detected.
+
+**P1-2 follow-up 6 — the residual "blank at cut" was preview drift, not the plan
+(same day).** The operator still saw a blank flash at cuts and felt the audio lag
+— but in the **editor preview**, not necessarily the export. Root cause found by
+elimination: `player.rs` and `main.rs`'s audio path are **unchanged this whole
+session** (so the audio lag is not a regression), and the render is deterministic
+(scene-cut boundaries, `-map 0:a:0` from the same seek — no drift). The preview,
+though, starts the playhead-driven crop and the rodio audio the instant Play is
+hit, while the live ffmpeg decoder needs ~0.1-0.5 s to spawn+seek+decode frame
+one — so the crop *leads* the video and every cut flashes blank, and A/V drifts.
+Fix (`editor.rs` + `player.rs`, preview only): **drive the playhead by the live
+decoder's delivered-frame count** (`PreviewPlayer::video_secs` = frames /
+`PLAY_FPS`), not wall-clock — the crop then advances frame-for-frame with the
+video and *cannot* switch to the next shot before that frame is on screen (a
+first-frame resync-only fix, tried first, only cured the spawn latency, not the
+ongoing drift of a decoder that isn't perfectly real-time — the operator nailed
+it: "cut after the play line passes the cut"). On the first frame the audio is
+(re)anchored to it; a 1.5 s / spawn-failure fallback keeps wall-clock so
+filmstrip playback is never frozen. The exported render was already correct;
+this makes the *preview* reflect it. (GUI-only — not covered by headless tests.)
+
+Verification: 6 crates compile with `--features face`, **all tests green**
+(core 14, frame 42, render 41, ingest 20, app 29 — incl. anchor, span-framing,
+follow-pan, lerp, prop-reject + hard-floor, multicam follow/cut/group,
+short-framing-survives, fps-agnostic timing, and scene-cut boundary/merge tests);
+every non-GUI stage validated on the real ANTITESA segments via production
+diagnostics (removed after use); the preview A/V resync is GUI-only and needs an
+in-app check.
+
+---
+
 ## 2026-07-03 (night) — the ensemble hang: diagnosed to WDDM VRAM spill, Cancel made real, watchdog fallback
 
 The operator caught it live: an ensemble caption pre-pass "stuck" (one decode

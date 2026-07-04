@@ -1328,18 +1328,14 @@ fn do_prepare(
     let sc = paths.sidecars();
 
     // Obtain the render source, the in-segment seek offset, and the source
-    // resolution (for the Layout) - all from one ffprobe of the media.
+    // resolution (for the Layout).
     let (render_src, seek_s, src_w, src_h) = match &session.promote {
         PromoteSource::Local(path) => {
             let p = yc_ingest::probe_segment(&paths.ffprobe, path, cancel)?;
             (path.clone(), range.start_s, p.width as f32, p.height as f32)
         }
         PromoteSource::YouTube(url) => {
-            let _ = tx.send(Progress::Stage("Fetching segment"));
-            let padded = yc_ingest::pad_range(range, session.vod.duration_s);
-            let segment = yc_ingest::fetch_segment(&sc, url, padded, &session.data_dir, cancel)?;
-            let p = yc_ingest::probe_segment(&paths.ffprobe, &segment, cancel)?;
-            let offset = yc_ingest::in_segment_offset(range.start_s, padded.start_s, &p);
+            let (segment, offset, p) = resolve_segment(paths, &sc, session, url, range, cancel, tx)?;
             (segment, offset, p.width as f32, p.height as f32)
         }
     };
@@ -1389,6 +1385,92 @@ fn do_prepare(
         title,
     };
     Ok((prepared, frames, frame_w, frame_h, fps, faces))
+}
+
+/// Extra request padding past a measured coverage shortfall on a refetch: the
+/// section download snaps to whole stream fragments, so ask for one typical
+/// fragment more than the exact miss.
+const REFETCH_EXTRA_S: f64 = 8.0;
+
+/// Fetch the padded Segment, then **measure** where it actually sits on the
+/// VOD timeline (`yc_ingest::align`) instead of assuming the download honored
+/// the requested section start. yt-dlp's HLS section download snaps to stream
+/// fragment boundaries on some VODs (measured 5.84 s early on a podcast VOD,
+/// exact on others); under the old assumption every seek consumer — the export
+/// cut, face detect, speaker-analysis frames, preview, the `enh` caption
+/// window — read media shifted by the snap while captions stayed on the true
+/// VOD timeline from analysis.wav: a constant caption-vs-audio offset in the
+/// export, and mouth-vs-voice misattribution in the speaker pass. The snapped
+/// section also *ends* short of the request, so when the measured window
+/// leaves the clip's tail uncovered, refetch once with the end widened by the
+/// shortfall (+ a fragment allowance). No confident lock (or a measurement
+/// error) falls back to the requested-start assumption — today's behavior.
+fn resolve_segment(
+    paths: &PipelinePaths,
+    sc: &yc_ingest::Sidecars,
+    session: &Session,
+    url: &str,
+    range: TimeRange,
+    cancel: &CancelToken,
+    tx: &Sender<Progress>,
+) -> Result<(PathBuf, f64, yc_ingest::SegmentProbe)> {
+    let mut padded = yc_ingest::pad_range(range, session.vod.duration_s);
+    let mut refetched = false;
+    loop {
+        let _ = tx.send(Progress::Stage("Fetching segment"));
+        let segment = yc_ingest::fetch_segment(sc, url, padded, &session.data_dir, cancel)?;
+        let probe = yc_ingest::probe_segment(&paths.ffprobe, &segment, cancel)?;
+        let assumed = yc_ingest::in_segment_offset(range.start_s, padded.start_s, &probe);
+        let _ = tx.send(Progress::Stage("Verifying segment timing"));
+        let anchor = match yc_ingest::measure_segment_anchor(
+            &paths.ffmpeg,
+            &paths.ffprobe,
+            &segment,
+            &session.analysis_wav,
+            padded.start_s,
+            cancel,
+        ) {
+            Ok(a) => a,
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(e) => {
+                tracing::warn!("segment anchor measurement failed: {e:#}");
+                None
+            }
+        };
+        let Some(anchor) = anchor else {
+            tracing::warn!("segment anchor: no confident lock; assuming the requested start");
+            return Ok((segment, assumed, probe));
+        };
+        let seek = (range.start_s - anchor.vod_t0_s).max(0.0);
+        if (seek - assumed).abs() > 0.25 {
+            tracing::warn!(
+                assumed,
+                measured = seek,
+                corr = anchor.corr,
+                "segment anchored {:+.2}s off the requested section; seeking the measured offset",
+                seek - assumed
+            );
+        }
+        let shortfall = yc_ingest::tail_shortfall_s(anchor.vod_t0_s, probe.duration_s, range.end_s);
+        if shortfall > 0.01 && !refetched {
+            refetched = true;
+            let end = padded.end_s + shortfall + REFETCH_EXTRA_S;
+            padded.end_s = match session.vod.duration_s {
+                Some(d) => end.min(d),
+                None => end,
+            };
+            tracing::warn!(
+                shortfall,
+                "segment misses the clip tail; refetching with the request widened to {:.1}s",
+                padded.end_s
+            );
+            continue;
+        }
+        if shortfall > 0.01 {
+            tracing::warn!(shortfall, "segment still misses the clip tail; the export may truncate");
+        }
+        return Ok((segment, seek, probe));
+    }
 }
 
 /// The 16 kHz-mono samples whisper captions from. With the `sep` feature and the
@@ -2367,9 +2449,68 @@ fn do_analyze_speakers(
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
     let analysis = SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence };
-    let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur);
+    // The source's own cut frames (pixel-level scene detection), so a multicam
+    // plan cuts exactly where the source does — no sampling grid to lag it.
+    let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
+    tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
+    let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
     Ok((analysis, plan))
+}
+
+/// The `scene` value above which an inter-frame change is a source **cut**, not
+/// motion. Measured on a real multicam VOD: hard cuts score ~0.3-0.5, the
+/// busiest in-shot motion stays under ~0.1 — 0.2 separates them with margin. A
+/// stray trigger costs nothing (it merges into its neighbour when the subject
+/// is unchanged); a miss would leave two shots fused, so err low.
+#[cfg(feature = "face")]
+const SCENE_CUT_THRESHOLD: f64 = 0.2;
+
+/// Detect the source's cut frames over the clip (`[seek_s, seek_s+dur]`) with
+/// ffmpeg's scene-change filter, returning clip-relative cut times (seconds).
+/// Best-effort: any failure yields an empty list, and the plan falls back to
+/// approximating cuts from the per-bin subject. One extra full-rate decode of
+/// the clip (cheap — pixel diff, no model), so the cuts are frame-exact even
+/// when the source frame rate differs from the analysis grid.
+#[cfg(feature = "face")]
+fn detect_scene_cuts(ffmpeg: &Path, src: &Path, seek_s: f64, dur_s: f64) -> Vec<f64> {
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "info".into(),
+        "-ss".into(),
+        format!("{seek_s:.3}"),
+        "-t".into(),
+        format!("{dur_s:.3}"),
+        "-i".into(),
+        src.display().to_string(),
+        "-vf".into(),
+        format!("select='gt(scene,{SCENE_CUT_THRESHOLD})',metadata=print"),
+        "-an".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
+    ];
+    let output = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let Ok(output) = output else {
+        tracing::warn!("scene-cut detection failed to spawn; plan will approximate cuts");
+        return Vec::new();
+    };
+    // metadata=print logs `... pts_time:<clip-relative seconds> ...` to stderr.
+    let text = String::from_utf8_lossy(&output.stderr);
+    let mut cuts: Vec<f64> = text
+        .lines()
+        .filter_map(|l| l.split("pts_time:").nth(1))
+        .filter_map(|s| s.split_whitespace().next())
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.02);
+    cuts
 }
 
 /// Without the `face` feature there is no detector: speaker analysis cannot run.

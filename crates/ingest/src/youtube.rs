@@ -195,12 +195,25 @@ fn run(program: &Path, args: &[String], deno_dir: Option<&Path>, cancel: &Cancel
 /// Like [`run`], but captures stdout (for metadata / ffprobe queries). Uses
 /// `wait_with_output` so the stdout pipe is drained while the child runs - a
 /// large `-J` dump cannot deadlock on a full pipe buffer.
-fn run_capture(
+pub(crate) fn run_capture(
     program: &Path,
     args: &[String],
     deno_dir: Option<&Path>,
     cancel: &CancelToken,
 ) -> Result<String> {
+    run_capture_bytes(program, args, deno_dir, cancel)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// [`run_capture`] for binary stdout (raw PCM from an ffmpeg `-f f32le -`
+/// decode — the anchor measurement's segment audio must not pass through a
+/// lossy UTF-8 conversion).
+pub(crate) fn run_capture_bytes(
+    program: &Path,
+    args: &[String],
+    deno_dir: Option<&Path>,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>> {
     if cancel.is_cancelled() {
         anyhow::bail!("cancelled");
     }
@@ -229,7 +242,7 @@ fn run_capture(
         program.display(),
         output.status
     );
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 // --- deno discovery ---------------------------------------------------------

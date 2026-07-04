@@ -17,9 +17,9 @@ fn main() {
     };
     let plan = CameraPlan {
         shots: vec![
-            Shot { start_s: 0.0, end_s: 4.0, track: Some(0), layout: solo(80.0) },
-            Shot { start_s: 4.0, end_s: 8.0, track: None, layout: split },
-            Shot { start_s: 8.0, end_s: 12.0, track: Some(1), layout: solo(800.0) },
+            Shot { start_s: 0.0, end_s: 4.0, track: Some(0), layout: solo(80.0), pan_to: None },
+            Shot { start_s: 4.0, end_s: 8.0, track: None, layout: split, pan_to: None },
+            Shot { start_s: 8.0, end_s: 12.0, track: Some(1), layout: solo(800.0), pan_to: None },
         ],
     };
     print!("{}", yc_render::build_camera_filtergraph(&plan, "clip.ass"));

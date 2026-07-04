@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use yc_core::{CameraPlan, Crop, Layout, NoConsole, CANVAS_H, CANVAS_W};
+use yc_core::{CameraPlan, Crop, Layout, NoConsole, Shot, CANVAS_H, CANVAS_W};
 
 /// `crop=w:h:x:y` in source pixels. Dimensions floored to even numbers >= 2 so
 /// the yuv420p encoder never sees an odd or zero-sized Panel.
@@ -89,11 +89,13 @@ fn layout_chain(layout: &Layout, in_label: &str, out_label: &str) -> String {
 
 /// Build the dynamic-camera filtergraph for a [`CameraPlan`] (podcast
 /// active-speaker mode): each [`Shot`] trims its contiguous span off the input,
-/// composites its own static Layout (solo crop, or a stacked split for a group
-/// shot), and the shots concat back into one 1080x1920 stream — **hard cuts**,
-/// the way a human editor cuts between podcast speakers. The ASS burn runs once
-/// over the concatenated stream, so caption timing is untouched (shots are
-/// contiguous and start at 0, exactly the whole-clip timeline).
+/// composites its own Layout (solo crop, or a stacked split for a group shot),
+/// and the shots concat back into one 1080x1920 stream — **hard cuts** between
+/// speakers, the way a human editor cuts. A solo shot whose subject drifted
+/// carries a `pan_to`: its crop origin glides linearly across the shot (the
+/// slow follow), still a single crop filter via time expressions. The ASS burn
+/// runs once over the concatenated stream, so caption timing is untouched
+/// (shots are contiguous and start at 0, exactly the whole-clip timeline).
 ///
 /// The caller writes this to a script file and passes `-filter_complex_script`
 /// (a many-shot graph outgrows a comfortable command line).
@@ -115,7 +117,7 @@ pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str) -> String {
             "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[t{i}]",
             shot.start_s, shot.end_s
         ));
-        parts.push(layout_chain(&shot.layout, &format!("t{i}"), &format!("s{i}")));
+        parts.push(shot_chain(shot, &format!("t{i}"), &format!("s{i}")));
         labels.push(format!("[s{i}]"));
     }
     parts.push(format!(
@@ -124,6 +126,32 @@ pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str) -> String {
         plan.shots.len(),
     ));
     parts.join(";")
+}
+
+/// The composite chain for one [`Shot`]: its Layout statically, or — for a
+/// solo shot with a follow pan — a crop whose origin glides linearly from the
+/// opening to the closing position across the shot. `t` is shot-relative
+/// (each shot's `setpts` rebases to 0) and the crop size never changes (the
+/// zoom must not breathe). The expressions are quoted and their commas
+/// escaped, so the filtergraph parser passes them to the crop filter whole.
+fn shot_chain(shot: &Shot, in_label: &str, out_label: &str) -> String {
+    if let (Layout::FullFrame { crop }, Some(to)) = (&shot.layout, &shot.pan_to) {
+        let dur = (shot.end_s - shot.start_s).max(0.001);
+        let even = |v: f32| (((v.round().max(2.0)) as i64) / 2) * 2;
+        let (x0, y0) = (crop.x.max(0.0), crop.y.max(0.0));
+        return format!(
+            "[{i}]crop={w}:{h}:x='{x0:.1}+({dx:.1})*min(t/{dur:.3}\\,1)':y='{y0:.1}+({dy:.1})*min(t/{dur:.3}\\,1)',scale={cw}:{ch},setsar=1[{o}]",
+            i = in_label,
+            o = out_label,
+            w = even(crop.w),
+            h = even(crop.h),
+            dx = to.x.max(0.0) - x0,
+            dy = to.y.max(0.0) - y0,
+            cw = CANVAS_W,
+            ch = CANVAS_H,
+        );
+    }
+    layout_chain(&shot.layout, in_label, out_label)
 }
 
 /// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks `seek_s` into
@@ -260,9 +288,9 @@ mod tests {
         };
         let plan = CameraPlan {
             shots: vec![
-                Shot { start_s: 0.0, end_s: 8.5, track: Some(0), layout: solo(100.0) },
-                Shot { start_s: 8.5, end_s: 14.0, track: None, layout: split },
-                Shot { start_s: 14.0, end_s: 30.0, track: Some(1), layout: solo(1200.0) },
+                Shot { start_s: 0.0, end_s: 8.5, track: Some(0), layout: solo(100.0), pan_to: None },
+                Shot { start_s: 8.5, end_s: 14.0, track: None, layout: split, pan_to: None },
+                Shot { start_s: 14.0, end_s: 30.0, track: Some(1), layout: solo(1200.0), pan_to: None },
             ],
         };
         let g = build_camera_filtergraph(&plan, "clip.ass");
@@ -288,6 +316,47 @@ mod tests {
         let g = build_camera_filtergraph(&CameraPlan::default(), "clip.ass");
         assert!(g.contains("subtitles=clip.ass"));
         assert!(!g.contains("concat"));
+    }
+
+    #[test]
+    fn follow_shot_pans_the_crop_origin_across_the_shot() {
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                start_s: 2.0,
+                end_s: 10.0,
+                track: Some(0),
+                layout: Layout::FullFrame {
+                    crop: Crop { x: 100.0, y: 40.0, w: 452.0, h: 802.0 },
+                },
+                pan_to: Some(Crop { x: 220.0, y: 40.0, w: 452.0, h: 802.0 }),
+            }],
+        };
+        let g = build_camera_filtergraph(&plan, "clip.ass");
+        // Same-size crop, origin gliding over the 8 s shot; commas escaped so
+        // the expression survives the filtergraph parser.
+        assert!(g.contains("crop=452:802:x='100.0+(120.0)*min(t/8.000\\,1)'"), "graph: {g}");
+        assert!(g.contains(":y='40.0+(0.0)*min(t/8.000\\,1)'"), "graph: {g}");
+        // A pan shot still scales to the canvas and burns once after concat.
+        assert!(g.contains("scale=1080:1920"));
+        assert_eq!(g.matches("subtitles=").count(), 1);
+    }
+
+    #[test]
+    fn static_shots_keep_the_plain_crop() {
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                start_s: 0.0,
+                end_s: 5.0,
+                track: Some(0),
+                layout: Layout::FullFrame {
+                    crop: Crop { x: 380.0, y: 0.0, w: 452.0, h: 802.0 },
+                },
+                pan_to: None,
+            }],
+        };
+        let g = build_camera_filtergraph(&plan, "clip.ass");
+        assert!(g.contains("crop=452:802:380:0"), "graph: {g}");
+        assert!(!g.contains("min(t/"), "no expression on a static shot: {g}");
     }
 
     #[test]

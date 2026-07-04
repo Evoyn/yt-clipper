@@ -111,6 +111,12 @@ pub struct EditorState {
     playhead_s: f64,
     /// `Some((anchor, offset))` while playing: playhead = offset + since(anchor).
     playing: Option<(Instant, f64)>,
+    /// Whether the live video's first frame has been aligned to the playhead
+    /// yet. The decoder takes ~0.1-0.5 s to spawn + seek + decode frame one,
+    /// but the playhead-driven crop and the audio start immediately — so
+    /// without this the crop leads the video and cuts flash blank. On the first
+    /// frame we re-anchor the playhead and restart the audio to it (see `show`).
+    video_aligned: bool,
     /// Live playback decode (streaming ffmpeg → one texture, ~24 fps): the
     /// motion upgrade over the 4 fps filmstrip, alive only while playing.
     live: Option<PreviewPlayer>,
@@ -209,6 +215,7 @@ impl EditorState {
             frame_fps: frame_fps.max(0.1),
             playhead_s: range.duration_s() * 0.5, // a representative middle frame
             playing: None,
+            video_aligned: false,
             live: None,
             ffmpeg,
             render_src,
@@ -323,9 +330,11 @@ impl EditorState {
                 },
             },
             CameraMode::ActiveSpeaker => match &self.plan {
+                // layout_at glides a follow-pan shot's crop at the playhead, so
+                // the preview shows the same motion the render bakes in.
                 Some(plan) => plan
                     .shot_at(t)
-                    .map(|s| s.layout.clone())
+                    .map(|s| s.layout_at(t))
                     .unwrap_or_else(|| self.manual_layout()),
                 None => self.manual_layout(),
             },
@@ -344,6 +353,7 @@ impl EditorState {
                             bbox: f.bbox,
                             presence: f.persistence,
                             activity: Vec::new(),
+                            path: Vec::new(),
                         })
                         .collect();
                     yc_frame::speaker::group_layout(&tracks, self.src_w, self.src_h)
@@ -395,10 +405,44 @@ impl EditorState {
     ) -> EditorAction {
         let mut action = EditorAction::None;
 
-        // Advance the playhead while playing.
+        // Pull the newest decoded frame(s) up front, so the frame count the
+        // playhead reads below and the texture the crop is drawn over are the
+        // same frame this repaint (no off-by-one flash at a cut). `frame_tex`
+        // re-polls during draw — a no-op drain that returns the same texture.
+        if self.playing.is_some() {
+            if let Some(live) = &mut self.live {
+                let _ = live.poll(ui.ctx());
+            }
+        }
+
+        // Drive the playhead by the LIVE VIDEO's delivered-frame time, not
+        // wall-clock — so the crop follows the frame actually on screen and can
+        // never flash the next shot before it is visible (the "blank before the
+        // cut": the decoder isn't perfectly real-time, so a wall-clock playhead
+        // outruns it and switches the crop early). Sequence: on Play the crop
+        // freezes at the spawn offset and the audio waits; the moment the first
+        // frame lands we re-anchor the audio to it, then the playhead advances
+        // frame-by-frame with the video. Filmstrip fallback (no live decode, or
+        // > 1.5 s with no frame) keeps wall-clock so playback is never frozen.
         let dur = self.range.duration_s();
-        if let Some((anchor, offset)) = self.playing {
-            self.playhead_s = offset + anchor.elapsed().as_secs_f64();
+        if let Some((_, offset)) = self.playing {
+            let video_secs = self.live.as_ref().and_then(|l| l.video_secs());
+            let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
+            let stalled = self.live.is_none() || (video_secs.is_none() && waited > 1.5);
+            if !self.video_aligned && (video_secs.is_some() || stalled) {
+                // First frame on screen (or give-up): start the audio here so it
+                // runs with the video, not the ~0.1-0.5 s-earlier Play instant.
+                self.video_aligned = true;
+                self.playing = Some((Instant::now(), offset));
+                action = EditorAction::Play(self.play_range_from(offset));
+            }
+            self.playhead_s = if !self.video_aligned {
+                offset // frozen on the first frame's content until it is on screen
+            } else if let Some(v) = self.live.as_ref().and_then(|l| l.video_secs()) {
+                offset + v // follow the video, frame for frame
+            } else {
+                offset + self.playing.expect("playing").0.elapsed().as_secs_f64() // filmstrip
+            };
             if self.playhead_s >= dur {
                 self.playhead_s = dur;
                 self.playing = None;
@@ -605,6 +649,7 @@ impl EditorState {
     /// playing). Failure is soft: the filmstrip keeps carrying playback.
     fn start_video(&mut self) {
         self.live = None; // kill any previous stream first
+        self.video_aligned = false; // re-align the playhead to the new stream's first frame
         let abs = self.seek_s + self.playhead_s;
         let remaining = (self.range.duration_s() - self.playhead_s).max(0.05);
         match PreviewPlayer::spawn(
@@ -994,6 +1039,8 @@ impl EditorState {
                         shot.layout = Layout::FullFrame {
                             crop: yc_frame::speaker::solo_crop(&track_bbox, src_w, src_h),
                         };
+                        // The operator picked a static framing: drop any follow.
+                        shot.pan_to = None;
                     }
                 }
             }

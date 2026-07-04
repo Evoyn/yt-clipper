@@ -35,6 +35,13 @@ pub struct PreviewPlayer {
     /// Whether any frame has arrived yet (until then callers should keep
     /// showing the filmstrip so Play never flashes black).
     got_frame: bool,
+    /// Total frames the decoder has delivered (including any coalesced when the
+    /// UI drains to newest). At [`PLAY_FPS`] this **is** the video's elapsed
+    /// content time — the caller drives the playhead by it so the crop can
+    /// never run ahead of the frame actually on screen (the "blank before the
+    /// cut": a wall-clock playhead outpaces a decoder that isn't perfectly
+    /// real-time, switching the crop before the new shot is visible).
+    frames_seen: u64,
 }
 
 /// Aspect-preserving even dimensions with the longest edge capped.
@@ -106,7 +113,15 @@ impl PreviewPlayer {
                 }
             }
         });
-        Ok(Self { child, rx, w, h, texture: None, got_frame: false })
+        Ok(Self { child, rx, w, h, texture: None, got_frame: false, frames_seen: 0 })
+    }
+
+    /// The video's elapsed **content** time (seconds) — frames delivered so far
+    /// over [`PLAY_FPS`] — or `None` before the first frame. The caller adds it
+    /// to the play offset for the playhead, so the crop follows the frame on
+    /// screen exactly and can never flash the next shot before it is visible.
+    pub fn video_secs(&self) -> Option<f64> {
+        (self.frames_seen > 0).then(|| self.frames_seen as f64 / PLAY_FPS)
     }
 
     /// Drain to the newest decoded frame and return the live texture to draw,
@@ -115,7 +130,10 @@ impl PreviewPlayer {
         let mut newest: Option<Vec<u8>> = None;
         loop {
             match self.rx.try_recv() {
-                Ok(f) => newest = Some(f),
+                Ok(f) => {
+                    newest = Some(f);
+                    self.frames_seen += 1;
+                }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
