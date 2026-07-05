@@ -4,6 +4,47 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-05 (night) — Diarization spike: a voice lane that hears who the camera can't see
+
+The operator's verdict on the Deddy render ("the cut is good… not framing
+the one who talking, maybe we need the diarization") kicked off the ADR
+0038 upgrade path. One session, spike only — zero production-path changes,
+gated on the operator's eyes/ears (ADR 0042):
+
+- **Model**: 3D-Speaker CAM++ zh_en advanced (Apache-2.0, 28 MB,
+  SHA-256-pinned from sherpa-onnx's release; ~2 s CPU per 70 s clip). The
+  fbank frontend the ONNX expects is implemented pure in `yc_frame::voice`
+  (unit-tested); a known-speaker selftest guards the whole path — and
+  rejected the other candidate (WeSpeaker CAM++ LM scrambled same/different
+  speakers under every documented convention).
+- **The lane**: 1.5 s voiced windows embedded + cosine-clustered; the
+  threshold swept per clip and scored OUT-OF-SAMPLE through the
+  cluster→seat join (in-sample scoring was measured circular: overfit
+  singletons "agree" 100% while carrying nothing).
+- **The discovery**: on Deddy, seats are not people — voice cluster V1
+  articulates as one angle's left man and speaks again where the camera
+  shows a different pair, while the framed man DRINKS FROM A CUP (the cup's
+  luma churn faked "talking"). The actual speaker was **off-screen** — the
+  gap mouth motion cannot close. Joins are therefore per camera angle, the
+  whole-clip join is banned in the attribution regime, and "known voice, no
+  seat in this angle" prints as an off-screen suspect (it nails the proven
+  stretch).
+- **Measured**: ANTITESA 95% voice/mouth agreement over 39.6 s, 7/9
+  switches confirmed, camera plan untouched (zero regression; the harness's
+  baseline render is byte-count-identical to the operator's validated
+  export). Deddy: both mouths move 90%+ of the time (attribution runs on
+  margins), 55% of voiced time is shared laughter/cross-talk (correctly
+  unattributable), and the conservative fusion changes zero shots — the
+  rescued 1.1 s interjection dies to the 2.4 s min-shot grammar by design.
+- **The gate artifacts** (in the Deddy stream folder): `diar_baseline.mp4`
+  vs `diar_offscreen_demo.mp4` — the demo shows the visible pair's split
+  screen where a known voice is off-screen (14.2–22.1 s: no more solo shot
+  of a man sipping coffee while somebody else talks). Two grammar decisions
+  for the operator: off-screen ⇒ split screen? interjections < 2.4 s ⇒ ever
+  cut? Integration is the next session, after the verdict.
+
+---
+
 ## 2026-07-05 (evening) — Deddy clip: 2 people were 4 tracks; camera now re-frames per angle
 
 Operator's new bug batch on a Deddy Corbuzier export (4-person episode, edit

@@ -46,8 +46,11 @@ ser = ["yc-detect/ser"]
 # Auto-detect framing (M6, ADR 0011): pulls `ort` via yc-frame for Ultraface
 # face detection. Off by default so the app builds without the ONNX Runtime
 # binary; framing then falls back to full-frame gameplay. The pure layout
-# geometry (yc-frame) is always linked regardless of this feature.
-face = ["yc-frame/face"]
+# geometry (yc-frame) is always linked regardless of this feature. Also pulls
+# the voice speaker-embedding session (same ort runtime) so the speaker_diag
+# harness can measure the diarization spike (ADR 0042 gate pending) — no
+# production job calls it yet.
+face = ["yc-frame/face", "yc-frame/voice"]
 # Vocal-stem captions: pulls `ort` via yc-detect and the htdemucs model, so the
 # export transcribes the streamer's voice split from music/SFX instead of the
 # mixed analysis audio. Off by default; the export then captions the mix as

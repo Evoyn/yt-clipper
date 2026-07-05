@@ -17,3 +17,7 @@ ort = { version = "2.0.0-rc.12", optional = true }
 # app enables it for auto-framing; the first `--features face` build triggers a
 # one-time ONNX Runtime binary download (shared with `yc-detect`'s `ser`).
 face = ["dep:ort"]
+# Voice speaker-embedding for the diarization spike (ADR 0042 gate pending):
+# pulls the same `ort` runtime for the CAM++ session in `voice`. The fbank
+# frontend + clustering in that module are pure and compile regardless.
+voice = ["dep:ort"]

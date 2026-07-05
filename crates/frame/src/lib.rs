@@ -25,6 +25,7 @@ pub mod infer;
 #[cfg(feature = "face")]
 pub use infer::Detector;
 pub mod speaker;
+pub mod voice;
 
 // ---- tunable constants (ADR 0011: seeded defaults, retune without re-arch) ----
 

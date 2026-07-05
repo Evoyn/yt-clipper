@@ -91,7 +91,9 @@ const SWITCH_MARGIN: f32 = 1.35;
 const SWITCH_CONFIRM_S: f64 = 0.8;
 /// Mouth activity below this is "nobody visibly talking" — attribution then
 /// holds the incumbent rather than guessing (voice-over, off-screen speech).
-const MIN_ACTIVITY: f32 = 0.004;
+/// Pub so the diag harness can tell a genuine mouth attribution from such a
+/// hold when scoring the voice lane against it.
+pub const MIN_ACTIVITY: f32 = 0.004;
 
 /// VAD: a bin is voiced when its RMS clears both an absolute floor (true
 /// silence) and a fraction of the clip's loud (p90) reference.
@@ -1347,8 +1349,10 @@ const GROUP_PRESENCE_FRAC: f32 = 0.4;
 /// at its median position over the span. So a multicam source splits only the
 /// people actually in the wide shot for its duration — not every stray framing
 /// that flickers through. Falls back to the most-present track (or all) if none
-/// clears the bar.
-fn group_layout_span(
+/// clears the bar. Pub so the diag harness can compose demo plans (e.g. the
+/// diarization spike's off-screen-override preview) from the same framing the
+/// planner uses.
+pub fn group_layout_span(
     tracks: &[SpeakerTrack],
     lo: usize,
     hi: usize,
