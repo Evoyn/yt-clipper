@@ -4,6 +4,38 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-05 — the flash-at-a-cut P1: one rounded digit, not a timing model
+
+**The Active Speaker "blank at a cut" (an empty seat / half-out person for one
+frame at some shot switches) is fixed at the root.** Per the frame-level
+evidence rule, the actual frames were extracted and *looked at* before any
+code changed. The bug was never detection, planning, or analysis fps — the
+render wrote shot boundaries into `camera.fg` rounded to **3 decimals**. A
+boundary is a real source frame's pts, and ffmpeg `trim`'s start is inclusive:
+when the rounding lands **above** the cut frame's pts (a coin flip per cut —
+7 of the ANTITESA clip's 14), the incoming shot rejects its own first frame
+and the outgoing shot keeps it — one frame of the **new** scene rendered
+through the **old** shot's crop. That is the "empty seat" flash, and why only
+*some* cuts showed it. Boundaries now print at full precision (shortest
+round-trip `{}`), with a regression test pinned to the measured production
+pts (13.302833 — the old rounded 13.303 fails it).
+
+Validated on the production path end to end: re-rendered the operator's exact
+clip (same `segment.mp4`, seek, plan, crops, NVENC args) with fixed
+boundaries — the export's scene-score series drops from **7 double-spike
+flashes to 0**, all 14 switches land on their exact predicted output frame,
+and frame strips at the three worst cuts show clean A→B switches. A
+validation render sits next to the original export as
+`Bicara tentang rebalance investasi (fix-validation).mp4` — eyeball, then
+delete it.
+
+Also **reverted an unvalidated uncommitted attempt** found in the tree (a
++60 ms `CUT_LEAD_S` hold and dissolve-boundary machinery in
+`yc_frame::speaker`): measured against the real footage, every detected cut
+IS the settled first frame of the new shot — no transition frames exist — so
+the hold would have stranded 1-2 new-scene frames in the old crop at **every**
+cut, making the flash universal instead of fixing it. (ADR 0038)
+
 ## 2026-07-04 — two P1 bugs: caption/audio desync root-caused to a segment-fetch snap; Active Speaker made production-ready
 
 Two operator-reported P1s, both fixed at the root, no rendering (operator tests

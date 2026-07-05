@@ -226,3 +226,43 @@ rate — 100 % cut accuracy, the operator's ask. `plan_follow_visible` (per-bin
 runs) remains the fallback when scene detection returns nothing (a genuinely
 static single shot, or a failed pass). The 24 fps grid still governs track
 building and per-shot framing; the *cut timing* no longer depends on it.
+
+## Refinement — trim boundaries carry full pts precision (2026-07-05)
+
+The operator's residual "1-3 frame blank" at a few cuts (the ANTITESA export)
+was **not** detection, planning, or analysis-fps — it was the render formatting
+shot boundaries at 3 decimals. A boundary is a real source frame's pts (scene
+detection returns the first frame of the incoming shot); ffmpeg `trim`'s
+`start` is inclusive (`pts >= start`) and `end` exclusive. `{:.3}` rounds
+~half of all cut pts **up** past the cut frame's own pts (e.g. 13.302833 →
+13.303), so the incoming shot's trim rejects its own first frame and the
+outgoing shot's trim keeps it: the first frame of the **new** scene renders
+through the **old** shot's crop — one frame of "empty seat" / half-out person
+exactly at the cut. Which cuts flash is a per-cut coin flip (does the pts
+round up?), which is why only some cuts showed it.
+
+Measured on the production clip (`segment.mp4`, `-ss 7.885`, 23.976 fps): 14
+cuts, 7 flashed — exactly the 7 whose pts round up at 3 dp; the 7 that round
+down were clean. The export's own scene-score series is the flash detector: a
+clean switch is a **single** inter-frame spike at the boundary's output slot;
+a stranded frame is a **double spike one frame apart**. The shipped export had
+7 doubles; after the fix, 0, with every switch on its exact predicted output
+frame, and frame strips at the worst cuts visually clean. The source's cuts
+are all single-frame hard cuts (no transition frames anywhere in the series).
+
+Fix: `build_camera_filtergraph` prints boundaries with Rust's shortest
+round-trip float `Display` (`{}`), never a fixed precision — even `{:.6}`
+rounds a 7-decimal pts like 0.0812889 up by 1e-7 (absorbed by the µs→tick
+rescale at mp4's common timebases, but the bug class only dies with lossless
+printing). The regression test pins the two measured production pts.
+
+Two prior theories are **ruled out for hard-cut sources**, and their
+uncommitted code was dropped rather than shipped: a fixed post-cut hold
+(`CUT_LEAD_S` — the detector does *not* fire early on this footage; every
+detected cut IS the settled first frame of the new shot, so a +60 ms hold
+would strand 1-2 new-scene frames in the old crop at **every** cut, making
+the flash universal), and tracked-subject boundaries for dissolves the
+detector missed (no dissolve exists in this footage, and bin-grid times are
+not frame pts — re-inviting the same stranding). If a source with real
+cross-dissolves ever appears, that work needs its own frame-level evidence
+first.

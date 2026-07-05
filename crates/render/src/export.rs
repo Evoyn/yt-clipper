@@ -113,8 +113,20 @@ pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str) -> String {
     for (i, shot) in plan.shots.iter().enumerate() {
         // trim + setpts rebase each shot to its own 0, so concat re-joins them
         // into one continuous timeline identical to the source clip's.
+        //
+        // Boundaries print at full f64 precision (`{}` is shortest-round-trip),
+        // NEVER rounded: a cut boundary is a real source-frame pts (scene
+        // detection returns the first frame of the incoming shot), trim's start
+        // is INCLUSIVE (keeps pts >= start) and its end EXCLUSIVE, so an exact
+        // boundary hands every frame to exactly one shot, with the cut frame
+        // opening the INCOMING shot. The old `{:.3}` rounded ~half of all cut
+        // pts UP past the cut frame, which stranded that frame at the tail of
+        // the OUTGOING shot — one frame of the new scene through the old
+        // shot's crop (the operator's "empty seat" flash at cuts; measured on
+        // the ANTITESA export: 7 of its 14 cuts flashed, exactly the 7 whose
+        // pts rounded up, e.g. 13.302833 -> 13.303).
         parts.push(format!(
-            "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[t{i}]",
+            "[0:v]trim=start={}:end={},setpts=PTS-STARTPTS[t{i}]",
             shot.start_s, shot.end_s
         ));
         parts.push(shot_chain(shot, &format!("t{i}"), &format!("s{i}")));
@@ -294,10 +306,13 @@ mod tests {
             ],
         };
         let g = build_camera_filtergraph(&plan, "clip.ass");
-        // One trim per shot, contiguous and rebased.
+        // One trim per shot, contiguous and rebased, boundaries printed
+        // shortest-round-trip (never rounded — rounding across a source frame's
+        // pts strands that frame in the wrong shot: a 1-frame flash).
         assert_eq!(g.matches("trim=start=").count(), 3);
-        assert!(g.contains("trim=start=0.000:end=8.500"));
-        assert!(g.contains("trim=start=8.500:end=14.000"));
+        assert!(g.contains("trim=start=0:end=8.5,"), "graph: {g}");
+        assert!(g.contains("trim=start=8.5:end=14,"), "graph: {g}");
+        assert!(g.contains("trim=start=14:end=30,"), "graph: {g}");
         assert!(g.contains("setpts=PTS-STARTPTS"));
         // The group shot splits its trimmed stream for the two panels.
         assert!(g.contains("split=2"), "group shot needs an explicit split: {g}");
@@ -309,6 +324,49 @@ mod tests {
         // Every shot scales to the canvas.
         assert!(g.matches("scale=1080:1920").count() == 2, "solo shots: {g}");
         assert!(g.contains("scale=1080:960"), "split panels: {g}");
+    }
+
+    #[test]
+    fn a_cut_frame_is_not_stranded_in_the_outgoing_shot() {
+        // The operator's flash-at-a-cut: a real source-frame pts like 13.302833
+        // rounds UP to 13.303 under the old `:.3`. `trim` start is inclusive
+        // (keeps pts >= start), so a boundary of 13.303 fails `13.302833 >= start`
+        // and drops that first new-scene frame into the OUTGOING shot — one
+        // frame of the new scene through the old shot's crop. The boundary must
+        // land AT or BELOW the frame's pts so it joins the INCOMING shot. Both
+        // constants are measured cut pts from the ANTITESA production clip:
+        // CUT_7DP also rounds up under a fixed `{:.6}` (0.0812889 -> 0.081289),
+        // which only shortest-round-trip printing survives.
+        use yc_core::Shot;
+        let solo = |x: f32| Layout::FullFrame { crop: Crop { x, y: 0.0, w: 608.0, h: 1080.0 } };
+        const CUT_7DP: f64 = 0.081_288_9;
+        const CUT: f64 = 13.302_833;
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: CUT_7DP, track: Some(1), layout: solo(1200.0), pan_to: None },
+                Shot { start_s: CUT_7DP, end_s: CUT, track: Some(0), layout: solo(100.0), pan_to: None },
+                Shot { start_s: CUT, end_s: 25.0, track: Some(1), layout: solo(1200.0), pan_to: None },
+            ],
+        };
+        let g = build_camera_filtergraph(&plan, "clip.ass");
+        // Each incoming shot's trim start must be <= its cut frame's pts (so
+        // `pts >= start` keeps the frame) yet not reach back to the previous
+        // frame (~41.7 ms earlier at 23.976 fps).
+        let start_at = |nth: usize| {
+            g.split("trim=start=")
+                .nth(nth)
+                .and_then(|s| s.split(':').next())
+                .and_then(|s| s.parse::<f64>().ok())
+                .expect("shot has a trim start")
+        };
+        for (nth, cut) in [(2, CUT_7DP), (3, CUT)] {
+            let start = start_at(nth);
+            assert!(
+                start <= cut,
+                "incoming trim start {start} must not exceed the cut frame pts {cut} (graph: {g})"
+            );
+            assert!(start > cut - 0.041, "and must not reach the previous frame (graph: {g})");
+        }
     }
 
     #[test]
