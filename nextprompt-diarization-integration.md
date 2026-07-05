@@ -9,15 +9,16 @@ interjection cuts), measured in the harness and rendered for the operator's
 eyes before anything ships.
 
 ## Open the grill with
-1. **The camera-smoothing verdict**: the operator watched
-   `camera_smoothing.mp4` vs the fix-validation export
-   (handoffs/2026-07-05-camera-smoothing.md §Gate state). If they report
-   residual twitch, fix THAT first — it is a constants question
-   (`REUSE_CENTER_FH`/`REUSE_H_FRAC`, re-measure via the best-prior-anchor
-   forensics before moving them), not a design question, and it blocks
-   integration polish.
-2. Where the voice lane surfaces in the Studio UI (speaker timeline lane?
+(The camera-smoothing gate PASSED 2026-07-05 late night — operator watched
+all three symptom windows: "i see it and it fixed". Do NOT re-collect it;
+the camera behavior incl. framing memory, static-first pans, and the
+camera audit is signed off. New camera changes this session must keep the
+audit clean on both fixtures.)
+1. Where the voice lane surfaces in the Studio UI (speaker timeline lane?
    confidence chip?), and whether `voice` stays inside the `face` feature.
+2. How the off-screen split interacts with the framing memory (group
+   pieces leave no anchors) and whether a voice-rescued interjection cut
+   re-frames or reuses (it lands mid-angle, not at a source cut).
 
 ## Read first (in this order)
 1. CONTEXT.md — Voice lane / Speaker track (seat!) / Camera plan.

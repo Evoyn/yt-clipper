@@ -64,11 +64,11 @@ session, one mechanism (ADR 0038's new "framing memory" refinement):
   summary BEFORE a render. Zero findings on both fixtures is the
   regression bar (asserted clean post-fix); each defect class has a
   true-positive unit test. 298 tests green.
-- **Gate artifact**: `camera_smoothing.mp4` re-rendered 22:58
-  (`YC_SMOOTH_RENDER=1`, the production export command, kept separate so
-  the diar_* A/B renders survive) — awaiting the operator's eyes on all
-  three symptoms (jump-cut twitch, 22-26 s, 30-40 s); the verdict opens
-  the next session's grill.
+- **Gate PASSED (same night)**: the operator watched the round-3
+  `camera_smoothing.mp4` (22:58) across all three symptom windows
+  (jump-cut twitch, 22-26 s, 30-40 s) — "i think thats good, i see it
+  and it fixed." Framing memory + static-first pans + the camera audit
+  are the signed-off production camera behavior.
 
 Next queued: the diarization integration slice
 (nextprompt-diarization-integration.md).

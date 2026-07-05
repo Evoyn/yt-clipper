@@ -479,3 +479,9 @@ caught), and **subject adrift** (a subject outside the crop's safe region
 logs each finding, and the Studio Camera panel + export summary show them
 BEFORE any render. Zero findings on both production fixtures is the
 regression bar; each defect class has a true-positive unit test.
+
+**Operator verdict (2026-07-05, late night): PASSED** — watched the
+round-3 render (`camera_smoothing.mp4`, all three symptom windows):
+"i think thats good, i see it and it fixed." The framing memory,
+static-first pans, and the camera audit are signed off as the production
+camera behavior.
