@@ -464,11 +464,199 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- same-subject piece pairs (crop stability forensics): each solo shot
+    // vs the PREVIOUS solo shot of the same track (adjacent or across runs) —
+    // exactly the pairs a framing memory would act on. Δsubj is the span-median
+    // face center/height; Δcrop is the planner's current output; sig compares
+    // the spans' 60px seat-geometry signatures (reference only — leans are
+    // known to split angles, ADR 0042). PAN pairs carry real motion and are
+    // excluded from the summary distributions.
+    println!("\n== same-subject piece pairs (crop stability forensics):");
+    let span_bins = |s: &yc_core::Shot| -> (usize, usize) {
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n_bins);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n_bins);
+        (b0, b1)
+    };
+    let med_of = |v: &mut Vec<f32>| -> f32 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    let shot_subj = |tr: &SpeakerTrack, b0: usize, b1: usize| -> Option<(f32, f32, f32)> {
+        let (mut xs, mut ys, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+        for b in b0..b1.min(n_bins) {
+            if let Some(f) = tr.path.get(b).and_then(|p| p.as_ref()) {
+                xs.push(f.cx());
+                ys.push(f.cy());
+                hs.push(f.h);
+            }
+        }
+        if xs.is_empty() {
+            return None;
+        }
+        Some((med_of(&mut xs), med_of(&mut ys), med_of(&mut hs)))
+    };
+    let span_sig = |b0: usize, b1: usize| -> String {
+        let len = b1.saturating_sub(b0).max(1);
+        let mut sig = String::new();
+        for t in &analysis.tracks {
+            let (mut xs, mut ys, mut hs) = (Vec::new(), Vec::new(), Vec::new());
+            for b in b0..b1.min(n_bins) {
+                if let Some(f) = t.path.get(b).and_then(|p| p.as_ref()) {
+                    xs.push(f.cx());
+                    ys.push(f.cy());
+                    hs.push(f.h);
+                }
+            }
+            if xs.len() * 5 < len * 2 {
+                continue; // seat absent from this span (<40%)
+            }
+            sig.push_str(&format!(
+                "{}:{},{},{};",
+                t.id,
+                (med_of(&mut xs) / 60.0).round() as i32,
+                (med_of(&mut ys) / 60.0).round() as i32,
+                (med_of(&mut hs) / 40.0).round() as i32
+            ));
+        }
+        sig
+    };
+    // (Δcenter px, |Δface h| %, Δcrop pos px, |Δcrop h| %) per pair, grouped
+    // by the signature verdict.
+    let mut same_sig: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut diff_sig: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut last_solo: std::collections::HashMap<usize, usize> = Default::default();
+    for (i, s) in plan.shots.iter().enumerate() {
+        let (Some(id), yc_core::Layout::FullFrame { crop }) = (s.track, &s.layout) else {
+            continue;
+        };
+        let Some(j) = last_solo.insert(id, i) else { continue };
+        let p = &plan.shots[j];
+        let yc_core::Layout::FullFrame { crop: pcrop } = &p.layout else { continue };
+        let Some(tr) = analysis.tracks.iter().find(|t| t.id == id) else { continue };
+        let (a0, a1) = span_bins(p);
+        let (b0, b1) = span_bins(s);
+        let (Some((ax, ay, ah)), Some((bx, by, bh))) =
+            (shot_subj(tr, a0, a1), shot_subj(tr, b0, b1))
+        else {
+            continue;
+        };
+        let d_center = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+        let d_h_pct = 100.0 * (bh - ah) / ah.max(1.0);
+        let d_crop_pos = ((crop.x - pcrop.x).powi(2) + (crop.y - pcrop.y).powi(2)).sqrt();
+        let d_crop_h_pct = 100.0 * (crop.h - pcrop.h) / pcrop.h.max(1.0);
+        let sig_same = span_sig(a0, a1) == span_sig(b0, b1);
+        let pan = p.pan_to.is_some() || s.pan_to.is_some();
+        println!(
+            "  #{j}->#{i} {} gap {:>4.1}s | subj d({:+5.0},{:+5.0})={:>4.0}px dh {:+5.1}% | crop dpos {:>4.0}px dh {:+6.1}% | sig {}{}",
+            speaker::track_label(id),
+            s.start_s - p.end_s,
+            bx - ax,
+            by - ay,
+            d_center,
+            d_h_pct,
+            d_crop_pos,
+            d_crop_h_pct,
+            if sig_same { "same" } else { "DIFF" },
+            if pan { " | PAN" } else { "" }
+        );
+        if !pan {
+            let row = (d_center, d_h_pct.abs(), d_crop_pos, d_crop_h_pct.abs());
+            if sig_same {
+                same_sig.push(row);
+            } else {
+                diff_sig.push(row);
+            }
+        }
+    }
+    let stats = |v: &[(f32, f32, f32, f32)], pick: fn(&(f32, f32, f32, f32)) -> f32| -> String {
+        if v.is_empty() {
+            return "-".into();
+        }
+        let mut xs: Vec<f32> = v.iter().map(pick).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        format!("med {:.1} max {:.1}", xs[xs.len() / 2], xs[xs.len() - 1])
+    };
+    for (name, v) in [("same-sig", &same_sig), ("diff-sig", &diff_sig)] {
+        println!(
+            "  {name} pairs ({}): subj dcenter px [{}] |dh|% [{}] | crop dpos px [{}] |dh|% [{}]",
+            v.len(),
+            stats(v, |r| r.0),
+            stats(v, |r| r.1),
+            stats(v, |r| r.2),
+            stats(v, |r| r.3)
+        );
+    }
+
+    // --- best prior anchor per solo piece: what the framing memory would
+    // actually find. For each solo shot, the prior same-track solo shot whose
+    // subject geometry is closest (center px + 4x |dh| px) — small deltas mark
+    // a RETURN to an already-framed camera (the reuse candidates), large ones
+    // a first visit to a new angle. Fractions are of the anchor's face height
+    // (fh) and crop width, the scale-free units a dead-zone would use.
+    println!("\n== best prior anchor per solo piece (the memory's view):");
+    let mut solos: Vec<(usize, usize, f32, f32, f32, &yc_core::Crop)> = Vec::new(); // (shot idx, track, cx, cy, fh, crop)
+    for (i, s) in plan.shots.iter().enumerate() {
+        let (Some(id), yc_core::Layout::FullFrame { crop }) = (s.track, &s.layout) else {
+            continue;
+        };
+        let Some(tr) = analysis.tracks.iter().find(|t| t.id == id) else { continue };
+        let (b0, b1) = span_bins(s);
+        let Some((cx, cy, fh)) = shot_subj(tr, b0, b1) else { continue };
+        let best = solos
+            .iter()
+            .filter(|(_, tid, ..)| *tid == id)
+            .map(|(j, _, ax, ay, ah, ac)| {
+                let dc = ((cx - ax).powi(2) + (cy - ay).powi(2)).sqrt();
+                let dh = fh - ah;
+                (dc + 4.0 * dh.abs(), *j, dc, dh, *ah, *ac)
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((_, j, dc, dh, ah, ac)) = best {
+            let dcrop_pos = ((crop.x - ac.x).powi(2) + (crop.y - ac.y).powi(2)).sqrt();
+            println!(
+                "  #{i} {} <- #{j}: subj dcenter {:>4.0}px ({:.2} fh, {:.2} crop-w) dh {:+5.1}% | crop would jump dpos {:>4.0}px dh {:+6.1}%{}",
+                speaker::track_label(id),
+                dc,
+                dc / ah.max(1.0),
+                dc / ac.w.max(1.0),
+                100.0 * dh / ah.max(1.0),
+                dcrop_pos,
+                100.0 * (crop.h - ac.h) / ac.h.max(1.0),
+                if plan.shots[i].pan_to.is_some() { " | PAN" } else { "" }
+            );
+        } else {
+            println!(
+                "  #{i} {}: first solo piece of its track (no prior anchor)",
+                speaker::track_label(id)
+            );
+        }
+        // A panning piece anchors its CLOSING crop (where the subject ended),
+        // matching the production memory.
+        solos.push((i, id, cx, cy, fh, plan.shots[i].pan_to.as_ref().unwrap_or(crop)));
+    }
+
     // --- the real filtergraph (render it with export_args-style ffmpeg flags
     // to SEE this plan; clip.ass + fonts live in the data dir) ----------------
     let fg = data_dir.join("camera_diag.fg");
     std::fs::write(&fg, yc_render::build_camera_filtergraph(&plan, "clip.ass"))?;
     println!("\nfiltergraph: {}", fg.display());
+
+    // Render THIS plan (the production camera) with the production export
+    // command — the camera-smoothing gate artifact. A separate env var from
+    // YC_VOICE_RENDER so the diarization gate's diar_*.mp4 A/B files are
+    // never clobbered.
+    if std::env::var_os("YC_SMOOTH_RENDER").is_some() {
+        let ffabs = std::fs::canonicalize(ffmpeg)?;
+        let args = yc_render::export_args_script(
+            Path::new("segment.mp4"),
+            seek_s,
+            dur,
+            "camera_diag.fg",
+            "../camera_smoothing.mp4",
+        );
+        println!("rendering ../camera_smoothing.mp4 ...");
+        yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+    }
 
     // --- per-bin CSV for deeper digging ---------------------------------------
     if let Some(csv) = csv_out {

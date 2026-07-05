@@ -146,6 +146,24 @@ const FOLLOW_EDGE_S: f64 = 1.6;
 const SPAN_P_LO: f32 = 0.10;
 const SPAN_P_HI: f32 = 0.90;
 
+/// Piece-to-piece framing memory (the jump-cut crop stability): a solo angle
+/// piece REUSES a remembered framing instead of re-deriving one while its
+/// subject's measured geometry stays inside the dead-zone — center within
+/// [`REUSE_CENTER_FH`] anchor face heights AND face height within
+/// [`REUSE_H_FRAC`] of the anchor's. Measured on the production fixtures
+/// (Deddy + ANTITESA): returns to an already-framed camera sit at ≤0.26 fh
+/// center / ≤7% height while real angle changes sit at ≥0.39 fh or ≥21%
+/// height — the thresholds live in that gap. Any reuse also requires the
+/// piece's whole [`SPAN_P_LO`]..[`SPAN_P_HI`] center band to stay at least a
+/// face's own extent plus air inside the reused crop (per-axis insets — a
+/// face is ~0.4 fh half-wide but 0.5 fh half-tall, and a solo crop is only
+/// ~2 fh wide against 3.6 fh tall), so a remembered framing can never crop
+/// through a bobbing face.
+const REUSE_CENTER_FH: f32 = 0.30;
+const REUSE_H_FRAC: f32 = 0.12;
+const REUSE_GUARD_X_FH: f32 = 0.55;
+const REUSE_GUARD_Y_FH: f32 = 0.75;
+
 /// One tracked person: a representative face box, how often they were
 /// visible, their per-bin mouth activity, and where the face actually was per
 /// bin. `id` is the track's index after the left-to-right relabel — 0 is
@@ -847,8 +865,20 @@ pub fn plan_shots(
     //    subject was never detected (occluded through that whole angle) keeps
     //    the previous piece's framing rather than snapping to a stale
     //    landmark.
+    //
+    //    Piece framing carries a whole-clip FRAMING MEMORY per seat
+    //    ([`piece_framing`]): a piece whose subject is still inside a
+    //    remembered framing's dead-zone reuses that crop verbatim, so a jump
+    //    cut back to an already-framed camera never twitches the zoom (the
+    //    re-derive-per-piece breathing measured 894->702->884->736 px across
+    //    27 s on the Deddy fixture), while a real angle change — a different
+    //    position or face size, including a different human in the same seat
+    //    (ADR 0042) — fails the dead-zone and re-frames fully at the cut,
+    //    where a re-frame is perceptually free.
     let mut cut_list: Vec<f64> = cuts.to_vec();
     cut_list.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut memory: std::collections::HashMap<usize, Vec<FramingAnchor>> =
+        std::collections::HashMap::new();
     let mut shots = Vec::with_capacity(final_runs.len());
     let mut t = 0.0f64;
     let mut bin = 0usize;
@@ -880,7 +910,14 @@ pub fn plan_shots(
             let pb1 = ((p1 / bin_s).round() as usize).clamp(pb0, b1);
             let (track, layout, pan_to) = match subj {
                 Subject::Track(id) => match analysis.tracks.iter().find(|tr| tr.id == *id) {
-                    Some(tr) => match solo_span_framing(tr, pb0, pb1, src_w, src_h) {
+                    Some(tr) => match piece_framing(
+                        tr,
+                        pb0,
+                        pb1,
+                        src_w,
+                        src_h,
+                        memory.entry(*id).or_default(),
+                    ) {
                         Some((c0, pan)) => (Some(*id), Layout::FullFrame { crop: c0 }, pan),
                         // Subject undetected through this piece: continuity
                         // first (the previous angle's framing), then the run,
@@ -1323,6 +1360,85 @@ pub fn solo_span_framing(
     Some((c0, Some(c1)))
 }
 
+/// One remembered solo framing for a seat: where the subject was measured
+/// (the piece's center-band midpoint and median face height) and the crop
+/// that piece emitted. Anchors are FIXED — a reuse never re-baselines one —
+/// so a slow drift accumulates delta against the original anchor and earns
+/// one honest re-frame when it becomes real, instead of creeping the camera
+/// along in sub-dead-zone steps that never re-frame at all.
+struct FramingAnchor {
+    cx: f32,
+    cy: f32,
+    fh: f32,
+    crop: Crop,
+}
+
+/// Solo framing for one angle piece, stabilized by the seat's framing memory
+/// (`anchors`, whole-clip). The fresh framing is [`solo_span_framing`]'s;
+/// then, most-recent anchor first:
+///
+/// - a piece that PANS (real within-piece drift) never reuses — it frames
+///   fresh and remembers its CLOSING state (tail center, closing crop), so
+///   the next piece matches where the subject ended up;
+/// - a static piece whose subject still sits inside an anchor's dead-zone
+///   ([`REUSE_CENTER_FH`] / [`REUSE_H_FRAC`]) reuses that anchor's crop
+///   VERBATIM — the zero-twitch jump cut (a human editor cutting back to
+///   the same camera reuses the same framing);
+/// - failing the center test but matching an anchor's face height, it
+///   reuses that anchor's SIZE re-placed at its own center — a lean moves
+///   the camera, never the zoom — and becomes a new anchor;
+/// - otherwise it frames fresh and becomes a new anchor.
+///
+/// Every reuse also passes the [`REUSE_GUARD_X_FH`]/[`REUSE_GUARD_Y_FH`]
+/// band-containment guard; a piece that bobs beyond the remembered framing
+/// falls through to fresh.
+fn piece_framing(
+    track: &SpeakerTrack,
+    lo: usize,
+    hi: usize,
+    src_w: f32,
+    src_h: f32,
+    anchors: &mut Vec<FramingAnchor>,
+) -> Option<(Crop, Option<Crop>)> {
+    let (c0, pan) = solo_span_framing(track, lo, hi, src_w, src_h)?;
+    let med = span_median_box(&track.path, lo, hi)?;
+    let (cx_lo, cx_hi, cy_lo, cy_hi) = span_center_band(&track.path, lo, hi)?;
+    if let Some(c1) = pan {
+        let (ex, ey) = edge_center(&track.path, lo, hi, true)?;
+        anchors.push(FramingAnchor { cx: ex, cy: ey, fh: med.h, crop: c1 });
+        return Some((c0, Some(c1)));
+    }
+    let (sx, sy) = ((cx_lo + cx_hi) * 0.5, (cy_lo + cy_hi) * 0.5);
+    let fits = |crop: &Crop, fh: f32| {
+        let (ix, iy) = (REUSE_GUARD_X_FH * fh, REUSE_GUARD_Y_FH * fh);
+        cx_lo >= crop.x + ix
+            && cx_hi <= crop.x + crop.w - ix
+            && cy_lo >= crop.y + iy
+            && cy_hi <= crop.y + crop.h - iy
+    };
+    // Verbatim reuse: the subject is still inside a remembered framing's
+    // dead-zone, so the crop must not move at all.
+    if let Some(a) = anchors.iter().rev().find(|a| {
+        ((sx - a.cx).powi(2) + (sy - a.cy).powi(2)).sqrt() <= REUSE_CENTER_FH * a.fh
+            && (med.h - a.fh).abs() <= REUSE_H_FRAC * a.fh
+            && fits(&a.crop, a.fh)
+    }) {
+        return Some((a.crop, None));
+    }
+    // Size reuse: the same face height at a genuinely new position — keep
+    // the remembered zoom, re-place it on the subject.
+    if let Some(a) = anchors.iter().rev().find(|a| (med.h - a.fh).abs() <= REUSE_H_FRAC * a.fh) {
+        let c = place_crop(sx, sy, a.crop.w, a.crop.h, src_w, src_h);
+        if fits(&c, a.fh) {
+            anchors.push(FramingAnchor { cx: sx, cy: sy, fh: med.h, crop: c });
+            return Some((c, None));
+        }
+    }
+    // Fresh framing, new anchor.
+    anchors.push(FramingAnchor { cx: sx, cy: sy, fh: med.h, crop: c0 });
+    Some((c0, None))
+}
+
 /// A split-screen panel's crop for one face: the panel's aspect, zoomed to
 /// [`SPLIT_ZOOM`] face-heights, headroom-biased, clamped.
 fn panel_crop(face: &FaceBox, src_w: f32, src_h: f32, panel_aspect: f32) -> Crop {
@@ -1740,6 +1856,134 @@ mod tests {
         let plan =
             plan_shots(&analysis(vec![Some(0); n], vec![ta, tb]), 1920.0, 1080.0, 12.0, &[0.2]);
         assert_eq!(plan.shots.len(), 1, "a 0.2 s sliver folds into the shot: {plan:?}");
+    }
+
+    /// A subject path built from back-to-back camera visits: the face sits at
+    /// (center x, face height) for `secs` per visit, with a source cut between
+    /// visits. Returns the path, the cut times, and the total duration.
+    fn visits_path(visits: &[(f32, f32, f64)]) -> (Vec<Option<FaceBox>>, Vec<f64>, f64) {
+        let mut path = Vec::new();
+        let mut cuts = Vec::new();
+        let mut t = 0.0f64;
+        for &(cx, h, secs) in visits {
+            for _ in 0..nbins(secs) {
+                path.push(Some(fb(cx - h * 0.5, 325.0, h, h)));
+            }
+            t += secs;
+            cuts.push(t);
+        }
+        cuts.pop();
+        (path, cuts, t)
+    }
+
+    /// Attribution-regime plan for one speaker on `path`: a context face keeps
+    /// both seats always visible (static-wide regime), the given source cuts
+    /// split the speaker's run into angle pieces.
+    fn plan_for_visits(path: Vec<Option<FaceBox>>, cuts: &[f64], dur: f64) -> CameraPlan {
+        let n = path.len();
+        let med = median_box(&path.iter().flatten().copied().collect::<Vec<_>>());
+        let ta = SpeakerTrack { id: 0, bbox: med, presence: 1.0, activity: vec![0.0; n], path };
+        let tb = SpeakerTrack {
+            id: 1,
+            bbox: fb(1500.0, 325.0, 150.0, 150.0),
+            presence: 1.0,
+            activity: vec![0.0; n],
+            path: (0..n).map(|_| Some(fb(1500.0, 325.0, 150.0, 150.0))).collect(),
+        };
+        plan_shots(&analysis(vec![Some(0); n], vec![ta, tb]), 1920.0, 1080.0, dur, cuts)
+    }
+
+    fn solo_crop_of(plan: &CameraPlan, i: usize) -> Crop {
+        match &plan.shots[i].layout {
+            Layout::FullFrame { crop } => *crop,
+            other => panic!("expected solo piece, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_jump_cut_back_to_the_same_camera_reuses_the_framing() {
+        // A-B-A camera alternation while one seat keeps talking: the return
+        // piece must reuse the FIRST piece's crop VERBATIM (the measured
+        // jump-cut twitch: re-deriving each piece from its own bins re-zoomed
+        // 894->702->884 px on Deddy), while the middle piece — a real angle
+        // change, new position AND face size — re-frames fully.
+        let (path, cuts, dur) =
+            visits_path(&[(400.0, 150.0, 4.0), (900.0, 100.0, 4.0), (404.0, 152.0, 4.0)]);
+        let plan = plan_for_visits(path, &cuts, dur);
+        assert_eq!(plan.shots.len(), 3, "{plan:?}");
+        let (c0, c1, c2) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 1), solo_crop_of(&plan, 2));
+        assert_eq!(c0, c2, "the return to the first camera reuses its framing verbatim");
+        assert!((c1.h - c0.h).abs() > 100.0, "the real angle change re-frames: {c0:?} vs {c1:?}");
+    }
+
+    #[test]
+    fn a_real_zoom_change_refuses_the_remembered_framing() {
+        // Same seat position, but the source cut to a tighter framing (face
+        // height +33%): the height gate must re-frame — reusing the wide crop
+        // would shrink a face the source meant to be big.
+        let (path, cuts, dur) = visits_path(&[(400.0, 150.0, 4.0), (400.0, 200.0, 4.0)]);
+        let plan = plan_for_visits(path, &cuts, dur);
+        assert_eq!(plan.shots.len(), 2, "{plan:?}");
+        let (c0, c1) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 1));
+        assert!(c1.h > c0.h * 1.2, "a zoomed source piece frames fresh: {c0:?} vs {c1:?}");
+    }
+
+    #[test]
+    fn a_lean_past_the_deadzone_moves_the_camera_but_not_the_zoom() {
+        // The subject re-appears 80 px away (past the 0.30 fh dead-zone) at
+        // the same face height: the piece re-places the REMEMBERED size on the
+        // new position — a lean moves the camera, never the zoom.
+        let (path, cuts, dur) = visits_path(&[(400.0, 150.0, 4.0), (480.0, 150.0, 4.0)]);
+        let plan = plan_for_visits(path, &cuts, dur);
+        assert_eq!(plan.shots.len(), 2, "{plan:?}");
+        let (c0, c1) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 1));
+        assert_eq!((c1.w, c1.h), (c0.w, c0.h), "size locks to the remembered framing");
+        assert!(c1.x > c0.x + 40.0, "position follows the subject: {c0:?} -> {c1:?}");
+    }
+
+    #[test]
+    fn fixed_anchors_earn_one_reframe_per_real_drift() {
+        // A slow slide in sub-dead-zone steps (25 px per piece, dead-zone
+        // 45 px): fixed anchors accumulate delta against the ORIGINAL anchor,
+        // so the camera reuses, re-frames ONCE when the drift becomes real,
+        // then holds the new anchor — a rolling baseline would never re-frame
+        // and let the face creep out of the crop.
+        let (path, cuts, dur) = visits_path(&[
+            (400.0, 150.0, 4.0),
+            (425.0, 150.0, 4.0),
+            (450.0, 150.0, 4.0),
+            (475.0, 150.0, 4.0),
+        ]);
+        let plan = plan_for_visits(path, &cuts, dur);
+        assert_eq!(plan.shots.len(), 4, "{plan:?}");
+        let crops: Vec<Crop> = (0..4).map(|i| solo_crop_of(&plan, i)).collect();
+        assert_eq!(crops[0], crops[1], "25 px sits inside the dead-zone: reuse");
+        assert_ne!(crops[1], crops[2], "50 px of accumulated drift re-frames once");
+        assert_eq!(crops[2], crops[3], "the new anchor holds again");
+    }
+
+    #[test]
+    fn a_panning_piece_anchors_its_closing_framing() {
+        // Piece 1 follows a real drift (a pan) and the subject then holds the
+        // new spot: the NEXT piece must reuse the pan's CLOSING crop verbatim
+        // (measured on Deddy: the return piece sat 16 px from the pan's
+        // closing crop but 79 px from its opening).
+        let mut path: Vec<Option<FaceBox>> = Vec::new();
+        for _ in 0..nbins(4.0) {
+            path.push(Some(fb(400.0 - 75.0, 325.0, 150.0, 150.0)));
+        }
+        let drift = nbins(2.0);
+        for i in 0..drift {
+            let cx = 400.0 + 300.0 * i as f32 / drift as f32;
+            path.push(Some(fb(cx - 75.0, 325.0, 150.0, 150.0)));
+        }
+        for _ in 0..nbins(2.0) + nbins(4.0) {
+            path.push(Some(fb(700.0 - 75.0, 325.0, 150.0, 150.0)));
+        }
+        let plan = plan_for_visits(path, &[4.0, 8.0], 12.0);
+        assert_eq!(plan.shots.len(), 3, "{plan:?}");
+        let pan_close = plan.shots[1].pan_to.expect("the drifting piece pans");
+        assert_eq!(solo_crop_of(&plan, 2), pan_close, "the return reuses the pan's closing crop");
     }
 
     #[test]

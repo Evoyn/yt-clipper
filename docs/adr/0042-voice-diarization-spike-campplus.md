@@ -173,6 +173,12 @@ The operator watched the A/B renders and ruled:
   re-identification** is the de-circularizing anchor, the other half of
   ADR 0038's upgrade path), and shared laughter/cross-talk is
   unattributable by design (holding the current shot there is correct).
+- The camera planner does **not** reuse the seat-geometry angle grouping:
+  per-angle crop stability shipped instead as geometry-matched **framing
+  memory** (ADR 0038 refinement, 2026-07-05) after the 60 px signature
+  measured too brittle for framing (leans split angles — on the Deddy
+  fixture every adjacent piece pair signed differently). The grouping stays
+  a harness diagnostic for the voice lane's per-angle joins.
 - On adoption the model gets an ADR 0041 registry row (URL + SHA-256 +
   size above; the Downloads UI heals a missing file). Until then the spike
   expects it at `models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`.

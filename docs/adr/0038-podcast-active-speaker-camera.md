@@ -355,3 +355,75 @@ documented upgrade path, now easier to justify since attribution operates
 on whole seats. No detector is 100 %; this refinement removes the
 structural errors (identity fragmentation and cross-angle framing), which
 is where the visible failures lived.
+
+## Refinement — framing memory: per-angle crop stability at jump cuts (2026-07-05)
+
+With cuts frame-exact and WHO structurally fixed, the operator's next
+verdict on the Deddy renders was WHERE-stability: "can we make the jitter
+tracking more smooth" — the exported camera re-framed AND re-zoomed at
+every small jump cut while the same seat kept talking. Each angle piece
+derived its crop from its own bins alone (`SOLO_ZOOM` × the piece's median
+face height + center-band growth), so Person A's crop height ran
+894→702→884→736 px across 0..27 s: detector variance, leans and per-camera
+differences re-derived a new framing at every cut a human editor would have
+cut back to with an unchanged one.
+
+The diag harness gained adjacent-piece forensics (each solo piece vs its
+best prior same-seat piece), and the numbers split bimodally on BOTH
+production fixtures:
+
+- **returns to an already-framed camera**: center ≤ 0.26 anchor face
+  heights, face height ≤ 7% off (the Deddy returns: 45/16/38/27/11/43/13 px)
+  — yet the re-derived crops jumped up to 79 px / 6.6% there: the twitch;
+- **real changes**: center ≥ 0.39 fh (a different angle re-positions the
+  seat ~100 px) or height ≥ 21.5% (a +24.7% piece is the source itself
+  cutting tighter).
+
+**Framing memory** (`piece_framing`, wrapping the step-5 solo piece chain —
+the attribution regime only): per seat, whole-clip, every framed piece
+leaves a FIXED anchor (band-center + median face height + the emitted crop;
+a panning piece anchors its CLOSING state, where the subject ended). A new
+piece searches its seat's anchors most-recent-first:
+
+- **inside the dead-zone** (center ≤ `REUSE_CENTER_FH` 0.30 fh AND height
+  ≤ `REUSE_H_FRAC` 12%, both mid-gap of the measured distributions) → the
+  anchor's crop VERBATIM — the zero-twitch jump cut. A reuse never
+  re-baselines the anchor, so a slow slide accumulates delta against the
+  original and earns ONE honest re-frame when it becomes real, always at a
+  source cut, where a re-frame is perceptually free;
+- **height matches at a genuinely new position** → the anchor's SIZE
+  re-placed on the subject: a lean moves the camera, never the zoom;
+- **otherwise** a fresh framing, a new anchor. Every reuse must also keep
+  the piece's whole P10–P90 center band a face's own extent plus air inside
+  the reused crop (`REUSE_GUARD_X_FH`/`REUSE_GUARD_Y_FH`) — a remembered
+  framing can never crop through a bobbing face; the guard falls through to
+  fresh instead.
+
+Angle identity is deliberately NOT computed. The ADR 0042 constraint — the
+same seat holds different humans across angles, so crop reuse must mean
+"same seat within the same camera angle" — is satisfied by the geometry
+match itself: a different angle either fails the dead-zone (different
+position/size → full re-frame at the cut) or matches so closely that the
+reused framing frames the new occupant correctly anyway. The spike's
+seat-geometry signature grouping (60 px grid) measured too brittle for this
+job — on the fixture EVERY adjacent piece pair got a different signature
+(leans split angles) — and stays a harness diagnostic for the voice lane
+only.
+
+Measured result on the Deddy fixture: boundaries, WHO and pans identical to
+the signed-off plan; 7 of 13 solo re-derives became verbatim reuses (crop
+delta 0 px, 0.0%); Person A's 0..27 s alternation collapsed to exactly the
+source's two camera framings (894 and 702 px) and a pan's next same-seat
+shot now holds the pan's landing crop exactly. ANTITESA (follow-visible
+regime, which never enters step 5) re-planned byte-identical
+(`camera_diag.fg` hash-equal). The operator gate artifact is
+`camera_smoothing.mp4` (the production export command via
+`YC_SMOOTH_RENDER=1`), beside the untouched diarization A/B renders.
+
+Rejected: **hardening the signature grouping into production** (an
+angle-identity mechanism with measured false splits, superseded by direct
+geometry matching); **rolling anchor re-baselines** (each piece comparing
+to its predecessor — a sub-dead-zone slide would then never re-frame and
+walk the face out of the crop); **previous-piece-only comparison** (an
+A-B-A camera alternation re-derives on every return, keeping the 894-vs-884
+class of pop the memory exists to kill).

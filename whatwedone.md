@@ -4,6 +4,46 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-05 (late night) — Framing memory: the jump-cut camera twitch is gone
+
+The operator's ask after the diarization gate renders — "can we make the
+jitter tracking more smooth" — turned out to be the attribution regime
+re-deriving every angle piece's crop from that piece's own bins: Person A's
+zoom breathed 894→702→884→736 px across 27 s of one seat talking. One
+session, one mechanism (ADR 0038's new "framing memory" refinement):
+
+- **Measured first**: speaker_diag gained adjacent-piece and
+  best-prior-anchor forensics; on BOTH fixtures the numbers split bimodally
+  — returns to an already-framed camera sit ≤0.26 face-heights / ≤7%
+  height off, real changes ≥0.39 fh / ≥21.5% — so the dead-zone (0.30 fh /
+  12%) was picked from the measured gap, not invented. (The session
+  prompt's "subject barely moved" hunch was half-wrong: adjacent pieces
+  are different ANGLES and genuinely move ~100 px; it's the RETURNS that
+  barely move, which is what the memory acts on.)
+- **Framing memory** (`piece_framing`, attribution regime's solo pieces
+  only): per seat, whole-clip, FIXED anchors. Inside the dead-zone → the
+  remembered crop VERBATIM (zero-twitch jump cut); same face height at a
+  genuinely new position → the remembered SIZE re-placed (a lean moves the
+  camera, never the zoom); otherwise fresh, always at a source cut where a
+  re-frame is perceptually free. A per-axis band guard means a reused
+  framing can never crop through a bobbing face. Angle identity is
+  deliberately NOT computed — the geometry match subsumes it, so ADR
+  0042's different-humans-per-seat constraint holds by construction, and
+  the brittle 60 px signature stays a voice-lane diagnostic.
+- **Result on Deddy**: boundaries, WHO and pans identical to the
+  signed-off plan; 7 of 13 solo re-derives became exact reuses (Person A's
+  0..27 s alternation is now exactly the source's two framings, 894 and
+  702 px); a pan's next same-seat shot holds the pan's landing crop
+  exactly. ANTITESA: byte-identical filtergraph (hash-checked). 293 tests
+  green (5 new).
+- **Gate artifact**: `camera_smoothing.mp4` (new `YC_SMOOTH_RENDER=1`,
+  the production export command, kept separate so the diar_* A/B renders
+  survive) — awaiting the operator's eyes; the verdict opens the next
+  session's grill.
+
+Next queued: the diarization integration slice
+(nextprompt-diarization-integration.md).
+
 ## 2026-07-05 (night) — Diarization spike: a voice lane that hears who the camera can't see
 
 The operator's verdict on the Deddy render ("the cut is good… not framing
