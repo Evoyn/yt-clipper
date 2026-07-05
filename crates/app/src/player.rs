@@ -17,8 +17,13 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use yc_core::NoConsole;
 
-/// Preview playback frame rate. 24 fps reads as normal video motion (the
-/// operator's ask); the decode + pipe cost at preview resolution is trivial.
+/// Fallback preview frame rate when the source's own rate is unknown (a probe
+/// without `r_frame_rate`). When the real rate IS known the decode runs on the
+/// SOURCE's grid instead: `fps=<source rate>` maps source frames 1:1 onto
+/// delivered frames, so `frames_seen / fps` is exact content time and the
+/// camera crop can bind to the precise frame on screen. A hardcoded 24 over a
+/// 23.976 source re-quantizes every cut by up to a frame (a per-cut coin flip
+/// — the preview twin of the render's trim-rounding flash).
 pub const PLAY_FPS: f64 = 24.0;
 /// Longest edge of the live playback frame — quality is explicitly secondary
 /// to motion here (the render always reads the full-res source).
@@ -31,17 +36,29 @@ pub struct PreviewPlayer {
     rx: Receiver<Vec<u8>>,
     w: usize,
     h: usize,
+    /// The decode grid (the source's probed rate, or [`PLAY_FPS`] fallback):
+    /// delivered frame n spans `[n/fps, (n+1)/fps)` of content time.
+    fps: f64,
     texture: Option<egui::TextureHandle>,
     /// Whether any frame has arrived yet (until then callers should keep
     /// showing the filmstrip so Play never flashes black).
     got_frame: bool,
     /// Total frames the decoder has delivered (including any coalesced when the
-    /// UI drains to newest). At [`PLAY_FPS`] this **is** the video's elapsed
+    /// UI drains to newest). Over [`Self::fps`] this **is** the video's elapsed
     /// content time — the caller drives the playhead by it so the crop can
     /// never run ahead of the frame actually on screen (the "blank before the
     /// cut": a wall-clock playhead outpaces a decoder that isn't perfectly
     /// real-time, switching the crop before the new shot is visible).
     frames_seen: u64,
+}
+
+/// Content time (seconds) of the MIDDLE of the newest delivered frame —
+/// frames `0..n` delivered, so the one on screen spans `[(n-1)/fps, n/fps)`.
+/// The midpoint is the robust instant to pick the camera shot with: a cut
+/// boundary is an exact frame pts, so comparing at mid-frame tolerates up to
+/// half a frame of seek/grid phase in either direction.
+pub(crate) fn frame_mid_s(frames_seen: u64, fps: f64) -> f64 {
+    (frames_seen as f64 - 0.5) / fps.max(1e-6)
 }
 
 /// Aspect-preserving even dimensions with the longest edge capped.
@@ -57,10 +74,11 @@ fn play_dims(src_w: f32, src_h: f32) -> (usize, usize) {
 }
 
 impl PreviewPlayer {
-    /// Start decoding `src` from `seek_s` (in-source seconds) for `dur_s`.
-    /// `-re` paces delivery at real time, so draining to the newest frame
-    /// keeps video within ~a frame of the app's wall-clock playhead (the
-    /// audio runs beside it in rodio, same clock).
+    /// Start decoding `src` from `seek_s` (in-source seconds) for `dur_s`,
+    /// on the source's own frame grid (`src_fps`, probed; 0 falls back to
+    /// [`PLAY_FPS`]). `-re` paces delivery at real time, so draining to the
+    /// newest frame keeps video within ~a frame of the app's wall-clock
+    /// playhead (the audio runs beside it in rodio, same clock).
     pub fn spawn(
         ffmpeg: &Path,
         src: &PathBuf,
@@ -68,8 +86,10 @@ impl PreviewPlayer {
         dur_s: f64,
         src_w: f32,
         src_h: f32,
+        src_fps: f64,
     ) -> std::io::Result<Self> {
         let (w, h) = play_dims(src_w, src_h);
+        let fps = if src_fps.is_finite() && src_fps > 0.0 { src_fps } else { PLAY_FPS };
         let mut child = Command::new(ffmpeg)
             .no_console()
             .args([
@@ -82,7 +102,7 @@ impl PreviewPlayer {
                 &format!("{:.3}", dur_s.max(0.05)),
                 "-an",
                 "-vf",
-                &format!("fps={PLAY_FPS},scale={w}:{h}:flags=fast_bilinear"),
+                &format!("fps={fps},scale={w}:{h}:flags=fast_bilinear"),
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -113,15 +133,21 @@ impl PreviewPlayer {
                 }
             }
         });
-        Ok(Self { child, rx, w, h, texture: None, got_frame: false, frames_seen: 0 })
+        Ok(Self { child, rx, w, h, fps, texture: None, got_frame: false, frames_seen: 0 })
     }
 
     /// The video's elapsed **content** time (seconds) — frames delivered so far
-    /// over [`PLAY_FPS`] — or `None` before the first frame. The caller adds it
-    /// to the play offset for the playhead, so the crop follows the frame on
-    /// screen exactly and can never flash the next shot before it is visible.
+    /// over the decode grid — or `None` before the first frame. The caller adds
+    /// it to the play offset for the playhead (the audio/caption clock).
     pub fn video_secs(&self) -> Option<f64> {
-        (self.frames_seen > 0).then(|| self.frames_seen as f64 / PLAY_FPS)
+        (self.frames_seen > 0).then(|| self.frames_seen as f64 / self.fps.max(1e-6))
+    }
+
+    /// Content time of the midpoint of the frame currently ON SCREEN, or
+    /// `None` before the first frame — what the camera crop must be picked
+    /// with (see [`frame_mid_s`]).
+    pub fn shown_frame_mid_s(&self) -> Option<f64> {
+        (self.frames_seen > 0).then(|| frame_mid_s(self.frames_seen, self.fps))
     }
 
     /// Drain to the newest decoded frame and return the live texture to draw,

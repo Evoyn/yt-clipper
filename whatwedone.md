@@ -4,6 +4,28 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-05 (later) — the same blank in the Studio preview + one camera control
+
+Operator confirmed the fixed export's cuts are clean, then caught the **same
+blank in the editor preview**. Same disease, different quantizer: the preview
+picked the camera crop by the **playhead clock**, but the screen shows the
+~2-4 fps filmstrip frame *nearest* the playhead when paused (up to hundreds
+of ms away — parked just past a ✂ marker, the new crop sat over the old
+scene for as long as you looked), and during playback the live pipe decoded
+at a hardcoded 24 fps over the 23.976 source (the same per-cut coin flip the
+render had). Fix, one principle: **the crop, tracking chip, face highlight,
+and face-click retarget are all picked at the content time of the frame
+actually on screen** (`display_time`: shown strip frame's time paused, newest
+live frame's midpoint playing), never the playhead — and the live decode now
+runs on the **source's own probed fps grid**, so the preview switch always
+lands on the same displayed frame as the content switch, at any preview
+resolution. The playhead stays the audio/caption clock, untouched.
+
+Also merged the redundant camera controls (operator ask): the **"Detect
+speakers" button is gone** — picking **Active Speaker / Group** already runs
+the same analysis automatically on first use (the chips now say so on hover);
+Failed keeps Retry. One control, one concept. (ADR 0038)
+
 ## 2026-07-05 — the flash-at-a-cut P1: one rounded digit, not a timing model
 
 **The Active Speaker "blank at a cut" (an empty seat / half-out person for one

@@ -125,6 +125,10 @@ pub struct EditorState {
     ffmpeg: std::path::PathBuf,
     render_src: std::path::PathBuf,
     seek_s: f64,
+    /// Probed source frame rate (0 = unknown → the player's fallback). The
+    /// live decode runs on this grid so delivered-frame counts convert
+    /// exactly to content time (see [`Self::display_time`]).
+    src_fps: f64,
     /// The auto-detected seed, kept for "Reset to auto".
     auto_layout: Layout,
     kind: LayoutKind,
@@ -199,6 +203,7 @@ impl EditorState {
         ffmpeg: std::path::PathBuf,
         render_src: std::path::PathBuf,
         seek_s: f64,
+        src_fps: f64,
     ) -> Self {
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
             seed_fields(&auto_layout, src_w, src_h);
@@ -220,6 +225,7 @@ impl EditorState {
             ffmpeg,
             render_src,
             seek_s,
+            src_fps,
             auto_layout,
             kind,
             seam,
@@ -659,6 +665,7 @@ impl EditorState {
             remaining,
             self.src_w,
             self.src_h,
+            self.src_fps,
         ) {
             Ok(p) => self.live = Some(p),
             Err(e) => tracing::warn!("live preview unavailable ({e}); filmstrip playback"),
@@ -717,9 +724,34 @@ impl EditorState {
                 }
             }
         }
-        let idx = ((self.playhead_s * self.frame_fps).round() as usize)
-            .min(self.frames.len().saturating_sub(1));
-        self.frames[idx].id()
+        self.frames[self.strip_idx()].id()
+    }
+
+    /// The filmstrip frame [`Self::frame_tex`] shows for the current playhead.
+    fn strip_idx(&self) -> usize {
+        ((self.playhead_s * self.frame_fps).round() as usize)
+            .min(self.frames.len().saturating_sub(1))
+    }
+
+    /// The clip time of the frame the preview is actually SHOWING — the only
+    /// correct time to pick the camera shot / face overlays with. The playhead
+    /// is a *clock* (audio and captions follow it); the picture quantizes it:
+    /// the ~2-4 fps filmstrip while paused/scrubbing (the nearest strip frame
+    /// can sit up to half a strip interval — hundreds of ms — away), the live
+    /// stream's newest delivered frame while playing. Picking the crop by the
+    /// clock instead of the picture paints the incoming shot's crop over the
+    /// outgoing shot's pixels around every cut: the editor's "blank at a cut"
+    /// (the render-side twin was the trim rounding fixed in `yc-render`).
+    /// Frame MIDPOINTS make the boundary comparison robust to sub-frame phase
+    /// (a cut boundary is an exact frame pts).
+    fn display_time(&self) -> f64 {
+        if self.playing.is_some() {
+            if let Some(mid) = self.live.as_ref().and_then(|l| l.shown_frame_mid_s()) {
+                let (_, offset) = self.playing.expect("playing");
+                return offset + mid;
+            }
+        }
+        strip_frame_time_s(self.strip_idx(), self.frame_fps)
     }
 
     /// Output view: the composited 9:16 result at the playhead — panels,
@@ -728,7 +760,10 @@ impl EditorState {
         let tex = self.frame_tex(ui.ctx());
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, CornerRadius::same(4), Color32::BLACK);
-        let layout = self.effective_layout(self.playhead_s);
+        // The crop follows the frame the texture is showing, NOT the playhead
+        // clock — see display_time (the "blank at a cut" otherwise).
+        let shown_t = self.display_time();
+        let layout = self.effective_layout(shown_t);
         let manual = self.camera_mode == CameraMode::Manual;
         match &layout {
             Layout::Stacked { seam, gameplay, facecam } => {
@@ -777,19 +812,20 @@ impl EditorState {
         if self.show_safe_area {
             draw_safe_area(&painter, canvas);
         }
-        // Tracking chip (Active Speaker): who the camera is on, how sure.
+        // Tracking chip (Active Speaker): who the camera is on, how sure —
+        // for the shot of the frame on screen (same time as the crop above).
         if self.camera_mode == CameraMode::ActiveSpeaker {
             if let Some(a) = &self.speakers {
                 let text = match self
                     .plan
                     .as_ref()
-                    .and_then(|p| p.shot_at(self.playhead_s))
+                    .and_then(|p| p.shot_at(shown_t))
                     .and_then(|s| s.track)
                 {
                     Some(id) => format!(
                         "Tracking {} · {:.0}%",
                         track_label(id),
-                        (a.confidence_at(self.playhead_s) * 100.0).clamp(0.0, 100.0)
+                        (a.confidence_at(shown_t) * 100.0).clamp(0.0, 100.0)
                     ),
                     None => "Group shot".to_string(),
                 };
@@ -987,10 +1023,12 @@ impl EditorState {
                 .map(|(i, f)| (i, f.bbox, track_label(i)))
                 .collect(),
         };
+        // "Active" = the shot of the frame ON SCREEN (display_time, not the
+        // playhead clock), so the highlighted face always matches the picture.
         let active = self
             .plan
             .as_ref()
-            .and_then(|p| p.shot_at(self.playhead_s))
+            .and_then(|p| p.shot_at(self.display_time()))
             .and_then(|s| s.track)
             .filter(|_| self.camera_mode == CameraMode::ActiveSpeaker);
         for (id, b, label) in &boxes {
@@ -1019,8 +1057,8 @@ impl EditorState {
     }
 
     /// Clicking a face: in Active Speaker mode, retarget the shot under the
-    /// playhead to that person (the manual override focus asks for); in the
-    /// static modes, frame that face.
+    /// DISPLAYED frame to that person (the manual override focus asks for);
+    /// in the static modes, frame that face.
     fn click_face(&mut self, id: usize) {
         let Some(track_bbox) = self
             .speakers
@@ -1033,8 +1071,12 @@ impl EditorState {
         match self.camera_mode {
             CameraMode::ActiveSpeaker => {
                 let (src_w, src_h) = (self.src_w, self.src_h);
+                // Retarget the shot of the frame the operator is LOOKING AT
+                // (display_time): near a cut the playhead clock can sit one
+                // shot over from the picture that prompted the click.
+                let t = self.display_time();
                 if let Some(plan) = &mut self.plan {
-                    if let Some(shot) = plan.shot_at_mut(self.playhead_s) {
+                    if let Some(shot) = plan.shot_at_mut(t) {
                         shot.track = Some(id);
                         shot.layout = Layout::FullFrame {
                             crop: yc_frame::speaker::solo_crop(&track_bbox, src_w, src_h),
@@ -1512,7 +1554,14 @@ impl EditorState {
                     _ => camera_mode_label(mode).to_string(),
                 };
                 // Full-width rows: every mode the same size, nothing shifts.
-                let resp = theme::wide_button(ui, theme::chip(selected, &label));
+                let mut resp = theme::wide_button(ui, theme::chip(selected, &label));
+                if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group) {
+                    // One control, not two: picking an AI mode IS the speaker
+                    // detection (the old separate "Detect speakers" button ran
+                    // the identical job and read as a different feature).
+                    resp = resp
+                        .on_hover_text("First use runs the speaker analysis (CPU, ~10-30 s)");
+                }
                 if resp.clicked() {
                     self.camera_mode = mode;
                     if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group)
@@ -1527,14 +1576,7 @@ impl EditorState {
             ui.add_space(4.0);
             match &self.speaker_job {
                 SpeakerJob::NotRun => {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Detect speakers"))
-                        .on_hover_text("Track faces + attribute speech (CPU, ~10-30 s)")
-                        .clicked()
-                    {
-                        self.speaker_job = SpeakerJob::Running;
-                        action = Some(EditorAction::AnalyzeSpeakers);
-                    }
+                    ui.weak("Active Speaker / Group analyze speakers on first use.");
                 }
                 SpeakerJob::Running => {
                     ui.weak("Analyzing speakers…");
@@ -2442,6 +2484,47 @@ mod tests {
         assert_eq!(nice_step(0.8), 1.0);
         assert_eq!(nice_step(20.0), 30.0);
     }
+
+    #[test]
+    fn preview_crop_time_binds_to_the_shown_frame_not_the_playhead() {
+        // The editor's "blank at a cut": parked at 13.31 s — just past the
+        // ANTITESA source cut at 13.302833 — the ~1.74 fps filmstrip is still
+        // SHOWING the frame extracted at ~13.23 s (index 23, outgoing shot).
+        // Picking the crop by the playhead would paint the INCOMING shot's
+        // crop over that outgoing picture; picking by the shown frame's time
+        // keeps crop and pixels on the same side of the cut.
+        let strip_fps = 120.0 / 69.0; // this clip's real adaptive strip rate
+        let idx = ((13.31f64 * strip_fps).round() as usize).min(119); // = strip_idx()
+        let t = strip_frame_time_s(idx, strip_fps);
+        assert_eq!(idx, 23);
+        assert!(t < 13.302833, "shown frame predates the cut: {t}");
+        // Live playback decodes on the SOURCE grid (fps=src_fps): each output
+        // tick shows the last source frame with pts <= the tick, so with the
+        // real ANTITESA seek phase (frames at k*delta + 39.6 ms) the cut frame
+        // (pts 13.302833, source k=318) first APPEARS at tick 319 (13.305).
+        // The shown frame's midpoint must pick the matching side of the cut
+        // in both states: tick 318 still shows the outgoing scene, tick 319
+        // shows the incoming one.
+        let fps = 24000.0 / 1001.0;
+        let showing_outgoing = crate::player::frame_mid_s(319, fps); // ticks 0..=318
+        assert!(
+            showing_outgoing < 13.302833,
+            "old scene on screen keeps the old crop: {showing_outgoing}"
+        );
+        let showing_cut = crate::player::frame_mid_s(320, fps); // ticks 0..=319
+        assert!(
+            showing_cut > 13.302833,
+            "the tick that shows the cut frame selects the incoming shot: {showing_cut}"
+        );
+    }
+}
+
+/// Clip time of filmstrip frame `idx` — the strip is extracted at
+/// `strip_fps` from the clip start, so frame k's content sits at ~k/fps.
+/// Camera shots / overlays for a strip frame must be picked at THIS time,
+/// not the playhead's (see [`EditorState::display_time`]).
+fn strip_frame_time_s(idx: usize, strip_fps: f64) -> f64 {
+    idx as f64 / strip_fps.max(1e-6)
 }
 
 /// A round ruler step (1/2/5/10/15/30/60s ladder) at least `raw` long.

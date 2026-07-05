@@ -297,6 +297,11 @@ pub enum Progress {
         /// media the render will.
         render_src: PathBuf,
         seek_s: f64,
+        /// Probed source frame rate (0 = unknown): the live preview decodes on
+        /// the source's own grid so the camera crop can bind to the exact
+        /// frame on screen — a hardcoded rate re-quantizes cuts (the preview's
+        /// "blank at a cut").
+        src_fps: f64,
     },
     /// The podcast speaker analysis + the derived active-speaker camera plan
     /// (focus 2026-07): tracks, per-bin attribution, and cut-based shots for
@@ -355,6 +360,9 @@ struct PreparedClip {
     seek_s: f64,
     src_w: f32,
     src_h: f32,
+    /// Probed source frame rate (`r_frame_rate`; 0 = unknown) — the editor's
+    /// live preview decodes on this grid (see `Progress::Prepared::src_fps`).
+    src_fps: f64,
     range: TimeRange,
     auto_layout: Layout,
     transcript: Option<Transcript>,
@@ -479,6 +487,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                                 faces,
                                 render_src: pc.render_src.clone(),
                                 seek_s: pc.seek_s,
+                                src_fps: pc.src_fps,
                             });
                             prepared = Some(pc);
                         }
@@ -1329,14 +1338,14 @@ fn do_prepare(
 
     // Obtain the render source, the in-segment seek offset, and the source
     // resolution (for the Layout).
-    let (render_src, seek_s, src_w, src_h) = match &session.promote {
+    let (render_src, seek_s, src_w, src_h, src_fps) = match &session.promote {
         PromoteSource::Local(path) => {
             let p = yc_ingest::probe_segment(&paths.ffprobe, path, cancel)?;
-            (path.clone(), range.start_s, p.width as f32, p.height as f32)
+            (path.clone(), range.start_s, p.width as f32, p.height as f32, p.fps)
         }
         PromoteSource::YouTube(url) => {
             let (segment, offset, p) = resolve_segment(paths, &sc, session, url, range, cancel, tx)?;
-            (segment, offset, p.width as f32, p.height as f32)
+            (segment, offset, p.width as f32, p.height as f32, p.fps)
         }
     };
 
@@ -1377,6 +1386,7 @@ fn do_prepare(
         seek_s,
         src_w,
         src_h,
+        src_fps,
         range,
         auto_layout,
         transcript: None,

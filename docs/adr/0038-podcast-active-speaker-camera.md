@@ -266,3 +266,36 @@ detector missed (no dissolve exists in this footage, and bin-grid times are
 not frame pts — re-inviting the same stranding). If a source with real
 cross-dissolves ever appears, that work needs its own frame-level evidence
 first.
+
+## Refinement — the preview crop binds to the frame on screen (2026-07-05)
+
+With the render fixed, the operator still saw the blank **in the Studio
+preview**: the same disease, different quantizer. The preview picked the
+camera shot by the **playhead clock**, but the playhead is not what is on
+screen — the picture quantizes it. Paused or scrubbing, the ~2-4 fps
+filmstrip shows the frame *nearest* the playhead (up to half a strip
+interval — hundreds of ms — away), so parked just past a ✂ marker the
+incoming shot's crop painted over the outgoing shot's pixels for as long as
+you looked at it. Playing, the live pipe decoded at a hardcoded `fps=24`
+over a 23.976 source, re-quantizing every cut by up to a frame — the same
+per-cut coin flip the render had.
+
+Fix, one principle: **crops, overlays, and face-click retargeting are picked
+at `display_time` — the content time of the frame actually displayed — never
+at the playhead.** The playhead remains the audio/caption clock. Paused,
+`display_time` is the shown strip frame's extraction time; playing, it is
+the **midpoint** of the newest delivered live frame (midpoints tolerate up
+to half a frame of seek/grid phase, since a cut boundary is an exact frame
+pts). The live pipe now decodes on the **source's own grid** (`fps=<probed
+r_frame_rate>`, threaded `SegmentProbe::fps` → `Progress::Prepared::src_fps`
+→ the editor → `PreviewPlayer::spawn`; 24 stays the fallback for unprobeable
+sources), so delivered-frame counts convert exactly to content time. The
+result is not "the preview switches at the cut pts" — it is stronger: the
+preview switch **always lands on the same displayed frame as the content
+switch**, whatever the strip or stream resolution.
+
+UX merge, same session (operator ask): the Camera panel's separate **"Detect
+speakers" button is gone** — it queued the identical `AnalyzeSpeakers` job
+that picking **Active Speaker / Group** already auto-queues, and read as a
+second feature. The AI mode chips carry the cost note ("first use runs the
+speaker analysis"); Failed keeps its Retry.

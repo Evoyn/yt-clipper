@@ -848,6 +848,7 @@ impl eframe::App for App {
                     frame_fps,
                     range,
                     faces,
+                    src_fps,
                     render_src,
                     seek_s,
                 } => {
@@ -905,6 +906,7 @@ impl eframe::App for App {
                             self.paths.ffmpeg(),
                             render_src,
                             seek_s,
+                            src_fps,
                         );
                         // The editor workflow pre-passes (focus 2026-07): kick
                         // transcription now so captions are editable before any

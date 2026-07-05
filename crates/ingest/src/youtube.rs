@@ -380,8 +380,8 @@ fn segment_args(url: &str, padded: TimeRange, ffmpeg: &Path, workdir: &Path) -> 
     ]
 }
 
-/// ffprobe the first video stream + container for the layout dimensions and the
-/// timeline anchor (`format=duration,start_time`).
+/// ffprobe the first video stream + container for the layout dimensions, the
+/// frame rate, and the timeline anchor (`format=duration,start_time`).
 fn probe_args(media: &Path) -> Vec<String> {
     vec![
         "-v".into(),
@@ -389,7 +389,7 @@ fn probe_args(media: &Path) -> Vec<String> {
         "-select_streams".into(),
         "v:0".into(),
         "-show_entries".into(),
-        "stream=width,height:format=duration,start_time".into(),
+        "stream=width,height,r_frame_rate:format=duration,start_time".into(),
         "-of".into(),
         "default=noprint_wrappers=1".into(),
         media.display().to_string(),
@@ -555,6 +555,12 @@ pub struct SegmentProbe {
     /// with a negative-PTS keyframe lead-in for clean decode). We still read it
     /// so the offset self-corrects if that ever changes.
     pub start_time_s: f64,
+    /// Video frame rate (`r_frame_rate`, e.g. 24000/1001 → 23.976…), 0 when
+    /// the container doesn't say. The editor's live preview decodes on THIS
+    /// grid so its delivered-frame count converts exactly to content time —
+    /// the camera crop binds to the frame on screen, and a hardcoded rate
+    /// re-quantizes every cut (the preview's "blank at a cut").
+    pub fps: f64,
 }
 
 /// ffprobe `media` for [`SegmentProbe`].
@@ -579,7 +585,18 @@ fn parse_probe(out: &str) -> Result<SegmentProbe> {
     // duration / start_time can be "N/A" on some containers; treat as 0.
     let duration_s = value("duration").and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let start_time_s = value("start_time").and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    Ok(SegmentProbe { width, height, duration_s, start_time_s })
+    // r_frame_rate is a rational ("24000/1001"), occasionally a bare number.
+    let fps = value("r_frame_rate")
+        .and_then(|v| match v.split_once('/') {
+            Some((n, d)) => {
+                let (n, d) = (n.parse::<f64>().ok()?, d.parse::<f64>().ok()?);
+                (d > 0.0).then(|| n / d)
+            }
+            None => v.parse::<f64>().ok(),
+        })
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(0.0);
+    Ok(SegmentProbe { width, height, duration_s, start_time_s, fps })
 }
 
 /// Seconds to seek into the Segment to reach the Clip's frame-accurate start.
@@ -643,7 +660,13 @@ mod tests {
 
     #[test]
     fn offset_is_the_left_pad_and_self_corrects_on_start_time() {
-        let probe = |st| SegmentProbe { width: 1920, height: 1080, duration_s: 64.0, start_time_s: st };
+        let probe = |st| SegmentProbe {
+            width: 1920,
+            height: 1080,
+            duration_s: 64.0,
+            start_time_s: st,
+            fps: 24000.0 / 1001.0,
+        };
         // Observed case: start_time = 0 -> offset is exactly the left pad.
         assert_eq!(in_segment_offset(600.0, 598.0, &probe(0.0)), 2.0);
         // If the container ever carried a residual start_time, add it.
@@ -655,11 +678,12 @@ mod tests {
     #[test]
     fn probe_parses_dims_duration_and_start_time() {
         // Shape of real ffprobe output for the spike segment.
-        let out = "width=1920\nheight=1080\nduration=60.016000\nstart_time=0.000000\n";
+        let out = "width=1920\nheight=1080\nr_frame_rate=24000/1001\nduration=60.016000\nstart_time=0.000000\n";
         let p = parse_probe(out).unwrap();
         assert_eq!((p.width, p.height), (1920, 1080));
         assert!((p.duration_s - 60.016).abs() < 1e-6);
         assert_eq!(p.start_time_s, 0.0);
+        assert!((p.fps - 24000.0 / 1001.0).abs() < 1e-9, "rational fps: {}", p.fps);
     }
 
     #[test]
@@ -669,5 +693,14 @@ mod tests {
         assert_eq!((p.width, p.height), (640, 360));
         assert_eq!(p.duration_s, 0.0);
         assert_eq!(p.start_time_s, 0.0);
+        assert_eq!(p.fps, 0.0, "absent rate reads as unknown");
+    }
+
+    #[test]
+    fn probe_fps_accepts_bare_and_rejects_degenerate_rates() {
+        let bare = "width=640\nheight=360\nr_frame_rate=30\n";
+        assert_eq!(parse_probe(bare).unwrap().fps, 30.0);
+        let zero_den = "width=640\nheight=360\nr_frame_rate=0/0\n";
+        assert_eq!(parse_probe(zero_den).unwrap().fps, 0.0);
     }
 }
