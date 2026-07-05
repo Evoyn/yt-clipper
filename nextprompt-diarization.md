@@ -49,6 +49,19 @@ people from fusing; do not weaken it).
   (prints tracks / pair forensics / attribution timeline / plan, writes the
   real filtergraph as `camera_diag.fg` + a per-bin CSV).
 
+## Operator ground truth (2026-07-05 evening, post-fix validation)
+The operator watched both fix-validation renders:
+- **ANTITESA: SIGNED OFF** (cuts clean — the trim-precision fix holds).
+- **Deddy: WHERE signed off, WHO residual** — "the cut is good you fix it,
+  but some of the cut error and not framing the one who talking. maybe we
+  need the diarization." So this session's premise is operator-confirmed,
+  not speculative: with tracking and framing structurally correct, the
+  remaining errors are attribution picking the wrong seat at some switches.
+**First thing in the grill: ask the operator for 2–3 timestamps in
+"Diskusi politik dan nutrisi (fix-validation).mp4" where the wrong person
+is framed** — those become labeled test moments for the spike (the baseline
+switch list to check against: 27.0 / 41.3 / 50.9 s, mean conf 0.38).
+
 ## The gaps diarization fills (priority order — measure, then claim)
 1. **Overlapping speech / rapid interjections** — mouth motion ties; the
    margin flips late or wrongly.

@@ -35,6 +35,13 @@ already the "lips" signal; per-voice identity (diarization) stays the
 documented upgrade path; 100 % is not a thing any detector delivers, but
 the structural failures are gone. (ADR 0038)
 
+**Operator verdict, same evening:** ANTITESA fix **signed off**; Deddy
+cuts/framing **signed off**, with a residual — some switches still frame
+the non-talker (WHO, not WHERE). Diarization is therefore
+operator-confirmed as the next lever; the ready session prompt is
+`nextprompt-diarization.md`, updated with this verdict (it opens by asking
+the operator for wrong-person timestamps as labeled test moments).
+
 ## 2026-07-05 (later) — the same blank in the Studio preview + one camera control
 
 Operator confirmed the fixed export's cuts are clean, then caught the **same
