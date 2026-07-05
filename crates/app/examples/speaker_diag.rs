@@ -13,10 +13,14 @@
 //! intermediates); the range is the clip's VOD-absolute range from
 //! project.json. Without `--features face` this prints a hint and exits.
 //!
-//! The diarization spike (ADR 0042 gate) adds a **voice lane** per candidate
-//! CAM++ model: voiced windows embedded and cosine-clustered, clusters joined
-//! to seat tracks by co-occurrence, agreement/disagreements vs the
-//! mouth-motion lane printed, lanes appended to the CSV. Also:
+//! The **voice lane** (ADR 0042, integrated) runs the PRODUCTION functions —
+//! `yc_frame::voice::{embed_windows, build_lane, fuse_attribution}` — per
+//! candidate CAM++ model, prints the evidence trail (CV-scored sweep, angle
+//! joins, off-screen suspects, disagreements), fuses the first model into
+//! the analysis exactly as `Job::AnalyzeSpeakers` does, and diffs the
+//! integrated plan against the mouth-only baseline. Lanes append to the CSV;
+//! `YC_INTEG_RENDER=1` renders the integrated plan to
+//! `../diar_integration.mp4` (the ADR 0042 integration gate artifact). Also:
 //!
 //!   … speaker_diag --features face -- selftest <wav> <wav> [<wav>…]
 //!
@@ -131,8 +135,8 @@ fn main() -> anyhow::Result<()> {
     let n_bins = (dur * fps).ceil().max(1.0) as usize;
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
-    let analysis =
-        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence };
+    let mut analysis =
+        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None };
 
     // --- scene cuts: detect_scene_cuts replica (same command, same parse) ----
     let out = std::process::Command::new(ffmpeg)
@@ -163,7 +167,9 @@ fn main() -> anyhow::Result<()> {
     cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     cuts.dedup_by(|a, b| (*a - *b).abs() < 0.02);
 
-    let plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
+    // The MOUTH-ONLY plan — the pre-integration camera, kept as the printed
+    // baseline the integrated plan is diffed against below.
+    let baseline_plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
 
     // --- forensics ------------------------------------------------------------
     let center = |t: &SpeakerTrack, b: usize| t.path.get(b).and_then(|p| p.as_ref()).map(|f| (f.cx(), f.cy()));
@@ -273,153 +279,115 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- voice lanes (diarization spike, ADR 0042): embed voiced windows,
-    // cosine-cluster them, join clusters to seat tracks by co-occurrence, and
-    // score the voice lane against the mouth lane. Models are optional — a
-    // missing file skips its lane so the visual forensics still print.
-    println!("\n== voice lanes (diarization spike):");
-    let windows = yc_frame::voice::plan_windows(&analysis.voiced, bin_s);
-    println!(
-        "  {} embed windows ({:.2}s / {:.2}s hop) over voiced spans",
-        windows.len(),
-        yc_frame::voice::WIN_S,
-        yc_frame::voice::HOP_S
-    );
-    let mut lanes: Vec<VoiceLane> = Vec::new();
-    for (tag, path, scale, cmn) in VOICE_MODELS {
-        match build_voice_lane(
-            tag,
-            Path::new(path),
+    // --- voice lanes (ADR 0042, INTEGRATED): the PRODUCTION functions —
+    // yc_frame::voice::{embed_windows, build_lane, fuse_attribution} — run
+    // here on the same inputs, so what this harness measures IS the analysis
+    // Job::AnalyzeSpeakers ships. Candidate models A/B beside the production
+    // one; a missing file skips its lane so the visual forensics still print.
+    println!("\n== voice lanes (production path):");
+    let attribution = speaker::attribution_regime(&analysis);
+    let mut lanes: Vec<(&'static str, yc_frame::voice::VoiceLane)> = Vec::new();
+    for (i, &(tag, path, scale, cmn)) in VOICE_MODELS.iter().enumerate() {
+        let model = Path::new(path);
+        if !model.is_file() {
+            println!("  [{tag}] missing {} — lane skipped", model.display());
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        let (embs, kept) = match yc_frame::voice::embed_windows(
+            model,
             scale,
             cmn,
             &samples,
-            &windows,
-            &analysis,
-            n_bins,
-            &cuts,
-            dur,
-            mean_faces >= 1.5,
+            &analysis.voiced,
+            bin_s,
         ) {
-            Ok(Some(l)) => lanes.push(l),
-            Ok(None) => {}
-            Err(e) => println!("  [{tag}] FAILED: {e:#}"),
+            Ok(v) => v,
+            Err(e) => {
+                println!("  [{tag}] FAILED: {e:#}");
+                continue;
+            }
+        };
+        println!(
+            "  [{tag}] {} windows ({:.2}s / {:.2}s hop) embedded in {:.1}s",
+            embs.len(),
+            yc_frame::voice::WIN_S,
+            yc_frame::voice::HOP_S,
+            t0.elapsed().as_secs_f32()
+        );
+        let Some((mut lane, diag)) =
+            yc_frame::voice::build_lane(&embs, &kept, &analysis, &cuts, dur, attribution)
+        else {
+            println!("  [{tag}] only {} embeddable windows — lane skipped", embs.len());
+            continue;
+        };
+        for l in &diag.lines {
+            println!("  [{tag}] {l}");
         }
-    }
-
-    // --- fused attribution (the ADR 0042 fusion rule, drafted here): voice
-    // as margin tiebreak. Where a joined voice disagrees with the mouth lane
-    // and the mouth cannot refute the voice's seat by its own switch margin,
-    // the voice's seat takes the bin (same confirm hold); everywhere else the
-    // mouth lane stands. Renders A/B with YC_VOICE_RENDER=1.
-    if let Some(lane) = lanes.first() {
-        let (fspeak, fconf) = fuse_attribution(&analysis, &lane.seat);
-        print!("\n== fused attribution (voice tiebreak) switches:");
-        let mut last: Option<usize> = None;
-        for b in 0..n_bins {
-            if let Some(id) = fspeak[b] {
-                if last != Some(id) {
-                    print!(" {:.1}s->{}", b as f64 * bin_s, speaker::track_label(id));
-                    last = Some(id);
+        // Window dump for offline digging (audio snippets, transcript overlay).
+        if std::env::var_os("YC_VOICE_WINDOWS").is_some() {
+            let mut wtxt = String::from("start_s,end_s,cluster,joined_seat\n");
+            for &(s, e, c, j) in &diag.windows {
+                wtxt.push_str(&format!("{s:.3},{e:.3},{c},{j}\n"));
+            }
+            let p = format!("{tag}_windows.csv");
+            std::fs::write(&p, wtxt)?;
+            println!("  [{tag}] window dump: {p}");
+        }
+        // The FIRST present model is the production lane: fuse it into the
+        // analysis exactly as Job::AnalyzeSpeakers does — the plan below is
+        // then the integrated production camera.
+        if i == 0 {
+            let (fspeak, fconf, overridden) =
+                yc_frame::voice::fuse_attribution(&analysis, &lane.seat);
+            print!("  [{tag}] fused attribution (voice tiebreak) switches:");
+            let mut last: Option<usize> = None;
+            for b in 0..n_bins {
+                if let Some(id) = fspeak[b] {
+                    if last != Some(id) {
+                        print!(" {:.1}s->{}", b as f64 * bin_s, speaker::track_label(id));
+                        last = Some(id);
+                    }
                 }
             }
+            println!();
+            println!(
+                "  [{tag}] overridden: {:.1}s | off-screen: {:.1}s | lane {:.1}s @ {:.0}%",
+                overridden.iter().filter(|o| **o).count() as f64 * bin_s,
+                diag.offscreen_s,
+                diag.claimed_s,
+                100.0 * diag.agreement
+            );
+            lane.overridden = overridden;
+            analysis.speaking = fspeak;
+            analysis.confidence = fconf;
+            analysis.voice = Some(lane.clone());
         }
-        println!();
-        let fused = SpeakerAnalysis {
-            bin_s,
-            tracks: analysis.tracks.clone(),
-            voiced: analysis.voiced.clone(),
-            speaking: fspeak,
-            confidence: fconf,
-        };
-        let fplan = speaker::plan_shots(&fused, src_w, src_h, dur, &cuts);
-        let changed = fplan
-            .shots
-            .iter()
-            .filter(|s| {
-                !plan.shots.iter().any(|p| {
-                    (p.start_s - s.start_s).abs() < 0.02
-                        && (p.end_s - s.end_s).abs() < 0.02
-                        && p.track == s.track
-                })
-            })
-            .count();
-        println!("== fused plan: {} shots ({} differ from baseline):", fplan.shots.len(), changed);
-        for s in &fplan.shots {
-            let same = plan.shots.iter().any(|p| {
+        lanes.push((tag, lane));
+    }
+
+    // The INTEGRATED production plan: plan_shots itself applies the
+    // off-screen splits and interjection rescues from analysis.voice. Every
+    // forensic below — the shot list, the camera audit, the crop-stability
+    // blocks, camera_diag.fg — runs on THIS plan.
+    let plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
+    let changed = plan
+        .shots
+        .iter()
+        .filter(|s| {
+            !baseline_plan.shots.iter().any(|p| {
                 (p.start_s - s.start_s).abs() < 0.02
                     && (p.end_s - s.end_s).abs() < 0.02
                     && p.track == s.track
-            });
-            let who = s.track.map(speaker::track_label).unwrap_or_else(|| "group".into());
-            println!(
-                "  {} {:>5.1}s..{:>5.1}s  {}",
-                if same { " " } else { "*" },
-                s.start_s,
-                s.end_s,
-                who
-            );
-        }
-        let vfg = data_dir.join("camera_voice.fg");
-        std::fs::write(&vfg, yc_render::build_camera_filtergraph(&fplan, "clip.ass"))?;
-        println!("fused filtergraph: {}", vfg.display());
-
-        // Off-screen override DEMO plan (the integration behavior, previewed
-        // from the harness): a shot whose voiced time is mostly a KNOWN but
-        // off-screen voice becomes the visible pair's split screen — podcast
-        // grammar for "the speaker isn't in this shot". The production
-        // planner is untouched; this render exists for the operator's gate.
-        let off = &lane.offscreen;
-        let mut dplan = fplan.clone();
-        let mut flipped = 0usize;
-        for s in dplan.shots.iter_mut() {
-            let b0 = ((s.start_s / bin_s).round() as usize).min(n_bins);
-            let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n_bins);
-            let voiced_n = (b0..b1).filter(|&b| analysis.voiced[b]).count();
-            let off_n = (b0..b1).filter(|&b| off[b]).count();
-            if voiced_n > 0 && off_n as f64 >= 0.5 * voiced_n as f64 && off_n as f64 * bin_s >= 1.2
-            {
-                s.track = None;
-                s.pan_to = None;
-                s.layout = speaker::group_layout_span(&analysis.tracks, b0, b1, src_w, src_h);
-                flipped += 1;
-                println!(
-                    "== off-screen demo: shot {:.1}s..{:.1}s -> visible-pair split ({:.1}s of known off-screen voice)",
-                    s.start_s,
-                    s.end_s,
-                    off_n as f64 * bin_s
-                );
-            }
-        }
-        if flipped > 0 {
-            let ofg = data_dir.join("camera_offscreen.fg");
-            std::fs::write(&ofg, yc_render::build_camera_filtergraph(&dplan, "clip.ass"))?;
-            println!("off-screen demo filtergraph: {}", ofg.display());
-        }
-
-        // A/B render (the operator gate artifact), production export command
-        // (NVENC + burned captions), outputs beside the stream folder's other
-        // renders. B is the off-screen demo when the clip has one (the fused
-        // plan rendered shot-identical to baseline on the Deddy fixture — the
-        // min-shot grammar absorbs the corrected interjection), else the
-        // fused plan.
-        if std::env::var_os("YC_VOICE_RENDER").is_some() {
-            let ffabs = std::fs::canonicalize(ffmpeg)?;
-            let b_side = if flipped > 0 {
-                ("camera_offscreen.fg", "../diar_offscreen_demo.mp4")
-            } else {
-                ("camera_voice.fg", "../diar_voice.mp4")
-            };
-            for (fg, out) in [("camera_diag.fg", "../diar_baseline.mp4"), b_side] {
-                // ffmpeg runs with the data dir as cwd (clip.ass + fontsdir
-                // resolve there), so the source is the bare segment name.
-                let args =
-                    yc_render::export_args_script(Path::new("segment.mp4"), seek_s, dur, fg, out);
-                println!("rendering {out} ...");
-                yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
-            }
-            println!("A/B renders written beside the stream folder's other exports.");
-        }
-    }
+            })
+        })
+        .count();
+    println!(
+        "\n== integrated plan: {} shots ({} differ from the {}-shot mouth-only baseline)",
+        plan.shots.len(),
+        changed,
+        baseline_plan.shots.len()
+    );
 
     println!("\n== plan ({} shots):", plan.shots.len());
     for (i, s) in plan.shots.iter().enumerate() {
@@ -655,10 +623,15 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(&fg, yc_render::build_camera_filtergraph(&plan, "clip.ass"))?;
     println!("\nfiltergraph: {}", fg.display());
 
-    // Render THIS plan (the production camera) with the production export
-    // command — the camera-smoothing gate artifact. A separate env var from
-    // YC_VOICE_RENDER so the diarization gate's diar_*.mp4 A/B files are
-    // never clobbered.
+    // Render THIS plan with the production export command. TWO env vars, two
+    // output names, because past gate artifacts must never be clobbered
+    // (their gates PASSED; the files are the record):
+    //  - YC_SMOOTH_RENDER  -> ../camera_smoothing.mp4  (the camera-smoothing
+    //    gate's name — NOTE: the plan now includes the voice behaviors, so
+    //    re-rendering under this name overwrites the signed-off artifact;
+    //    prefer YC_INTEG_RENDER unless reproducing that old gate on purpose)
+    //  - YC_INTEG_RENDER   -> ../diar_integration.mp4  (the ADR 0042
+    //    integration gate artifact, watched against diar_baseline.mp4)
     if std::env::var_os("YC_SMOOTH_RENDER").is_some() {
         let ffabs = std::fs::canonicalize(ffmpeg)?;
         let args = yc_render::export_args_script(
@@ -671,6 +644,18 @@ fn main() -> anyhow::Result<()> {
         println!("rendering ../camera_smoothing.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
     }
+    if std::env::var_os("YC_INTEG_RENDER").is_some() {
+        let ffabs = std::fs::canonicalize(ffmpeg)?;
+        let args = yc_render::export_args_script(
+            Path::new("segment.mp4"),
+            seek_s,
+            dur,
+            "camera_diag.fg",
+            "../diar_integration.mp4",
+        );
+        println!("rendering ../diar_integration.mp4 ...");
+        yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+    }
 
     // --- per-bin CSV for deeper digging ---------------------------------------
     if let Some(csv) = csv_out {
@@ -678,8 +663,8 @@ fn main() -> anyhow::Result<()> {
         for t in &analysis.tracks {
             w.push_str(&format!(",{}x,{}y,{}act", t.id, t.id, t.id));
         }
-        for l in &lanes {
-            w.push_str(&format!(",{0}_cluster,{0}_seat", l.tag));
+        for (tag, _) in &lanes {
+            w.push_str(&format!(",{0}_cluster,{0}_seat", tag));
         }
         w.push('\n');
         for b in 0..n_bins {
@@ -696,7 +681,7 @@ fn main() -> anyhow::Result<()> {
                     None => w.push_str(",,,"),
                 }
             }
-            for l in &lanes {
+            for (_, l) in &lanes {
                 let c = l.cluster[b].map(|v| v as i64).unwrap_or(-1);
                 let s = l.seat[b].map(|v| v as i64).unwrap_or(-1);
                 w.push_str(&format!(",{c},{s}"));
@@ -709,7 +694,9 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The speaker-embedding model (diarization spike): 3D-Speaker CAM++ zh_en
+/// The speaker-embedding models this harness runs (first = the PRODUCTION
+/// lane, fused into the analysis; the rest are A/B candidates). Production
+/// today: 3D-Speaker CAM++ zh_en
 /// "advanced" — CAM++ is the fastest surveyed architecture on CPU — from the
 /// sherpa-onnx `speaker-recongition-models` release (that typo is real),
 /// SHA-256-verified against the release's published checksum.txt, Apache-2.0.
@@ -731,574 +718,6 @@ const VOICE_MODELS: [(&str, &str, yc_frame::voice::SampleScale, bool); 1] = [
         true,
     ),
 ];
-
-/// A voice-cluster must co-occur with a genuine mouth attribution for at
-/// least this long (bins at SPEAKER_FPS) and win this share of its own
-/// co-occurrence mass to join a seat; anything less stays unjoined (an
-/// off-screen voice, an impure cluster, or a shared class like laughter).
-/// Measured on the Deddy fixture: pure single-voice clusters co-occur with
-/// their seat at 0.71-1.00 share, while the impure both-voices blob sat at
-/// 0.55 — the floor lives in that gap.
-#[cfg(feature = "face")]
-const JOIN_MIN_BINS: usize = 24;
-#[cfg(feature = "face")]
-const JOIN_MIN_SHARE: f32 = 0.65;
-/// Evidence floor for the per-angle-segment join (bins at SPEAKER_FPS): less
-/// than the whole-clip floor because a segment is short, but still half a
-/// second of co-occurrence before a voice claims a seat within one angle.
-#[cfg(feature = "face")]
-const JOIN_MIN_BINS_SEG: usize = 12;
-
-/// One model's diarization result on the analysis grid: the raw voice
-/// cluster per bin, and the seat it maps to through the co-occurrence join.
-#[cfg(feature = "face")]
-struct VoiceLane {
-    tag: &'static str,
-    cluster: Vec<Option<usize>>,
-    seat: Vec<Option<usize>>,
-    /// Bins where a KNOWN voice (joined somewhere) holds no seat in the
-    /// on-screen angle — the off-screen-speaker signal (empty when the
-    /// regime makes the whole-clip join valid).
-    offscreen: Vec<bool>,
-}
-
-/// Build one model's voice lane and print its forensics: window count +
-/// embed time, a threshold sweep scored end-to-end through the join
-/// (coverage x agreement picks the cut), cluster-to-seat co-occurrence with
-/// the join verdicts, agreement % vs the mouth lane, disagreement runs, and
-/// the voice switch list.
-#[cfg(feature = "face")]
-#[allow(clippy::too_many_arguments)]
-fn build_voice_lane(
-    tag: &'static str,
-    model: &std::path::Path,
-    scale: yc_frame::voice::SampleScale,
-    cmn: bool,
-    samples: &[f32],
-    windows: &[(f64, f64)],
-    analysis: &yc_frame::speaker::SpeakerAnalysis,
-    n_bins: usize,
-    cuts: &[f64],
-    dur: f64,
-    attribution_regime: bool,
-) -> anyhow::Result<Option<VoiceLane>> {
-    use yc_frame::{speaker, voice};
-    if !model.is_file() {
-        println!("  [{tag}] missing {} — lane skipped", model.display());
-        return Ok(None);
-    }
-    let bin_s = analysis.bin_s;
-    let sr = yc_ingest::WHISPER_SR as f64;
-    let t0 = std::time::Instant::now();
-    let mut embedder = voice::VoiceEmbedder::load(model, scale, cmn)?;
-    let mut embs: Vec<Vec<f32>> = Vec::new();
-    let mut kept: Vec<(f64, f64)> = Vec::new();
-    for &(s, e) in windows {
-        let (i0, i1) = ((s * sr).round() as usize, ((e * sr).round() as usize).min(samples.len()));
-        if i1 <= i0 || (i1 - i0) as f64 / sr < 0.25 {
-            continue;
-        }
-        embs.push(embedder.embed(&samples[i0..i1])?);
-        kept.push((s, e));
-    }
-    if embs.len() < 2 {
-        println!("  [{tag}] only {} embeddable windows — lane skipped", embs.len());
-        return Ok(None);
-    }
-    // Genuine mouth attribution per bin (not an off-screen hold) — the
-    // join's and the scorer's reference lane.
-    let genuine: Vec<Option<usize>> = (0..n_bins)
-        .map(|b| {
-            let id = analysis.speaking[b]?;
-            let act = analysis
-                .tracks
-                .iter()
-                .map(|t| t.activity.get(b).copied().unwrap_or(0.0))
-                .fold(0.0f32, f32::max);
-            (analysis.voiced[b] && act >= speaker::MIN_ACTIVITY).then_some(id)
-        })
-        .collect();
-    // Per voiced bin: the nearest covering window's cluster.
-    let bin_clusters = |assignment: &[usize]| -> Vec<Option<usize>> {
-        (0..n_bins)
-            .map(|b| {
-                if !analysis.voiced.get(b).copied().unwrap_or(false) {
-                    return None;
-                }
-                let t = (b as f64 + 0.5) * bin_s;
-                let mut best: Option<(f64, usize)> = None;
-                for (i, &(s, e)) in kept.iter().enumerate() {
-                    if t >= s && t < e {
-                        let d = (t - (s + e) * 0.5).abs();
-                        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                            best = Some((d, assignment[i]));
-                        }
-                    }
-                }
-                best.map(|(_, c)| c)
-            })
-            .collect()
-    };
-    // Join clusters to seats by co-occurrence on genuine-mouth bins (several
-    // clusters may join one seat — an over-split voice is harmless, the join
-    // reunifies it; an impure cluster joins nothing), restricted to bins the
-    // `keep` filter admits so the join can be cross-validated.
-    let join_on = |lane: &[Option<usize>], k: usize, keep: &dyn Fn(usize) -> bool| -> Vec<Option<usize>> {
-        let mut counts = vec![std::collections::HashMap::<usize, usize>::new(); k];
-        let mut totals = vec![0usize; k];
-        for b in 0..n_bins {
-            if !keep(b) {
-                continue;
-            }
-            let (Some(c), Some(s)) = (lane[b], genuine[b]) else { continue };
-            *counts[c].entry(s).or_default() += 1;
-            totals[c] += 1;
-        }
-        (0..k)
-            .map(|c| {
-                let (&s, &n) = counts[c].iter().max_by_key(|(_, &n)| n)?;
-                (totals[c] >= JOIN_MIN_BINS && n as f32 >= JOIN_MIN_SHARE * totals[c] as f32)
-                    .then_some(s)
-            })
-            .collect()
-    };
-    let seat_lane = |lane: &[Option<usize>], joined: &[Option<usize>]| -> Vec<Option<usize>> {
-        (0..n_bins).map(|b| lane[b].and_then(|c| joined[c])).collect()
-    };
-    // Agreement with the mouth lane where both claim; coverage = claimed time.
-    let score = |seat: &[Option<usize>]| -> (usize, usize, usize) {
-        let (mut both, mut agree, mut cov) = (0usize, 0usize, 0usize);
-        for b in 0..n_bins {
-            if seat[b].is_some() {
-                cov += 1;
-            }
-            let (Some(v), Some(m)) = (seat[b], genuine[b]) else { continue };
-            both += 1;
-            if v == m {
-                agree += 1;
-            }
-        }
-        (cov, agree, both)
-    };
-
-    // Threshold sweep, scored OUT-OF-SAMPLE: the join is computed on
-    // alternating 2 s blocks and the seat lane scored on the complementary
-    // blocks (both directions). In-sample scoring is circular — with tiny
-    // clusters every join copies the mouth lane on its own bins and "agrees"
-    // 100% while carrying no identity (measured on the Deddy fixture: thr
-    // 0.30 in-sample looked perfect and was pure overfit). A real voice
-    // cluster joins the same seat from either half; an overfit singleton
-    // claims nothing out-of-sample.
-    let block = |b: usize| (b / 48) % 2 == 0; // 2 s blocks at 24 fps
-    println!(
-        "  [{tag}] {} windows embedded in {:.1}s | thr:  k joined  in-cov in-agr | cv-cov cv-agr  score",
-        embs.len(),
-        t0.elapsed().as_secs_f32()
-    );
-    let mut pick: Option<(f32, f64)> = None;
-    for &t in &[0.30f32, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60] {
-        let cl = voice::cluster_cosine(&embs, t);
-        let lane = bin_clusters(&cl.assignment);
-        let joined = join_on(&lane, cl.k, &|_| true);
-        let seat = seat_lane(&lane, &joined);
-        let (cov, agree, both) = score(&seat);
-        // Cross-validated: even-block join claims odd blocks and vice versa.
-        let join_even = join_on(&lane, cl.k, &|b| block(b));
-        let join_odd = join_on(&lane, cl.k, &|b| !block(b));
-        let seat_cv: Vec<Option<usize>> = (0..n_bins)
-            .map(|b| {
-                let j = if block(b) { &join_odd } else { &join_even };
-                lane[b].and_then(|c| j[c])
-            })
-            .collect();
-        let (cv_cov, cv_agree, cv_both) = score(&seat_cv);
-        let cv_frac = cv_agree as f64 / cv_both.max(1) as f64;
-        let s = cv_frac * cv_cov as f64 * bin_s;
-        println!(
-            "  [{tag}]     {t:.2}: {:>2} {:>6}  {:>5.1}s  {:>4.0}% | {:>5.1}s  {:>4.0}%  {s:>5.1}",
-            cl.k,
-            joined.iter().flatten().count(),
-            cov as f64 * bin_s,
-            100.0 * agree as f64 / both.max(1) as f64,
-            cv_cov as f64 * bin_s,
-            100.0 * cv_frac
-        );
-        if pick.map(|(_, ps)| s > ps).unwrap_or(true) {
-            pick = Some((t, s));
-        }
-    }
-    let thr = pick.map(|(t, _)| t).unwrap_or(0.45);
-    println!("  [{tag}] picked thr {thr:.2} (best cv score)");
-    let cl = voice::cluster_cosine(&embs, thr);
-    let cluster = bin_clusters(&cl.assignment);
-    let joined = join_on(&cluster, cl.k, &|_| true);
-
-    // Detail rows for the picked threshold.
-    let mut counts = vec![std::collections::HashMap::<usize, usize>::new(); cl.k];
-    let mut totals = vec![0usize; cl.k];
-    for b in 0..n_bins {
-        let (Some(c), Some(s)) = (cluster[b], genuine[b]) else { continue };
-        *counts[c].entry(s).or_default() += 1;
-        totals[c] += 1;
-    }
-    println!("  [{tag}] cluster <-> seat co-occurrence (genuine-mouth bins):");
-    for c in 0..cl.k {
-        let n_windows = cl.assignment.iter().filter(|&&a| a == c).count();
-        let voiced_s = cluster.iter().filter(|&&v| v == Some(c)).count() as f64 * bin_s;
-        if voiced_s < 0.75 && joined[c].is_none() {
-            continue; // singleton noise — not worth a row
-        }
-        let mut row: Vec<(usize, usize)> = counts[c].iter().map(|(&s, &n)| (s, n)).collect();
-        row.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-        let desc: Vec<String> = row
-            .iter()
-            .map(|(s, n)| format!("{} {:.1}s", speaker::track_label(*s), *n as f64 * bin_s))
-            .collect();
-        let verdict = match joined[c] {
-            Some(s) => format!("-> {}", speaker::track_label(s)),
-            None if totals[c] == 0 => "-> OFF-SCREEN? (never co-occurs with a moving mouth)".into(),
-            None => "-> unjoined (impure or shared, e.g. laughter)".into(),
-        };
-        // Overlap forensic: how often BOTH mouths move during this cluster's
-        // bins — a shared class (laughter, cross-talk) shows both mouths at
-        // once, which no voice embedding can attribute to one person.
-        let (mut vis, mut multi) = (0usize, 0usize);
-        for b in 0..n_bins {
-            if cluster[b] != Some(c) {
-                continue;
-            }
-            vis += 1;
-            let moving = analysis
-                .tracks
-                .iter()
-                .filter(|t| t.activity.get(b).copied().unwrap_or(0.0) >= speaker::MIN_ACTIVITY)
-                .count();
-            if moving >= 2 {
-                multi += 1;
-            }
-        }
-        println!(
-            "    V{c}: {n_windows} windows, {voiced_s:.1}s of voiced bins [{}] both-mouths {:.0}% {verdict}",
-            desc.join(", "),
-            100.0 * multi as f64 / vis.max(1) as f64
-        );
-    }
-    // ANGLE-AWARE JOIN (measured necessity on the Deddy fixture): the same
-    // screen seat holds DIFFERENT humans in different camera angles — the
-    // source cuts between two-person angles of a 4+-person table, and the
-    // same-seat merge welds a position's framings into one track (ADR 0038:
-    // labels are seats, not identities; V2's windows sat on a green-shirted
-    // man in one angle and a white-shirted man in another). A voice cluster
-    // therefore joins a seat PER inter-cut segment; the whole-clip join is
-    // only the fallback where a segment lacks evidence. The cluster itself
-    // is the person; the per-segment map says which seat that person
-    // occupies in the angle on screen (no seat = off-screen there).
-    let mut seg_bounds: Vec<f64> = vec![0.0];
-    for &c in cuts {
-        if c > 0.03 && c < dur - 0.03 {
-            seg_bounds.push(c);
-        }
-    }
-    seg_bounds.push(dur);
-    let n_segs = seg_bounds.len() - 1;
-    let seg_of = |b: usize| -> usize {
-        let t = (b as f64 + 0.5) * bin_s;
-        seg_bounds.windows(2).position(|w| t >= w[0] && t < w[1]).unwrap_or(n_segs - 1)
-    };
-    // Group segments into ANGLES by seat geometry: jump cuts return to the
-    // same camera over and over, and within one camera each seat's face sits
-    // at the same position/size. Joining per (cluster, angle) accumulates
-    // identity evidence across ALL of an angle's segments — so a claim at
-    // one moment rests on other moments of the same camera, not only on the
-    // mouth lane's opinion of the moment being judged (a purely per-segment
-    // join just echoed the mouth lane: 99% "agreement" with no information).
-    let seg_angle: Vec<usize> = {
-        let mut sigs: Vec<String> = Vec::new();
-        let mut ids: Vec<usize> = Vec::new();
-        for g in 0..n_segs {
-            let (b0, b1) = (
-                (seg_bounds[g] / bin_s).round() as usize,
-                ((seg_bounds[g + 1] / bin_s).round() as usize).min(n_bins),
-            );
-            let len = b1.saturating_sub(b0).max(1);
-            let mut sig = String::new();
-            for t in &analysis.tracks {
-                let mut xs: Vec<f32> = Vec::new();
-                let mut ys: Vec<f32> = Vec::new();
-                let mut hs: Vec<f32> = Vec::new();
-                for b in b0..b1 {
-                    if let Some(f) = t.path.get(b).and_then(|p| p.as_ref()) {
-                        xs.push(f.cx());
-                        ys.push(f.cy());
-                        hs.push(f.h);
-                    }
-                }
-                if xs.len() * 5 < len * 2 {
-                    continue; // seat absent from this camera (<40%)
-                }
-                let med = |v: &mut Vec<f32>| -> f32 {
-                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    v[v.len() / 2]
-                };
-                sig.push_str(&format!(
-                    "{}:{},{},{};",
-                    t.id,
-                    (med(&mut xs) / 60.0).round() as i32,
-                    (med(&mut ys) / 60.0).round() as i32,
-                    (med(&mut hs) / 40.0).round() as i32
-                ));
-            }
-            let id = sigs.iter().position(|s| *s == sig).unwrap_or_else(|| {
-                sigs.push(sig.clone());
-                sigs.len() - 1
-            });
-            ids.push(id);
-        }
-        ids
-    };
-    let n_angles = seg_angle.iter().copied().max().map(|m| m + 1).unwrap_or(1);
-    let mut ang_counts = vec![std::collections::HashMap::<(usize, usize), usize>::new(); n_angles];
-    let mut ang_totals = vec![std::collections::HashMap::<usize, usize>::new(); n_angles];
-    for b in 0..n_bins {
-        let (Some(c), Some(s)) = (cluster[b], genuine[b]) else { continue };
-        let a = seg_angle[seg_of(b)];
-        *ang_counts[a].entry((c, s)).or_default() += 1;
-        *ang_totals[a].entry(c).or_default() += 1;
-    }
-    // A single-segment angle's co-occurrence is pure echo of the mouth lane
-    // over that one stretch (it can never disagree with it, so it carries no
-    // identity information) — only an angle seen 2+ times may override the
-    // whole-clip join. On the Deddy fixture this is what lets the voice keep
-    // saying "seat B" at 20.8s where the mouth lane held A for that entire
-    // one-off segment (the strip shows B exclaiming).
-    let ang_segments: Vec<usize> =
-        (0..n_angles).map(|a| seg_angle.iter().filter(|&&x| x == a).count()).collect();
-    let ang_join = |c: usize, a: usize| -> Option<usize> {
-        if ang_segments[a] < 2 {
-            return None;
-        }
-        let total = *ang_totals[a].get(&c)?;
-        let (&(_, s), &n) = ang_counts[a]
-            .iter()
-            .filter(|((cc, _), _)| *cc == c)
-            .max_by_key(|&(_, &n)| n)?;
-        (total >= JOIN_MIN_BINS_SEG && n as f32 >= JOIN_MIN_SHARE * total as f32).then_some(s)
-    };
-    println!("  [{tag}] angles (segments grouped by seat geometry) + voice->seat per angle:");
-    for a in 0..n_angles {
-        let spans: Vec<String> = (0..n_segs)
-            .filter(|&g| seg_angle[g] == a)
-            .map(|g| format!("{:.1}-{:.1}", seg_bounds[g], seg_bounds[g + 1]))
-            .collect();
-        let items: Vec<String> = (0..cl.k)
-            .filter_map(|c| ang_join(c, a).map(|s| format!("V{c}->{}", speaker::track_label(s))))
-            .collect();
-        println!(
-            "    angle {a}: [{}]  {}",
-            spans.join(" "),
-            if items.is_empty() { "(no joined voice)".into() } else { items.join("  ") }
-        );
-    }
-    // In the ATTRIBUTION regime with several camera angles, a seat track is a
-    // SCREEN POSITION shared by different humans across angles (proven on the
-    // Deddy fixture: V1's voice articulates as the left man of one angle and
-    // is off-screen in another, where the left seat is a different person) —
-    // so a whole-clip join must NOT leak across angles there. In the
-    // follow-visible regime each track is one person's framing, so the
-    // whole-clip join is the identity and stays.
-    let ban_global = attribution_regime && n_angles > 1;
-    let seat: Vec<Option<usize>> = (0..n_bins)
-        .map(|b| {
-            let c = cluster[b]?;
-            let a = seg_angle[seg_of(b)];
-            ang_join(c, a).or(if ban_global { None } else { joined[c] })
-        })
-        .collect();
-    // Off-screen suspects: the voice is a KNOWN person (joined in some other
-    // angle, or clip-wide) but holds no seat in the angle on screen — the
-    // speaker the camera cannot show. The mouth lane can only mis-attribute
-    // these (it holds a visible mouth); they are the "off-screen voice" gap
-    // diarization exists to fill (ADR 0038).
-    let mut offscreen = vec![false; n_bins];
-    if ban_global {
-        let known_elsewhere = |c: usize| -> bool {
-            joined[c].is_some() || (0..n_angles).any(|a| ang_join(c, a).is_some())
-        };
-        for b in 0..n_bins {
-            offscreen[b] =
-                cluster[b].filter(|&c| seat[b].is_none() && known_elsewhere(c)).is_some();
-        }
-        println!("  [{tag}] off-screen suspects (known voice, no seat in the on-screen angle):");
-        let mut b = 0usize;
-        while b < n_bins {
-            if !offscreen[b] {
-                b += 1;
-                continue;
-            }
-            let (s0, c0) = (b, cluster[b].unwrap());
-            while b < n_bins && cluster[b] == Some(c0) && seat[b].is_none() {
-                b += 1;
-            }
-            let dur_run = (b - s0) as f64 * bin_s;
-            if dur_run >= 0.5 {
-                println!(
-                    "    {:>5.1}s..{:>5.1}s ({dur_run:.1}s): V{c0} speaks (mouth lane says {})",
-                    s0 as f64 * bin_s,
-                    b as f64 * bin_s,
-                    analysis.speaking[s0.min(n_bins - 1)]
-                        .map(speaker::track_label)
-                        .unwrap_or_else(|| "nobody".into())
-                );
-            }
-        }
-    }
-    let (cov, agree, both) = score(&seat);
-    println!(
-        "  [{tag}] agreement with mouth attribution: {:.0}% over {:.1}s co-claimed ({:.1}s claimed total)",
-        100.0 * agree as f64 / both.max(1) as f64,
-        both as f64 * bin_s,
-        cov as f64 * bin_s
-    );
-    let mut b = 0usize;
-    let mut printed = 0usize;
-    while b < n_bins {
-        let (Some(v), Some(m)) = (seat[b], genuine[b]) else {
-            b += 1;
-            continue;
-        };
-        if v == m {
-            b += 1;
-            continue;
-        }
-        let s0 = b;
-        while b < n_bins && seat[b] == Some(v) && genuine[b] == Some(m) {
-            b += 1;
-        }
-        let dur = (b - s0) as f64 * bin_s;
-        if dur >= 0.4 && printed < 14 {
-            println!(
-                "    DISAGREE {:>5.1}s..{:>5.1}s ({dur:.1}s): mouth={} voice={}",
-                s0 as f64 * bin_s,
-                b as f64 * bin_s,
-                speaker::track_label(m),
-                speaker::track_label(v)
-            );
-            printed += 1;
-        }
-    }
-    // Window dump for offline digging (audio snippets, transcript overlay).
-    if std::env::var_os("YC_VOICE_WINDOWS").is_some() {
-        let mut wtxt = String::from("start_s,end_s,cluster,joined_seat\n");
-        for (i, &(s, e)) in kept.iter().enumerate() {
-            let c = cl.assignment[i];
-            wtxt.push_str(&format!(
-                "{s:.3},{e:.3},{c},{}\n",
-                joined[c].map(|v| v as i64).unwrap_or(-1)
-            ));
-        }
-        let p = format!("{tag}_windows.csv");
-        std::fs::write(&p, wtxt)?;
-        println!("  [{tag}] window dump: {p}");
-    }
-    print!("  [{tag}] voice switches:");
-    let mut last: Option<usize> = None;
-    let mut n_sw = 0usize;
-    for b in 0..n_bins {
-        if let Some(v) = seat[b] {
-            if last != Some(v) {
-                print!(" {:.1}s->{}", b as f64 * bin_s, speaker::track_label(v));
-                last = Some(v);
-                n_sw += 1;
-                if n_sw > 24 {
-                    print!(" ...");
-                    break;
-                }
-            }
-        }
-    }
-    println!();
-    Ok(Some(VoiceLane { tag, cluster, seat, offscreen }))
-}
-
-/// The ADR 0042 fusion rule, drafted where it can be measured: the mouth
-/// lane stands wherever it can defend its bin by its own switch margin; a
-/// JOINED voice seat that the mouth cannot refute by that margin takes the
-/// bin instead, and a switch of the fused lane still needs the same
-/// confirmation hold. The voice never replaces the visual join — it
-/// tiebreaks it; bins where the voice claims nothing (shared/unjoined
-/// clusters, silence) follow the mouth lane unchanged.
-#[cfg(feature = "face")]
-fn fuse_attribution(
-    analysis: &yc_frame::speaker::SpeakerAnalysis,
-    voice_seat: &[Option<usize>],
-) -> (Vec<Option<usize>>, Vec<f32>) {
-    use yc_frame::speaker;
-    let n = analysis.speaking.len();
-    // Mirrors SWITCH_MARGIN / SWITCH_CONFIRM_S in yc_frame::speaker (private
-    // there; the values are pinned by its tests).
-    let margin = 1.35f32;
-    let confirm = (0.8 * speaker::SPEAKER_FPS).round() as usize;
-    let act = |id: usize, b: usize| -> f32 {
-        analysis
-            .tracks
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.activity.get(b).copied())
-            .unwrap_or(0.0)
-    };
-    // The mouth lane's own commitments pass through untouched — they already
-    // went through the production margin + hold (an early draft re-held them
-    // and VAD-gap resets pushed the mouth's legitimate 50.9s switch on the
-    // Deddy fixture out to 69.2s). Only OVERRIDES hold: an override run
-    // counts claimed bins (a breath does not reset it — voice windows
-    // straddle breaths by construction) and commits RETROACTIVELY to its
-    // start once it has lasted the confirm time. The hold exists to stop
-    // flicker, not to shorten the interjection it rescues; the analysis is
-    // offline, so back-filling is legitimate.
-    let mut out: Vec<Option<usize>> = analysis.speaking.clone();
-    let mut conf = analysis.confidence.clone();
-    let mut challenger: Option<usize> = None;
-    let mut run: Vec<usize> = Vec::new();
-    for b in 0..n {
-        if !analysis.voiced[b] {
-            continue; // a breath neither advances nor resets an override run
-        }
-        let over = match (analysis.speaking[b], voice_seat[b]) {
-            (Some(m), Some(v)) if m != v && act(m, b) < margin * act(v, b).max(speaker::MIN_ACTIVITY) => {
-                Some(v) // the mouth cannot refute the voice by its own margin
-            }
-            _ => None,
-        };
-        match (over, challenger) {
-            (Some(v), Some(c)) if v == c => {
-                run.push(b);
-                if run.len() >= confirm {
-                    for &rb in &run {
-                        out[rb] = Some(v);
-                    }
-                }
-            }
-            (Some(v), _) => {
-                challenger = Some(v);
-                run = vec![b];
-            }
-            (None, _) => {
-                challenger = None;
-                run.clear();
-            }
-        }
-    }
-    for b in 0..n {
-        if out[b] != analysis.speaking[b] {
-            if let Some(id) = out[b] {
-                let total: f32 =
-                    analysis.tracks.iter().map(|t| t.activity.get(b).copied().unwrap_or(0.0)).sum();
-                conf[b] = if total > 0.0 { (act(id, b) / total).max(0.5) } else { 0.5 };
-            }
-        }
-    }
-    (out, conf)
-}
 
 /// `selftest <wav> <wav> [<wav>…]`: embed whole 16 kHz mono wavs with every
 /// present candidate model and print pairwise cosine similarity — ground

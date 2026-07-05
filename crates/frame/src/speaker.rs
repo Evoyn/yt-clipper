@@ -86,9 +86,14 @@ const PROP_HARD_MIN_FRAC: f32 = 0.4;
 /// Activity smoothing window, seconds (moving average over the grid).
 const ACTIVITY_SMOOTH_S: f64 = 0.6;
 /// A challenger must out-move the incumbent by this factor to take the camera.
-const SWITCH_MARGIN: f32 = 1.35;
-/// ...and hold that lead for this long before the switch commits.
-const SWITCH_CONFIRM_S: f64 = 0.8;
+/// `pub(crate)` because the voice fusion ([`crate::voice::fuse_attribution`])
+/// applies the SAME margin — the mouth refutes a voice override exactly as it
+/// refutes a mouth challenger.
+pub(crate) const SWITCH_MARGIN: f32 = 1.35;
+/// ...and hold that lead for this long before the switch commits. The voice
+/// fusion's override hold reuses it (`pub(crate)`), and it is also the floor
+/// a voice-rescued interjection must carry to survive the min-shot grammar.
+pub(crate) const SWITCH_CONFIRM_S: f64 = 0.8;
 /// Mouth activity below this is "nobody visibly talking" — attribution then
 /// holds the incumbent rather than guessing (voice-over, off-screen speech).
 /// Pub so the diag harness can tell a genuine mouth attribution from such a
@@ -111,6 +116,15 @@ const MIN_PIECE_S: f64 = 0.35;
 /// them collapses into one group shot instead of a cut storm.
 const RAPID_SHOT_S: f64 = 4.0;
 const RAPID_RUN: usize = 3;
+
+/// Off-screen split (ADR 0042, operator-approved): an angle piece flips to
+/// the visible pair's split screen when at least this share of its voiced
+/// bins carry a KNOWN off-screen voice...
+const OFFSCREEN_VOICED_SHARE: f64 = 0.5;
+/// ...and that off-screen speech lasts at least this long absolute — the
+/// gate demo's measured thresholds, so a single breath of off-screen voice
+/// never flips a shot.
+const OFFSCREEN_MIN_S: f64 = 1.2;
 
 /// Scene-type threshold: mean tracked faces visible per bin. A **static wide
 /// shot** keeps everyone in frame at once (≈ the track count), so the camera
@@ -209,7 +223,11 @@ pub fn track_label(id: usize) -> String {
 
 /// The full speaker analysis for one Clip, on the [`SPEAKER_FPS`] grid: the
 /// tracks, the audio gate, and the attributed speaker per bin (with a 0..1
-/// confidence — the winner's share of total mouth activity).
+/// confidence — the winner's share of total mouth activity). Since the voice
+/// lane integrated (ADR 0042), `speaking`/`confidence` are the **fused**
+/// attribution wherever `voice` is present — the mouth lane's commitments
+/// with the voice's margin-tiebreak overrides — so every consumer (planner,
+/// editor lanes, chip) reads the one lane the camera actually follows.
 #[derive(Debug, Clone, Default)]
 pub struct SpeakerAnalysis {
     pub bin_s: f64,
@@ -217,6 +235,9 @@ pub struct SpeakerAnalysis {
     pub voiced: Vec<bool>,
     pub speaking: Vec<Option<usize>>,
     pub confidence: Vec<f32>,
+    /// The voice lane (`None` = model absent/broken or too little speech —
+    /// the analysis is then exactly the pre-integration mouth-only one).
+    pub voice: Option<crate::voice::VoiceLane>,
 }
 
 impl SpeakerAnalysis {
@@ -735,6 +756,15 @@ fn mean_visible_faces(tracks: &[SpeakerTrack], n: usize) -> f32 {
     total as f32 / n as f32
 }
 
+/// True when the analysis sits in the ATTRIBUTION regime (a static wide shot
+/// where the plan must *choose* the speaker) rather than follow-visible —
+/// exactly the test [`plan_shots`] applies, exposed because the voice lane's
+/// join is regime-scoped (ADR 0042: the whole-clip join is banned where a
+/// seat is a screen position shared across angles).
+pub fn attribution_regime(analysis: &SpeakerAnalysis) -> bool {
+    mean_visible_faces(&analysis.tracks, analysis.speaking.len()) >= MULTICAM_MAX_MEAN_FACES
+}
+
 /// Turn the speaker analysis into a **cut-based** [`CameraPlan`]. Two regimes,
 /// chosen by how many faces are on screen at once ([`mean_visible_faces`]):
 ///
@@ -852,18 +882,34 @@ pub fn plan_shots(
     }
 
     // 4. Absorb remaining too-short runs into their predecessor (a lone quick
-    //    interjection isn't worth a cut), merging same-subject neighbours.
+    //    interjection isn't worth a cut), merging same-subject neighbours —
+    //    UNLESS the voice lane rescued the run (ADR 0042: "cut when voice is
+    //    sure"): a sub-minimum run survives when it carries at least the
+    //    fusion confirm hold's worth of voice-OVERRIDDEN bins. Only a
+    //    same-angle-joined voice can override, so the rescued speaker is on
+    //    screen in the current angle by construction — an off-screen voice
+    //    (no seat there) can never mint a cut, and mouth motion alone never
+    //    rescues anything.
+    let confirm_bins = (SWITCH_CONFIRM_S / bin_s).round().max(1.0) as usize;
+    let rescued = |b0: usize, len: usize| -> bool {
+        let Some(v) = &analysis.voice else { return false };
+        (b0..(b0 + len).min(v.overridden.len())).filter(|&b| v.overridden[b]).count()
+            >= confirm_bins
+    };
     let mut final_runs: Vec<(Subject, usize)> = Vec::new();
+    let mut run_b0 = 0usize;
     for (subj, len) in grouped {
         match final_runs.last_mut() {
             Some((prev, plen)) if *prev == subj => *plen += len,
-            Some((_, plen)) if len < min_bins => *plen += len,
+            Some((_, plen)) if len < min_bins && !rescued(run_b0, len) => *plen += len,
             _ => final_runs.push((subj, len)),
         }
+        run_b0 += len;
     }
     // A short FIRST run has no predecessor to absorb it: fold it into the run
-    // that follows, so the camera never opens on a sub-minimum flash shot.
-    if final_runs.len() >= 2 && final_runs[0].1 < min_bins {
+    // that follows (the camera never opens on a sub-minimum flash shot) —
+    // with the same rescue exception.
+    if final_runs.len() >= 2 && final_runs[0].1 < min_bins && !rescued(0, final_runs[0].1) {
         let (_, len) = final_runs.remove(0);
         final_runs[0].1 += len;
     }
@@ -926,7 +972,30 @@ pub fn plan_shots(
             let (p0, p1) = (w[0], w[1]);
             let pb0 = ((p0 / bin_s).round() as usize).clamp(b0, b1);
             let pb1 = ((p1 / bin_s).round() as usize).clamp(pb0, b1);
+            // Off-screen override (ADR 0042, operator-approved): a piece whose
+            // voiced time is mostly a KNOWN but off-screen voice becomes the
+            // visible pair's split screen — podcast grammar for "the speaker
+            // isn't in this shot", so nobody on screen is framed solo as the
+            // speaker. Decided BEFORE framing: the piece writes no framing
+            // anchor (group pieces leave none), so the return to this angle
+            // after the split reuses the pre-split crop verbatim.
+            let offscreen_split = analysis
+                .voice
+                .as_ref()
+                .map(|v| {
+                    let voiced_n = (pb0..pb1).filter(|&b| analysis.voiced[b]).count();
+                    let off_n = (pb0..pb1)
+                        .filter(|&b| v.offscreen.get(b).copied().unwrap_or(false))
+                        .count();
+                    voiced_n > 0
+                        && off_n as f64 >= OFFSCREEN_VOICED_SHARE * voiced_n as f64
+                        && off_n as f64 * bin_s >= OFFSCREEN_MIN_S
+                })
+                .unwrap_or(false);
             let (track, layout, pan_to) = match subj {
+                Subject::Track(_) if offscreen_split => {
+                    (None, group_layout_span(&analysis.tracks, pb0, pb1, src_w, src_h), None)
+                }
                 Subject::Track(id) => match analysis.tracks.iter().find(|tr| tr.id == *id) {
                     Some(tr) => match piece_framing(
                         tr,
@@ -1969,7 +2038,39 @@ mod tests {
             confidence: vec![1.0; n],
             speaking,
             tracks,
+            voice: None,
         }
+    }
+
+    /// `analysis()` plus a voice lane: `overridden` and `offscreen` true over
+    /// the given bin spans (seat/cluster left empty — the planner reads only
+    /// these two vectors).
+    fn analysis_with_voice(
+        speaking: Vec<Option<usize>>,
+        tracks: Vec<SpeakerTrack>,
+        overridden: &[(usize, usize)],
+        offscreen: &[(usize, usize)],
+    ) -> SpeakerAnalysis {
+        let n = speaking.len();
+        let mut a = analysis(speaking, tracks);
+        let mut lane = crate::voice::VoiceLane {
+            cluster: vec![None; n],
+            seat: vec![None; n],
+            offscreen: vec![false; n],
+            overridden: vec![false; n],
+        };
+        for &(b0, b1) in overridden {
+            for b in b0..b1.min(n) {
+                lane.overridden[b] = true;
+            }
+        }
+        for &(b0, b1) in offscreen {
+            for b in b0..b1.min(n) {
+                lane.offscreen[b] = true;
+            }
+        }
+        a.voice = Some(lane);
+        a
     }
 
     /// Drive a [`TrackBuilder`] with one face per frame at the given center xs
@@ -2492,7 +2593,7 @@ mod tests {
         assert_eq!(plan.shots.len(), 1);
         let shot = &plan.shots[0];
         let pan = shot.pan_to.expect("drift must engage the follow pan");
-        let (Layout::FullFrame { crop }) = &shot.layout else { panic!("solo") };
+        let Layout::FullFrame { crop } = &shot.layout else { panic!("solo") };
         assert_eq!(pan.w, crop.w, "pan must not resize the crop");
         assert_eq!(pan.h, crop.h);
         assert!(pan.x > crop.x + 100.0, "pan moves toward the drift: {} -> {}", crop.x, pan.x);
@@ -2695,6 +2796,103 @@ mod tests {
         let tracks = b.finish();
         assert_eq!(tracks.len(), 1, "the small motionless prop must be dropped: {tracks:?}");
         assert!(tracks[0].bbox.w > 60.0, "the real (large) face survives");
+    }
+
+    #[test]
+    fn a_voice_rescued_interjection_survives_the_min_shot() {
+        // B interjects for 1.2 s inside A's floor — far under MIN_SHOT_S. The
+        // fused lane attributed it (speaking says B) and the voice lane marks
+        // those bins OVERRIDDEN: the run must survive absorption (ADR 0042:
+        // "cut when voice is sure") — and WITHOUT the override marker the
+        // very same lane is absorbed exactly as before the integration.
+        let n = nbins(20.0);
+        let (i0, i1) = (nbins(8.0), nbins(9.2));
+        let speaking: Vec<Option<usize>> =
+            (0..n).map(|b| Some(if (i0..i1).contains(&b) { 1 } else { 0 })).collect();
+        let tracks = vec![track(0, 300.0, vec![0.0; n]), track(1, 1500.0, vec![0.0; n])];
+        let with_voice = analysis_with_voice(
+            speaking.clone(),
+            tracks.clone(),
+            &[(i0, i1)],
+            &[],
+        );
+        let plan = plan_shots(&with_voice, 1920.0, 1080.0, 20.0, &[]);
+        assert_eq!(plan.shots.len(), 3, "the rescued interjection earns its cut: {plan:?}");
+        assert_eq!(plan.shots[1].track, Some(1));
+        assert!((plan.shots[0].end_s - 8.0).abs() < 0.05, "cut at the interjection start");
+        assert!((plan.shots[1].end_s - 9.2).abs() < 0.06, "cut back where it ends");
+        // The resuming shot reuses A's pre-interjection framing VERBATIM (the
+        // framing memory across the cut-away) — nothing breathes.
+        let (c0, c2) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 2));
+        assert_eq!(c0, c2, "cut away, cut back, identical framing");
+        // Same fused lane, no override evidence: absorbed (mouth motion alone
+        // never mints a sub-minimum cut).
+        let without = analysis(speaking, tracks);
+        let plan = plan_shots(&without, 1920.0, 1080.0, 20.0, &[]);
+        assert_eq!(plan.shots.len(), 1, "no voice evidence, no rescue: {plan:?}");
+    }
+
+    #[test]
+    fn an_offscreen_piece_flips_to_the_visible_pairs_split() {
+        // Attribution regime (both seats always visible), A holds the floor,
+        // and the middle angle piece (between the source cuts at 4 s and 8 s)
+        // is mostly a KNOWN off-screen voice: it must become the visible
+        // pair's split screen — and write NO framing anchor, so the return
+        // piece reuses A's pre-split crop verbatim.
+        let n = nbins(12.0);
+        let speaking = vec![Some(0); n];
+        let tracks = vec![track(0, 400.0, vec![0.0; n]), track(1, 1400.0, vec![0.0; n])];
+        let a = analysis_with_voice(
+            speaking.clone(),
+            tracks.clone(),
+            &[],
+            &[(nbins(4.0), nbins(8.0))],
+        );
+        let plan = plan_shots(&a, 1920.0, 1080.0, 12.0, &[4.0, 8.0]);
+        assert_eq!(plan.shots.len(), 3, "{plan:?}");
+        assert_eq!(plan.shots[1].track, None, "nobody on screen framed solo as the speaker");
+        assert!(
+            matches!(plan.shots[1].layout, Layout::Stacked { .. }),
+            "two visible people = the split screen: {:?}",
+            plan.shots[1].layout
+        );
+        let (c0, c2) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 2));
+        assert_eq!(c0, c2, "return from the split reuses the pre-split framing verbatim");
+        // Below the measured thresholds (0.9 s < 1.2 s, and a minority of the
+        // piece's voiced time) nothing flips.
+        let a = analysis_with_voice(
+            speaking,
+            tracks,
+            &[],
+            &[(nbins(4.0), nbins(4.9))],
+        );
+        let plan = plan_shots(&a, 1920.0, 1080.0, 12.0, &[4.0, 8.0]);
+        assert!(
+            plan.shots.iter().all(|s| s.track == Some(0)),
+            "a breath of off-screen voice must not flip a shot: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn follow_visible_plans_ignore_the_voice_lane() {
+        // Multicam regime (one face at a time): the source already cut to its
+        // subject, so the voice lane must change NOTHING — the ANTITESA
+        // byte-identical regression gate as a unit test.
+        let n = 100;
+        let a_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i < 40).then(|| fb(260.0, 300.0, 90.0, 90.0))).collect();
+        let b_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i >= 40).then(|| fb(1500.0, 300.0, 90.0, 90.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(300.0, 300.0, 90.0, 90.0), presence: 0.4, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1500.0, 300.0, 90.0, 90.0), presence: 0.6, activity: vec![0.0; n], path: b_path };
+        let speaking = vec![Some(1); n];
+        let bare = analysis(speaking.clone(), vec![ta.clone(), tb.clone()]);
+        let voiced = analysis_with_voice(speaking, vec![ta, tb], &[(0, n)], &[(0, n)]);
+        for cuts in [&[][..], &[40.0 / SPEAKER_FPS][..]] {
+            let p_bare = plan_shots(&bare, 1920.0, 1080.0, 20.0, cuts);
+            let p_voice = plan_shots(&voiced, 1920.0, 1080.0, 20.0, cuts);
+            assert_eq!(p_bare, p_voice, "voice must not touch a follow-visible plan");
+        }
     }
 
     #[test]

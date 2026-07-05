@@ -61,6 +61,12 @@ pub struct PipelinePaths {
     /// build). Only read by the `face`-gated auto-frame pass.
     #[cfg_attr(not(feature = "face"), allow(dead_code))]
     pub face_model: PathBuf,
+    /// CAM++ speaker-embedding model for the voice lane (ADR 0042). May be
+    /// absent: the speaker analysis is then mouth-only (exactly the
+    /// pre-integration behavior) and the Camera panel says so. Only read by
+    /// the `face`-gated speaker analysis.
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub voice_model: PathBuf,
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). May be absent:
     /// the export then captions the mixed analysis audio. Only read by the
     /// `sep`-gated caption pass.
@@ -304,9 +310,13 @@ pub enum Progress {
         src_fps: f64,
     },
     /// The podcast speaker analysis + the derived active-speaker camera plan
-    /// (focus 2026-07): tracks, per-bin attribution, and cut-based shots for
+    /// (focus 2026-07): tracks, per-bin attribution (fused with the voice
+    /// lane when its model is present — ADR 0042), and cut-based shots for
     /// the editor's overlays, speaker timeline, and Active Speaker mode.
-    Speakers { analysis: SpeakerAnalysis, plan: CameraPlan },
+    /// `voice_note` says why the voice lane is off when `analysis.voice` is
+    /// `None` (missing model, too little speech, a broken session) — the
+    /// Camera panel's status line.
+    Speakers { analysis: SpeakerAnalysis, plan: CameraPlan, voice_note: Option<String> },
     /// The refined transcript a Render is about to burn (post-correction,
     /// post-refine — exactly what `generate_ass` consumes), sent as soon as it is
     /// known so the editor's caption preview shows the render's truth while NVENC
@@ -520,8 +530,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                 Job::AnalyzeSpeakers => match (&session, &prepared) {
                     (Some(s), Some(pc)) => {
                         match do_analyze_speakers(&paths, s, pc, &worker_cancel, &tx_prog) {
-                            Ok((analysis, plan)) => {
-                                let _ = tx_prog.send(Progress::Speakers { analysis, plan });
+                            Ok((analysis, plan, voice_note)) => {
+                                let _ =
+                                    tx_prog.send(Progress::Speakers { analysis, plan, voice_note });
                                 let _ = tx_prog.send(Progress::JobDone);
                             }
                             Err(e) => {
@@ -2384,9 +2395,13 @@ fn tracking_dims(src_w: f32, src_h: f32) -> (u32, u32) {
 /// Podcast speaker analysis over the prepared Segment (focus 2026-07): stream
 /// tracking frames at [`yc_frame::speaker::SPEAKER_FPS`], detect faces per
 /// frame (Ultraface, CPU), build persistent tracks with per-bin mouth
-/// activity, gate by the clip audio, attribute the speaker per bin, and derive
-/// the cut-based active-speaker [`CameraPlan`]. Memory stays one frame deep
-/// (streamed); a 60 s clip runs in roughly the time of its face inference.
+/// activity, gate by the clip audio, attribute the speaker per bin, join the
+/// voice lane (ADR 0042 — CAM++ embeddings fused as a margin tiebreak, when
+/// the model is present), and derive the cut-based active-speaker
+/// [`CameraPlan`]. Memory stays one frame deep (streamed); a 60 s clip runs
+/// in roughly the time of its face inference (the voice lane adds ~2 s).
+/// Returns the analysis, the plan, and a note for the Camera panel when the
+/// voice lane is off.
 #[cfg(feature = "face")]
 fn do_analyze_speakers(
     paths: &PipelinePaths,
@@ -2394,7 +2409,7 @@ fn do_analyze_speakers(
     prepared: &PreparedClip,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
-) -> Result<(SpeakerAnalysis, CameraPlan)> {
+) -> Result<(SpeakerAnalysis, CameraPlan, Option<String>)> {
     use yc_frame::speaker;
     anyhow::ensure!(
         paths.face_model.is_file(),
@@ -2458,11 +2473,76 @@ fn do_analyze_speakers(
     let n_bins = (dur * fps).ceil().max(1.0) as usize;
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
-    let analysis = SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence };
+    let mut analysis = SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None };
     // The source's own cut frames (pixel-level scene detection), so a multicam
     // plan cuts exactly where the source does — no sampling grid to lag it.
+    // Detected BEFORE the voice lane: its per-angle joins group the segments
+    // between these cuts by seat geometry.
     let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
     tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
+
+    // --- voice lane (ADR 0042): the diarization tiebreak beside the mouth
+    // lane. Additive by design — a missing or broken model yields exactly the
+    // mouth-only analysis (plus a note for the Camera panel), never a failed
+    // job. The fused speaking/confidence become THE lane every consumer reads.
+    let mut voice_note: Option<String> = None;
+    if !paths.voice_model.is_file() {
+        voice_note = Some("Voice lane off — model missing (Diagnostics ▸ Downloads)".into());
+        tracing::info!("voice model absent; speaker analysis is mouth-only");
+    } else {
+        match yc_frame::voice::embed_windows(
+            &paths.voice_model,
+            yc_frame::voice::SampleScale::Unit,
+            true,
+            &samples,
+            &analysis.voiced,
+            bin_s,
+        ) {
+            Ok((embs, kept)) => {
+                match yc_frame::voice::build_lane(
+                    &embs,
+                    &kept,
+                    &analysis,
+                    &cuts,
+                    dur,
+                    speaker::attribution_regime(&analysis),
+                ) {
+                    Some((mut lane, diag)) => {
+                        for l in &diag.lines {
+                            tracing::debug!(line = %l, "voice lane");
+                        }
+                        let (fspeak, fconf, overridden) =
+                            yc_frame::voice::fuse_attribution(&analysis, &lane.seat);
+                        tracing::info!(
+                            thr = diag.picked_thr,
+                            claimed_s = diag.claimed_s,
+                            agreement = diag.agreement,
+                            offscreen_s = diag.offscreen_s,
+                            overridden_bins = overridden.iter().filter(|o| **o).count(),
+                            "speaker analysis: voice lane joined"
+                        );
+                        lane.overridden = overridden;
+                        analysis.speaking = fspeak;
+                        analysis.confidence = fconf;
+                        analysis.voice = Some(lane);
+                    }
+                    None => {
+                        voice_note =
+                            Some("Voice lane off — too little speech to identify voices".into());
+                        tracing::info!("voice lane skipped: too few embeddable windows");
+                    }
+                }
+            }
+            Err(e) => {
+                voice_note = Some(format!("Voice lane failed — mouth-only analysis ({e:#})"));
+                tracing::warn!(error = %format!("{e:#}"), "voice lane failed; mouth-only analysis");
+            }
+        }
+    }
+    if cancel.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+
     let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
     // Jitter-class defects (a crop moving without subject cause) are flagged
@@ -2470,7 +2550,7 @@ fn do_analyze_speakers(
     for f in speaker::audit_camera_plan(&analysis, &plan) {
         tracing::warn!(finding = %f, "camera plan audit");
     }
-    Ok((analysis, plan))
+    Ok((analysis, plan, voice_note))
 }
 
 /// The `scene` value above which an inter-frame change is a source **cut**, not
@@ -2536,7 +2616,7 @@ fn do_analyze_speakers(
     _prepared: &PreparedClip,
     _cancel: &CancelToken,
     _tx: &Sender<Progress>,
-) -> Result<(SpeakerAnalysis, CameraPlan)> {
+) -> Result<(SpeakerAnalysis, CameraPlan, Option<String>)> {
     anyhow::bail!(
         "speaker detection needs a `face` build (cargo --features face) and the face model"
     )

@@ -178,6 +178,9 @@ pub struct EditorState {
     /// planned camera moves without subject cause — shown BEFORE an export so
     /// a jitter-class defect is flagged, not discovered in the render.
     camera_audit: Vec<String>,
+    /// Why the voice lane is off when `speakers.voice` is `None` (missing
+    /// model, too little speech, a broken session) — the Camera panel line.
+    voice_note: Option<String>,
     pub speaker_job: SpeakerJob,
     /// Selected caption row (click focuses + seeks).
     sel_unit: Option<usize>,
@@ -255,6 +258,7 @@ impl EditorState {
             speakers: None,
             plan: None,
             camera_audit: Vec::new(),
+            voice_note: None,
             speaker_job: SpeakerJob::NotRun,
             sel_unit: None,
             scroll_to_sel: false,
@@ -277,7 +281,12 @@ impl EditorState {
     }
 
     /// Receive the speaker analysis + camera plan (`Progress::Speakers`).
-    pub fn set_speakers(&mut self, analysis: SpeakerAnalysis, plan: CameraPlan) {
+    pub fn set_speakers(
+        &mut self,
+        analysis: SpeakerAnalysis,
+        plan: CameraPlan,
+        voice_note: Option<String>,
+    ) {
         // Auto-arm Active Speaker when the analysis proves multi-person and
         // the operator hasn't chosen a mode deliberately (Manual = the seed).
         if analysis.tracks.len() >= 2 && self.camera_mode == CameraMode::Manual {
@@ -285,6 +294,7 @@ impl EditorState {
         }
         self.speakers = Some(analysis);
         self.plan = Some(plan);
+        self.voice_note = voice_note;
         self.speaker_job = SpeakerJob::Ready;
         self.refresh_camera_audit();
     }
@@ -830,8 +840,13 @@ impl EditorState {
         }
         // Tracking chip (Active Speaker): who the camera is on, how sure —
         // for the shot of the frame on screen (same time as the crop above).
+        // When the bin under the frame was voice-overridden the chip says so,
+        // and a group shot held for a KNOWN off-screen voice reads as the
+        // off-screen split, not a generic group (ADR 0042).
         if self.camera_mode == CameraMode::ActiveSpeaker {
             if let Some(a) = &self.speakers {
+                let bin = (shown_t / a.bin_s.max(1e-9)) as usize;
+                let voice_bin = |v: &Vec<bool>| v.get(bin).copied().unwrap_or(false);
                 let text = match self
                     .plan
                     .as_ref()
@@ -839,11 +854,22 @@ impl EditorState {
                     .and_then(|s| s.track)
                 {
                     Some(id) => format!(
-                        "Tracking {} · {:.0}%",
+                        "Tracking {} · {:.0}%{}",
                         track_label(id),
-                        (a.confidence_at(shown_t) * 100.0).clamp(0.0, 100.0)
+                        (a.confidence_at(shown_t) * 100.0).clamp(0.0, 100.0),
+                        if a.voice.as_ref().map(|v| voice_bin(&v.overridden)).unwrap_or(false) {
+                            " · voice"
+                        } else {
+                            ""
+                        }
                     ),
-                    None => "Group shot".to_string(),
+                    None => {
+                        if a.voice.as_ref().map(|v| voice_bin(&v.offscreen)).unwrap_or(false) {
+                            "Off-screen voice · split".to_string()
+                        } else {
+                            "Group shot".to_string()
+                        }
+                    }
                 };
                 chip(&painter, canvas.min + egui::vec2(8.0, 8.0), &text, theme::GOLD);
             }
@@ -1147,6 +1173,19 @@ impl EditorState {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(a) = &self.speakers {
+                    if a.voice.is_some() {
+                        ui.label(
+                            egui::RichText::new("▪ off-screen")
+                                .color(theme::ERR.gamma_multiply(0.9))
+                                .size(11.5),
+                        )
+                        .on_hover_text(
+                            "Voice lane (diarization): who the VOICE is, joined per camera \
+                             angle. Red = a known voice with no seat on screen — the planner \
+                             shows the visible pair's split there.",
+                        );
+                        ui.label(egui::RichText::new("▪ voice").size(11.5).weak());
+                    }
                     for t in a.tracks.iter().rev() {
                         ui.label(
                             egui::RichText::new(format!("■ {}", track_label(t.id)))
@@ -1160,9 +1199,15 @@ impl EditorState {
         });
         ui.add_space(4.0);
 
-        // The strip: ruler(16) + captions(22) + speakers(N*12) + cuts(10).
+        // The strip: ruler(16) + captions(22) + speakers(N*12) + voice(12) + cuts(10).
         let n_tracks = self.speakers.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
-        let strip_h = 16.0 + 24.0 + (n_tracks as f32 * 13.0) + 12.0 + 8.0;
+        let has_voice = self.speakers.as_ref().map(|a| a.voice.is_some()).unwrap_or(false);
+        let strip_h = 16.0
+            + 24.0
+            + (n_tracks as f32 * 13.0)
+            + if has_voice { 13.0 } else { 0.0 }
+            + 12.0
+            + 8.0;
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), strip_h.max(60.0)),
             Sense::click_and_drag(),
@@ -1283,6 +1328,39 @@ impl EditorState {
                     }
                 }
                 lane_y += 13.0;
+            }
+            // The voice lane (ADR 0042): the diarization evidence itself,
+            // beside the fused seat lanes above — spans where the voice
+            // claims a seat, in that seat's colour (dimmer: it is evidence,
+            // not the camera), and KNOWN off-screen voice in red. The
+            // operator can see WHY a split or a rescued cut happened.
+            if let Some(v) = &a.voice {
+                let span = |sel: &dyn Fn(usize) -> Option<Color32>| {
+                    let mut i = 0usize;
+                    while i < v.seat.len() {
+                        let Some(color) = sel(i) else {
+                            i += 1;
+                            continue;
+                        };
+                        let mut j = i;
+                        while j < v.seat.len() && sel(j) == Some(color) {
+                            j += 1;
+                        }
+                        p.rect_filled(
+                            Rect::from_min_max(
+                                egui::pos2(t_to_x(i as f64 * a.bin_s), lane_y + 1.0),
+                                egui::pos2(t_to_x(j as f64 * a.bin_s), lane_y + 8.0),
+                            ),
+                            CornerRadius::same(2),
+                            color,
+                        );
+                        i = j;
+                    }
+                };
+                span(&|b: usize| v.seat[b].map(|s| theme::track_color(s).gamma_multiply(0.45)));
+                span(&|b: usize| {
+                    v.offscreen[b].then(|| theme::ERR.gamma_multiply(0.8))
+                });
             }
         }
 
@@ -1614,6 +1692,32 @@ impl EditorState {
                         if let Some(plan) = &self.plan {
                             ui.weak(format!("{} camera cuts planned", plan.shots.len().saturating_sub(1)));
                         }
+                        // Voice lane status (ADR 0042): what the diarization
+                        // evidence contributed — or why it is off.
+                        match (&a.voice, &self.voice_note) {
+                            (Some(v), _) => {
+                                let bin_s = a.bin_s.max(1e-9);
+                                let claimed =
+                                    v.seat.iter().flatten().count() as f64 * bin_s;
+                                let off =
+                                    v.offscreen.iter().filter(|o| **o).count() as f64 * bin_s;
+                                let over =
+                                    v.overridden.iter().filter(|o| **o).count() as f64 * bin_s;
+                                let mut line =
+                                    format!("Voice lane: {claimed:.1}s attributed");
+                                if over > 0.0 {
+                                    line.push_str(&format!(" · {over:.1}s corrected"));
+                                }
+                                if off > 0.0 {
+                                    line.push_str(&format!(" · {off:.1}s off-screen"));
+                                }
+                                ui.weak(line);
+                            }
+                            (None, Some(note)) => {
+                                ui.weak(note.as_str());
+                            }
+                            (None, None) => {}
+                        }
                         // Camera audit: jitter-class defects caught BEFORE the
                         // export (a crop moving without subject cause).
                         for w in &self.camera_audit {
@@ -1841,10 +1945,35 @@ impl EditorState {
                     ui,
                     "Camera",
                     if spec_camera {
-                        format!(
-                            "Active Speaker · {} cuts",
-                            self.plan.as_ref().map(|p| p.shots.len().saturating_sub(1)).unwrap_or(0)
-                        )
+                        // Off-screen splits are deliberate grammar (ADR 0042),
+                        // so the summary names them — the operator should never
+                        // be surprised by a split in the render.
+                        let cuts = self
+                            .plan
+                            .as_ref()
+                            .map(|p| p.shots.len().saturating_sub(1))
+                            .unwrap_or(0);
+                        let splits = match (&self.speakers, &self.plan) {
+                            (Some(a), Some(p)) if a.voice.is_some() => p
+                                .shots
+                                .iter()
+                                .filter(|s| {
+                                    s.track.is_none()
+                                        && a.voice.as_ref().is_some_and(|v| {
+                                            let b = (s.start_s / a.bin_s.max(1e-9)) as usize;
+                                            let e = ((s.end_s / a.bin_s.max(1e-9)) as usize)
+                                                .min(v.offscreen.len());
+                                            (b..e).any(|i| v.offscreen[i])
+                                        })
+                                })
+                                .count(),
+                            _ => 0,
+                        };
+                        if splits > 0 {
+                            format!("Active Speaker · {cuts} cuts · {splits} off-screen splits")
+                        } else {
+                            format!("Active Speaker · {cuts} cuts")
+                        }
                     } else {
                         camera_mode_label(self.camera_mode).to_string()
                     },

@@ -4,6 +4,51 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-06 (small hours) — The voice lane joins production: fused attribution, off-screen splits, voice-gated interjection cuts
+
+ADR 0042's gate passed, so this session made the spike real — one
+implementation, the integration slice, with the grill settling four
+decisions first (recorded in ADR 0042's new "Integration" section):
+
+- **The fused lane IS production attribution.** `SpeakerAnalysis` carries
+  `voice: Option<VoiceLane>` (per-bin joined seat / off-screen / overridden)
+  and `speaking`/`confidence` are the fused result — `plan_shots` keeps its
+  signature, every consumer reads the one lane the camera follows. The
+  join/sweep/fusion logic lifted VERBATIM into pure `yc_frame::voice`
+  functions, and `speaker_diag` now CALLS the production functions (~570
+  copied lines deleted) — the ADR 0029 "harness measures a copy" hazard is
+  structurally closed.
+- **The two operator-approved behaviors live in `plan_shots` itself.** An
+  angle piece whose voiced time is ≥50% known off-screen voice for ≥1.2 s
+  (the demo's measured thresholds) becomes the visible pair's split — 
+  decided BEFORE framing so it writes no anchor, and the return to that
+  angle reuses the pre-split crop verbatim (measured: dpos 0px across both
+  Deddy splits). A sub-2.4 s run survives absorption only when it carries
+  ≥ the 0.8 s confirm hold of voice-OVERRIDDEN bins — and only a
+  same-angle-joined voice can override, so "speaker on screen" is
+  structural, not a check.
+- **The Studio shows the evidence**: a voice row under the seat lanes
+  (seat-colored claims, red off-screen spans), chip tags (`· voice`,
+  `Off-screen voice · split`), a Camera-panel voice status line (or the
+  reason the lane is off), and the export summary counts off-screen splits.
+  The CAM++ model is an ADR 0041 download row (pin verified byte-for-byte +
+  live URL this session); missing/broken model = mouth-only analysis, never
+  a failed job.
+- **Validated on the production path**: Deddy reproduces every spike number
+  (thr 0.60, lane 8.9 s @ 93%, off-screen suspects 15.7/18.9/20.8 s) and the
+  integrated plan differs from baseline by EXACTLY the two approved splits,
+  camera audit clean; ANTITESA `camera_diag.fg` byte-identical to the pinned
+  hash (follow-visible untouched, plus a unit test pinning voice-blindness
+  there). 306 tests green in both feature configs. `diar_integration.mp4`
+  rendered with the production export command for the operator's gate —
+  old gate artifacts untouched.
+
+Notable measured truth: the 20.8 s interjection does NOT earn its cut on
+this fixture — its angle is single-visit, so the voice can't prove the
+speaker on-screen; the off-screen split covers it (matching the approved
+demo render). Making that cut fire needs person identity across angles:
+face re-id, the next spike.
+
 ## 2026-07-05 (late night) — Framing memory: the jump-cut camera twitch is gone
 
 The operator's ask after the diarization gate renders — "can we make the

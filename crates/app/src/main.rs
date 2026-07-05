@@ -44,6 +44,7 @@ fn main() -> eframe::Result<()> {
         llm_model: paths.llm_model(),
         llm_judge: paths.llm_judge(),
         face_model: paths.face_model(),
+        voice_model: paths.voice_model(),
         sep_model: paths.sep_model(),
         deep_filter: paths.deep_filter(),
         mtmd_cli: paths.mtmd_cli(),
@@ -432,6 +433,12 @@ impl AppPaths {
     /// downloaded; framing then falls back to full-frame gameplay.
     fn face_model(&self) -> PathBuf {
         self.models.join("version-RFB-320.onnx")
+    }
+
+    /// CAM++ speaker-embedding model for the voice lane (ADR 0042). Absent
+    /// unless downloaded; the speaker analysis is then mouth-only.
+    fn voice_model(&self) -> PathBuf {
+        self.models.join("3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
     }
 
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). Absent unless
@@ -933,9 +940,9 @@ impl eframe::App for App {
                         ed.set_captions(transcript);
                     }
                 }
-                Progress::Speakers { analysis, plan } => {
+                Progress::Speakers { analysis, plan, voice_note } => {
                     if let Some(ed) = &mut self.editor {
-                        ed.set_speakers(analysis, plan);
+                        ed.set_speakers(analysis, plan, voice_note);
                     }
                 }
                 Progress::JobDone => {
@@ -1292,6 +1299,13 @@ impl App {
             ),
             dep(
                 false,
+                "voice model",
+                p.voice_model(),
+                "voice lane: speaker diarization beside the mouth lane (ADR 0042)",
+                &["voice-model"],
+            ),
+            dep(
+                false,
                 "SER model",
                 p.ser_model(),
                 "arousal Signal (ser builds, ADR 0008) (~610 MB)",
@@ -1432,6 +1446,14 @@ impl App {
                 sha256: "34cd7e60aeff28744c657de7a3dc64e872d506741de66987f3426f2b79f88017",
                 total_bytes: 1_270_727,
                 install: Install::File(p.face_model()),
+            },
+            DownloadSpec {
+                id: "voice-model",
+                label: "voice model (CAM++ speaker embedding)",
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+                sha256: "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+                total_bytes: 28_281_164,
+                install: Install::File(p.voice_model()),
             },
             DownloadSpec {
                 id: "ser-model",

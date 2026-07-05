@@ -1,5 +1,9 @@
 # Speaker diarization spike: a CAM++ voice lane beside the mouth lane, angle-scoped identity, off-screen detection
 
+> **Integration shipped 2026-07-05 (the session after the verdicts)** — see
+> the "Integration" section at the end for the production shape and the
+> three decisions it added.
+
 ADR 0038 chose mouth-motion attribution and named audio diarization the
 upgrade path. The operator's verdict on the Deddy fix-validation render made
 that path current (2026-07-05 evening): the cuts are right (WHERE signed
@@ -189,3 +193,51 @@ The operator watched the A/B renders and ruled:
 - `SPEAKER_FPS`, the caption decode path, and every production analysis
   and render path are untouched; the full workspace suite stays green
   (288 tests).
+
+## Integration (2026-07-05, the session after the verdicts)
+
+The lane joined `Job::AnalyzeSpeakers` with the two approved behaviors.
+The grill settled four decisions the spike had left open:
+
+- **The fused lane IS the production attribution.** `SpeakerAnalysis`
+  gained `voice: Option<VoiceLane>` (per-bin joined seat, off-screen flag,
+  and which bins fusion overrode), and `speaking`/`confidence` are the
+  fused result — one source of truth for what the camera follows, and
+  `plan_shots` keeps its signature (the voice rides inside the analysis).
+  The join/sweep/fusion logic lifted verbatim into pure `yc_frame::voice`
+  functions; `speaker_diag` now CALLS the production functions instead of
+  carrying a copy (the ADR 0029 lesson, closed). Fusion runs in both
+  regimes (only the join is regime-scoped); follow-visible plans ignore
+  attribution by construction, so ANTITESA's `camera_diag.fg` stays
+  byte-identical — the standing regression gate.
+- **The off-screen split is decided per angle piece, before framing.** In
+  `plan_shots` step 5, a solo piece whose voiced bins are ≥50% known
+  off-screen voice for ≥1.2 s (the demo's measured thresholds) becomes the
+  visible pair's split screen and **writes no framing anchor** — group
+  pieces leave no anchors stays an invariant, and the return to the angle
+  after the split reuses the pre-split crop verbatim (zero twitch across
+  the interlude). The spike's post-pass demo would have left an anchor for
+  a solo crop that never rendered; deciding before framing doesn't.
+- **The interjection rescue lives in the min-shot absorption.** A
+  sub-2.4 s run survives step-4 absorption only when it carries at least
+  the fusion confirm hold (0.8 s) of voice-**overridden** bins — "cut when
+  voice is sure" made mechanical, robust to silence-fill padding at the
+  run's tail. "Speaker on screen in the current angle" is structural, not
+  a check: only a same-angle-joined voice can override (an off-screen
+  voice holds no seat there), so mouth motion alone — and off-screen
+  speech — can never mint a sub-minimum cut. The interjection piece and
+  the resuming shot frame through the existing framing memory: cut away,
+  cut back, the resumed crop is verbatim the pre-interjection one.
+- **The model soft-degrades and self-heals.** A missing or broken CAM++
+  file logs a warning and yields exactly the pre-integration mouth-only
+  analysis (never a failed job); the model is an ADR 0041 download row
+  (`voice-model`, the sherpa-onnx `speaker-recongition-models` release
+  URL, the SHA-256 above), and the Camera panel's voice status line says
+  when the lane is off and why.
+
+The Studio surfaces the lane: a thin voice row in the timeline strip
+(spans colored by joined seat, off-screen spans distinct), a `voice` tag
+on the tracking chip when the current bin was voice-overridden (or an
+off-screen split), and a one-line voice summary in the Camera panel. The
+integration gate artifact is `diar_integration.mp4` (`YC_INTEG_RENDER=1`
+in the harness) against the operator's existing `diar_baseline.mp4`.
