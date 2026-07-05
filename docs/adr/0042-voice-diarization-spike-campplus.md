@@ -135,6 +135,29 @@ Voice never replaces the visual join — it tiebreaks it:
   gate A/B pairs the baseline against the **off-screen demo** render
   (two shots become the visible pair's split).
 
+## Operator verdicts (2026-07-05, same night — the gate PASSED)
+
+The operator watched the A/B renders and ruled:
+
+- **Off-screen split screen: approved — "the split screen is good, use
+  it."** The off-screen override (a known voice with no seat in the
+  on-screen angle shows the visible pair's split) is greenlit for
+  integration into the production planner.
+- **Interjections under the min-shot: "cut when voice is sure."** The
+  2.4 s minimum gains one exception: a short turn earns a cut only when
+  the voice lane confidently attributes it AND its speaker is on screen
+  in the current angle. Mouth motion alone never triggers it (that was
+  the flicker the min-shot rule exists to stop).
+- **Scaling question ("what if 4+ people on screen?") answered**: the
+  group framing already degrades by visible-count (1 solo / 2 split /
+  3+ the centered wide column, people counted at ≥40% presence in the
+  shot). The 3+-visible column is the acknowledged compromise; a 2x2
+  grid for a true 4-wide is a small, isolated `group_layout` extension
+  to gate with the operator's eyes if a real clip ever wants it.
+- **Order**: the camera-smoothing session
+  (`nextprompt-camera-smoothing.md`, the jump-cut re-frame twitch) runs
+  first; the integration slice is its own session after it.
+
 ## Consequences
 
 - The operator gate (watching `diar_baseline.mp4` vs
@@ -142,7 +165,8 @@ Voice never replaces the visual join — it tiebreaks it:
   decisions first: should a **known off-screen voice** show the visible
   pair's split screen (as demoed), and should **short interjections**
   (< 2.4 s) ever earn a cut. Both change ADR 0038 behavior; neither is
-  assumed.
+  assumed. *(Both were answered the same night — see Operator verdicts
+  above: split approved, interjections cut only on confident voice.)*
 - Integration also inherits two measured limits: the cluster↔seat join
   leans on the mouth lane for co-occurrence (a stretch where the mouth is
   consistently wrong can mis-join a single-angle voice — **face

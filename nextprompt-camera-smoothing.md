@@ -81,13 +81,13 @@ position stability only).
   face -- "<data dir>" <start> <end> [csv]`; `YC_VOICE_RENDER=1` renders
   A/B gate files.
 
-## Pending gate (fold in if the operator has answered)
-The diarization A/B verdict + two grammar decisions are outstanding
-(handoffs/2026-07-05-diarization-spike.md): off-screen voice -> split
-screen? interjections < 2.4 s -> ever cut? If the operator answers before
-or during this session, record the verdicts in ADR 0042 and queue the
-integration slice as its own session — do NOT fold integration into this
-one.
+## Diarization gate: ANSWERED (2026-07-05 night; ADR 0042 verdicts section)
+Split screen approved ("use it"); interjections < 2.4 s cut ONLY on a
+confident voice attribution with the speaker on screen; the 4+-people
+question answered (visible-count degradation; 2x2 grid is a possible
+later gated extension). Integration is unblocked and QUEUED AFTER this
+session — do NOT fold it into this one. This session is WHERE-stability
+only; it must not change WHO or add any voice-driven behavior.
 
 ## Ritual
 /grill-with-docs first; finish with /handoff to `handoffs/<date>-<slug>.md`
