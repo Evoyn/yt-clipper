@@ -100,6 +100,11 @@ const VAD_REL_FRAC: f32 = 0.22;
 
 /// Minimum shot length, seconds — cutting faster than this reads as jumpy.
 const MIN_SHOT_S: f64 = 2.4;
+/// Minimum length of a per-angle piece when an EDITED source splits an
+/// attribution shot at its scene cuts (see `plan_shots` step 5): a cut closer
+/// than this to a piece boundary folds into the neighbour — a sliver re-frame
+/// is a flash, and the neighbouring angle's framing carries those frames.
+const MIN_PIECE_S: f64 = 0.35;
 /// Consecutive shots shorter than this each mark a rapid exchange; a run of
 /// them collapses into one group shot instead of a cut storm.
 const RAPID_SHOT_S: f64 = 4.0;
@@ -213,12 +218,6 @@ struct Track {
     path: Vec<Option<FaceBox>>,
     prev_patch: Option<[f32; PATCH_W * PATCH_H]>,
     frames_seen: usize,
-}
-
-impl Track {
-    fn mean_cx(&self) -> f32 {
-        self.sum_cx / self.boxes.len() as f32
-    }
 }
 
 /// Accumulates per-frame detections + pixels into [`SpeakerTrack`]s. Feed every
@@ -350,15 +349,19 @@ impl TrackBuilder {
         patch
     }
 
-    /// Close the builder: keep persistent tracks, relabel left-to-right
-    /// ("Person A" is the leftmost — stable reading order), smooth activity.
+    /// Close the builder: merge same-seat fragments, keep persistent tracks,
+    /// relabel left-to-right ("Person A" is the leftmost — stable reading
+    /// order), smooth activity.
     pub fn finish(self) -> Vec<SpeakerTrack> {
         let n = self.n_frames.max(1);
         let win = (ACTIVITY_SMOOTH_S * SPEAKER_FPS).round().max(1.0) as usize;
         let min_frames = (MIN_TRACK_SECONDS * SPEAKER_FPS).round().max(1.0) as usize;
-        let mut kept: Vec<(f32, SpeakerTrack)> = Vec::new();
+        // Build EVERY track first (no persistence gate yet): a real seat can be
+        // fragmented into pieces individually too short to survive, and the
+        // merge below must see the fragments to reunite them.
+        let mut all: Vec<Seat> = Vec::new();
         for t in self.tracks {
-            if t.frames_seen < min_frames {
+            if t.frames_seen == 0 {
                 continue;
             }
             let presence = t.frames_seen as f32 / n as f32;
@@ -368,20 +371,29 @@ impl TrackBuilder {
                     raw[i] = v;
                 }
             }
-            let mean_cx = t.mean_cx();
             let mut path = t.path;
             path.resize(n, None);
-            kept.push((
-                mean_cx,
-                SpeakerTrack {
+            all.push(Seat {
+                sum_cx: t.sum_cx,
+                boxes: t.boxes,
+                tr: SpeakerTrack {
                     id: 0, // assigned after the left-to-right sort
-                    bbox: median_box(&t.boxes),
+                    bbox: FaceBox { x: 0.0, y: 0.0, w: 0.0, h: 0.0, score: 0.0 },
                     presence,
                     activity: smooth(&raw, win),
                     path,
                 },
-            ));
+            });
         }
+        for s in all.iter_mut() {
+            s.tr.bbox = median_box(&s.boxes);
+        }
+        merge_same_seat_fragments(&mut all, n);
+        let mut kept: Vec<(f32, SpeakerTrack)> = all
+            .into_iter()
+            .filter(|s| s.tr.path.iter().filter(|p| p.is_some()).count() >= min_frames)
+            .map(|s| (s.sum_cx / s.boxes.len().max(1) as f32, s.tr))
+            .collect();
         // Drop printed-face props (a book cover, a poster on the set): much
         // smaller than the real speakers AND far less mouth motion (a printed
         // face only shimmers with codec noise). Guarded so it can't empty the
@@ -416,6 +428,110 @@ impl TrackBuilder {
             })
             .collect()
     }
+}
+
+/// A track being assembled in [`TrackBuilder::finish`], with the raw
+/// aggregates the same-seat merge needs to recombine.
+struct Seat {
+    sum_cx: f32,
+    boxes: Vec<FaceBox>,
+    tr: SpeakerTrack,
+}
+
+/// Two tracks are fragments of the SAME seat when their median boxes sit
+/// within this fraction of the wider face of each other. Two real adjacent
+/// people never overlap this closely (measured Deddy: same-seat fragments 20
+/// and 104 px apart vs 170 px faces; the other person 519+ px away).
+const MERGE_NEAR_FRAC: f32 = 0.8;
+/// ...and they are on screen AT THE SAME TIME for at most this long. Same-seat
+/// fragments alternate (one person can't be detected twice), so co-visibility
+/// stays at stray double-fires (measured: 0.0-0.1 s); two real people sit
+/// co-visible for most of a shared framing.
+const MERGE_CO_VISIBLE_S: f64 = 0.35;
+/// ...and each fragment must share the screen with somebody OUTSIDE the pair
+/// for at least this fraction of its visible bins. This is what keeps the rule
+/// safe on a solo-camera multicam edit (the Leon/ANTITESA source): there, two
+/// different people's solo framings can also be near + alternating — but a
+/// solo framing shows NO other face, so it never clears this bar, while a
+/// two-person angle (the Deddy source) always does.
+const MERGE_CONTEXT_FRAC: f32 = 0.4;
+
+/// Reunite tracks that are fragments of one on-screen seat (person position).
+///
+/// A detection gap (a hand, a mic, a profile turn) plus a shift past the
+/// match radius mints a NEW track, and the stale one later reclaims its old
+/// spot — one person becomes several interleaved half-tracks. Measured on the
+/// Deddy clip: 2 people became 4 tracks (pairs 20 px and 104 px apart,
+/// co-visible 0.0-0.1 s), which fragmented the mouth-activity signal
+/// (attribution flip-flopped between one person's own halves, mean confidence
+/// 0.21), drew twin labelled boxes on one head in the editor, and fed framing
+/// windows that landed inside a fragment's gap (the drifting "follow" pans
+/// toward stale positions). Merging is transitive (union-find by repeated
+/// scan) and recombines paths (first-Some), activity (per-bin max — the same
+/// mouth seen via different framings), boxes, and box-count aggregates.
+fn merge_same_seat_fragments(all: &mut Vec<Seat>, n: usize) {
+    let max_co = (MERGE_CO_VISIBLE_S * SPEAKER_FPS).round() as usize;
+    loop {
+        let mut merged_any = false;
+        'scan: for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                if !same_seat(&all[i], &all[j], all, max_co, n) {
+                    continue;
+                }
+                let b = all.remove(j);
+                let a = &mut all[i];
+                for k in 0..n {
+                    if a.tr.path[k].is_none() {
+                        a.tr.path[k] = b.tr.path[k];
+                    }
+                    a.tr.activity[k] = a.tr.activity[k].max(b.tr.activity[k]);
+                }
+                a.sum_cx += b.sum_cx;
+                a.boxes.extend(b.boxes);
+                a.tr.bbox = median_box(&a.boxes);
+                a.tr.presence =
+                    a.tr.path.iter().filter(|p| p.is_some()).count() as f32 / n.max(1) as f32;
+                merged_any = true;
+                break 'scan;
+            }
+        }
+        if !merged_any {
+            return;
+        }
+    }
+}
+
+/// The [`merge_same_seat_fragments`] test for one pair: near, temporally
+/// complementary, and both fragments live in multi-person framings.
+fn same_seat(a: &Seat, b: &Seat, all: &[Seat], max_co: usize, n: usize) -> bool {
+    let dx = a.tr.bbox.cx() - b.tr.bbox.cx();
+    let dy = a.tr.bbox.cy() - b.tr.bbox.cy();
+    let near = (dx * dx + dy * dy).sqrt() < MERGE_NEAR_FRAC * a.tr.bbox.w.max(b.tr.bbox.w);
+    if !near {
+        return false;
+    }
+    let co = (0..n)
+        .filter(|&k| a.tr.path[k].is_some() && b.tr.path[k].is_some())
+        .count();
+    if co > max_co {
+        return false;
+    }
+    let with_context = |s: &Seat, other: &Seat| {
+        let vis: Vec<usize> = (0..n).filter(|&k| s.tr.path[k].is_some()).collect();
+        if vis.is_empty() {
+            return false;
+        }
+        let ctx = vis
+            .iter()
+            .filter(|&&k| {
+                all.iter().any(|o| {
+                    !std::ptr::eq(o, s) && !std::ptr::eq(o, other) && o.tr.path[k].is_some()
+                })
+            })
+            .count();
+        ctx as f32 >= MERGE_CONTEXT_FRAC * vis.len() as f32
+    };
+    with_context(a, b) && with_context(b, a)
 }
 
 fn median_box(boxes: &[FaceBox]) -> FaceBox {
@@ -586,7 +702,11 @@ fn mean_visible_faces(tracks: &[SpeakerTrack], n: usize) -> f32 {
 ///
 /// - **Static wide shot** (everyone visible): the classic active-speaker plan —
 ///   attribution picks the talker, silence holds, flickers absorb, a rapid
-///   exchange collapses into a group shot, shots respect [`MIN_SHOT_S`].
+///   exchange collapses into a group shot, shots respect [`MIN_SHOT_S`]. When
+///   the source turns out to be an **edit anyway** (`cuts` non-empty — e.g. a
+///   show cutting between two-person angles, where faces-per-frame alone can't
+///   tell), each shot re-frames at the source's cut frames: WHO stays
+///   attribution's choice, WHERE is per-angle (see step 5).
 /// - **Multicam edit / solo** (≈1 face at a time): the source already cut to
 ///   its subject, so the plan *follows the visible face* and mirrors those cuts,
 ///   never parking a crop on an off-screen position (the empty-crop failure on
@@ -714,6 +834,19 @@ pub fn plan_shots(
     //    track's path over the run's bins), not the whole-clip landmark box —
     //    a speaker who has shifted since the clip's start is still centered,
     //    and a drift across the run becomes the slow follow pan.
+    //
+    //    In an EDITED source (`cuts` non-empty: camera angles / jump cuts —
+    //    a genuinely static wide shot has none), each run additionally splits
+    //    at the source's own cut frames and each piece is framed from ITS
+    //    bins alone. A source cut re-positions its people (~100 px jumps on
+    //    the Deddy clip), so one crop — or worse, one glide — spanning a cut
+    //    is framed on a position average that exists in NEITHER angle: the
+    //    operator's drifting camera and cropped-off face. A piece where the
+    //    subject was never detected (occluded through that whole angle) keeps
+    //    the previous piece's framing rather than snapping to a stale
+    //    landmark.
+    let mut cut_list: Vec<f64> = cuts.to_vec();
+    cut_list.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mut shots = Vec::with_capacity(final_runs.len());
     let mut t = 0.0f64;
     let mut bin = 0usize;
@@ -727,28 +860,56 @@ pub fn plan_shots(
         t = end_s;
         let (b0, b1) = (bin, bin + len);
         bin = b1;
-        let (track, layout, pan_to) = match subj {
-            Subject::Track(id) => {
-                match analysis.tracks.iter().find(|tr| tr.id == *id) {
-                    Some(tr) => match solo_span_framing(tr, b0, b1, src_w, src_h) {
-                        Some((c0, pan)) => {
-                            (Some(*id), Layout::FullFrame { crop: c0 }, pan)
-                        }
-                        // Face absent through the whole run: the landmark box.
-                        None => (
-                            Some(*id),
-                            Layout::FullFrame { crop: solo_crop(&tr.bbox, src_w, src_h) },
-                            None,
-                        ),
+        // Piece boundaries: the run's span, split at in-run cuts, slivers
+        // folded into their neighbour (MIN_PIECE_S).
+        let mut bounds: Vec<f64> = vec![start_s];
+        for &c in &cut_list {
+            if c > bounds.last().copied().unwrap_or(start_s) + MIN_PIECE_S
+                && c < end_s - MIN_PIECE_S
+            {
+                bounds.push(c);
+            }
+        }
+        bounds.push(end_s);
+        let mut prev: Option<(Option<usize>, Layout)> = None;
+        for w in bounds.windows(2) {
+            let (p0, p1) = (w[0], w[1]);
+            let pb0 = ((p0 / bin_s).round() as usize).clamp(b0, b1);
+            let pb1 = ((p1 / bin_s).round() as usize).clamp(pb0, b1);
+            let (track, layout, pan_to) = match subj {
+                Subject::Track(id) => match analysis.tracks.iter().find(|tr| tr.id == *id) {
+                    Some(tr) => match solo_span_framing(tr, pb0, pb1, src_w, src_h) {
+                        Some((c0, pan)) => (Some(*id), Layout::FullFrame { crop: c0 }, pan),
+                        // Subject undetected through this piece: continuity
+                        // first (the previous angle's framing), then the run,
+                        // then the whole-clip landmark box.
+                        None => match &prev {
+                            Some((tid, l)) => (*tid, l.clone(), None),
+                            None => match solo_span_framing(tr, b0, b1, src_w, src_h) {
+                                Some((c0, _)) => {
+                                    (Some(*id), Layout::FullFrame { crop: c0 }, None)
+                                }
+                                None => (
+                                    Some(*id),
+                                    Layout::FullFrame {
+                                        crop: solo_crop(&tr.bbox, src_w, src_h),
+                                    },
+                                    None,
+                                ),
+                            },
+                        },
                     },
-                    None => (None, group_layout_span(&analysis.tracks, b0, b1, src_w, src_h), None),
+                    None => {
+                        (None, group_layout_span(&analysis.tracks, pb0, pb1, src_w, src_h), None)
+                    }
+                },
+                Subject::Group => {
+                    (None, group_layout_span(&analysis.tracks, pb0, pb1, src_w, src_h), None)
                 }
-            }
-            Subject::Group => {
-                (None, group_layout_span(&analysis.tracks, b0, b1, src_w, src_h), None)
-            }
-        };
-        shots.push(Shot { start_s, end_s, track, layout, pan_to });
+            };
+            prev = Some((track, layout.clone()));
+            shots.push(Shot { start_s: p0, end_s: p1, track, layout, pan_to });
+        }
     }
     CameraPlan { shots }
 }
@@ -1456,6 +1617,125 @@ mod tests {
             speaking,
             tracks,
         }
+    }
+
+    /// Drive a [`TrackBuilder`] with one face per frame at the given center xs
+    /// (None = the face is undetected that frame), plus an optional always-on
+    /// context face — the same-seat merge fixtures.
+    fn built_tracks(seat_xs: &[Option<f32>], context_x: Option<f32>) -> Vec<SpeakerTrack> {
+        let (fw, fh) = (64usize, 36usize);
+        let rgb = frame_with_patch(fw, fh, None);
+        let mut b = TrackBuilder::new(1920.0, 1080.0, fw, fh);
+        for x in seat_xs {
+            let mut faces = Vec::new();
+            if let Some(cx) = x {
+                faces.push(fb(cx - 85.0, 300.0, 170.0, 170.0));
+            }
+            if let Some(cx) = context_x {
+                faces.push(fb(cx - 85.0, 280.0, 170.0, 170.0));
+            }
+            b.observe(&faces, &rgb);
+        }
+        b.finish()
+    }
+
+    /// One person drifting 600→780 px, an occlusion gap, then re-detected back
+    /// at 615 px: the last-seen match radius mints a SECOND track (the Deddy
+    /// fragmentation). The xs series shared by the two merge tests.
+    fn split_seat_xs() -> Vec<Option<f32>> {
+        let mut xs: Vec<Option<f32>> = Vec::new();
+        for i in 0..nbins(5.0) {
+            xs.push(Some(600.0 + 180.0 * i as f32 / nbins(5.0) as f32));
+        }
+        for _ in 0..6 {
+            xs.push(None); // the occlusion gap
+        }
+        for _ in 0..nbins(5.0) {
+            xs.push(Some(615.0)); // back near the seat: > match radius from 780
+        }
+        xs
+    }
+
+    #[test]
+    fn same_seat_fragments_merge_when_other_people_share_the_frame() {
+        // A two-person framing (a context face is always on screen), so the
+        // near + alternating pair must reunite into ONE seat track — the
+        // Deddy failure was 2 people becoming 4 tracks, splitting the mouth
+        // signal and drawing twin labels on one head.
+        let tracks = built_tracks(&split_seat_xs(), Some(1400.0));
+        assert_eq!(tracks.len(), 2, "seat + context, not fragments: {tracks:?}");
+        let seat = tracks
+            .iter()
+            .find(|t| t.bbox.cx() < 1000.0)
+            .expect("left seat track");
+        let vis = seat.path.iter().filter(|p| p.is_some()).count();
+        assert!(vis >= nbins(9.5), "merged seat spans both fragments: {vis} bins");
+    }
+
+    #[test]
+    fn solo_camera_alternation_does_not_merge() {
+        // The same near + alternating pair with NOBODY else on screen — the
+        // signature of a solo-camera multicam edit (Leon/ANTITESA), where two
+        // near-positioned alternating tracks are two DIFFERENT people's
+        // framings. Merging here would fuse two people into one subject.
+        let tracks = built_tracks(&split_seat_xs(), None);
+        assert_eq!(tracks.len(), 2, "solo framings stay separate: {tracks:?}");
+        let max_vis = tracks
+            .iter()
+            .map(|t| t.path.iter().filter(|p| p.is_some()).count())
+            .max()
+            .unwrap();
+        assert!(max_vis <= nbins(5.5), "no track absorbed the other: {max_vis} bins");
+    }
+
+    #[test]
+    fn attribution_shots_reframe_at_the_sources_own_cuts() {
+        // Static wide regime (both faces always visible), one speaker
+        // throughout — but the source is itself an edit: a cut at 5.0 s moves
+        // the speaker's on-screen position 120 px (a new angle). The plan must
+        // re-frame AT the cut (two shots, same subject, different crops)
+        // instead of averaging one crop/glide across both angles (the Deddy
+        // drifting-camera + cropped-face failure).
+        let n = nbins(12.0);
+        let cut_bin = nbins(5.0);
+        let a_path: Vec<Option<FaceBox>> = (0..n)
+            .map(|i| {
+                Some(if i < cut_bin {
+                    fb(325.0, 325.0, 150.0, 150.0) // cx 400
+                } else {
+                    fb(445.0, 325.0, 150.0, 150.0) // cx 520: the angle jump
+                })
+            })
+            .collect();
+        let b_path: Vec<Option<FaceBox>> = (0..n).map(|_| Some(fb(1325.0, 325.0, 150.0, 150.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(325.0, 325.0, 150.0, 150.0), presence: 1.0, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1325.0, 325.0, 150.0, 150.0), presence: 1.0, activity: vec![0.0; n], path: b_path };
+        let plan =
+            plan_shots(&analysis(vec![Some(0); n], vec![ta, tb]), 1920.0, 1080.0, 12.0, &[5.0]);
+        assert_eq!(plan.shots.len(), 2, "one piece per angle: {plan:?}");
+        assert!((plan.shots[0].end_s - 5.0).abs() < 1e-9, "re-frame exactly at the cut");
+        assert_eq!((plan.shots[0].track, plan.shots[1].track), (Some(0), Some(0)));
+        let crop_x = |s: &Shot| match &s.layout {
+            Layout::FullFrame { crop } => crop.x,
+            other => panic!("solo piece: {other:?}"),
+        };
+        let dx = crop_x(&plan.shots[1]) - crop_x(&plan.shots[0]);
+        assert!(dx > 60.0, "each piece framed on its own angle's position: dx {dx}");
+        assert!(
+            plan.shots.iter().all(|s| s.pan_to.is_none()),
+            "static positions per angle must not glide: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_hugging_the_shot_edge_does_not_make_a_sliver_piece() {
+        let n = nbins(12.0);
+        let path: Vec<Option<FaceBox>> = (0..n).map(|_| Some(fb(325.0, 325.0, 150.0, 150.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(325.0, 325.0, 150.0, 150.0), presence: 1.0, activity: vec![0.0; n], path: path.clone() };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1325.0, 325.0, 150.0, 150.0), presence: 1.0, activity: vec![0.0; n], path };
+        let plan =
+            plan_shots(&analysis(vec![Some(0); n], vec![ta, tb]), 1920.0, 1080.0, 12.0, &[0.2]);
+        assert_eq!(plan.shots.len(), 1, "a 0.2 s sliver folds into the shot: {plan:?}");
     }
 
     #[test]

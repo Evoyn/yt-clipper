@@ -299,3 +299,59 @@ speakers" button is gone** — it queued the identical `AnalyzeSpeakers` job
 that picking **Active Speaker / Group** already auto-queues, and read as a
 second feature. The AI mode chips carry the cost note ("first use runs the
 speaker analysis"); Failed keeps its Retry.
+
+## Refinement — same-seat track merge + angle-aware attribution shots (2026-07-05)
+
+The Deddy Corbuzier clip (a 4-person episode cut between TWO-PERSON angles
+and jump cuts — the burned studio clock leaps minutes across a cut) broke
+the attribution regime three ways at once: a drifting camera (slow pans
+right/down "chasing" nobody), twin labelled boxes on one head in the
+editor, and attribution flipping to the "wrong" person. `speaker_diag`
+(new inspector, the production glue replicated 1:1) measured the shared
+root: **2 people on screen became 4 tracks**. A detection gap (mic/hand/
+profile) plus a shift past the last-seen match radius mints a new track,
+and the stale one later reclaims its old spot — fragments 20 px and 104 px
+apart, co-visible 0.0-0.1 s, one with a 31.8 s hole. Fragmented tracks
+fragmented the mouth signal (mean attribution confidence 0.21, "switches"
+between one person's own halves), and framing windows landed inside a
+fragment's gaps, producing pans toward stale positions (a −114 px glide
+while the subject moved +2 px; a +95 px "down" drift computed after its
+track had vanished).
+
+Two fixes, both in `yc_frame::speaker`, both measured on the same clip:
+
+- **`merge_same_seat_fragments`** (in `TrackBuilder::finish`, before the
+  persistence gate so short fragments can be saved by reuniting): tracks
+  merge when **near** (median centers within 0.8× the wider face — measured
+  same-seat pairs sit 20-104 px apart vs 519 px to the next person),
+  **temporally complementary** (co-visible ≤ 0.35 s — one person can't be
+  detected twice), and — the safety gate — **each fragment shares the frame
+  with someone outside the pair** for ≥ 40 % of its bins. That last test is
+  what keeps solo-camera multicam edits (Leon/ANTITESA) unmerged: there,
+  two *different people's* solo framings also alternate near the same
+  position, but a solo framing shows no other face, so it never clears the
+  bar, while any two-person angle does. Result on the clip: 4 tracks → the
+  2 real seats (right seat 100 % presence, zero gaps), confidence 0.21 →
+  0.38, switches only between real people.
+- **Angle-aware attribution shots** (`plan_shots` step 5): when the
+  "static wide" source turns out to be an edit anyway (`cuts` non-empty —
+  faces-per-frame alone cannot tell a true static wide from a show cutting
+  between two-person angles), each attribution run splits at the source's
+  own cut frames and each piece frames from ITS bins alone; slivers under
+  `MIN_PIECE_S` (0.35 s) fold into their neighbour, and a piece whose
+  subject was never detected keeps the previous piece's framing. A cut
+  re-positions everyone (~100 px here), so one crop or glide spanning a cut
+  was framed on an average position existing in neither angle — the
+  cropped-off forehead and the drift. WHO stays attribution's job; WHERE is
+  per-angle. Result: 15 pieces, remaining pans match measured real motion
+  to the pixel ((+56,+42) pan vs (+57,+42) moved — an actual lean,
+  followed), the re-render sweep shows 14 single switch spikes with 0 flash
+  doubles, and the frame strips regain headroom.
+
+The operator asked for "100 % who-is-speaking, remember the voice, detect
+the lips": lips ARE the current signal (mouth-region luma motion, chosen at
+the top of this ADR); voice-remembering is diarization — still the
+documented upgrade path, now easier to justify since attribution operates
+on whole seats. No detector is 100 %; this refinement removes the
+structural errors (identity fragmentation and cross-angle framing), which
+is where the visible failures lived.

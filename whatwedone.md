@@ -4,6 +4,37 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-05 (evening) — Deddy clip: 2 people were 4 tracks; camera now re-frames per angle
+
+Operator's new bug batch on a Deddy Corbuzier export (4-person episode, edit
+cuts between two-person angles + jump cuts): the camera drifted right/down,
+attribution "sometimes didn't know who spoke", and the editor showed the
+wrong person label (twin boxes on one head). The new `speaker_diag`
+inspector (production glue 1:1) measured one shared root: **2 on-screen
+people had become 4 tracks** — a detection gap plus a shift past the match
+radius mints a duplicate track (fragments 20/104 px apart, co-visible
+0.0-0.1 s, one with a 31.8 s hole). Fragmentation split the mouth-motion
+signal (mean confidence 0.21, fake "switches" between one person's own
+halves) and framing windows fell into fragment gaps (pans gliding toward
+stale positions — a −114 px glide while the subject moved +2 px).
+
+Fixes (pure `yc_frame::speaker`, 46 tests green): **same-seat fragments
+merge** (near + alternating + each fragment shares the frame with someone
+outside the pair — that context gate is what keeps Leon-style solo-camera
+framings, which show nobody else, from ever fusing two people), and the
+attribution regime **re-frames each shot at the source's own cut frames**
+(WHO stays attribution, WHERE is per-angle; slivers fold; an occluded piece
+keeps the previous framing). Measured on the same clip: 4 tracks → the 2
+real seats (right seat 100 % presence, no gaps), confidence 0.21 → 0.38,
+15 per-angle pieces whose remaining pans match real measured motion to the
+pixel, re-render sweep 14 single switch spikes / 0 flash doubles, and the
+cropped-off-forehead framing regains headroom. Validation render:
+`Diskusi politik dan nutrisi (fix-validation).mp4` beside the export —
+eyeball, then delete. Honest limit stated to the operator: mouth-motion is
+already the "lips" signal; per-voice identity (diarization) stays the
+documented upgrade path; 100 % is not a thing any detector delivers, but
+the structural failures are gone. (ADR 0038)
+
 ## 2026-07-05 (later) — the same blank in the Studio preview + one camera control
 
 Operator confirmed the fixed export's cuts are clean, then caught the **same
