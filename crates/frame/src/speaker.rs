@@ -138,6 +138,14 @@ const SPLIT_ZOOM: f32 = 3.0;
 /// gets a perfectly static shot, and cuts stay the grammar for speaker
 /// changes (ADR 0038).
 const FOLLOW_DEADZONE_FRAC: f32 = 0.12;
+/// A follow pan is only modelled when the head→tail drift EXPLAINS the
+/// subject's excursion: the off-drift remainder of the center band ("extra")
+/// must stay under this fraction of the drift itself. Measured on the Deddy
+/// fixture: genuine one-way drifts carry extra ≤ 0.36× their drift, while
+/// the 22–27 s out-and-back lunge carried 1.7× — a linear glide there chases
+/// a mid-lunge average while the subject moves the other way (the operator's
+/// "jitter to the left"). An excursion holds a grown static crop instead.
+const PAN_EXTRA_FRAC: f32 = 0.6;
 /// Seconds at a shot's head/tail whose median face center anchors the shot's
 /// opening/closing framing (and the follow pan between them).
 const FOLLOW_EDGE_S: f64 = 1.6;
@@ -1340,6 +1348,16 @@ pub fn solo_span_framing(
     let (cx_lo, cx_hi, cy_lo, cy_hi) = span_center_band(&track.path, lo, hi)?;
     let extra_x = ((cx_hi - cx_lo) - (ex - sx).abs()).max(0.0);
     let extra_y = ((cy_hi - cy_lo) - (ey - sy).abs()).max(0.0);
+    // A glide only fits a one-way drift. When the subject swept far beyond
+    // the drift line and came back (extra >> drift — an out-and-back lunge,
+    // not a move), a linear pan chases a mid-lunge average while the subject
+    // returns the other way: hold one static crop over the whole band
+    // instead ([`PAN_EXTRA_FRAC`], measured).
+    if (extra_x * extra_x + extra_y * extra_y).sqrt()
+        > PAN_EXTRA_FRAC * ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt()
+    {
+        return Some((static_span_crop(track, lo, hi, src_w, src_h)?, None));
+    }
     let mut h = base_h + extra_y;
     let mut w = (h * aspect).max(base_w + extra_x);
     h = w / aspect;
@@ -2182,6 +2200,36 @@ mod tests {
         assert_eq!(pan.w, crop.w, "pan must not resize the crop");
         assert_eq!(pan.h, crop.h);
         assert!(pan.x > crop.x + 100.0, "pan moves toward the drift: {} -> {}", crop.x, pan.x);
+    }
+
+    #[test]
+    fn an_out_and_back_excursion_holds_a_static_frame_not_a_glide() {
+        // The subject lunges 300 px left and comes most of the way BACK
+        // within one shot (the Deddy 22-27 s excursion): a head->tail glide
+        // models it as a slow leftward drift, so the camera slides away from
+        // a subject who has already returned — the operator's "jitter to the
+        // left". The excursion (band far wider than the drift) must refuse
+        // the pan and hold ONE static crop containing the whole band.
+        let n = nbins(6.0);
+        let xs: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                if t < 0.5 {
+                    700.0 - 600.0 * t // out: 700 -> 400
+                } else {
+                    400.0 + 300.0 * (t - 0.5) // back: 400 -> 550
+                }
+            })
+            .collect();
+        let tracks = vec![track_with_path(0, &xs), track_with_path(1, &vec![1500.0; n])];
+        let plan = plan_shots(&analysis(vec![Some(0); n], tracks), 1920.0, 1080.0, 6.0, &[]);
+        assert_eq!(plan.shots.len(), 1);
+        let shot = &plan.shots[0];
+        assert!(shot.pan_to.is_none(), "an excursion must not glide: {shot:?}");
+        let Layout::FullFrame { crop } = &shot.layout else { panic!("solo") };
+        assert!(crop.w > 2.0 * 162.0, "the static crop grows to hold the excursion: {crop:?}");
+        let c = crop.x + crop.w * 0.5;
+        assert!((500.0..=580.0).contains(&c), "framed on the band center, got {c}");
     }
 
     #[test]

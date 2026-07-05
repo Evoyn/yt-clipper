@@ -36,10 +36,23 @@ session, one mechanism (ADR 0038's new "framing memory" refinement):
   702 px); a pan's next same-seat shot holds the pan's landing crop
   exactly. ANTITESA: byte-identical filtergraph (hash-checked). 293 tests
   green (5 new).
-- **Gate artifact**: `camera_smoothing.mp4` (new `YC_SMOOTH_RENDER=1`,
-  the production export command, kept separate so the diar_* A/B renders
-  survive) — awaiting the operator's eyes; the verdict opens the next
-  session's grill.
+- **Operator retest, same night**: "22-26s still have jitter to the left"
+  — that window is the follow-PAN piece, which the memory never touches
+  (and which rendered identically pre/post). The per-bin CSV showed an
+  out-and-back lunge (365 px out, most of the way back, face undetected
+  the first 1.3 s) modelled as one linear glide — the camera slid left
+  while the subject returned right. Fix: a pan must have its head→tail
+  drift EXPLAIN the excursion (`PAN_EXTRA_FRAC` 0.6 — genuine drifts
+  measure the off-drift remainder ≤0.36× their drift, the lunge 1.7×);
+  an excursion holds ONE static crop grown over the whole band. Piece #4's
+  glide became a stationary full-height frame; the three genuine drift
+  pans and every reuse unchanged; ANTITESA still byte-identical; 294
+  tests green.
+- **Gate artifact**: `camera_smoothing.mp4` re-rendered 22:24
+  (`YC_SMOOTH_RENDER=1`, the production export command, kept separate so
+  the diar_* A/B renders survive) — awaiting the operator's eyes on BOTH
+  symptoms (jump-cut twitch + the 22-26 s window); the verdict opens the
+  next session's grill.
 
 Next queued: the diarization integration slice
 (nextprompt-diarization-integration.md).

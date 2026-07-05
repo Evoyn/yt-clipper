@@ -427,3 +427,23 @@ to its predecessor — a sub-dead-zone slide would then never re-frame and
 walk the face out of the crop); **previous-piece-only comparison** (an
 A-B-A camera alternation re-derives on every return, keeping the 894-vs-884
 class of pop the memory exists to kill).
+
+**Operator retest, same night: 22–26 s still jittered left.** That window
+is the follow-PAN piece — untouched by the memory (pan pieces never
+reuse), and rendered identically before and after it. The per-bin series
+showed why it reads wrong: the subject lunges 365 px left and RETURNS
+(22.1–27.0 s, the face undetected for the first 1.3 s), and a linear
+head→tail glide models that as a slow leftward drift — the camera slides
+away from a subject who is already coming back. The discriminator is
+measured and bimodal: genuine one-way drifts carry an off-drift band
+remainder ("extra") of ≤ 0.36× their drift (#6/#9/#12: 18/34/35 px);
+the lunge carried ~1.7× (≈200 px extra on a 114 px drift). A pan now
+requires the drift to EXPLAIN the excursion (`PAN_EXTRA_FRAC` 0.6,
+mid-gap); otherwise the piece holds ONE static crop grown over the whole
+band — the same containment grammar static pieces already use. On this
+piece the (365,0)→(251,0) glide becomes a stationary full-height frame at
+(255,0); the three genuine drift pans and every reuse are unchanged, and
+ANTITESA stays byte-identical. The prior refinement's "remaining pans
+match measured real motion to the pixel" claim was true of head→tail
+NETS — it could not see a there-and-back excursion inside one piece;
+extra-vs-drift is the shape test that can.
