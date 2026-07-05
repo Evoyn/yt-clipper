@@ -241,3 +241,34 @@ on the tracking chip when the current bin was voice-overridden (or an
 off-screen split), and a one-line voice summary in the Camera panel. The
 integration gate artifact is `diar_integration.mp4` (`YC_INTEG_RENDER=1`
 in the harness) against the operator's existing `diar_baseline.mp4`.
+
+## Integration gate verdict (2026-07-06): PASSED, with ear-truth annotations
+
+The operator watched the A/B and ruled **"it still looks good"** — the
+integration stands as shipped. They also volunteered who-talks-when ground
+truth that the analysis must eventually reproduce (the face re-id spike's
+acceptance target, ADR 0043):
+
+- **14–20 s: the actual talker is the split's bottom-panel man — on
+  screen.** The top man is drinking (the cup-churn track the mouth lane
+  framed). This contradicts the lane's off-screen call there — and the
+  claim is dominant, not marginal: V1 covers 4.4 s of the piece's 5.7
+  voiced seconds (96% of its voiced bins flagged off-screen). The spike's
+  triangulation proved "not the drinker" and concluded "off-screen",
+  without ruling out the *other* visible person. The operator further
+  confirmed the solo man framed after the split (~22 s, the "IYA DONG"
+  strip that anchored V1's identity) is a **different person** than the
+  bottom-panel talker — so either the 14–20 windows mis-clustered into V1,
+  or the ear attributed a backchannel mouth; per-angle face identity is
+  the instrument that can tell. Note the circularity at full strength
+  here: V1's whole-clip co-occurrence with "genuine" mouth-A is mostly
+  the cup-churn stretch itself, so the out-of-sample sweep validated the
+  join against a systematically wrong reference (both CV halves of
+  14–22 s carry the same churn) — the CV guards against overfit clusters,
+  not a poisoned reference lane (ADR 0043).
+- **~21 s: the top man (the drinker) talks for ~1 s** — the operator
+  heard the interjection the voice lane found at 20.8 s, unprompted. The
+  structural gap stands: a single-visit angle can't prove its speaker on
+  screen, so the rescue can't fire there without face re-id.
+- **22–27 s: cross-talk ("most of them talking"); 27–30 s: shared
+  laughter** — the second split covers it; unattributable by design.

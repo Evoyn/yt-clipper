@@ -4,6 +4,42 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-06 (morning) — Face re-id spike: the occupant map, gate PASSED ("each row is one human")
+
+Two gates closed and one instrument was born (ADR 0043; ADR 0042 gained its
+verdict section):
+
+- **The diarization integration gate PASSED** — "it still looks good" — with
+  ear-truth annotations that rewrote the 14–22 s story: the actual talker was
+  the split's bottom-panel man, ON screen. Frame forensics then proved the
+  source has exactly TWO real cameras (four humans) that the seat-geometry
+  signature had fragmented into eleven angles, and that the drinker's
+  cup-churn had poisoned the mouth reference the voice join cross-validated
+  against — the measured circularity limit, now with pixels.
+- **The occupant map** (`speaker_diag` face lane): full-res targeted-seek
+  crops per (segment, seat), YuNet 5-landmark alignment (survey: SFace
+  Apache-2.0 + YuNet MIT, pinned via the zoo's own LFS oids; InsightFace
+  rejected on license like Rev.ai; box-only alignment REJECTED by the
+  faceselftest — a different-person +0.397 beat a same-person +0.351),
+  SFace embeddings averaged per entry, clustered at the largest dendrogram
+  gap. Deddy: 4 persons exactly, 23/23 confident entries match the
+  frame-verified truth, 13 signature angles → the 2 real cameras over 11/13
+  segments, two pose-extreme singletons split conservatively (never
+  mis-joined). **Operator gate on the contact sheet: PASSED.**
+- **The replay finding**: joining over merged cameras with today's rule makes
+  it WORSE (8.9→22.8 s claimed against the poisoned reference; even the
+  laughter blob joins) — but the map exposes the poison as a visible
+  contradiction: V1 joins seat A in both cameras while those seats hold
+  different humans. Next slice (the production per-person join) designs
+  against that: person-consistency gate + purity-weighted co-occurrence,
+  own render gate.
+- Housekeeping: the release exe the operator ran at 04:36 predated the
+  integration commit by 2 h (why the Studio "showed no difference") —
+  rebuilt; their 04:36 promote also overwrote the ANTITESA fixture segment
+  with a different 40 s Moment, so the standing fg byte-pin is unmeasurable
+  until they re-promote 790–859 (code-stability proven via stash A/B:
+  HEAD reproduces the drifted bytes exactly). Suites 315/315 both ways.
+
 ## 2026-07-06 (small hours) — The voice lane joins production: fused attribution, off-screen splits, voice-gated interjection cuts
 
 ADR 0042's gate passed, so this session made the spike real — one

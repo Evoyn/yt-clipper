@@ -24,6 +24,7 @@ use yc_core::{Crop, Layout, LayoutPref, CANVAS_H, CANVAS_W};
 pub mod infer;
 #[cfg(feature = "face")]
 pub use infer::Detector;
+pub mod face_id;
 pub mod speaker;
 pub mod voice;
 

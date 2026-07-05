@@ -2506,6 +2506,7 @@ fn do_analyze_speakers(
                     &cuts,
                     dur,
                     speaker::attribution_regime(&analysis),
+                    None,
                 ) {
                     Some((mut lane, diag)) => {
                         for l in &diag.lines {

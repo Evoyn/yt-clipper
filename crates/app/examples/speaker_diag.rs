@@ -27,6 +27,21 @@
 //! embeds whole 16 kHz wavs and prints their pairwise cosine similarity —
 //! run it on known same/different-speaker recordings to validate the fbank +
 //! embedding path end-to-end before trusting fixture numbers.
+//!
+//! The **face lane** (ADR 0043 spike, harness-only) builds the OCCUPANT MAP:
+//! full-res face crops per (angle segment, seat), YuNet landmarks, SFace
+//! embeddings, agglomerative person clusters — printed as (segment × seat →
+//! person), segments merged into CAMERAS by identical occupants, a contact
+//! sheet written for the operator's eyes, and the voice join REPLAYED over
+//! the merged cameras as a printed diff. Production analysis/plan untouched;
+//! missing face-id models skip the lane. And:
+//!
+//!   … speaker_diag --features face -- faceselftest <img> [<img>…]
+//!
+//! detects faces in full frames (1920x1080 assumed if ffprobe can't read the
+//! image) and prints pairwise cosines for BOTH pipelines — YuNet-aligned and
+//! box-pseudo-landmarks — on known same/different faces: the model must
+//! order them correctly before any fixture number means anything.
 
 #[cfg(not(feature = "face"))]
 fn main() {
@@ -45,6 +60,10 @@ fn main() -> anyhow::Result<()> {
     if first == "selftest" {
         let wavs: Vec<String> = args.collect();
         return voice_selftest(&wavs);
+    }
+    if first == "faceselftest" {
+        let imgs: Vec<String> = args.collect();
+        return face_selftest(&imgs);
     }
     let data_dir = PathBuf::from(first);
     let start_s: f64 = args.next().expect("clip start_s").parse()?;
@@ -287,6 +306,12 @@ fn main() -> anyhow::Result<()> {
     println!("\n== voice lanes (production path):");
     let attribution = speaker::attribution_regime(&analysis);
     let mut lanes: Vec<(&'static str, yc_frame::voice::VoiceLane)> = Vec::new();
+    // Kept for the ADR 0043 face-lane replay: the analysis BEFORE fusion
+    // mutates it (the replay must join against the same reference the
+    // production lane did) and the production model's embedded windows.
+    let mut prefuse: Option<SpeakerAnalysis> = None;
+    let mut prod_windows: Option<(Vec<Vec<f32>>, Vec<(f64, f64)>)> = None;
+    let mut prod_stats: Option<(f64, f64, f64, f64)> = None; // claimed, agr, off, overridden
     for (i, &(tag, path, scale, cmn)) in VOICE_MODELS.iter().enumerate() {
         let model = Path::new(path);
         if !model.is_file() {
@@ -316,7 +341,7 @@ fn main() -> anyhow::Result<()> {
             t0.elapsed().as_secs_f32()
         );
         let Some((mut lane, diag)) =
-            yc_frame::voice::build_lane(&embs, &kept, &analysis, &cuts, dur, attribution)
+            yc_frame::voice::build_lane(&embs, &kept, &analysis, &cuts, dur, attribution, None)
         else {
             println!("  [{tag}] only {} embeddable windows — lane skipped", embs.len());
             continue;
@@ -338,6 +363,8 @@ fn main() -> anyhow::Result<()> {
         // analysis exactly as Job::AnalyzeSpeakers does — the plan below is
         // then the integrated production camera.
         if i == 0 {
+            prefuse = Some(analysis.clone());
+            prod_windows = Some((embs.clone(), kept.clone()));
             let (fspeak, fconf, overridden) =
                 yc_frame::voice::fuse_attribution(&analysis, &lane.seat);
             print!("  [{tag}] fused attribution (voice tiebreak) switches:");
@@ -358,6 +385,12 @@ fn main() -> anyhow::Result<()> {
                 diag.claimed_s,
                 100.0 * diag.agreement
             );
+            prod_stats = Some((
+                diag.claimed_s,
+                diag.agreement,
+                diag.offscreen_s,
+                overridden.iter().filter(|o| **o).count() as f64 * bin_s,
+            ));
             lane.overridden = overridden;
             analysis.speaking = fspeak;
             analysis.confidence = fconf;
@@ -617,6 +650,108 @@ fn main() -> anyhow::Result<()> {
         solos.push((i, id, cx, cy, fh, plan.shots[i].pan_to.as_ref().unwrap_or(crop)));
     }
 
+    // --- face lane (ADR 0043 spike, harness-only): the OCCUPANT MAP — who
+    // occupies each seat, per angle segment. Full-res crops via targeted
+    // seeks, YuNet landmarks -> SFace embeddings -> person clusters; then the
+    // voice join replayed over occupant-merged cameras as a printed diff.
+    // Nothing above (analysis, plan, audit, fg) is touched by any of this.
+    let face_map: Option<Vec<usize>> = {
+        let yunet = Path::new(YUNET_MODEL);
+        let sface = Path::new(SFACE_MODEL);
+        if !yunet.is_file() || !sface.is_file() {
+            println!(
+                "\n== face lane: missing {} or {} — lane skipped",
+                yunet.display(),
+                sface.display()
+            );
+            None
+        } else {
+            let ref_analysis = prefuse.as_ref().unwrap_or(&analysis);
+            match face_lane(
+                ffmpeg,
+                &segment,
+                seek_s,
+                probe.fps,
+                probe.width as usize,
+                probe.height as usize,
+                yunet,
+                sface,
+                ref_analysis,
+                &cuts,
+                dur,
+                &data_dir,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("\n== face lane FAILED: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+    if let (Some(map), Some((embs, kept)), Some(pf)) = (&face_map, &prod_windows, &prefuse) {
+        println!("\n== voice join REPLAY over occupant cameras (ADR 0043 diagnostic — production untouched):");
+        match yc_frame::voice::build_lane(embs, kept, pf, &cuts, dur, attribution, Some(map)) {
+            Some((rlane, rdiag)) => {
+                for l in &rdiag.lines {
+                    println!("  [reid] {l}");
+                }
+                let (_, _, rover) = yc_frame::voice::fuse_attribution(pf, &rlane.seat);
+                let (pc, pa, po, pv) = prod_stats.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                println!(
+                    "  [reid] claimed {:.1}s @ {:.0}% | off-screen {:.1}s | overridden {:.1}s   (production lane: {pc:.1}s @ {:.0}% | {po:.1}s | {pv:.1}s)",
+                    rdiag.claimed_s,
+                    100.0 * rdiag.agreement,
+                    rdiag.offscreen_s,
+                    rover.iter().filter(|o| **o).count() as f64 * bin_s,
+                    100.0 * pa,
+                );
+                // Reclassified off-screen mass: where the production lane
+                // cried off-screen and the occupant-merged join resolves the
+                // voice to an ON-SCREEN seat (or the flag just dissolves).
+                if let Some((_, plane)) = lanes.first() {
+                    let mut b = 0usize;
+                    while b < n_bins {
+                        let was = plane.offscreen.get(b).copied().unwrap_or(false);
+                        let now = rlane.offscreen.get(b).copied().unwrap_or(false);
+                        if was == now {
+                            b += 1;
+                            continue;
+                        }
+                        let s0 = b;
+                        while b < n_bins
+                            && plane.offscreen.get(b).copied().unwrap_or(false) == was
+                            && rlane.offscreen.get(b).copied().unwrap_or(false) == now
+                        {
+                            b += 1;
+                        }
+                        let run = (b - s0) as f64 * bin_s;
+                        if run < 0.4 {
+                            continue;
+                        }
+                        let what = if was {
+                            match rlane.seat[s0.min(n_bins - 1)] {
+                                Some(s) => format!(
+                                    "off-screen -> ON SCREEN as {}",
+                                    speaker::track_label(s)
+                                ),
+                                None => "off-screen -> dissolved (unjoined here)".into(),
+                            }
+                        } else {
+                            "newly off-screen".into()
+                        };
+                        println!(
+                            "  [reid]   {:>5.1}s..{:>5.1}s ({run:.1}s): {what}",
+                            s0 as f64 * bin_s,
+                            b as f64 * bin_s
+                        );
+                    }
+                }
+            }
+            None => println!("  [reid] lane skipped (too few windows)"),
+        }
+    }
+
     // --- the real filtergraph (render it with export_args-style ffmpeg flags
     // to SEE this plan; clip.ass + fonts live in the data dir) ----------------
     let fg = data_dir.join("camera_diag.fg");
@@ -750,6 +885,434 @@ fn voice_selftest(wavs: &[String]) -> anyhow::Result<()> {
             for j in i + 1..embs.len() {
                 let cos: f32 = embs[i].iter().zip(embs[j].iter()).map(|(a, b)| a * b).sum();
                 println!("  {} <-> {}: {cos:+.3}", names[i], names[j]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The face-identity models (ADR 0043 spike): the OpenCV zoo pair designed to
+/// work together — YuNet for the 5 landmarks the alignment needs (MIT,
+/// 232,589 bytes, SHA-256 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`),
+/// SFace for the embedding (Apache-2.0, 38,696,353 bytes, SHA-256
+/// `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`), both
+/// verified against the repo's own Git-LFS oids. InsightFace zoo models were
+/// rejected on their non-commercial license (the ADR 0042 Rev.ai precedent);
+/// AuraFace-v1 (Apache-2.0, ResNet100) is the heavyweight backup if SFace
+/// ever underwhelms on the selftest.
+#[cfg(feature = "face")]
+const YUNET_MODEL: &str = "models/face_detection_yunet_2023mar.onnx";
+#[cfg(feature = "face")]
+const SFACE_MODEL: &str = "models/face_recognition_sface_2021dec.onnx";
+
+/// Crops sampled per (segment, seat) — averaged into one embedding, so a
+/// blink or a motion-blurred sample can't mint its own person.
+#[cfg(feature = "face")]
+const FACE_SAMPLES_PER_SEG: usize = 4;
+/// Region around the tracked face box handed to YuNet (the warp needs
+/// forehead-to-chin plus air; the box is Ultraface-tight).
+#[cfg(feature = "face")]
+const FACE_REGION_EXPAND: f32 = 2.0;
+
+/// Fetch ONE full-res rgb24 frame at clip-relative `t` (segment seek
+/// `seek_s + t`). `None` when the stream yields nothing (end of segment).
+#[cfg(feature = "face")]
+fn fetch_frame(
+    ffmpeg: &std::path::Path,
+    video: &std::path::Path,
+    seek: f64,
+    w: usize,
+    h: usize,
+    fps: f64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut out: Option<Vec<u8>> = None;
+    yc_ingest::stream_frames_rgb(
+        ffmpeg,
+        video,
+        seek,
+        (2.5 / fps).max(0.05),
+        w as u32,
+        h as u32,
+        fps,
+        1,
+        &mut |rgb| {
+            out = Some(rgb.to_vec());
+            false
+        },
+    )?;
+    Ok(out)
+}
+
+/// Copy a clamped rectangle out of an rgb24 frame.
+#[cfg(feature = "face")]
+fn crop_rgb(src: &[u8], sw: usize, sh: usize, x0: i32, y0: i32, w: usize, h: usize) -> (Vec<u8>, usize, usize, i32, i32) {
+    let x0 = x0.clamp(0, sw.saturating_sub(1) as i32);
+    let y0 = y0.clamp(0, sh.saturating_sub(1) as i32);
+    let x1 = ((x0 as usize) + w).min(sw);
+    let y1 = ((y0 as usize) + h).min(sh);
+    let (cw, ch) = (x1 - x0 as usize, y1 - y0 as usize);
+    let mut out = vec![0u8; cw * ch * 3];
+    for y in 0..ch {
+        let s = ((y0 as usize + y) * sw + x0 as usize) * 3;
+        out[y * cw * 3..(y + 1) * cw * 3].copy_from_slice(&src[s..s + cw * 3]);
+    }
+    (out, cw, ch, x0, y0)
+}
+
+/// Write an rgb24 buffer as a PNG through the sidecar ffmpeg (the repo has no
+/// image codec dependency, and doesn't want one for a diag artifact).
+#[cfg(feature = "face")]
+fn write_png_rgb(
+    ffmpeg: &std::path::Path,
+    out: &std::path::Path,
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(ffmpeg)
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{w}x{h}"),
+            "-i",
+            "-",
+            "-frames:v",
+            "1",
+            &out.display().to_string(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    child.stdin.take().expect("piped stdin").write_all(rgb)?;
+    let status = child.wait()?;
+    anyhow::ensure!(status.success(), "ffmpeg png encode failed");
+    Ok(())
+}
+
+/// The ADR 0043 face lane: sample full-res crops per (segment, seat), embed
+/// through YuNet landmarks + SFace, cluster into PERSONS (threshold picked at
+/// the largest dendrogram gap — printed, not trusted silently), print the
+/// occupant map + camera merge, write the operator's contact sheet. Returns
+/// the segment→camera map for the voice-join replay (`None` when too few
+/// entries embedded to say anything).
+#[cfg(feature = "face")]
+#[allow(clippy::too_many_arguments)]
+fn face_lane(
+    ffmpeg: &std::path::Path,
+    segment: &std::path::Path,
+    seek_s: f64,
+    src_fps: f64,
+    src_w: usize,
+    src_h: usize,
+    yunet: &std::path::Path,
+    sface: &std::path::Path,
+    analysis: &yc_frame::speaker::SpeakerAnalysis,
+    cuts: &[f64],
+    dur: f64,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    use yc_frame::face_id::{self, FaceIdentifier};
+    let bin_s = analysis.bin_s;
+    let n_bins = analysis.speaking.len();
+    let bounds = yc_frame::voice::segment_bounds(cuts, dur);
+    let n_segs = bounds.len() - 1;
+    let t0 = std::time::Instant::now();
+    let mut ident = FaceIdentifier::load(yunet, sface)?;
+    println!("\n== face lane (ADR 0043 spike): occupant map — who occupies each seat, per segment");
+
+    // Sample times per segment: bins where the MOST tracks are present, at
+    // spread quantiles, inset from the cut edges (a cut-straddling decode
+    // would crop the wrong camera's pixels).
+    let seg_bins = |g: usize| -> (usize, usize) {
+        let b0 = (bounds[g] / bin_s).round() as usize;
+        let b1 = ((bounds[g + 1] / bin_s).round() as usize).min(n_bins);
+        (b0, b1.max(b0))
+    };
+    let count_at = |b: usize| -> usize {
+        analysis
+            .tracks
+            .iter()
+            .filter(|t| t.path.get(b).map(|p| p.is_some()).unwrap_or(false))
+            .count()
+    };
+    // (seg, sample time) — seek once per time, crop every present seat.
+    let mut samples: Vec<(usize, f64)> = Vec::new();
+    for g in 0..n_segs {
+        let (b0, b1) = seg_bins(g);
+        if b1 <= b0 {
+            continue;
+        }
+        // Inset one bin from each edge when the segment affords it.
+        let (lo, hi) = if b1 - b0 > 2 { (b0 + 1, b1 - 1) } else { (b0, b1) };
+        let max_c = (lo..hi).map(count_at).max().unwrap_or(0);
+        if max_c == 0 {
+            continue;
+        }
+        let cands: Vec<usize> = (lo..hi).filter(|&b| count_at(b) == max_c).collect();
+        let mut picked: Vec<usize> = Vec::new();
+        for q in [0.12, 0.38, 0.62, 0.88].iter().take(FACE_SAMPLES_PER_SEG) {
+            let b = cands[((cands.len() - 1) as f64 * q).round() as usize];
+            if !picked.contains(&b) {
+                picked.push(b);
+            }
+        }
+        for b in picked {
+            samples.push((g, (b as f64 + 0.5) * bin_s));
+        }
+    }
+
+    // Embed every (segment, seat) crop. One seek per sampled time.
+    struct Entry {
+        seg: usize,
+        track: usize,
+        emb: Vec<f32>,
+        crop: Vec<u8>, // best aligned 112x112 rgb24, for the contact sheet
+        n: usize,
+        t_first: f64,
+    }
+    let mut acc: std::collections::HashMap<(usize, usize), (Vec<Vec<f32>>, f32, Vec<u8>, f64)> =
+        std::collections::HashMap::new();
+    let (mut n_frames, mut n_nodet) = (0usize, 0usize);
+    for &(g, t) in &samples {
+        let Some(frame) = fetch_frame(ffmpeg, segment, seek_s + t, src_w, src_h, src_fps)? else {
+            continue;
+        };
+        n_frames += 1;
+        let b = ((t / bin_s) as usize).min(n_bins.saturating_sub(1));
+        for tr in &analysis.tracks {
+            let Some(fb) = tr.path.get(b).and_then(|p| p.as_ref()) else { continue };
+            let side = ((fb.w.max(fb.h) * FACE_REGION_EXPAND) as usize).max(64);
+            let (region, rw, rh, rx, ry) = crop_rgb(
+                &frame,
+                src_w,
+                src_h,
+                (fb.cx() - side as f32 * 0.5) as i32,
+                (fb.cy() - side as f32 * 0.5) as i32,
+                side,
+                side,
+            );
+            let dets = ident.detect(&region, rw, rh)?;
+            // The intended face: nearest to the tracked box center (region
+            // coords), sane size relative to it — a neighbour leaking into
+            // the region or a poster face must not become this seat's crop.
+            let (ecx, ecy) = (fb.cx() - rx as f32, fb.cy() - ry as f32);
+            let best = dets
+                .iter()
+                .filter(|d| d.bbox.h >= 0.4 * fb.h && d.bbox.h <= 2.5 * fb.h)
+                .map(|d| {
+                    let dc = ((d.bbox.cx() - ecx).powi(2) + (d.bbox.cy() - ecy).powi(2)).sqrt();
+                    (dc, d)
+                })
+                .filter(|(dc, _)| *dc < 0.9 * fb.h.max(1.0))
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let Some((_, det)) = best else {
+                n_nodet += 1;
+                continue;
+            };
+            let (aligned, emb) = ident.align_and_embed(&region, rw, rh, &det.kps)?;
+            let e = acc.entry((g, tr.id)).or_insert_with(|| (Vec::new(), -1.0, Vec::new(), t));
+            e.0.push(emb);
+            if det.bbox.score > e.1 {
+                e.1 = det.bbox.score;
+                e.2 = aligned;
+            }
+        }
+    }
+    let mut entries: Vec<Entry> = acc
+        .into_iter()
+        .filter_map(|((seg, track), (embs, _, crop, t_first))| {
+            let n = embs.len();
+            face_id::aggregate_unit(&embs).map(|emb| Entry { seg, track, emb, crop, n, t_first })
+        })
+        .collect();
+    entries.sort_by(|a, b| (a.seg, a.track).cmp(&(b.seg, b.track)));
+    println!(
+        "  {} (segment,seat) entries from {n_frames} frames ({n_nodet} crops without a usable det) in {:.1}s",
+        entries.len(),
+        t0.elapsed().as_secs_f32()
+    );
+    if entries.len() < 2 {
+        println!("  too few entries — occupant map skipped");
+        return Ok(None);
+    }
+
+    // Person clusters: run the agglomeration to ONE cluster, cut at the
+    // largest merge-distance gap (printed — the same-face/different-face
+    // margin is the evidence, not a magic threshold).
+    let embs: Vec<Vec<f32>> = entries.iter().map(|e| e.emb.clone()).collect();
+    let full = yc_frame::voice::cluster_cosine(&embs, 10.0);
+    let thr = if full.merges.len() < 2 {
+        0.5
+    } else {
+        let mut gap_at = 0usize;
+        let mut gap = 0f32;
+        for i in 0..full.merges.len() - 1 {
+            let d = full.merges[i + 1] - full.merges[i];
+            if d > gap {
+                gap = d;
+                gap_at = i;
+            }
+        }
+        (full.merges[gap_at] + full.merges[gap_at + 1]) * 0.5
+    };
+    let trail: Vec<String> = full.merges.iter().map(|d| format!("{d:.2}")).collect();
+    let cl = yc_frame::voice::cluster_cosine(&embs, thr);
+    println!(
+        "  merge trail: [{}] -> cut at {:.2} -> {} persons",
+        trail.join(" "),
+        thr,
+        cl.k
+    );
+    let seat_ch = |id: usize| (b'A' + (id % 26) as u8) as char;
+    for p in 0..cl.k {
+        let members: Vec<String> = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| cl.assignment[*i] == p)
+            .map(|(_, e)| format!("seg{} {}@{:.1}s x{}", e.seg, seat_ch(e.track), e.t_first, e.n))
+            .collect();
+        println!("  P{p}: {} entries [{}]", members.len(), members.join(", "));
+    }
+
+    // The occupant map + segments merged into CAMERAS by identical occupants.
+    let mut seg_map: Vec<std::collections::BTreeMap<usize, usize>> =
+        vec![Default::default(); n_segs];
+    for (i, e) in entries.iter().enumerate() {
+        seg_map[e.seg].insert(e.track, cl.assignment[i]);
+    }
+    println!("  occupant map (segment x seat -> person):");
+    let mut cam_keys: Vec<String> = Vec::new();
+    let mut seg_cam: Vec<usize> = vec![0; n_segs];
+    for g in 0..n_segs {
+        let desc: Vec<String> =
+            seg_map[g].iter().map(|(t, p)| format!("{}=P{p}", seat_ch(*t))).collect();
+        let key = if seg_map[g].is_empty() {
+            format!("<no faces:{g}>") // evidence-free segments never merge
+        } else {
+            desc.join(" ")
+        };
+        let cam = cam_keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+            cam_keys.push(key.clone());
+            cam_keys.len() - 1
+        });
+        seg_cam[g] = cam;
+        println!(
+            "    seg{g:>2} {:>5.1}-{:>5.1}s  cam{cam} {}",
+            bounds[g],
+            bounds[g + 1],
+            if seg_map[g].is_empty() { "(no faces sampled)".into() } else { desc.join("  ") }
+        );
+    }
+    let n_cams = cam_keys.len();
+    println!("  cameras by occupants: {n_cams} (the signature grouping saw its own count above)");
+
+    // Contact sheet: one row per person, tiles time-ordered — the operator's
+    // eyes-gate ("every row is one human") without a render.
+    let tile = face_id::ALIGN_SIZE;
+    let pad = 4usize;
+    let max_cols = 16usize;
+    let mut rows: Vec<Vec<&Entry>> = vec![Vec::new(); cl.k];
+    for (i, e) in entries.iter().enumerate() {
+        rows[cl.assignment[i]].push(e);
+    }
+    for r in rows.iter_mut() {
+        r.sort_by(|a, b| a.t_first.partial_cmp(&b.t_first).unwrap_or(std::cmp::Ordering::Equal));
+        r.truncate(max_cols);
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols > 0 {
+        let (sw, sh) = (pad + cols * (tile + pad), pad + cl.k * (tile + pad));
+        let mut sheet = vec![24u8; sw * sh * 3];
+        for (p, row) in rows.iter().enumerate() {
+            for (c, e) in row.iter().enumerate() {
+                let (ox, oy) = (pad + c * (tile + pad), pad + p * (tile + pad));
+                for y in 0..tile {
+                    let dst = ((oy + y) * sw + ox) * 3;
+                    let src = y * tile * 3;
+                    sheet[dst..dst + tile * 3].copy_from_slice(&e.crop[src..src + tile * 3]);
+                }
+            }
+        }
+        let sheet_path = data_dir.join("face_contact.png");
+        write_png_rgb(ffmpeg, &sheet_path, &sheet, sw, sh)?;
+        println!("  contact sheet: {} (row = person, columns time-ordered)", sheet_path.display());
+    }
+    Ok(Some(seg_cam))
+}
+
+/// `faceselftest <img> [<img>…]`: detect every face in each full frame and
+/// print pairwise cosines for BOTH pipelines — YuNet-aligned and
+/// box-pseudo-landmark — labeled by frame and left-to-right position. The
+/// model must order known same/different faces correctly here BEFORE any
+/// fixture number means anything (the WeSpeaker rejection discipline).
+/// OpenCV's own same-identity floor for SFace is cosine 0.363 — the
+/// calibration line to read the matrix against.
+#[cfg(feature = "face")]
+fn face_selftest(imgs: &[String]) -> anyhow::Result<()> {
+    use std::path::Path;
+    use yc_frame::face_id::{self, FaceIdentifier};
+    use yc_ingest::CancelToken;
+    anyhow::ensure!(!imgs.is_empty(), "faceselftest needs >= 1 image path");
+    let ffmpeg = Path::new("sidecars/ffmpeg.exe");
+    let ffprobe = Path::new("sidecars/ffprobe.exe");
+    let (yunet, sface) = (Path::new(YUNET_MODEL), Path::new(SFACE_MODEL));
+    anyhow::ensure!(yunet.is_file(), "missing {}", yunet.display());
+    anyhow::ensure!(sface.is_file(), "missing {}", sface.display());
+    let mut ident = FaceIdentifier::load(yunet, sface)?;
+    let cancel = CancelToken::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut aligned_embs: Vec<Vec<f32>> = Vec::new();
+    let mut box_embs: Vec<Vec<f32>> = Vec::new();
+    for img in imgs {
+        let p = Path::new(img);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(img);
+        let (w, h) = match yc_ingest::probe_segment(ffprobe, p, &cancel) {
+            Ok(pr) => (pr.width as usize, pr.height as usize),
+            Err(_) => {
+                println!("[{stem}] ffprobe failed — assuming 1920x1080");
+                (1920, 1080)
+            }
+        };
+        let Some(frame) = fetch_frame(ffmpeg, p, 0.0, w, h, 25.0)? else {
+            println!("[{stem}] no frame decoded — skipped");
+            continue;
+        };
+        let mut dets = ident.detect(&frame, w, h)?;
+        // Tiny background faces (posters, thumbnails) aren't selftest
+        // subjects; the podcast faces are >= 100 px in these frames.
+        dets.retain(|d| d.bbox.h >= 0.06 * h as f32);
+        dets.sort_by(|a, b| {
+            a.bbox.cx().partial_cmp(&b.bbox.cx()).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (i, d) in dets.iter().enumerate() {
+            let (_, emb) = ident.align_and_embed(&frame, w, h, &d.kps)?;
+            let box_emb = ident.embed(&frame, w, h, &face_id::box_pseudo_landmarks(&d.bbox))?;
+            println!(
+                "[{stem}] face {i}: center ({:>4.0},{:>4.0}) {:.0}x{:.0} score {:.2}",
+                d.bbox.cx(),
+                d.bbox.cy(),
+                d.bbox.w,
+                d.bbox.h,
+                d.bbox.score
+            );
+            labels.push(format!("{stem}.{i}"));
+            aligned_embs.push(emb);
+            box_embs.push(box_emb);
+        }
+    }
+    anyhow::ensure!(aligned_embs.len() >= 2, "selftest needs >= 2 detected faces");
+    for (name, embs) in [("YuNet-ALIGNED", &aligned_embs), ("box-pseudo", &box_embs)] {
+        println!("\n[{name}] pairwise cosine (SFace same-identity reference: +0.363):");
+        for i in 0..embs.len() {
+            for j in i + 1..embs.len() {
+                let cos: f32 = embs[i].iter().zip(embs[j].iter()).map(|(a, b)| a * b).sum();
+                println!("  {} <-> {}: {cos:+.3}", labels[i], labels[j]);
             }
         }
     }

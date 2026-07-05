@@ -382,6 +382,21 @@ pub struct VoiceDiag {
     pub offscreen_s: f64,
 }
 
+/// Clip-relative segment boundaries from the source's scene cuts: 0, every
+/// in-range cut, `duration_s`. The voice lane's angle grouping and the face
+/// lane's occupant map (ADR 0043 spike) slice the clip identically through
+/// this, so their per-segment verdicts line up bin for bin.
+pub fn segment_bounds(cuts: &[f64], duration_s: f64) -> Vec<f64> {
+    let mut seg_bounds: Vec<f64> = vec![0.0];
+    for &c in cuts {
+        if c > 0.03 && c < duration_s - 0.03 {
+            seg_bounds.push(c);
+        }
+    }
+    seg_bounds.push(duration_s);
+    seg_bounds
+}
+
 /// Build the voice lane from embedded windows: a threshold sweep scored
 /// **out-of-sample end to end** through the cluster→seat join picks the
 /// clustering cut, clusters join seats **per camera angle** (segments
@@ -393,6 +408,12 @@ pub struct VoiceDiag {
 /// person's voice onto another person's seat); in follow-visible each track
 /// is one person's framing, so the whole-clip join is the identity.
 ///
+/// `angle_override` replaces the seat-geometry angle grouping with a caller's
+/// own segment→angle map (one entry per [`segment_bounds`] segment) — the
+/// ADR 0043 harness replays the join over occupant-merged cameras through
+/// it. Production callers pass `None`: the signature grouping is the shipped
+/// behavior (pinned by the ANTITESA `camera_diag.fg` byte hash).
+///
 /// `None` when fewer than two windows embedded (nothing to cluster) —
 /// callers degrade to the mouth-only analysis.
 pub fn build_lane(
@@ -402,6 +423,7 @@ pub fn build_lane(
     cuts: &[f64],
     duration_s: f64,
     attribution_regime: bool,
+    angle_override: Option<&[usize]>,
 ) -> Option<(VoiceLane, VoiceDiag)> {
     let n_bins = analysis.speaking.len();
     let bin_s = analysis.bin_s;
@@ -596,13 +618,7 @@ pub fn build_lane(
     // where a segment lacks evidence. The cluster itself is the person; the
     // per-segment map says which seat that person occupies in the angle on
     // screen (no seat = off-screen there).
-    let mut seg_bounds: Vec<f64> = vec![0.0];
-    for &c in cuts {
-        if c > 0.03 && c < duration_s - 0.03 {
-            seg_bounds.push(c);
-        }
-    }
-    seg_bounds.push(duration_s);
+    let seg_bounds = segment_bounds(cuts, duration_s);
     let n_segs = seg_bounds.len() - 1;
     let seg_of = |b: usize| -> usize {
         let t = (b as f64 + 0.5) * bin_s;
@@ -615,7 +631,9 @@ pub fn build_lane(
     // one moment rests on other moments of the same camera, not only on the
     // mouth lane's opinion of the moment being judged (a purely per-segment
     // join just echoed the mouth lane: 99% "agreement" with no information).
-    let seg_angle: Vec<usize> = {
+    let seg_angle: Vec<usize> = if let Some(map) = angle_override.filter(|m| m.len() == n_segs) {
+        map.to_vec()
+    } else {
         let mut sigs: Vec<String> = Vec::new();
         let mut ids: Vec<usize> = Vec::new();
         for g in 0..n_segs {
@@ -1313,7 +1331,7 @@ mod tests {
         let (analysis, cuts) = two_angle_fixture();
         let (embs, kept) = one_voice_windows(8.0);
         let (lane, diag) =
-            build_lane(&embs, &kept, &analysis, &cuts, 8.0, true).expect("lane builds");
+            build_lane(&embs, &kept, &analysis, &cuts, 8.0, true, None).expect("lane builds");
         assert_eq!(lane.seat[nb(1.0)], Some(0), "angle 0 joins seat A");
         assert_eq!(lane.seat[nb(5.0)], Some(0));
         assert_eq!(lane.seat[nb(3.0)], None, "the join must not leak across angles");
@@ -1333,7 +1351,7 @@ mod tests {
         let (analysis, cuts) = two_angle_fixture();
         let (embs, kept) = one_voice_windows(8.0);
         let (lane, _) =
-            build_lane(&embs, &kept, &analysis, &cuts, 8.0, false).expect("lane builds");
+            build_lane(&embs, &kept, &analysis, &cuts, 8.0, false, None).expect("lane builds");
         assert_eq!(lane.seat[nb(3.0)], Some(0), "whole-clip join stands in follow-visible");
         assert!(lane.offscreen.iter().all(|o| !o));
     }
@@ -1367,7 +1385,7 @@ mod tests {
         }
         let (embs, kept) = one_voice_windows(6.0);
         let (lane, _) =
-            build_lane(&embs, &kept, &analysis, &[2.0, 4.0], 6.0, true).expect("lane builds");
+            build_lane(&embs, &kept, &analysis, &[2.0, 4.0], 6.0, true, None).expect("lane builds");
         assert_eq!(lane.seat[nb(1.0)], Some(0), "the twice-seen angle joins");
         assert_eq!(lane.seat[nb(3.0)], None, "a single-visit angle only echoes — no claim");
         assert!(lane.offscreen[nb(3.0)], "it stays a suspect for the operator's ear");

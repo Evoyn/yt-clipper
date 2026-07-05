@@ -1,0 +1,59 @@
+{
+  "creator": "",
+  "language": "",
+  "note": "",
+  "prime": false,
+  "harvest": false,
+  "dictionaries": [],
+  "vocabulary": [],
+  "corrections": [
+    {
+      "wrong": "average-nya",
+      "right": "",
+      "note": "auto-harvested (conf 0.31) from \"Beli sekarang atau nggak?\" at 18:57 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "kayaknya",
+      "right": "",
+      "note": "auto-harvested (conf 0.15) from \"Bicara tentang rebalance investasi\" at 13:37 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "Rebalance-nya",
+      "right": "",
+      "note": "auto-harvested (conf 0.21) from \"Bicara tentang rebalance investasi\" at 13:10 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "gridnya",
+      "right": "",
+      "note": "auto-harvested (conf 0.28) from \"Bicara tentang rebalance investasi\" at 14:14 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "kepinginnya",
+      "right": "",
+      "note": "auto-harvested (conf 0.42) from \"Bicara tentang rebalance investasi\" at 14:15 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    },
+    {
+      "wrong": "antitesanya",
+      "right": "",
+      "note": "auto-harvested (conf 0.43) from \"Bicara tentang rebalance investasi\" at 13:20 - operator verify",
+      "status": "unverified",
+      "context": false,
+      "clip_only": false
+    }
+  ]
+}
