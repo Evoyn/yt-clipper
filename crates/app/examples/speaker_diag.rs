@@ -464,6 +464,20 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --- camera plan audit: the jitter-class defect detector (camera creep /
+    // re-frame without cause / subject adrift). ZERO findings on the
+    // production fixtures is the regression bar; a finding means this plan
+    // would render with a visible camera defect.
+    let audit = speaker::audit_camera_plan(&analysis, &plan);
+    if audit.is_empty() {
+        println!("\n== camera audit: clean (0 findings)");
+    } else {
+        println!("\n== camera audit: {} FINDING(S) — this plan renders with visible camera defects:", audit.len());
+        for f in &audit {
+            println!("  ! {f}");
+        }
+    }
+
     // --- same-subject piece pairs (crop stability forensics): each solo shot
     // vs the PREVIOUS solo shot of the same track (adjacent or across runs) —
     // exactly the pairs a framing memory would act on. Δsubj is the span-median

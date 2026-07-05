@@ -48,11 +48,27 @@ session, one mechanism (ADR 0038's new "framing memory" refinement):
   glide became a stationary full-height frame; the three genuine drift
   pans and every reuse unchanged; ANTITESA still byte-identical; 294
   tests green.
-- **Gate artifact**: `camera_smoothing.mp4` re-rendered 22:24
+- **Operator retest #2, same night**: "30-40 still have the same jitter"
+  — the 11 s pan there passed the monotonicity test (net +56 px) but the
+  series is wander-and-settle: ~5 px/s of PERMANENT camera micro-motion
+  over a mostly-still subject, whose band fits a 1.06× static crop. Pans
+  are now **static-first** (`PAN_STATIC_GROWTH` 1.25): a pan must be
+  monotonic AND uncontainable; wander holds a static frame. All four
+  Deddy pans became static — the plan has ZERO pans; seat A settles to 3
+  framings and seat B to 4 across the whole 70 s clip.
+- **The detector the operator asked for** ("detect first so we don't
+  have this kind of bug again if I export new videos"):
+  `audit_camera_plan` flags camera creep / re-frame without cause /
+  subject adrift on every plan — printed by the diag harness, logged by
+  `AnalyzeSpeakers`, and shown in the Studio Camera panel + export
+  summary BEFORE a render. Zero findings on both fixtures is the
+  regression bar (asserted clean post-fix); each defect class has a
+  true-positive unit test. 298 tests green.
+- **Gate artifact**: `camera_smoothing.mp4` re-rendered 22:58
   (`YC_SMOOTH_RENDER=1`, the production export command, kept separate so
-  the diar_* A/B renders survive) — awaiting the operator's eyes on BOTH
-  symptoms (jump-cut twitch + the 22-26 s window); the verdict opens the
-  next session's grill.
+  the diar_* A/B renders survive) — awaiting the operator's eyes on all
+  three symptoms (jump-cut twitch, 22-26 s, 30-40 s); the verdict opens
+  the next session's grill.
 
 Next queued: the diarization integration slice
 (nextprompt-diarization-integration.md).

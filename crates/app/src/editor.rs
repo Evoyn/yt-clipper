@@ -174,6 +174,10 @@ pub struct EditorState {
     pub speakers: Option<SpeakerAnalysis>,
     /// The active-speaker cut plan (worker seed, operator-overridable).
     plan: Option<CameraPlan>,
+    /// Camera-plan audit findings (`audit_camera_plan`): stretches where the
+    /// planned camera moves without subject cause — shown BEFORE an export so
+    /// a jitter-class defect is flagged, not discovered in the render.
+    camera_audit: Vec<String>,
     pub speaker_job: SpeakerJob,
     /// Selected caption row (click focuses + seeks).
     sel_unit: Option<usize>,
@@ -250,6 +254,7 @@ impl EditorState {
             faces,
             speakers: None,
             plan: None,
+            camera_audit: Vec::new(),
             speaker_job: SpeakerJob::NotRun,
             sel_unit: None,
             scroll_to_sel: false,
@@ -281,6 +286,17 @@ impl EditorState {
         self.speakers = Some(analysis);
         self.plan = Some(plan);
         self.speaker_job = SpeakerJob::Ready;
+        self.refresh_camera_audit();
+    }
+
+    /// Re-audit the current camera plan against the analysis (on receipt and
+    /// after any operator override) so the Camera panel's warnings never go
+    /// stale.
+    fn refresh_camera_audit(&mut self) {
+        self.camera_audit = match (&self.speakers, &self.plan) {
+            (Some(a), Some(p)) => yc_frame::speaker::audit_camera_plan(a, p),
+            _ => Vec::new(),
+        };
     }
 
     /// Keep `lines` in step with the current genre and any operator edits.
@@ -1085,6 +1101,7 @@ impl EditorState {
                         shot.pan_to = None;
                     }
                 }
+                self.refresh_camera_audit();
             }
             _ => {
                 // Frame this face, hand control to Manual (full-cam kind).
@@ -1597,6 +1614,15 @@ impl EditorState {
                         if let Some(plan) = &self.plan {
                             ui.weak(format!("{} camera cuts planned", plan.shots.len().saturating_sub(1)));
                         }
+                        // Camera audit: jitter-class defects caught BEFORE the
+                        // export (a crop moving without subject cause).
+                        for w in &self.camera_audit {
+                            ui.label(
+                                egui::RichText::new(format!("⚠ {w}"))
+                                    .color(theme::GOLD)
+                                    .size(12.0),
+                            );
+                        }
                         ui.weak("Click a face in Original view to override a shot.");
                     }
                 }
@@ -1823,6 +1849,13 @@ impl EditorState {
                         camera_mode_label(self.camera_mode).to_string()
                     },
                 );
+                if spec_camera && !self.camera_audit.is_empty() {
+                    for w in &self.camera_audit {
+                        ui.label(
+                            egui::RichText::new(format!("⚠ {w}")).color(theme::GOLD).size(12.0),
+                        );
+                    }
+                }
                 row(
                     ui,
                     "Speaker tracking",

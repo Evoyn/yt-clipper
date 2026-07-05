@@ -447,3 +447,35 @@ ANTITESA stays byte-identical. The prior refinement's "remaining pans
 match measured real motion to the pixel" claim was true of head→tail
 NETS — it could not see a there-and-back excursion inside one piece;
 extra-vs-drift is the shape test that can.
+
+**Second retest, same night: 30–40 s — the wander-crawl.** The 11 s pan
+(net +56 px ≈ 5 px/s) passed the monotonicity test and still read as
+jitter: the per-bin series is wander-and-settle (a shift, a rest, a
+lunge, a rest — never sustained travel), so a linear crawl keeps the
+camera in PERMANENT micro-motion over a subject who is mostly still —
+while the whole band would fit a static crop grown just 1.06×. The rule
+that survives all three operator verdicts is **static-first**: a pan must
+be monotonic AND necessary. `PAN_STATIC_GROWTH` (1.25): when one static
+crop contains the span band by growing ≤ 25 % over the base zoom, hold
+static — camera motion needs a reason a slightly wider frame can't
+supply. Genuine cross-frame travel (the Leon-class case the follow was
+built for) needs ~3.8× and keeps its pan. On the fixture this converts
+ALL FOUR pans to static frames: with the framing memory, the whole 70 s
+clip settles to three framings for seat A and four for seat B, every
+remaining crop change sitting on a source cut with a measured subject
+change behind it.
+
+**And the detector (operator ask: "detect first so we don't have this
+kind of bug again if I export new videos")**: `audit_camera_plan` — pure,
+O(shots × bins) — checks every plan against the subject evidence for the
+three shipped defect classes: **camera creep** (a crop moving ≥ 4 px per
+1 s window while the subject moves less than half of that, sustained
+≥ 2 s — the wander-crawl and the lunge-chase), **re-frame without cause**
+(consecutive same-seat shots whose crop jumps > 10 % zoom or > 0.2
+crop-widths while the subject stayed inside the reuse dead-zone — the
+jump-cut twitch, audited so any future planner path regressing it is
+caught), and **subject adrift** (a subject outside the crop's safe region
+≥ 1 s). The diag harness prints the audit per plan, `AnalyzeSpeakers`
+logs each finding, and the Studio Camera panel + export summary show them
+BEFORE any render. Zero findings on both production fixtures is the
+regression bar; each defect class has a true-positive unit test.

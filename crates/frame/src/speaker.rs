@@ -146,6 +146,16 @@ const FOLLOW_DEADZONE_FRAC: f32 = 0.12;
 /// a mid-lunge average while the subject moves the other way (the operator's
 /// "jitter to the left"). An excursion holds a grown static crop instead.
 const PAN_EXTRA_FRAC: f32 = 0.6;
+/// ...and a pan must also be NECESSARY: when ONE static crop can contain the
+/// whole span band by growing no more than this factor over the base zoom,
+/// hold static — camera motion needs a reason a slightly wider frame can't
+/// supply. Measured on the operator-flagged Deddy pans: the 11 s
+/// wander-and-settle glide (30–41 s, ~5 px/s — permanent micro-motion over a
+/// mostly-still subject) needed only 1.06× to contain statically, and the
+/// other pans 1.09–1.15×, while genuine cross-frame travel (the Leon case
+/// the follow exists for) needs ~3.8×. A seated podcast almost never
+/// justifies a glide.
+const PAN_STATIC_GROWTH: f32 = 1.25;
 /// Seconds at a shot's head/tail whose median face center anchors the shot's
 /// opening/closing framing (and the follow pan between them).
 const FOLLOW_EDGE_S: f64 = 1.6;
@@ -1294,6 +1304,17 @@ fn place_crop(cx: f32, cy: f32, w: f32, h: f32, src_w: f32, src_h: f32) -> Crop 
 /// span's median face, grown so the whole [`SPAN_P_LO`]..[`SPAN_P_HI`] center
 /// band stays comfortably inside (the bobbing guard) — a mover is framed
 /// wider, never cropped through the face. `None` when the face never appears.
+/// The (w, h) a static crop needs to contain `band` plus most of the base
+/// framing as margin — before any source clamping. Shared by
+/// [`static_span_crop`] and the pan-necessity test (a pan is only justified
+/// when this growth would be excessive).
+fn span_contain_size(band: (f32, f32, f32, f32), base_h: f32, aspect: f32) -> (f32, f32) {
+    let (cx_lo, cx_hi, cy_lo, cy_hi) = band;
+    let h = base_h.max((cy_hi - cy_lo) + base_h * 0.9);
+    let w = (h * aspect).max((cx_hi - cx_lo) + base_h * aspect * 0.9);
+    (w, w / aspect)
+}
+
 fn static_span_crop(
     track: &SpeakerTrack,
     lo: usize,
@@ -1306,9 +1327,7 @@ fn static_span_crop(
     let aspect = CANVAS_W as f32 / CANVAS_H as f32;
     let base_h = med.h * SOLO_ZOOM;
     // Contain the band plus most of the base framing as margin around it.
-    let mut h = base_h.max((cy_hi - cy_lo) + base_h * 0.9);
-    let mut w = (h * aspect).max((cx_hi - cx_lo) + base_h * aspect * 0.9);
-    h = w / aspect;
+    let (mut w, mut h) = span_contain_size((cx_lo, cx_hi, cy_lo, cy_hi), base_h, aspect);
     if h > src_h {
         h = src_h;
         w = h * aspect;
@@ -1356,6 +1375,16 @@ pub fn solo_span_framing(
     if (extra_x * extra_x + extra_y * extra_y).sqrt()
         > PAN_EXTRA_FRAC * ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt()
     {
+        return Some((static_span_crop(track, lo, hi, src_w, src_h)?, None));
+    }
+    // ...and it must be NECESSARY: a wander that a modest static growth
+    // contains gets the static frame — a multi-second crawl over a
+    // mostly-still subject is permanent micro-motion, the operator's
+    // "jitter" ([`PAN_STATIC_GROWTH`], measured). Only travel too large to
+    // hold in one frame earns camera motion.
+    let (_, contain_h) =
+        span_contain_size((cx_lo, cx_hi, cy_lo, cy_hi), base_h, aspect);
+    if contain_h <= PAN_STATIC_GROWTH * base_h {
         return Some((static_span_crop(track, lo, hi, src_w, src_h)?, None));
     }
     let mut h = base_h + extra_y;
@@ -1596,6 +1625,192 @@ pub fn static_mode_layout(
         },
         None => Layout::FullFrame { crop: crate::centered_fullcam_crop(src_w, src_h) },
     }
+}
+
+// --- camera plan audit: catch jitter-class defects BEFORE an export ---------
+
+/// Camera creep: within one shot, the crop must not move more than this per
+/// audit window while the subject moved less than half of it — a camera in
+/// sustained micro-motion over a still subject is the defect the operator
+/// reads as jitter.
+const AUDIT_CREEP_CAM_PX: f32 = 4.0;
+/// ...and the creep must persist this long to report (a single window is
+/// detector noise).
+const AUDIT_CREEP_MIN_S: f64 = 2.0;
+/// Subject-adrift: the subject's detected center must not sit outside the
+/// crop's safe region (the [`REUSE_GUARD_X_FH`]/[`REUSE_GUARD_Y_FH`] insets)
+/// for longer than this.
+const AUDIT_ADRIFT_MIN_S: f64 = 1.0;
+
+/// Audit a camera plan against the subject evidence: find stretches where
+/// the CAMERA does something the SUBJECT didn't cause — the defect class the
+/// operator reads as jitter. Three checks, each born from a shipped bug
+/// (ADR 0038, 2026-07-05):
+///
+/// - **camera creep**: a panning shot whose crop keeps moving while its
+///   subject is still (the 30–41 s wander-crawl and 22–27 s lunge-chase);
+/// - **re-frame without cause**: consecutive same-seat solo shots whose crop
+///   jumps position or zoom while the subject's measured geometry barely
+///   changed (the jump-cut twitch the framing memory kills — audited so any
+///   future planner path that regresses it is caught);
+/// - **subject adrift**: a subject riding outside a crop's safe region for
+///   a sustained stretch (a mis-parked or under-grown framing).
+///
+/// Pure and cheap (O(shots × bins)). The diag harness prints it per plan,
+/// `AnalyzeSpeakers` logs each finding, and the Studio Camera panel shows
+/// them before an export — "detect first" (operator ask, 2026-07-05). Zero
+/// findings on the production fixtures is a regression bar; a finding on
+/// new footage means the plan would render with a visible camera defect.
+pub fn audit_camera_plan(analysis: &SpeakerAnalysis, plan: &CameraPlan) -> Vec<String> {
+    let bin_s = if analysis.bin_s > 0.0 { analysis.bin_s } else { 1.0 / SPEAKER_FPS };
+    let n = analysis.speaking.len();
+    let mut findings = Vec::new();
+    let track = |id: usize| analysis.tracks.iter().find(|t| t.id == id);
+    let center = |id: usize, b: usize| -> Option<(f32, f32)> {
+        track(id)?.path.get(b)?.as_ref().map(|f| (f.cx(), f.cy()))
+    };
+    let med2 = |pts: &[(f32, f32)]| -> (f32, f32) {
+        let m = |mut v: Vec<f32>| -> f32 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        (m(pts.iter().map(|p| p.0).collect()), m(pts.iter().map(|p| p.1).collect()))
+    };
+
+    // Previous solo shot's (track, end_s, closing crop, subject stats) for
+    // the re-frame check.
+    let mut prev: Option<(usize, f64, Crop, (f32, f32, f32))> = None;
+    for s in &plan.shots {
+        let (Some(id), Layout::FullFrame { crop }) = (s.track, &s.layout) else {
+            prev = None;
+            continue;
+        };
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n);
+        let Some(tr) = track(id) else { continue };
+        let subj = match (span_median_box(&tr.path, b0, b1), span_center_band(&tr.path, b0, b1)) {
+            (Some(med), Some((xl, xh, yl, yh))) => {
+                ((xl + xh) * 0.5, (yl + yh) * 0.5, med.h)
+            }
+            _ => {
+                prev = None;
+                continue;
+            }
+        };
+        let dur = (s.end_s - s.start_s).max(1e-6);
+        let crop_at = |t: f64| -> Crop {
+            match &s.pan_to {
+                Some(p) => crop.lerp(p, (((t - s.start_s) / dur) as f32).clamp(0.0, 1.0)),
+                None => *crop,
+            }
+        };
+
+        // --- camera creep (pan shots only; a static crop cannot creep).
+        if s.pan_to.is_some() {
+            let win = ((1.0 / bin_s).round() as usize).max(2);
+            let step = (win / 2).max(1);
+            let mut flagged: Vec<(f64, f64)> = Vec::new();
+            let mut b = b0;
+            while b + win <= b1 {
+                let (t0, t1) = (b as f64 * bin_s, (b + win) as f64 * bin_s);
+                let det: Vec<(f32, f32)> = (b..b + win).filter_map(|k| center(id, k)).collect();
+                if det.len() * 2 >= win {
+                    let q = (det.len() / 4).max(1);
+                    let a = med2(&det[..q]);
+                    let z = med2(&det[det.len() - q..]);
+                    let subj_d = ((z.0 - a.0).powi(2) + (z.1 - a.1).powi(2)).sqrt();
+                    let (c0, c1) = (crop_at(t0), crop_at(t1));
+                    let cam_d = ((c1.x - c0.x).powi(2) + (c1.y - c0.y).powi(2)).sqrt();
+                    if cam_d >= AUDIT_CREEP_CAM_PX && subj_d < cam_d * 0.5 {
+                        match flagged.last_mut() {
+                            Some((_, e)) if *e >= t0 => *e = t1,
+                            _ => flagged.push((t0, t1)),
+                        }
+                    }
+                }
+                b += step;
+            }
+            for (t0, t1) in flagged {
+                if t1 - t0 >= AUDIT_CREEP_MIN_S {
+                    findings.push(format!(
+                        "{t0:.1}-{t1:.1}s: camera creeps over a still {} (crop glides while the subject isn't moving)",
+                        track_label(id)
+                    ));
+                }
+            }
+        }
+
+        // --- re-frame without cause at a boundary (consecutive same seat).
+        if let Some((pid, pend, pcrop, (px, py, pfh))) = &prev {
+            if *pid == id && (s.start_s - pend).abs() < 0.05 {
+                let (sx, sy, fh) = subj;
+                let zoom_pop = (crop.h - pcrop.h).abs() > 0.10 * pcrop.h;
+                let pos_jump = {
+                    let (ccx, ccy) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
+                    let (pcx, pcy) = (pcrop.x + pcrop.w * 0.5, pcrop.y + pcrop.h * 0.5);
+                    ((ccx - pcx).powi(2) + (ccy - pcy).powi(2)).sqrt() > 0.20 * pcrop.w
+                };
+                let cause = ((sx - px).powi(2) + (sy - py).powi(2)).sqrt()
+                    > REUSE_CENTER_FH * pfh
+                    || (fh - pfh).abs() > REUSE_H_FRAC * pfh;
+                if (zoom_pop || pos_jump) && !cause {
+                    findings.push(format!(
+                        "{:.1}s: crop re-frames on {} without subject cause (zoom {:+.0}%, position {:.0} px)",
+                        s.start_s,
+                        track_label(id),
+                        100.0 * (crop.h - pcrop.h) / pcrop.h.max(1.0),
+                        {
+                            let (ccx, ccy) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
+                            let (pcx, pcy) = (pcrop.x + pcrop.w * 0.5, pcrop.y + pcrop.h * 0.5);
+                            ((ccx - pcx).powi(2) + (ccy - pcy).powi(2)).sqrt()
+                        }
+                    ));
+                }
+            }
+        }
+
+        // --- subject adrift: outside the crop's safe region, sustained.
+        let (ix, iy) = (REUSE_GUARD_X_FH * subj.2, REUSE_GUARD_Y_FH * subj.2);
+        let mut out_start: Option<f64> = None;
+        for b in b0..=b1 {
+            let t = (b as f64 * bin_s).min(s.end_s);
+            let inside = (b < b1)
+                .then(|| center(id, b))
+                .flatten()
+                .map(|(cx, cy)| {
+                    let c = crop_at(t);
+                    cx >= c.x + ix && cx <= c.x + c.w - ix && cy >= c.y + iy && cy <= c.y + c.h - iy
+                });
+            match inside {
+                Some(false) if out_start.is_none() => out_start = Some(t),
+                Some(true) | None if b == b1 => {}
+                Some(true) => {
+                    if let Some(t0) = out_start.take() {
+                        if t - t0 >= AUDIT_ADRIFT_MIN_S {
+                            findings.push(format!(
+                                "{t0:.1}-{t:.1}s: {} rides outside the crop's safe region",
+                                track_label(id)
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if b == b1 {
+                if let Some(t0) = out_start.take() {
+                    if t - t0 >= AUDIT_ADRIFT_MIN_S {
+                        findings.push(format!(
+                            "{t0:.1}-{t:.1}s: {} rides outside the crop's safe region",
+                            track_label(id)
+                        ));
+                    }
+                }
+            }
+        }
+
+        prev = Some((id, s.end_s, s.pan_to.unwrap_or(*crop), subj));
+    }
+    findings
 }
 
 #[cfg(test)]
@@ -2005,6 +2220,87 @@ mod tests {
     }
 
     #[test]
+    fn audit_flags_a_creeping_pan() {
+        // The 30-41 s class: a crop gliding for seconds over a still subject.
+        let n = nbins(8.0);
+        let a = analysis(vec![Some(0); n], vec![track_with_path(0, &vec![600.0; n])]);
+        let crop = Crop { x: 448.0, y: 52.0, w: 304.0, h: 540.0 };
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                start_s: 0.0,
+                end_s: 8.0,
+                track: Some(0),
+                layout: Layout::FullFrame { crop },
+                pan_to: Some(Crop { x: 528.0, ..crop }),
+            }],
+        };
+        let f = audit_camera_plan(&a, &plan);
+        assert!(f.iter().any(|l| l.contains("creeps")), "{f:?}");
+    }
+
+    #[test]
+    fn audit_flags_a_zoom_pop_without_cause() {
+        // The jump-cut-twitch class: adjacent same-seat shots re-zooming while
+        // the subject's measured geometry is unchanged.
+        let n = nbins(8.0);
+        let a = analysis(vec![Some(0); n], vec![track_with_path(0, &vec![600.0; n])]);
+        let c1 = Crop { x: 448.0, y: 52.0, w: 304.0, h: 540.0 };
+        let c2 = Crop { x: 411.0, y: 2.0, w: 378.0, h: 672.0 }; // +24% zoom, same seat
+        let plan = CameraPlan {
+            shots: vec![
+                Shot {
+                    start_s: 0.0,
+                    end_s: 4.0,
+                    track: Some(0),
+                    layout: Layout::FullFrame { crop: c1 },
+                    pan_to: None,
+                },
+                Shot {
+                    start_s: 4.0,
+                    end_s: 8.0,
+                    track: Some(0),
+                    layout: Layout::FullFrame { crop: c2 },
+                    pan_to: None,
+                },
+            ],
+        };
+        let f = audit_camera_plan(&a, &plan);
+        assert!(f.iter().any(|l| l.contains("without subject cause")), "{f:?}");
+    }
+
+    #[test]
+    fn audit_passes_clean_static_and_true_follow_plans() {
+        let n = nbins(8.0);
+        // A still subject inside a contained static crop: clean.
+        let a = analysis(vec![Some(0); n], vec![track_with_path(0, &vec![600.0; n])]);
+        let crop = Crop { x: 448.0, y: 52.0, w: 304.0, h: 540.0 };
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                start_s: 0.0,
+                end_s: 8.0,
+                track: Some(0),
+                layout: Layout::FullFrame { crop },
+                pan_to: None,
+            }],
+        };
+        assert!(audit_camera_plan(&a, &plan).is_empty(), "{:?}", audit_camera_plan(&a, &plan));
+        // A subject genuinely travelling WITH the camera: also clean.
+        let xs: Vec<f32> = (0..n).map(|i| 400.0 + 400.0 * i as f32 / n as f32).collect();
+        let a = analysis(vec![Some(0); n], vec![track_with_path(0, &xs)]);
+        let c0 = Crop { x: 248.0, y: 52.0, w: 304.0, h: 540.0 };
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                start_s: 0.0,
+                end_s: 8.0,
+                track: Some(0),
+                layout: Layout::FullFrame { crop: c0 },
+                pan_to: Some(Crop { x: 648.0, ..c0 }),
+            }],
+        };
+        assert!(audit_camera_plan(&a, &plan).is_empty(), "{:?}", audit_camera_plan(&a, &plan));
+    }
+
+    #[test]
     fn shots_cut_between_speakers_and_respect_min_length() {
         // 20 s clip: A for 8 s, B for 12 s.
         let n = nbins(20.0);
@@ -2230,6 +2526,39 @@ mod tests {
         assert!(crop.w > 2.0 * 162.0, "the static crop grows to hold the excursion: {crop:?}");
         let c = crop.x + crop.w * 0.5;
         assert!((500.0..=580.0).contains(&c), "framed on the band center, got {c}");
+    }
+
+    #[test]
+    fn a_wander_and_settle_holds_a_static_frame_not_a_crawl() {
+        // The subject shifts +25 px, settles, shifts +25 px again, settles
+        // (the Deddy 30-41 s shape): the net head->tail drift clears the
+        // dead-zone and is monotonic, but there is no sustained travel — a
+        // multi-second linear crawl over a mostly-still subject reads as
+        // jitter. A modest static growth contains the whole band, so the
+        // shot must hold ONE static crop, not glide.
+        let n = nbins(8.0);
+        let xs: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / n as f64 * 8.0;
+                if t < 2.0 {
+                    600.0
+                } else if t < 2.5 {
+                    600.0 + 50.0 * ((t - 2.0) / 0.5) as f32
+                } else if t < 4.5 {
+                    650.0
+                } else {
+                    650.0
+                }
+            })
+            .collect();
+        let tracks = vec![track_with_path(0, &xs), track_with_path(1, &vec![1500.0; n])];
+        let plan = plan_shots(&analysis(vec![Some(0); n], tracks), 1920.0, 1080.0, 8.0, &[]);
+        assert_eq!(plan.shots.len(), 1);
+        let shot = &plan.shots[0];
+        assert!(shot.pan_to.is_none(), "wander-and-settle must not crawl: {shot:?}");
+        let Layout::FullFrame { crop } = &shot.layout else { panic!("solo") };
+        assert!(crop.x + 60.0 <= 600.0, "home position inside: {crop:?}");
+        assert!(crop.x + crop.w - 60.0 >= 650.0, "settled position inside: {crop:?}");
     }
 
     #[test]

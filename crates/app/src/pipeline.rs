@@ -2465,6 +2465,11 @@ fn do_analyze_speakers(
     tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
     let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
+    // Jitter-class defects (a crop moving without subject cause) are flagged
+    // here and in the Studio's Camera panel BEFORE any export renders them.
+    for f in speaker::audit_camera_plan(&analysis, &plan) {
+        tracing::warn!(finding = %f, "camera plan audit");
+    }
     Ok((analysis, plan))
 }
 
