@@ -31,6 +31,21 @@
 //! run it on known same/different-speaker recordings to validate the fbank +
 //! embedding path end-to-end before trusting fixture numbers.
 //!
+//! The **laughter lane** (ADR 0045 SPIKE, harness-only) scores every 0.25 s
+//! step of the same analysis.wav with an AudioSet-class tagger
+//! (`yc_frame::reaction`), extends the per-segment evidence table with a
+//! laugh column, and judges the pre-declared discrimination bars when the
+//! operator supplies the ear-truth spans (`YC_LAUGH_TARGET="22.1-27.0"`,
+//! optional `YC_LAUGH_EXSPLIT="14.2-22.1,27.0-30.2"`). Nothing feeds the
+//! plan. Its Bar 0:
+//!
+//!   … speaker_diag --features face -- tagselftest <wav> [<wav>…]
+//!
+//! scores whole 16 kHz wavs under both sample-scale conventions and prints
+//! top-5 AudioSet classes + raw logit ranges — the model must rank known
+//! content correctly (and the right scale shows itself) before any fixture
+//! number means anything.
+//!
 //! The **face lane** (ADR 0043/0044, production path) builds the OCCUPANT
 //! MAP with `yc_frame::occupant::build_occupant_map`: full-res face crops
 //! per (segment, seat), YuNet landmarks, SFace embeddings, person clusters
@@ -68,6 +83,10 @@ fn main() -> anyhow::Result<()> {
     if first == "faceselftest" {
         let imgs: Vec<String> = args.collect();
         return face_selftest(&imgs);
+    }
+    if first == "tagselftest" {
+        let wavs: Vec<String> = args.collect();
+        return tag_selftest(&wavs);
     }
     let data_dir = PathBuf::from(first);
     let start_s: f64 = args.next().expect("clip start_s").parse()?;
@@ -439,12 +458,58 @@ fn main() -> anyhow::Result<()> {
         lanes.push((tag, lane));
     }
 
+    // --- laughter lane (ADR 0045 SPIKE, harness-only): the shared-reaction
+    // instrument. Scores every 0.25 s step of the SAME analysis.wav samples
+    // the voice lane embeds, VAD-independent; nothing here feeds the plan —
+    // the numbers below are the spike's whole product.
+    let mut laugh: Option<(Vec<f32>, yc_frame::reaction::TagSession, Vec<String>)> = {
+        let model = Path::new(TAG_MODEL);
+        let labels_p = Path::new(TAG_LABELS);
+        if !model.is_file() || !labels_p.is_file() {
+            println!(
+                "\n== laughter lane: missing {} or {} — skipped",
+                model.display(),
+                labels_p.display()
+            );
+            None
+        } else {
+            let labels = yc_frame::reaction::parse_class_labels(&std::fs::read_to_string(labels_p)?);
+            let family = yc_frame::reaction::laughter_family(&labels);
+            let t0 = std::time::Instant::now();
+            match yc_frame::reaction::TagSession::load(model, TAG_SCALE, TAG_OUTPUT)
+                .and_then(|mut s| yc_frame::reaction::tag_steps(&mut s, &samples, dur, &family).map(|st| (st, s)))
+            {
+                Ok((steps, sess)) => {
+                    println!(
+                        "\n== laughter lane (ADR 0045 spike): {} steps ({:.2}s win / {:.2}s step, scale {:?}) in {:.1}s | {} classes, family x{} at {:?}",
+                        steps.len(),
+                        yc_frame::reaction::TAG_WIN_S,
+                        yc_frame::reaction::TAG_STEP_S,
+                        TAG_SCALE,
+                        t0.elapsed().as_secs_f32(),
+                        labels.len(),
+                        family.len(),
+                        family
+                    );
+                    Some((steps, sess, labels))
+                }
+                Err(e) => {
+                    println!("\n== laughter lane FAILED: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+    let laugh_bins: Option<Vec<f32>> = laugh
+        .as_ref()
+        .map(|(steps, _, _)| yc_frame::reaction::project_to_bins(steps, n_bins, bin_s));
+
     // Per-segment evidence table (ADR 0044 grammar forensics): what each
     // inter-cut segment's voiced time is made of — the printed gaps any
     // shared-class plan rule must derive its thresholds from.
     {
         let bounds = yc_frame::voice::segment_bounds(&cuts, dur);
-        println!("\n== per-segment voiced evidence (voiced / contested / voice-claimed / absent):");
+        println!("\n== per-segment voiced evidence (voiced / contested / voice-claimed / absent / laugh-mean):");
         for g in 0..bounds.len() - 1 {
             let b0 = (bounds[g] / bin_s).round() as usize;
             let b1 = (((bounds[g + 1] / bin_s).round() as usize).min(n_bins)).max(b0);
@@ -502,16 +567,171 @@ fn main() -> anyhow::Result<()> {
                 .take(3)
                 .map(|(c, n)| format!("V{c} {:.0}%", 100.0 * *n as f64 / nv as f64))
                 .collect();
+            // Mean laughter score over ALL of the segment's bins (the lane is
+            // VAD-independent — breathy laughter has no voiced bins to count).
+            let laugh_s = laugh_bins
+                .as_ref()
+                .map(|lb| {
+                    let n = (b1 - b0).max(1);
+                    let mean = (b0..b1).map(|b| lb[b] as f64).sum::<f64>() / n as f64;
+                    format!("{:>3.0}%", 100.0 * mean)
+                })
+                .unwrap_or_else(|| "  --".into());
             println!(
-                "  seg{g:>2} {:>5.1}-{:>5.1}s  voiced {:>4.1}s | contested {:>3.0}% | claimed {:>3.0}% | absent {:>3.0}% | mouth-dom {} | clusters [{}]",
+                "  seg{g:>2} {:>5.1}-{:>5.1}s  voiced {:>4.1}s | contested {:>3.0}% | claimed {:>3.0}% | absent {:>3.0}% | laugh {} | mouth-dom {} | clusters [{}]",
                 bounds[g],
                 bounds[g + 1],
                 voiced.len() as f64 * bin_s,
                 100.0 * contested as f64 / nv as f64,
                 100.0 * claimed as f64 / nv as f64,
                 100.0 * absent as f64 / nv as f64,
+                laugh_s,
                 dom,
                 comp_s.join(" ")
+            );
+        }
+    }
+
+    // --- laughter bars (ADR 0045): the pre-declared discrimination gates —
+    // at ONE tau from the declared grid: target mass >= 50%, every monologue
+    // segment <= 10%, gap >= 5x vs the worst monologue. Judged only when the
+    // operator supplies the fixture's ear-truth spans:
+    //   YC_LAUGH_TARGET="22.1-27.0"             the known laughter stretch
+    //   YC_LAUGH_EXSPLIT="14.2-22.1,27.0-30.2"  ex-split pieces (findings only)
+    if let Some((steps, sess, labels)) = laugh.as_mut() {
+        use yc_frame::reaction::{mask_runs, mass_in_span};
+        let parse_span = |s: &str| -> Option<(f64, f64)> {
+            let (a, b) = s.split_once('-')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        };
+        let target = std::env::var("YC_LAUGH_TARGET").ok().and_then(|s| parse_span(&s));
+        let exsplit: Vec<(f64, f64)> = std::env::var("YC_LAUGH_EXSPLIT")
+            .map(|s| s.split(',').filter_map(parse_span).collect())
+            .unwrap_or_default();
+        let taus = [0.1f32, 0.2, 0.3, 0.4, 0.5];
+        let bounds = yc_frame::voice::segment_bounds(&cuts, dur);
+        // Top-5 classes the model hears over a span — the "is it actually
+        // laughter" forensic (one aggregate window per span).
+        let mut top5 = |span: (f64, f64)| -> String {
+            let sr = yc_frame::voice::VOICE_SR as f64;
+            let (i0, i1) =
+                ((span.0 * sr) as usize, ((span.1 * sr) as usize).min(samples.len()));
+            match sess.tag(&samples[i0..i1.max(i0 + 1)]) {
+                Ok(probs) => {
+                    let mut idx: Vec<usize> = (0..probs.len()).collect();
+                    idx.sort_by(|&a, &b| {
+                        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.iter()
+                        .take(5)
+                        .map(|&i| {
+                            format!(
+                                "{} {:.2}",
+                                labels.get(i).map(|s| s.as_str()).unwrap_or("?"),
+                                probs[i]
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                }
+                Err(e) => format!("(tag failed: {e})"),
+            }
+        };
+        if let Some(tspan) = target {
+            // Monologue segments: inter-cut segments not overlapping the
+            // target or ex-split spans, with >= 1 s voiced (declared bars).
+            let excl: Vec<(f64, f64)> =
+                std::iter::once(tspan).chain(exsplit.iter().copied()).collect();
+            let mono: Vec<(usize, (f64, f64))> = (0..bounds.len() - 1)
+                .filter_map(|g| {
+                    let span = (bounds[g], bounds[g + 1]);
+                    if excl.iter().any(|e| span.0 < e.1 && e.0 < span.1) {
+                        return None;
+                    }
+                    let b0 = (span.0 / bin_s).round() as usize;
+                    let b1 = (((span.1 / bin_s).round() as usize).min(n_bins)).max(b0);
+                    let v = (b0..b1).filter(|&b| analysis.voiced[b]).count() as f64 * bin_s;
+                    (v >= 1.0).then_some((g, span))
+                })
+                .collect();
+            println!(
+                "\n== laughter bars (ADR 0045; target {:.1}-{:.1}s, {} monologue segs, tau grid {taus:?}):",
+                tspan.0,
+                tspan.1,
+                mono.len()
+            );
+            let mut selected: Option<f32> = None;
+            for &tau in &taus {
+                let (th, tt) = mass_in_span(steps, tspan, tau);
+                let tmass = 100.0 * th as f64 / tt.max(1) as f64;
+                let (mut worst, mut worst_g): (f64, Option<usize>) = (0.0, None);
+                for &(g, span) in &mono {
+                    let (h, t) = mass_in_span(steps, span, tau);
+                    let m = 100.0 * h as f64 / t.max(1) as f64;
+                    if m > worst {
+                        worst = m;
+                        worst_g = Some(g);
+                    }
+                }
+                let bar_a = tmass >= 50.0;
+                let bar_b = worst <= 10.0;
+                let (ratio_s, bar_c) = if worst > 0.0 {
+                    (format!("{:.1}x", tmass / worst), tmass / worst >= 5.0)
+                } else {
+                    ("inf".into(), tmass > 0.0)
+                };
+                println!(
+                    "  tau {tau:.1}: target {tmass:>3.0}% ({th}/{tt}) A[{}] | worst mono {worst:>3.0}%{} B[{}] | gap {ratio_s} C[{}]{}",
+                    if bar_a { "pass" } else { "FAIL" },
+                    worst_g.map(|g| format!(" seg{g}")).unwrap_or_default(),
+                    if bar_b { "pass" } else { "FAIL" },
+                    if bar_c { "pass" } else { "FAIL" },
+                    if bar_a && bar_b && bar_c { "  << ALL BARS MET" } else { "" }
+                );
+                if bar_a && bar_b && bar_c && selected.is_none() {
+                    selected = Some(tau);
+                }
+            }
+            match selected {
+                Some(tau) => println!("  BARS: PASS at tau {tau:.1}"),
+                None => println!(
+                    "  BARS: FAIL — no tau on the declared grid meets A(>=50%) B(<=10% every monologue) C(gap >=5x)"
+                ),
+            }
+            // Findings (not bars): the ex-split pieces' masses, the mask, and
+            // what the model hears on target vs the longest monologue control.
+            let jt = selected.unwrap_or(0.3);
+            for e in &exsplit {
+                let (h, t) = mass_in_span(steps, *e, jt);
+                println!(
+                    "  finding: ex-split {:.1}-{:.1}s mass {:>3.0}% ({h}/{t}) at tau {jt:.1}",
+                    e.0,
+                    e.1,
+                    100.0 * h as f64 / t.max(1) as f64
+                );
+            }
+            let runs = mask_runs(steps, jt);
+            let spans: Vec<String> =
+                runs.iter().map(|r| format!("{:.2}-{:.2}", r.0, r.1)).collect();
+            println!("  mask runs at tau {jt:.1}: [{}]", spans.join(" "));
+            println!("  target hears: {}", top5(tspan));
+            if let Some(&(g, span)) = mono
+                .iter()
+                .max_by(|a, b| {
+                    let da = a.1 .1 - a.1 .0;
+                    let db = b.1 .1 - b.1 .0;
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                println!("  control seg{g} ({:.1}-{:.1}s) hears: {}", span.0, span.1, top5(span));
+            }
+        } else {
+            let runs = mask_runs(steps, 0.3);
+            let spans: Vec<String> =
+                runs.iter().map(|r| format!("{:.2}-{:.2}", r.0, r.1)).collect();
+            println!(
+                "\n== laughter bars: set YC_LAUGH_TARGET=\"start-end\" (+ optional YC_LAUGH_EXSPLIT) to judge the declared bars; mask at tau 0.3: [{}]",
+                spans.join(" ")
             );
         }
     }
@@ -830,6 +1050,9 @@ fn main() -> anyhow::Result<()> {
         for (tag, _) in &lanes {
             w.push_str(&format!(",{0}_cluster,{0}_seat", tag));
         }
+        if laugh_bins.is_some() {
+            w.push_str(",laugh");
+        }
         w.push('\n');
         for b in 0..n_bins {
             w.push_str(&format!(
@@ -849,6 +1072,9 @@ fn main() -> anyhow::Result<()> {
                 let c = l.cluster[b].map(|v| v as i64).unwrap_or(-1);
                 let s = l.seat[b].map(|v| v as i64).unwrap_or(-1);
                 w.push_str(&format!(",{c},{s}"));
+            }
+            if let Some(lb) = &laugh_bins {
+                w.push_str(&format!(",{:.3}", lb[b]));
             }
             w.push('\n');
         }
@@ -882,6 +1108,90 @@ const VOICE_MODELS: [(&str, &str, yc_frame::voice::SampleScale, bool); 1] = [
         true,
     ),
 ];
+
+/// The audio-event tagging model (ADR 0045 spike): icefall Zipformer-M
+/// audio tagger trained on AudioSet (527 classes, laughter family included),
+/// from the sherpa-onnx `audio-tagging-models` release — the CAM++ sourcing
+/// pattern, Apache-2.0. Asset
+/// `sherpa-onnx-zipformer-audio-tagging-2024-04-09.tar.bz2`, SHA-256
+/// `6c89b86c3d4812520e6937316d9aff944458871ec037dd47cf33ae2034b5eb54` (the
+/// live asset, matching the GitHub API digest; the release's checksum.txt
+/// still lists a stale pre-re-upload hash `8d786db8…`). The installed
+/// `model.onnx` hashes `a8f11014905fbaab81644514b79e719f3fcfa3ad45d29a25b46e34eb03c48ed8`.
+/// Input `(x [N,T,80] fbank, x_lens [N])` — the existing byte-validated
+/// Kaldi frontend feeds it directly; picked over the CED exports for exactly
+/// that reason (CED wants a 64-mel torchaudio-style frontend — new matching
+/// work the spike doesn't pay for speculatively).
+#[cfg(feature = "face")]
+const TAG_MODEL: &str = "models/sherpa-onnx-zipformer-audio-tagging-2024-04-09.onnx";
+/// The release's AudioSet label table (index,mid,display_name), installed
+/// beside the model; SHA-256 `cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429`.
+#[cfg(feature = "face")]
+const TAG_LABELS: &str = "models/audioset_class_labels_indices.csv";
+/// Fbank sample scale for the tagger — PINNED by `tagselftest` on the
+/// release's own 13 test wavs (no CMN here, so scale genuinely changes the
+/// features): `Unit` reproduces the published reference outputs rank-perfect
+/// on all 13 (4.wav: Laughter top with the family beneath; Stream, Oink,
+/// Meow, Siren all correct), while `Int16` audibly breaks them (the laughter
+/// wav tags as Music/Singing, the stream as Engine) — the icefall/lhotse
+/// [-1,1] training convention, seen not assumed.
+#[cfg(feature = "face")]
+const TAG_SCALE: yc_frame::voice::SampleScale = yc_frame::voice::SampleScale::Unit;
+/// Output convention — PINNED by the same selftest: raw outputs live in
+/// exactly [0, 1] with hard zeros on absent classes, and match the published
+/// reference probabilities nearly digit-for-digit (Cat raw 0.944 vs 0.939
+/// published, Oink 0.895 vs 0.888) — the export ends in a sigmoid, so
+/// `tag()` must NOT apply another one.
+#[cfg(feature = "face")]
+const TAG_OUTPUT: yc_frame::reaction::TagOutput = yc_frame::reaction::TagOutput::Probs;
+
+/// `tagselftest <wav> [<wav>…]`: score whole 16 kHz mono wavs with the
+/// audio-event tagger under BOTH sample-scale conventions and print top-5
+/// AudioSet classes + the raw logit range per wav — Bar 0 of the ADR 0045
+/// spike: the model must rank known content correctly (and the right scale
+/// show itself) before any fixture number means anything.
+#[cfg(feature = "face")]
+fn tag_selftest(wavs: &[String]) -> anyhow::Result<()> {
+    use std::path::Path;
+    use yc_core::TimeRange;
+    anyhow::ensure!(!wavs.is_empty(), "tagselftest needs >= 1 wav path (16 kHz mono)");
+    let model = Path::new(TAG_MODEL);
+    anyhow::ensure!(model.is_file(), "missing {}", model.display());
+    let labels = yc_frame::reaction::parse_class_labels(&std::fs::read_to_string(TAG_LABELS)?);
+    let fam = yc_frame::reaction::laughter_family(&labels);
+    println!("labels: {} classes | laughter family x{} at {fam:?}", labels.len(), fam.len());
+    for scale in [yc_frame::voice::SampleScale::Int16, yc_frame::voice::SampleScale::Unit] {
+        let mut sess = yc_frame::reaction::TagSession::load(model, scale, TAG_OUTPUT)?;
+        println!("[scale {scale:?}]");
+        for p in wavs {
+            let s = yc_ingest::read_range_samples(
+                Path::new(p),
+                TimeRange { start_s: 0.0, end_s: 36_000.0 },
+            )?;
+            // Raw model outputs, deliberately: their range REVEALS the output
+            // convention (sigmoid-terminated = [0,1] with hard zeros) instead
+            // of assuming it.
+            let raw = sess.tag_raw(&s)?;
+            let (lo, hi) = raw
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+            let mut idx: Vec<usize> = (0..raw.len()).collect();
+            idx.sort_by(|&a, &b| {
+                raw[b].partial_cmp(&raw[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let name = Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p);
+            let top: Vec<String> = idx
+                .iter()
+                .take(5)
+                .map(|&i| {
+                    format!("{} {:.2}", labels.get(i).map(|s| s.as_str()).unwrap_or("?"), raw[i])
+                })
+                .collect();
+            println!("  {name}: raw [{lo:+.2}..{hi:+.2}] | {}", top.join(" | "));
+        }
+    }
+    Ok(())
+}
 
 /// `selftest <wav> <wav> [<wav>…]`: embed whole 16 kHz mono wavs with every
 /// present candidate model and print pairwise cosine similarity — ground

@@ -4,6 +4,42 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-06 (evening) — Laughter-class instrument spike: bars declared, annotation overturned, gate PASSED
+
+ADR 0044's named path measured (ADR 0045): an AudioSet-class tagger
+(icefall Zipformer-M, sherpa-onnx pinned release — the CAM++ sourcing
+pattern) scores every 0.25 s of the same analysis.wav the voice lane reads,
+for the new **Shared reaction** class (CONTEXT.md). Harness-only; zero
+production behavior change.
+
+- **Conventions seen, not assumed**: the tagselftest on the release's own
+  13 test wavs pinned `Unit` sample scale (rank-perfect vs the published
+  reference on all 13; `Int16` audibly breaks — laughter tags as Music)
+  and caught that the export is sigmoid-terminated (raw [0,1] with hard
+  zeros) — the first cut double-sigmoided; `TagOutput::Probs` pinned. The
+  release's checksum.txt is stale (asset re-uploaded); pinned by the live
+  hash `6c89b86c…` instead, discrepancy recorded.
+- **Bars declared in the grill BEFORE code**: ≥50% laughter mass on the
+  known stretch, ≤10% on every monologue segment, gap ≥5×, at one tau
+  from {0.1..0.5}. First judge: **FAIL** on the recorded span 22.1–27.0
+  (peaks 25%) — but every monologue at 0% and the mask sitting at
+  25.5–30.25, exactly where ADR 0044's own text (the V4/V8/V9
+  fragmentation segment = 27.0–30.2) said the laughter was. The operator
+  ear-checked both spans: **the annotation was wrong, the instrument
+  right** (second overturn on this fixture). Same bars re-judged on the
+  ear-corrected span: **PASS at tau 0.1 (89% / 0% / ∞), tau 0.2 also
+  passes** — and the ex-split 14.2–22.1 measures 0%: that piece has no
+  laughter fuel, stated plainly.
+- **Texture for the wiring slice**: real overlapped podcast laughter
+  scores 0.1–0.3 per step (bursts, not a wall; clean test-wav laughter
+  0.86) — the grammar threshold must be burst-derived, low tau over the
+  zero-noise floor.
+- **Bars**: suites green both ways (334 face / 268 non-face — the +7 are
+  the new `yc_frame::reaction` pure tests); Deddy person-join bars intact
+  through every run; ANTITESA follow-visible, audit clean, fg byte-pin
+  `9e07d81f…` intact, laughter lane quiet there. **Operator gate: PASSED —
+  production wiring queued** (`nextprompt-laughter-wiring.md`).
+
 ## 2026-07-06 (afternoon) — Studio timeline resizable, voice row visible, gate PASSED
 
 The operator's fresh-binary ask ("timeline is so small it doesnt visible

@@ -20,6 +20,13 @@ description: Drive yt-clipper (egui GUI) and its diag harnesses to verify change
    bars (ADR 0044): occupant map `4 persons + 2 singleton sighting(s)` cut
    at 0.40; exactly one VALID edge (`V2 x cam0 ... -> P1`); off-screen
    1.5 s (positive absence only, spans 20.8-21.4 + 68.6-69.1).
+   Laughter bars (ADR 0045 spike; ear-truth spans are operator knowledge,
+   supplied by env): Deddy with `YC_LAUGH_TARGET=25.5-30.25
+   YC_LAUGH_EXSPLIT=14.2-22.1` prints `BARS: PASS at tau 0.1` (target 89%,
+   every monologue 0%, tau 0.2 also passes at 63%); ex-split 14.2-22.1
+   mass 0%. The 22.1-27.0 span is a DEAD stale annotation — never judge
+   against it. Bar 0: `tagselftest` on the release test wavs — 4.wav must
+   rank Laughter top at scale Unit (raw ~0.86, sigmoid-terminated export).
    Renders (never clobber old gate artifacts — pick fresh names for new gates):
    `YC_INTEG_RENDER=1` -> ../diar_integration.mp4; `YC_SMOOTH_RENDER=1` ->
    ../camera_smoothing.mp4; `YC_PERSON_RENDER=1` -> ../diar_person.mp4

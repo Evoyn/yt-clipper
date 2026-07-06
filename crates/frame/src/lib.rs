@@ -26,6 +26,7 @@ pub mod infer;
 pub use infer::Detector;
 pub mod face_id;
 pub mod occupant;
+pub mod reaction;
 pub mod speaker;
 pub mod voice;
 
