@@ -4,6 +4,52 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-07 — Shared-reaction wiring: the laughter mask ships into production (ADR 0046)
+
+ADR 0045's PASSED instrument gained its production caller: the
+shared-reaction mask now computes inside `Job::AnalyzeSpeakers`, the split
+grammar consumes it, the Studio timeline shows it, and the tagger heals
+from Diagnostics ▸ Downloads. Gate: a fresh `diar_reaction.mp4` A/B'd
+against `diar_person.mp4` on the operator's eyes — **PASSED, shipped**.
+
+- **The lane**: `SpeakerAnalysis.reaction: Option<Vec<f32>>` — a SIBLING of
+  the voice lane (a missing CAM++ model can't kill it), computed in the
+  attribution regime only (the occupant-map gate), so a follow-visible Clip
+  structurally never computes it (~10 s CPU saved; the ANTITESA byte-pin
+  holds by construction). Conventions ride the call site: `Unit` scale,
+  `Probs` output (both selftest-pinned, ADR 0045). Missing/broken tagger =
+  a Camera-panel note, never a failed job.
+- **The grammar**: a piece with ≥ 2.0 s of bins at tau 0.1 flips to the
+  visible pair's split screen — absolute burst-seconds (a share rule
+  under-fires on the measured burst texture), piece-level, mirroring the
+  off-screen split exactly (decided before framing, no anchor written).
+  Deddy: shot #5 (27.0–30.2, wall-to-wall mask) flips; #4 (1.25 s, its
+  22.1–25.5 majority is ear-confirmed speech), #6 (0.3 s), and the
+  ex-split 14.2–22.1 (0%) all hold — realized exactly as pre-declared.
+- **One deviation, surfaced and ruled**: killing #5's solo anchor re-seeded
+  the whole downstream Person B chain (size-reuse had propagated #5's
+  843 px crop height; #6/#10/#11/#14 now frame at 773 px — B's talking
+  posture, not his mid-laugh posture; ≤ 43 px movement, audit clean). The
+  operator accepted the re-seed over having a split piece mint solo
+  framing state.
+- **Downloads (ADR 0041 pattern)**: two rows + two `Install::File` specs
+  from k2-fsa's own HF mirror at immutable revision `3c795f58…` — chosen
+  over the GitHub tarball (living release, checksum.txt already stale once,
+  .tar.bz2 would need new archive code); both hashes verified
+  byte-identical to the gate-passing install. fp32 ships; int8 (~68 MB,
+  hash recorded) waits on a measured re-run of the bars.
+- **Studio**: the voice row is now the evidence row — reaction mask in
+  gold beside seat claims and off-screen red; renders when either lane
+  exists.
+- **Bars**: suites green both ways — count of record corrected to **337
+  both ways** (the historic "268 non-face" was a partial-run artifact;
+  no frame test was ever feature-gated). Laughter bars PASS verbatim,
+  person-join intact, audits clean, ANTITESA fg pin `9e07d81f…` intact,
+  Bar 0 reproduces. Also healed: a broken persisted window geometry
+  (saved minimized at −32000) that booted the GUI at 16×16.
+
+---
+
 ## 2026-07-06 (evening) — Laughter-class instrument spike: bars declared, annotation overturned, gate PASSED
 
 ADR 0044's named path measured (ADR 0045): an AudioSet-class tagger

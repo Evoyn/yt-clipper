@@ -47,6 +47,8 @@ fn main() -> eframe::Result<()> {
         voice_model: paths.voice_model(),
         yunet_model: paths.yunet_model(),
         sface_model: paths.sface_model(),
+        tag_model: paths.tag_model(),
+        tag_labels: paths.tag_labels(),
         sep_model: paths.sep_model(),
         deep_filter: paths.deep_filter(),
         mtmd_cli: paths.mtmd_cli(),
@@ -453,6 +455,20 @@ impl AppPaths {
     /// Absent unless downloaded; the voice join is then seat-scoped.
     fn sface_model(&self) -> PathBuf {
         self.models.join("face_recognition_sface_2021dec.onnx")
+    }
+
+    /// Zipformer AudioSet event tagger for the shared-reaction mask (ADR
+    /// 0045/0046). Absent unless downloaded; the split grammar then sees no
+    /// laughter fuel (reaction splits simply never arm).
+    fn tag_model(&self) -> PathBuf {
+        self.models.join("sherpa-onnx-zipformer-audio-tagging-2024-04-09.onnx")
+    }
+
+    /// The tagger's AudioSet class-label CSV (index → display name) — the
+    /// laughter family is looked up by display name, so the lane needs both
+    /// files.
+    fn tag_labels(&self) -> PathBuf {
+        self.models.join("audioset_class_labels_indices.csv")
     }
 
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). Absent unless
@@ -1334,6 +1350,20 @@ impl App {
             ),
             dep(
                 false,
+                "reaction tagger",
+                p.tag_model(),
+                "Shared reaction: laughter-class mask feeding the split grammar (ADR 0045/0046) (~260 MB)",
+                &["tagger-model"],
+            ),
+            dep(
+                false,
+                "AudioSet labels",
+                p.tag_labels(),
+                "the reaction tagger's class names (laughter family lookup)",
+                &["tagger-labels"],
+            ),
+            dep(
+                false,
                 "SER model",
                 p.ser_model(),
                 "arousal Signal (ser builds, ADR 0008) (~610 MB)",
@@ -1502,6 +1532,29 @@ impl App {
                 sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
                 total_bytes: 38_696_353,
                 install: Install::File(p.sface_model()),
+            },
+            // The shared-reaction tagger pair (ADR 0045/0046): k2-fsa's OWN
+            // HuggingFace mirror at a pinned revision, chosen over the GitHub
+            // release asset because that tag is a LIVING release (assets
+            // re-uploaded in place — its checksum.txt was already stale once,
+            // ADR 0045) and ships only .tar.bz2; the HF revision URL is
+            // immutable and serves the bare files. Both hashes verified
+            // byte-identical to the gate-passing install on 2026-07-07.
+            DownloadSpec {
+                id: "tagger-model",
+                label: "reaction tagger (Zipformer audio tags)",
+                url: "https://huggingface.co/k2-fsa/sherpa-onnx-zipformer-audio-tagging-2024-04-09/resolve/3c795f58cd1fe15a42cee103519e7a5cbbd93415/model.onnx",
+                sha256: "a8f11014905fbaab81644514b79e719f3fcfa3ad45d29a25b46e34eb03c48ed8",
+                total_bytes: 259_079_136,
+                install: Install::File(p.tag_model()),
+            },
+            DownloadSpec {
+                id: "tagger-labels",
+                label: "AudioSet class labels",
+                url: "https://huggingface.co/k2-fsa/sherpa-onnx-zipformer-audio-tagging-2024-04-09/resolve/3c795f58cd1fe15a42cee103519e7a5cbbd93415/class_labels_indices.csv",
+                sha256: "cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429",
+                total_bytes: 14_675,
+                install: Install::File(p.tag_labels()),
             },
             DownloadSpec {
                 id: "ser-model",

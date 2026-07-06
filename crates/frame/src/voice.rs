@@ -1573,6 +1573,7 @@ mod tests {
             speaking: vec![Some(0); n],
             confidence: vec![1.0; n],
             voice: None,
+            reaction: None,
         };
         a.tracks[0].activity = vec![0.004; n]; // the floor: refutable
         a.tracks[1].activity = vec![0.001; n];
@@ -1613,6 +1614,7 @@ mod tests {
             speaking: vec![Some(0); n],
             confidence: vec![1.0; n],
             voice: None,
+            reaction: None,
         };
         a.tracks[0].activity = vec![0.02; n];
         a.tracks[1].activity = vec![0.001; n];
@@ -1655,6 +1657,7 @@ mod tests {
             speaking,
             confidence: vec![1.0; n],
             voice: None,
+            reaction: None,
         };
         (analysis, vec![2.0, 4.0, 6.0])
     }
@@ -1718,6 +1721,7 @@ mod tests {
                 .collect(),
             confidence: vec![1.0; n],
             voice: None,
+            reaction: None,
         };
         for b in 0..n {
             if (nb(2.0)..nb(4.0)).contains(&b) {
@@ -1855,6 +1859,7 @@ mod tests {
             speaking,
             confidence: vec![1.0; n],
             voice: None,
+            reaction: None,
         }
     }
 

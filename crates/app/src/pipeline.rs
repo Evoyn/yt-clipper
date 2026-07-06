@@ -76,6 +76,14 @@ pub struct PipelinePaths {
     pub yunet_model: PathBuf,
     #[cfg_attr(not(feature = "face"), allow(dead_code))]
     pub sface_model: PathBuf,
+    /// AudioSet event tagger + its class-label CSV for the shared-reaction
+    /// mask (ADR 0045/0046). Either absent: no reaction mask (the split
+    /// grammar simply never sees laughter fuel) and the Camera panel says so.
+    /// Only read by the `face`-gated speaker analysis, attribution regime.
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub tag_model: PathBuf,
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub tag_labels: PathBuf,
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). May be absent:
     /// the export then captions the mixed analysis audio. Only read by the
     /// `sep`-gated caption pass.
@@ -2482,7 +2490,8 @@ fn do_analyze_speakers(
     let n_bins = (dur * fps).ceil().max(1.0) as usize;
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
-    let mut analysis = SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None };
+    let mut analysis =
+        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
     // The source's own cut frames (pixel-level scene detection), so a multicam
     // plan cuts exactly where the source does — no sampling grid to lag it.
     // Detected BEFORE the voice lane: its per-angle joins group the segments
@@ -2596,6 +2605,65 @@ fn do_analyze_speakers(
         anyhow::bail!("cancelled");
     }
 
+    // --- shared-reaction lane (ADR 0045/0046): the laughter-class mask the
+    // split grammar reads as "the group reacts together". Attribution regime
+    // only — a follow-visible plan never consults it (the source already
+    // chose its subject), so those clips never pay the tagging cost and the
+    // follow-visible byte-pin holds structurally. Additive like the voice
+    // lane: a missing or broken tagger yields exactly the mask-less analysis
+    // plus a Camera-panel note, never a failed job.
+    let mut reaction_note: Option<String> = None;
+    if attribution {
+        if !(paths.tag_model.is_file() && paths.tag_labels.is_file()) {
+            reaction_note =
+                Some("Shared reaction off — tagger missing (Diagnostics ▸ Downloads)".into());
+            tracing::info!("reaction tagger absent; split grammar sees no laughter fuel");
+        } else {
+            let _ = tx.send(Progress::Stage("Scoring shared reactions (audio tags)"));
+            let tag = || -> Result<Vec<f32>> {
+                use yc_frame::reaction;
+                let labels =
+                    reaction::parse_class_labels(&std::fs::read_to_string(&paths.tag_labels)?);
+                let family = reaction::laughter_family(&labels);
+                anyhow::ensure!(
+                    !family.is_empty(),
+                    "no laughter-family classes in {}",
+                    paths.tag_labels.display()
+                );
+                // Conventions pinned by the tagselftest (ADR 0045), not
+                // assumed: fbank on [-1, 1] samples (Int16 audibly breaks the
+                // model) and a sigmoid-terminated export (re-sigmoiding was
+                // the first cut's caught bug).
+                let mut sess = reaction::TagSession::load(
+                    &paths.tag_model,
+                    yc_frame::voice::SampleScale::Unit,
+                    reaction::TagOutput::Probs,
+                )?;
+                let steps = reaction::tag_steps(&mut sess, &samples, dur, &family)?;
+                Ok(reaction::project_to_bins(&steps, n_bins, bin_s))
+            };
+            match tag() {
+                Ok(bins) => {
+                    let masked_s = bins
+                        .iter()
+                        .filter(|&&s| s >= speaker::REACTION_TAU)
+                        .count() as f64
+                        * bin_s;
+                    tracing::info!(masked_s, "speaker analysis: shared-reaction mask");
+                    analysis.reaction = Some(bins);
+                }
+                Err(e) => {
+                    reaction_note =
+                        Some(format!("Shared reaction failed — no reaction mask ({e:#})"));
+                    tracing::warn!(error = %format!("{e:#}"), "reaction lane failed; no mask");
+                }
+            }
+        }
+    }
+    if cancel.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
+
     let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
     // Jitter-class defects (a crop moving without subject cause) are flagged
@@ -2605,12 +2673,9 @@ fn do_analyze_speakers(
     }
     // One note string, one line per lane that is off/degraded — the Camera
     // panel prints each line.
-    let note = match (voice_note, face_note) {
-        (Some(v), Some(f)) => Some(format!("{v}\n{f}")),
-        (Some(v), None) => Some(v),
-        (None, Some(f)) => Some(f),
-        (None, None) => None,
-    };
+    let lines: Vec<String> =
+        [voice_note, face_note, reaction_note].into_iter().flatten().collect();
+    let note = (!lines.is_empty()).then(|| lines.join("\n"));
     Ok((analysis, plan, note))
 }
 

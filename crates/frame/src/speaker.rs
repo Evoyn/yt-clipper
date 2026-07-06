@@ -126,6 +126,20 @@ const OFFSCREEN_VOICED_SHARE: f64 = 0.5;
 /// never flips a shot.
 const OFFSCREEN_MIN_S: f64 = 1.2;
 
+/// Shared-reaction split (ADR 0045/0046): a piece flips to the visible pair's
+/// split screen when its reaction-masked time (bins scoring >= this tau)
+/// totals at least [`REACTION_MIN_S`]. Tau is the instrument's measured
+/// operating point — real overlapped laughter scores 0.1–0.3 per step while
+/// every monologue segment held 0% at EVERY tau on both gate fixtures, so the
+/// low tau buys 89% target coverage over a zero-noise floor. `pub` because the
+/// Studio's voice row paints the same mask the grammar reads.
+pub const REACTION_TAU: f32 = 0.1;
+/// Absolute masked seconds that arm the reaction split — burst-derived
+/// (laughter is bursts among speech, not a wall, so a share-of-piece rule
+/// under-fires); on the gate fixture the laughter piece carries 3.2 s against
+/// 1.25 s for the loudest non-flipping neighbour.
+const REACTION_MIN_S: f64 = 2.0;
+
 /// Scene-type threshold: mean tracked faces visible per bin. A **static wide
 /// shot** keeps everyone in frame at once (≈ the track count), so the camera
 /// plan must *choose* the speaker (attribution + cuts, ADR 0038). A **multicam
@@ -238,6 +252,14 @@ pub struct SpeakerAnalysis {
     /// The voice lane (`None` = model absent/broken or too little speech —
     /// the analysis is then exactly the pre-integration mouth-only one).
     pub voice: Option<crate::voice::VoiceLane>,
+    /// Shared-reaction score per bin (ADR 0045/0046): the laughter-family
+    /// probability from the audio-event tagger, projected onto this grid.
+    /// Computed only in the attribution regime (a follow-visible plan never
+    /// reads it — the source already chose its subject); `None` = tagger
+    /// absent/broken or a follow-visible Clip. [`plan_shots`] flips a piece
+    /// with >= [`REACTION_MIN_S`] of bins at [`REACTION_TAU`] to the visible
+    /// pair's split screen — "nobody on screen is THE speaker".
+    pub reaction: Option<Vec<f32>>,
 }
 
 impl SpeakerAnalysis {
@@ -992,8 +1014,24 @@ pub fn plan_shots(
                         && off_n as f64 * bin_s >= OFFSCREEN_MIN_S
                 })
                 .unwrap_or(false);
+            // Shared-reaction override (ADR 0046): same grammar, second honest
+            // fuel — a piece carrying >= REACTION_MIN_S of laughter-class mask
+            // is the group reacting together, so nobody on screen is THE
+            // speaker. Absolute masked seconds, not a share: real overlapped
+            // laughter is bursts among speech (ADR 0045), and a burst is
+            // VAD-independent evidence (breathy laughter has no voiced bins).
+            let reaction_split = analysis
+                .reaction
+                .as_ref()
+                .map(|r| {
+                    let masked = (pb0..pb1)
+                        .filter(|&b| r.get(b).copied().unwrap_or(0.0) >= REACTION_TAU)
+                        .count();
+                    masked as f64 * bin_s >= REACTION_MIN_S
+                })
+                .unwrap_or(false);
             let (track, layout, pan_to) = match subj {
-                Subject::Track(_) if offscreen_split => {
+                Subject::Track(_) if offscreen_split || reaction_split => {
                     (None, group_layout_span(&analysis.tracks, pb0, pb1, src_w, src_h), None)
                 }
                 Subject::Track(id) => match analysis.tracks.iter().find(|tr| tr.id == *id) {
@@ -2039,7 +2077,28 @@ mod tests {
             speaking,
             tracks,
             voice: None,
+            reaction: None,
         }
+    }
+
+    /// `analysis()` plus a shared-reaction mask: bins in the given spans score
+    /// just above [`REACTION_TAU`] (the measured burst texture — modest
+    /// probabilities over a zero floor), the rest exactly 0.
+    fn analysis_with_reaction(
+        speaking: Vec<Option<usize>>,
+        tracks: Vec<SpeakerTrack>,
+        masked: &[(usize, usize)],
+    ) -> SpeakerAnalysis {
+        let n = speaking.len();
+        let mut a = analysis(speaking, tracks);
+        let mut r = vec![0.0f32; n];
+        for &(b0, b1) in masked {
+            for b in b0..b1.min(n) {
+                r[b] = REACTION_TAU + 0.05;
+            }
+        }
+        a.reaction = Some(r);
+        a
     }
 
     /// `analysis()` plus a voice lane: `overridden` and `offscreen` true over
@@ -2871,6 +2930,74 @@ mod tests {
             plan.shots.iter().all(|s| s.track == Some(0)),
             "a breath of off-screen voice must not flip a shot: {plan:?}"
         );
+    }
+
+    #[test]
+    fn a_reaction_piece_flips_to_the_visible_pairs_split() {
+        // Attribution regime, A holds the floor, and the middle angle piece
+        // (between the source cuts at 4 s and 8 s) carries 3 s of laughter
+        // mask (>= REACTION_MIN_S): the group reacts together, so the piece
+        // becomes the visible pair's split screen — and writes NO framing
+        // anchor, so the return piece reuses A's pre-split crop verbatim
+        // (the off-screen split's exact semantics, second fuel).
+        let n = nbins(12.0);
+        let speaking = vec![Some(0); n];
+        let tracks = vec![track(0, 400.0, vec![0.0; n]), track(1, 1400.0, vec![0.0; n])];
+        let a = analysis_with_reaction(
+            speaking.clone(),
+            tracks.clone(),
+            &[(nbins(4.5), nbins(7.5))],
+        );
+        let plan = plan_shots(&a, 1920.0, 1080.0, 12.0, &[4.0, 8.0]);
+        assert_eq!(plan.shots.len(), 3, "{plan:?}");
+        assert_eq!(plan.shots[1].track, None, "nobody on screen framed solo as the speaker");
+        assert!(
+            matches!(plan.shots[1].layout, Layout::Stacked { .. }),
+            "two visible people = the split screen: {:?}",
+            plan.shots[1].layout
+        );
+        let (c0, c2) = (solo_crop_of(&plan, 0), solo_crop_of(&plan, 2));
+        assert_eq!(c0, c2, "return from the split reuses the pre-split framing verbatim");
+    }
+
+    #[test]
+    fn a_short_reaction_burst_must_not_flip_a_shot() {
+        // The gate fixture's measured near-miss: the piece BEFORE the laughter
+        // piece carried 1.25 s of mask (the burst's front tail bleeding across
+        // the source cut) and stays a solo of the actual speaker — only
+        // >= REACTION_MIN_S of masked time arms the split.
+        let n = nbins(12.0);
+        let speaking = vec![Some(0); n];
+        let tracks = vec![track(0, 400.0, vec![0.0; n]), track(1, 1400.0, vec![0.0; n])];
+        let a = analysis_with_reaction(
+            speaking,
+            tracks,
+            &[(nbins(4.0), nbins(5.25))],
+        );
+        let plan = plan_shots(&a, 1920.0, 1080.0, 12.0, &[4.0, 8.0]);
+        assert!(
+            plan.shots.iter().all(|s| s.track == Some(0)),
+            "a sub-threshold burst must not flip a shot: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_sub_tau_reaction_wall_changes_nothing() {
+        // A mask present but everywhere below REACTION_TAU (the monologue
+        // floor) must leave the plan byte-identical to a no-mask analysis —
+        // the None/Some(quiet) equivalence the pipeline's degraded modes
+        // (tagger absent vs present-and-quiet) rest on.
+        let n = nbins(12.0);
+        let speaking = vec![Some(0); n];
+        let tracks = vec![track(0, 400.0, vec![0.0; n]), track(1, 1400.0, vec![0.0; n])];
+        let bare = analysis(speaking.clone(), tracks.clone());
+        let mut quiet = analysis(speaking, tracks);
+        quiet.reaction = Some(vec![REACTION_TAU - 0.02; n]);
+        let (p0, p1) = (
+            plan_shots(&bare, 1920.0, 1080.0, 12.0, &[4.0, 8.0]),
+            plan_shots(&quiet, 1920.0, 1080.0, 12.0, &[4.0, 8.0]),
+        );
+        assert_eq!(format!("{p0:?}"), format!("{p1:?}"), "a quiet mask moved the plan");
     }
 
     #[test]

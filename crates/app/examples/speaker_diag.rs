@@ -23,7 +23,8 @@
 //! to the CSV; `YC_INTEG_RENDER=1` renders the integrated plan to
 //! `../diar_integration.mp4` (the ADR 0042 gate artifact — do not clobber);
 //! `YC_PERSON_RENDER=1` renders to `../diar_person.mp4` (the ADR 0044
-//! person-join gate artifact). Also:
+//! person-join gate artifact); `YC_REACTION_RENDER=1` renders to
+//! `../diar_reaction.mp4` (the ADR 0046 shared-reaction gate artifact). Also:
 //!
 //!   … speaker_diag --features face -- selftest <wav> <wav> [<wav>…]
 //!
@@ -31,13 +32,14 @@
 //! run it on known same/different-speaker recordings to validate the fbank +
 //! embedding path end-to-end before trusting fixture numbers.
 //!
-//! The **laughter lane** (ADR 0045 SPIKE, harness-only) scores every 0.25 s
-//! step of the same analysis.wav with an AudioSet-class tagger
+//! The **laughter lane** (ADR 0045, production path since ADR 0046) scores
+//! every 0.25 s step of the same analysis.wav with an AudioSet-class tagger
 //! (`yc_frame::reaction`), extends the per-segment evidence table with a
-//! laugh column, and judges the pre-declared discrimination bars when the
-//! operator supplies the ear-truth spans (`YC_LAUGH_TARGET="22.1-27.0"`,
-//! optional `YC_LAUGH_EXSPLIT="14.2-22.1,27.0-30.2"`). Nothing feeds the
-//! plan. Its Bar 0:
+//! laugh column, judges the pre-declared discrimination bars when the
+//! operator supplies the ear-truth spans (`YC_LAUGH_TARGET="25.5-30.25"`,
+//! optional `YC_LAUGH_EXSPLIT="14.2-22.1"`), and — attribution regime only,
+//! exactly as `Job::AnalyzeSpeakers` — feeds the integrated plan's
+//! shared-reaction splits below. Its Bar 0:
 //!
 //!   … speaker_diag --features face -- tagselftest <wav> [<wav>…]
 //!
@@ -178,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
     let mut analysis =
-        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None };
+        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
 
     // --- scene cuts: detect_scene_cuts replica (same command, same parse) ----
     let out = std::process::Command::new(ffmpeg)
@@ -458,10 +460,11 @@ fn main() -> anyhow::Result<()> {
         lanes.push((tag, lane));
     }
 
-    // --- laughter lane (ADR 0045 SPIKE, harness-only): the shared-reaction
-    // instrument. Scores every 0.25 s step of the SAME analysis.wav samples
-    // the voice lane embeds, VAD-independent; nothing here feeds the plan —
-    // the numbers below are the spike's whole product.
+    // --- laughter lane (ADR 0045, production path since ADR 0046): the
+    // shared-reaction instrument. Scores every 0.25 s step of the SAME
+    // analysis.wav samples the voice lane embeds, VAD-independent; the mask
+    // joins the integrated analysis before the plan (attribution regime only,
+    // the production twin), and the bars below stay the instrument's gate.
     let mut laugh: Option<(Vec<f32>, yc_frame::reaction::TagSession, Vec<String>)> = {
         let model = Path::new(TAG_MODEL);
         let labels_p = Path::new(TAG_LABELS);
@@ -736,10 +739,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // The shared-reaction mask joins the integrated analysis EXACTLY as
+    // production does (ADR 0046): attribution regime only — a follow-visible
+    // plan never consults it, so the ANTITESA byte-pin holds by construction
+    // (and the pipeline never even computes the mask there).
+    if speaker::attribution_regime(&analysis) {
+        analysis.reaction = laugh_bins.clone();
+    }
+
     // The INTEGRATED production plan: plan_shots itself applies the
-    // off-screen splits and interjection rescues from analysis.voice. Every
-    // forensic below — the shot list, the camera audit, the crop-stability
-    // blocks, camera_diag.fg — runs on THIS plan.
+    // off-screen splits, the shared-reaction splits, and interjection rescues
+    // from analysis.voice/analysis.reaction. Every forensic below — the shot
+    // list, the camera audit, the crop-stability blocks, camera_diag.fg —
+    // runs on THIS plan.
     let plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
     let changed = plan
         .shots
@@ -1038,6 +1050,20 @@ fn main() -> anyhow::Result<()> {
             "../diar_person.mp4",
         );
         println!("rendering ../diar_person.mp4 ...");
+        yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+    }
+    //  - YC_REACTION_RENDER -> ../diar_reaction.mp4  (the ADR 0046
+    //    shared-reaction gate artifact, watched against diar_person.mp4)
+    if std::env::var_os("YC_REACTION_RENDER").is_some() {
+        let ffabs = std::fs::canonicalize(ffmpeg)?;
+        let args = yc_render::export_args_script(
+            Path::new("segment.mp4"),
+            seek_s,
+            dur,
+            "camera_diag.fg",
+            "../diar_reaction.mp4",
+        );
+        println!("rendering ../diar_reaction.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
     }
 

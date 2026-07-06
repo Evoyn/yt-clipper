@@ -1213,7 +1213,13 @@ impl EditorState {
         // exactly the old layout, and dragging taller always visibly fattens
         // the lanes (no cap: the panel's own max bounds them).
         let n_tracks = self.speakers.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
-        let has_voice = self.speakers.as_ref().map(|a| a.voice.is_some()).unwrap_or(false);
+        // The evidence row exists when either audio lane does — a machine
+        // without the CAM++ model still shows reaction spans (ADR 0046).
+        let has_voice = self
+            .speakers
+            .as_ref()
+            .map(|a| a.voice.is_some() || a.reaction.is_some())
+            .unwrap_or(false);
         let n_lanes = n_tracks + usize::from(has_voice);
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), ui.available_height().max(60.0)),
@@ -1343,21 +1349,22 @@ impl EditorState {
                 }
                 lane_y += lane_h;
             }
-            // The voice lane (ADR 0042): the diarization evidence itself,
-            // beside the fused seat lanes above — spans where the voice
-            // claims a seat, in that seat's colour (dimmer: it is evidence,
-            // not the camera), and KNOWN off-screen voice in red. The
-            // operator can see WHY a split or a rescued cut happened.
-            if let Some(v) = &a.voice {
-                let span = |sel: &dyn Fn(usize) -> Option<Color32>| {
+            // The evidence row: the audio lanes themselves, beside the fused
+            // seat lanes above — the voice lane (ADR 0042) as spans where the
+            // voice claims a seat, in that seat's colour (dimmer: it is
+            // evidence, not the camera), KNOWN off-screen voice in red, and
+            // the shared-reaction mask (ADR 0046) in gold. The operator can
+            // see WHY a split or a rescued cut happened.
+            if a.voice.is_some() || a.reaction.is_some() {
+                let span = |n: usize, sel: &dyn Fn(usize) -> Option<Color32>| {
                     let mut i = 0usize;
-                    while i < v.seat.len() {
+                    while i < n {
                         let Some(color) = sel(i) else {
                             i += 1;
                             continue;
                         };
                         let mut j = i;
-                        while j < v.seat.len() && sel(j) == Some(color) {
+                        while j < n && sel(j) == Some(color) {
                             j += 1;
                         }
                         p.rect_filled(
@@ -1371,10 +1378,20 @@ impl EditorState {
                         i = j;
                     }
                 };
-                span(&|b: usize| v.seat[b].map(|s| theme::track_color(s).gamma_multiply(0.45)));
-                span(&|b: usize| {
-                    v.offscreen[b].then(|| theme::ERR.gamma_multiply(0.8))
-                });
+                if let Some(v) = &a.voice {
+                    span(v.seat.len(), &|b: usize| {
+                        v.seat[b].map(|s| theme::track_color(s).gamma_multiply(0.45))
+                    });
+                    span(v.offscreen.len(), &|b: usize| {
+                        v.offscreen[b].then(|| theme::ERR.gamma_multiply(0.8))
+                    });
+                }
+                if let Some(r) = &a.reaction {
+                    span(r.len(), &|b: usize| {
+                        (r[b] >= yc_frame::speaker::REACTION_TAU)
+                            .then(|| theme::GOLD.gamma_multiply(0.6))
+                    });
+                }
             }
         }
 
