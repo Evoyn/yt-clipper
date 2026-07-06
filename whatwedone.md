@@ -4,6 +4,50 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-06 (mid-day) — Person-scoped voice join in production, gate PASSED ("honest evidence over lucky output")
+
+The ADR 0043 spike became production (ADR 0044): the voice⇄seat join
+rebuilt over the occupant map, gated on `diar_person.mp4` vs the passed
+`diar_integration.mp4`.
+
+- **The join**: purity-gated (cluster, camera) edges — contested
+  co-occurrence (2+ mouths over the floor) is no evidence at all; measured
+  per-edge, clean edges run 16–17% contested vs 87–100% on every poisoned
+  one (`JOIN_MAX_CONTESTED` 0.65 mid the gap). Clean edges resolve through
+  the map to PERSONS; a person claims its mapped seat in any segment (face
+  evidence beats the single-visit rule); contradicting clean edges = the
+  cluster is provably impure, refused an identity, camera-local claims
+  kept. Off-screen became **positive absence only** — fully-known camera,
+  person not among the occupants — never ignorance. Singletons are unknown
+  occupants (block absence proofs, never merge cameras). The CV sweep
+  scores the join that ships (thr moved 0.60 → 0.55 on Deddy).
+- **What it found**: the false 14–20 s "off-screen dominant" call is dead
+  (V1 refused, holds honestly), and the instrument OVERTURNED the ear at
+  20.8–21.4 s — the interjection voice is the peci man (P1), positively
+  absent, on clean two-camera evidence (16%/17% contested), with the
+  source itself J-cutting to him at 69.1 s. The interjection cut therefore
+  correctly does NOT fire. The two approved splits lose their poisoned
+  fuel and revert to solos; three honest replacements for the laughter
+  split were measured and all failed to discriminate (contested share
+  74–100% everywhere; absence ≤35%; cluster composition inverted) —
+  laughter is out-of-domain for a speech embedder, so no unmeasurable
+  grammar shipped. **Operator gate: PASS — ship it.** The laughter-class
+  instrument queues as the named path to win the splits back.
+- **Wiring**: occupant map in `Job::AnalyzeSpeakers` (attribution regime +
+  both models + viable lane only; ~15 s of targeted seeks per 70 s clip;
+  soft-degrades to the seat-scoped join, never a failed job); pure
+  machinery in `yc_frame::occupant` shared by pipeline and harness; YuNet +
+  SFace as registry rows with Downloads healing (pins re-verified
+  byte-identical against the full-hash zoo URLs); Camera panel prints
+  per-lane off/degraded notes.
+- **Regression**: ANTITESA fg byte-pin `9e07d81f…` intact through the whole
+  rebuild (the map never computes in follow-visible, structurally); 327
+  tests green both ways (+12); camera audits clean on both fixtures; the
+  re-promoted fixture re-armed the pin at clean HEAD before any code.
+- Queued: draggable/scrollable Studio timeline (the voice row is invisible
+  at today's strip height — operator request from the fresh-binary first
+  look).
+
 ## 2026-07-06 (morning) — Face re-id spike: the occupant map, gate PASSED ("each row is one human")
 
 Two gates closed and one instrument was born (ADR 0043; ADR 0042 gained its

@@ -1692,31 +1692,27 @@ impl EditorState {
                         if let Some(plan) = &self.plan {
                             ui.weak(format!("{} camera cuts planned", plan.shots.len().saturating_sub(1)));
                         }
-                        // Voice lane status (ADR 0042): what the diarization
-                        // evidence contributed — or why it is off.
-                        match (&a.voice, &self.voice_note) {
-                            (Some(v), _) => {
-                                let bin_s = a.bin_s.max(1e-9);
-                                let claimed =
-                                    v.seat.iter().flatten().count() as f64 * bin_s;
-                                let off =
-                                    v.offscreen.iter().filter(|o| **o).count() as f64 * bin_s;
-                                let over =
-                                    v.overridden.iter().filter(|o| **o).count() as f64 * bin_s;
-                                let mut line =
-                                    format!("Voice lane: {claimed:.1}s attributed");
-                                if over > 0.0 {
-                                    line.push_str(&format!(" · {over:.1}s corrected"));
-                                }
-                                if off > 0.0 {
-                                    line.push_str(&format!(" · {off:.1}s off-screen"));
-                                }
-                                ui.weak(line);
+                        // Voice lane status (ADR 0042/0044): what the
+                        // diarization evidence contributed — or why a lane is
+                        // off/degraded (one note line per lane).
+                        if let Some(v) = &a.voice {
+                            let bin_s = a.bin_s.max(1e-9);
+                            let claimed = v.seat.iter().flatten().count() as f64 * bin_s;
+                            let off = v.offscreen.iter().filter(|o| **o).count() as f64 * bin_s;
+                            let over = v.overridden.iter().filter(|o| **o).count() as f64 * bin_s;
+                            let mut line = format!("Voice lane: {claimed:.1}s attributed");
+                            if over > 0.0 {
+                                line.push_str(&format!(" · {over:.1}s corrected"));
                             }
-                            (None, Some(note)) => {
-                                ui.weak(note.as_str());
+                            if off > 0.0 {
+                                line.push_str(&format!(" · {off:.1}s off-screen"));
                             }
-                            (None, None) => {}
+                            ui.weak(line);
+                        }
+                        if let Some(note) = &self.voice_note {
+                            for l in note.lines() {
+                                ui.weak(l);
+                            }
                         }
                         // Camera audit: jitter-class defects caught BEFORE the
                         // export (a crop moving without subject cause).

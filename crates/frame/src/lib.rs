@@ -25,6 +25,7 @@ pub mod infer;
 #[cfg(feature = "face")]
 pub use infer::Detector;
 pub mod face_id;
+pub mod occupant;
 pub mod speaker;
 pub mod voice;
 

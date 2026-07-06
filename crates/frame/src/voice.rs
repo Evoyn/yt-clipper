@@ -342,6 +342,16 @@ const JOIN_MIN_SHARE: f32 = 0.65;
 /// segment is short, but still half a second of co-occurrence before a
 /// voice claims a seat within one angle.
 const JOIN_MIN_BINS_SEG: usize = 12;
+/// Purity gate for a person-join edge (ADR 0044): the share of an edge's
+/// co-occurrence bins where 2+ mouths clear the activity floor may not
+/// exceed this. A contested bin's mouth pick is a margin coin-flip between
+/// movers — during the Deddy cup-churn stretch, systematically the wrong
+/// one — so it is no evidence at all. Measured on the fixture's per-edge
+/// printout: clean edges run 16–17% contested (V2 x cam0/cam4), every
+/// poisoned edge announces itself at 87–100% — the gate sits mid the
+/// whole-cluster 39%-vs-91% gap, far above the clean per-edge ceiling and
+/// with headroom for legitimately messier clips (backchannel overlap).
+const JOIN_MAX_CONTESTED: f32 = 0.65;
 /// Clustering thresholds the CV-scored sweep considers (cosine distance).
 const SWEEP_THRESHOLDS: [f32; 7] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60];
 
@@ -399,20 +409,34 @@ pub fn segment_bounds(cuts: &[f64], duration_s: f64) -> Vec<f64> {
 
 /// Build the voice lane from embedded windows: a threshold sweep scored
 /// **out-of-sample end to end** through the cluster→seat join picks the
-/// clustering cut, clusters join seats **per camera angle** (segments
-/// grouped by seat geometry; a single-visit angle can only echo the mouth
-/// lane, so it may not claim), and a joined voice with no seat in the
-/// on-screen angle marks an **off-screen speaker**. In the attribution
-/// regime with several angles the whole-clip join is banned (a seat is a
-/// screen position, not a person — ADR 0042 measured it leaking one
-/// person's voice onto another person's seat); in follow-visible each track
-/// is one person's framing, so the whole-clip join is the identity.
+/// clustering cut, then the join runs one of two ways:
 ///
-/// `angle_override` replaces the seat-geometry angle grouping with a caller's
-/// own segment→angle map (one entry per [`segment_bounds`] segment) — the
-/// ADR 0043 harness replays the join over occupant-merged cameras through
-/// it. Production callers pass `None`: the signature grouping is the shipped
-/// behavior (pinned by the ANTITESA `camera_diag.fg` byte hash).
+/// - **Person-scoped** (ADR 0044), when an [`crate::occupant::OccupantMap`]
+///   is supplied in the attribution regime: evidence pools per CAMERA
+///   (segments merged by identical known occupants) and a cluster's identity
+///   is a PERSON. A (cluster, camera) edge counts only when the camera is
+///   seen 2+ times, the evidence floors pass, its contested share stays
+///   under [`JOIN_MAX_CONTESTED`] (a both-mouths bin is a margin coin-flip,
+///   not evidence — the Deddy churn stretch announced itself at 91–95%
+///   contested against 39% on the clean edge), and the claimed seat's
+///   occupant is KNOWN. Surviving edges resolve to persons; a cluster whose
+///   clean edges still name two persons is provably impure — REFUSED: no
+///   person, no off-screen powers, though its clean camera-local claims
+///   stand. A resolved person claims its mapped seat in ANY segment (a map
+///   placement is face evidence, not mouth echo — it is exempt from the
+///   single-visit rule), and the off-screen flag becomes POSITIVE ABSENCE
+///   only: it fires solely where every on-screen seat has a known occupant
+///   and the voice's person is not among them.
+/// - **Seat-scoped** (ADR 0042, the shipped fallback), otherwise: clusters
+///   join seats per signature angle (a single-visit angle can only echo the
+///   mouth lane, so it may not claim), the whole-clip join is banned in the
+///   attribution regime with several angles, and ignorance-based off-screen
+///   suspects print as diagnostics but never set the lane's off-screen bits
+///   (the flag needs the map's positive evidence — ADR 0044).
+///
+/// In follow-visible each track is one person's framing, so the whole-clip
+/// join is the identity and a supplied map is ignored (pinned by the
+/// ANTITESA `camera_diag.fg` byte hash).
 ///
 /// `None` when fewer than two windows embedded (nothing to cluster) —
 /// callers degrade to the mouth-only analysis.
@@ -423,7 +447,7 @@ pub fn build_lane(
     cuts: &[f64],
     duration_s: f64,
     attribution_regime: bool,
-    angle_override: Option<&[usize]>,
+    occupants: Option<&crate::occupant::OccupantMap>,
 ) -> Option<(VoiceLane, VoiceDiag)> {
     let n_bins = analysis.speaking.len();
     let bin_s = analysis.bin_s;
@@ -507,6 +531,216 @@ pub fn build_lane(
         (cov, agree, both)
     };
 
+    // --- the join's shared basis: segments, cameras, purity -------------------
+    let seg_bounds = segment_bounds(cuts, duration_s);
+    let n_segs = seg_bounds.len() - 1;
+    let seg_of = |b: usize| -> usize {
+        let t = (b as f64 + 0.5) * bin_s;
+        seg_bounds.windows(2).position(|w| t >= w[0] && t < w[1]).unwrap_or(n_segs - 1)
+    };
+    // The person join runs only where its evidence means something: the
+    // attribution regime. In follow-visible the whole-clip join is the
+    // identity and a supplied map is ignored (the ANTITESA fg byte-pin).
+    let map = occupants.filter(|_| attribution_regime);
+    let n_map_cams = map.map(|m| m.camera_visits.len()).unwrap_or(0);
+    // Contested bins: 2+ mouths over the activity floor — a shared class
+    // (laughter, cross-talk) or a poisoned stretch (the cup churn). The mouth
+    // pick on such a bin is a margin coin-flip between movers, so the person
+    // join refuses to count it as evidence at all.
+    let contested_bin: Vec<bool> = (0..n_bins)
+        .map(|b| {
+            analysis
+                .tracks
+                .iter()
+                .filter(|t| t.activity.get(b).copied().unwrap_or(0.0) >= speaker::MIN_ACTIVITY)
+                .count()
+                >= 2
+        })
+        .collect();
+    // Tracks actually on screen per segment (>=40% of its bins — the signature
+    // rule) — the coverage a positive-absence proof must clear.
+    let present: Vec<Vec<usize>> = (0..n_segs)
+        .map(|g| {
+            let b0 = (seg_bounds[g] / bin_s).round() as usize;
+            let b1 = ((seg_bounds[g + 1] / bin_s).round() as usize).min(n_bins);
+            let len = b1.saturating_sub(b0).max(1);
+            analysis
+                .tracks
+                .iter()
+                .filter(|t| {
+                    (b0..b1)
+                        .filter(|&b| t.path.get(b).map(|p| p.is_some()).unwrap_or(false))
+                        .count()
+                        * 5
+                        >= len * 2
+                })
+                .map(|t| t.id)
+                .collect()
+        })
+        .collect();
+    // PERSON-SCOPED JOIN (ADR 0044): per (cluster, camera) edge, gated on
+    // multi-visit + evidence floors + the purity gate + a KNOWN occupant for
+    // the claimed seat (the occupant both names the edge's person and proves
+    // that pooling the camera's segments pooled one human's seat). Surviving
+    // edges resolve to persons; edges naming two persons for one cluster are
+    // a proven impurity — the cluster is REFUSED an identity and keeps only
+    // its clean camera-local claims.
+    struct Edge {
+        total: usize,
+        contested: usize,
+        counts: std::collections::HashMap<usize, usize>,
+    }
+    type LocalClaims = std::collections::HashMap<(usize, usize), usize>;
+    let person_join = |lane: &[Option<usize>],
+                       k: usize,
+                       keep: &dyn Fn(usize) -> bool,
+                       rows: Option<&mut Vec<String>>|
+     -> (LocalClaims, Vec<Option<usize>>, Vec<bool>) {
+        let map = map.expect("person join needs the occupant map");
+        let mut edges: std::collections::HashMap<(usize, usize), Edge> = Default::default();
+        for b in 0..n_bins {
+            if !keep(b) {
+                continue;
+            }
+            let (Some(c), Some(s)) = (lane[b], genuine[b]) else { continue };
+            let cam = map.seg_camera[seg_of(b)];
+            let e = edges
+                .entry((c, cam))
+                .or_insert_with(|| Edge { total: 0, contested: 0, counts: Default::default() });
+            e.total += 1;
+            if contested_bin[b] {
+                e.contested += 1;
+            }
+            *e.counts.entry(s).or_default() += 1;
+        }
+        let mut local: LocalClaims = Default::default();
+        let mut named: Vec<Vec<usize>> = vec![Vec::new(); k];
+        let mut printable: Vec<(usize, usize, String)> = Vec::new();
+        for (&(c, cam), e) in &edges {
+            let Some((&seat, &n)) = e.counts.iter().max_by_key(|(_, &n)| n) else { continue };
+            let share = n as f32 / e.total.max(1) as f32;
+            let contested = e.contested as f32 / e.total.max(1) as f32;
+            let occupant = (0..n_segs)
+                .find(|&g| map.seg_camera[g] == cam)
+                .and_then(|g| map.seats[g].get(&seat))
+                .copied();
+            let verdict = if !map.multi_visit(cam) {
+                "dead: single-visit camera (echo)".to_string()
+            } else if e.total < JOIN_MIN_BINS_SEG {
+                format!("dead: under the {JOIN_MIN_BINS_SEG}-bin floor")
+            } else if share < JOIN_MIN_SHARE {
+                format!("dead: share {:.0}% under {:.0}%", 100.0 * share, 100.0 * JOIN_MIN_SHARE)
+            } else if contested > JOIN_MAX_CONTESTED {
+                format!(
+                    "dead: {:.0}% contested (gate {:.0}%)",
+                    100.0 * contested,
+                    100.0 * JOIN_MAX_CONTESTED
+                )
+            } else {
+                match occupant {
+                    Some(crate::occupant::Occupant::Person(p)) => {
+                        local.insert((c, cam), seat);
+                        if !named[c].contains(&p) {
+                            named[c].push(p);
+                        }
+                        format!("VALID -> P{p}")
+                    }
+                    Some(crate::occupant::Occupant::Unknown) => {
+                        "dead: unknown occupant".to_string()
+                    }
+                    None => "dead: unmapped seat".to_string(),
+                }
+            };
+            if rows.is_some() {
+                printable.push((
+                    c,
+                    cam,
+                    format!(
+                        "  edge V{c} x cam{cam}: {:.1}s on {} (share {:.0}%, contested {:.0}%) {verdict}",
+                        e.total as f64 * bin_s,
+                        speaker::track_label(seat),
+                        100.0 * share,
+                        100.0 * contested
+                    ),
+                ));
+            }
+        }
+        if let Some(rows) = rows {
+            printable.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            rows.extend(printable.into_iter().map(|(_, _, s)| s));
+        }
+        let mut person: Vec<Option<usize>> = vec![None; k];
+        let mut refused = vec![false; k];
+        for c in 0..k {
+            match named[c].as_slice() {
+                [] => {}
+                [p] => person[c] = Some(*p),
+                _ => refused[c] = true, // provably impure: no person identity
+            }
+        }
+        (local, person, refused)
+    };
+    // The whole-clip join under the map's rules: the same floors as
+    // [`join_on`] plus the purity gate — in the map path a contested bin is
+    // not evidence anywhere, including the single-camera fallback below.
+    let join_on_pure = |lane: &[Option<usize>], k: usize, keep: &dyn Fn(usize) -> bool| -> Vec<Option<usize>> {
+        let mut counts = vec![std::collections::HashMap::<usize, usize>::new(); k];
+        let mut totals = vec![0usize; k];
+        let mut cont = vec![0usize; k];
+        for b in 0..n_bins {
+            if !keep(b) {
+                continue;
+            }
+            let (Some(c), Some(s)) = (lane[b], genuine[b]) else { continue };
+            *counts[c].entry(s).or_default() += 1;
+            totals[c] += 1;
+            if contested_bin[b] {
+                cont[c] += 1;
+            }
+        }
+        (0..k)
+            .map(|c| {
+                let (&s, &n) = counts[c].iter().max_by_key(|(_, &n)| n)?;
+                (totals[c] >= JOIN_MIN_BINS
+                    && n as f32 >= JOIN_MIN_SHARE * totals[c] as f32
+                    && cont[c] as f32 <= JOIN_MAX_CONTESTED * totals[c] as f32)
+                    .then_some(s)
+            })
+            .collect()
+    };
+    // Per-bin assignment under the person join: a resolved person claims its
+    // mapped seat in ANY segment (face evidence — exempt from the single-visit
+    // rule); positive absence is the only off-screen proof; a refused cluster
+    // falls back to its clean camera-local claim; and the whole-clip join
+    // survives only when the map sees a single camera (no cross-camera leak
+    // is possible — the seat-scoped ban rule re-derived over cameras).
+    let assign_person = |lane: &[Option<usize>],
+                         local: &LocalClaims,
+                         person: &[Option<usize>],
+                         whole: &[Option<usize>]|
+     -> (Vec<Option<usize>>, Vec<bool>) {
+        let map = map.expect("person join needs the occupant map");
+        let ban_global = n_map_cams > 1;
+        let mut seat: Vec<Option<usize>> = vec![None; n_bins];
+        let mut off = vec![false; n_bins];
+        for b in 0..n_bins {
+            let Some(c) = lane[b] else { continue };
+            let g = seg_of(b);
+            if let Some(p) = person[c] {
+                if let Some(s) = map.seat_of(g, p) {
+                    seat[b] = Some(s);
+                } else if map.absent(g, p, &present[g]) {
+                    off[b] = true;
+                }
+            } else if let Some(&s) = local.get(&(c, map.seg_camera[g])) {
+                seat[b] = Some(s);
+            } else if !ban_global {
+                seat[b] = whole[c];
+            }
+        }
+        (seat, off)
+    };
+
     // Threshold sweep, scored OUT-OF-SAMPLE: the join is computed on
     // alternating 2 s blocks and the seat lane scored on the complementary
     // blocks (both directions). In-sample scoring is circular — with tiny
@@ -526,24 +760,49 @@ pub fn build_lane(
         let cl = cluster_cosine(embs, t);
         let lane = bin_clusters(&cl.assignment);
         let joined = join_on(&lane, cl.k, &|_| true);
-        let seat = seat_lane(&lane, &joined);
+        // The sweep scores THE join that ships: person-scoped when the map is
+        // active (the poisoned-reference lesson — a sweep scored on a
+        // different join optimizes a different objective), seat-scoped else.
+        let (seat, seat_cv, n_joined) = if map.is_some() {
+            let (local, person, _) = person_join(&lane, cl.k, &|_| true, None);
+            let whole_pure = join_on_pure(&lane, cl.k, &|_| true);
+            let (seat, _) = assign_person(&lane, &local, &person, &whole_pure);
+            let n_joined = (0..cl.k)
+                .filter(|&c| person[c].is_some() || local.keys().any(|&(lc, _)| lc == c))
+                .count();
+            // Cross-validated: the even-block join claims odd blocks and vice
+            // versa (the map itself is face evidence, not co-occurrence — it
+            // is not split).
+            let (loc_e, per_e, _) = person_join(&lane, cl.k, &|b| block(b), None);
+            let (loc_o, per_o, _) = person_join(&lane, cl.k, &|b| !block(b), None);
+            let whole_e = join_on_pure(&lane, cl.k, &|b| block(b));
+            let whole_o = join_on_pure(&lane, cl.k, &|b| !block(b));
+            let (seat_e, _) = assign_person(&lane, &loc_e, &per_e, &whole_e);
+            let (seat_o, _) = assign_person(&lane, &loc_o, &per_o, &whole_o);
+            let seat_cv: Vec<Option<usize>> =
+                (0..n_bins).map(|b| if block(b) { seat_o[b] } else { seat_e[b] }).collect();
+            (seat, seat_cv, n_joined)
+        } else {
+            let seat = seat_lane(&lane, &joined);
+            // Cross-validated: even-block join claims odd blocks and vice versa.
+            let join_even = join_on(&lane, cl.k, &|b| block(b));
+            let join_odd = join_on(&lane, cl.k, &|b| !block(b));
+            let seat_cv: Vec<Option<usize>> = (0..n_bins)
+                .map(|b| {
+                    let j = if block(b) { &join_odd } else { &join_even };
+                    lane[b].and_then(|c| j[c])
+                })
+                .collect();
+            (seat, seat_cv, joined.iter().flatten().count())
+        };
         let (cov, agree, both) = score(&seat);
-        // Cross-validated: even-block join claims odd blocks and vice versa.
-        let join_even = join_on(&lane, cl.k, &|b| block(b));
-        let join_odd = join_on(&lane, cl.k, &|b| !block(b));
-        let seat_cv: Vec<Option<usize>> = (0..n_bins)
-            .map(|b| {
-                let j = if block(b) { &join_odd } else { &join_even };
-                lane[b].and_then(|c| j[c])
-            })
-            .collect();
         let (cv_cov, cv_agree, cv_both) = score(&seat_cv);
         let cv_frac = cv_agree as f64 / cv_both.max(1) as f64;
         let s = cv_frac * cv_cov as f64 * bin_s;
         lines.push(format!(
             "    {t:.2}: {:>2} {:>6}  {:>5.1}s  {:>4.0}% | {:>5.1}s  {:>4.0}%  {s:>5.1}",
             cl.k,
-            joined.iter().flatten().count(),
+            n_joined,
             cov as f64 * bin_s,
             100.0 * agree as f64 / both.max(1) as f64,
             cv_cov as f64 * bin_s,
@@ -609,170 +868,248 @@ pub fn build_lane(
             100.0 * multi as f64 / vis.max(1) as f64
         ));
     }
-    // ANGLE-AWARE JOIN (measured necessity on the Deddy fixture): the same
-    // screen seat holds DIFFERENT humans in different camera angles — the
-    // source cuts between two-person angles of a 4+-person table, and the
-    // same-seat merge welds a position's framings into one track (ADR 0038:
-    // labels are seats, not identities). A voice cluster therefore joins a
-    // seat PER inter-cut segment; the whole-clip join is only the fallback
-    // where a segment lacks evidence. The cluster itself is the person; the
-    // per-segment map says which seat that person occupies in the angle on
-    // screen (no seat = off-screen there).
-    let seg_bounds = segment_bounds(cuts, duration_s);
-    let n_segs = seg_bounds.len() - 1;
-    let seg_of = |b: usize| -> usize {
-        let t = (b as f64 + 0.5) * bin_s;
-        seg_bounds.windows(2).position(|w| t >= w[0] && t < w[1]).unwrap_or(n_segs - 1)
-    };
-    // Group segments into ANGLES by seat geometry: jump cuts return to the
-    // same camera over and over, and within one camera each seat's face sits
-    // at the same position/size. Joining per (cluster, angle) accumulates
-    // identity evidence across ALL of an angle's segments — so a claim at
-    // one moment rests on other moments of the same camera, not only on the
-    // mouth lane's opinion of the moment being judged (a purely per-segment
-    // join just echoed the mouth lane: 99% "agreement" with no information).
-    let seg_angle: Vec<usize> = if let Some(map) = angle_override.filter(|m| m.len() == n_segs) {
-        map.to_vec()
-    } else {
-        let mut sigs: Vec<String> = Vec::new();
-        let mut ids: Vec<usize> = Vec::new();
-        for g in 0..n_segs {
-            let (b0, b1) = (
-                (seg_bounds[g] / bin_s).round() as usize,
-                ((seg_bounds[g + 1] / bin_s).round() as usize).min(n_bins),
-            );
-            let len = b1.saturating_sub(b0).max(1);
-            let mut sig = String::new();
-            for t in &analysis.tracks {
-                let mut xs: Vec<f32> = Vec::new();
-                let mut ys: Vec<f32> = Vec::new();
-                let mut hs: Vec<f32> = Vec::new();
-                for b in b0..b1 {
-                    if let Some(f) = t.path.get(b).and_then(|p| p.as_ref()) {
-                        xs.push(f.cx());
-                        ys.push(f.cy());
-                        hs.push(f.h);
-                    }
-                }
-                if xs.len() * 5 < len * 2 {
-                    continue; // seat absent from this camera (<40%)
-                }
-                let med = |v: &mut Vec<f32>| -> f32 {
-                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    v[v.len() / 2]
-                };
-                sig.push_str(&format!(
-                    "{}:{},{},{};",
-                    t.id,
-                    (med(&mut xs) / 60.0).round() as i32,
-                    (med(&mut ys) / 60.0).round() as i32,
-                    (med(&mut hs) / 40.0).round() as i32
-                ));
-            }
-            let id = sigs.iter().position(|s| *s == sig).unwrap_or_else(|| {
-                sigs.push(sig.clone());
-                sigs.len() - 1
-            });
-            ids.push(id);
-        }
-        ids
-    };
-    let n_angles = seg_angle.iter().copied().max().map(|m| m + 1).unwrap_or(1);
-    let mut ang_counts = vec![std::collections::HashMap::<(usize, usize), usize>::new(); n_angles];
-    let mut ang_totals = vec![std::collections::HashMap::<usize, usize>::new(); n_angles];
-    for b in 0..n_bins {
-        let (Some(c), Some(s)) = (cluster[b], genuine[b]) else { continue };
-        let a = seg_angle[seg_of(b)];
-        *ang_counts[a].entry((c, s)).or_default() += 1;
-        *ang_totals[a].entry(c).or_default() += 1;
-    }
-    // A single-segment angle's co-occurrence is pure echo of the mouth lane
-    // over that one stretch (it can never disagree with it, so it carries no
-    // identity information) — only an angle seen 2+ times may override the
-    // whole-clip join. On the Deddy fixture this is what lets the voice keep
-    // saying "seat B" at 20.8s where the mouth lane held A for that entire
-    // one-off segment (the strip shows B exclaiming).
-    let ang_segments: Vec<usize> =
-        (0..n_angles).map(|a| seg_angle.iter().filter(|&&x| x == a).count()).collect();
-    let ang_join = |c: usize, a: usize| -> Option<usize> {
-        if ang_segments[a] < 2 {
-            return None;
-        }
-        let total = *ang_totals[a].get(&c)?;
-        let (&(_, s), &n) = ang_counts[a]
-            .iter()
-            .filter(|((cc, _), _)| *cc == c)
-            .max_by_key(|&(_, &n)| n)?;
-        (total >= JOIN_MIN_BINS_SEG && n as f32 >= JOIN_MIN_SHARE * total as f32).then_some(s)
-    };
-    lines.push("angles (segments grouped by seat geometry) + voice->seat per angle:".into());
-    for a in 0..n_angles {
-        let spans: Vec<String> = (0..n_segs)
-            .filter(|&g| seg_angle[g] == a)
-            .map(|g| format!("{:.1}-{:.1}", seg_bounds[g], seg_bounds[g + 1]))
-            .collect();
-        let items: Vec<String> = (0..cl.k)
-            .filter_map(|c| ang_join(c, a).map(|s| format!("V{c}->{}", speaker::track_label(s))))
-            .collect();
+    // THE FINAL JOIN — person-scoped over occupant cameras when the map is
+    // active (ADR 0044), seat-scoped over signature angles otherwise (ADR
+    // 0042, the shipped fallback).
+    let (seat, offscreen) = if let Some(m) = map {
+        let mut rows: Vec<String> = Vec::new();
+        let (local, person, refused) = person_join(&cluster, cl.k, &|_| true, Some(&mut rows));
         lines.push(format!(
-            "  angle {a}: [{}]  {}",
-            spans.join(" "),
-            if items.is_empty() { "(no joined voice)".into() } else { items.join("  ") }
+            "person join over {n_map_cams} occupant cameras ({} known persons):",
+            m.n_persons
         ));
-    }
-    // In the ATTRIBUTION regime with several camera angles, a seat track is a
-    // SCREEN POSITION shared by different humans across angles (proven on the
-    // Deddy fixture: V1's voice articulates as the left man of one angle and
-    // is off-screen in another, where the left seat is a different person) —
-    // so a whole-clip join must NOT leak across angles there. In the
-    // follow-visible regime each track is one person's framing, so the
-    // whole-clip join is the identity and stays.
-    let ban_global = attribution_regime && n_angles > 1;
-    let seat: Vec<Option<usize>> = (0..n_bins)
-        .map(|b| {
-            let c = cluster[b]?;
-            let a = seg_angle[seg_of(b)];
-            ang_join(c, a).or(if ban_global { None } else { joined[c] })
-        })
-        .collect();
-    // Off-screen suspects: the voice is a KNOWN person (joined in some other
-    // angle, or clip-wide) but holds no seat in the angle on screen — the
-    // speaker the camera cannot show. The mouth lane can only mis-attribute
-    // these (it holds a visible mouth); they are the "off-screen voice" gap
-    // diarization exists to fill (ADR 0038).
-    let mut offscreen = vec![false; n_bins];
-    if ban_global {
-        let known_elsewhere = |c: usize| -> bool {
-            joined[c].is_some() || (0..n_angles).any(|a| ang_join(c, a).is_some())
-        };
-        for b in 0..n_bins {
-            offscreen[b] =
-                cluster[b].filter(|&c| seat[b].is_none() && known_elsewhere(c)).is_some();
+        for cam in 0..n_map_cams {
+            let spans: Vec<String> = (0..n_segs)
+                .filter(|&g| m.seg_camera[g] == cam)
+                .map(|g| format!("{:.1}-{:.1}", seg_bounds[g], seg_bounds[g + 1]))
+                .collect();
+            let occ = (0..n_segs)
+                .find(|&g| m.seg_camera[g] == cam)
+                .map(|g| {
+                    m.seats[g]
+                        .iter()
+                        .map(|(t, o)| match o {
+                            crate::occupant::Occupant::Person(p) => {
+                                format!("{}=P{p}", speaker::track_label(*t))
+                            }
+                            crate::occupant::Occupant::Unknown => {
+                                format!("{}=?", speaker::track_label(*t))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            lines.push(format!(
+                "  cam{cam}: [{}] {}{}",
+                spans.join(" "),
+                if occ.is_empty() { "(no faces sampled)".into() } else { occ },
+                if m.multi_visit(cam) { "" } else { "  (single visit)" }
+            ));
         }
-        lines.push("off-screen suspects (known voice, no seat in the on-screen angle):".into());
+        lines.extend(rows);
+        for c in 0..cl.k {
+            if refused[c] {
+                lines.push(format!(
+                    "  V{c}: REFUSED — clean edges name different persons (impure cluster; camera-local claims only)"
+                ));
+            } else if let Some(p) = person[c] {
+                lines.push(format!("  V{c}: person P{p}"));
+            }
+        }
+        let (seat, off) =
+            assign_person(&cluster, &local, &person, &join_on_pure(&cluster, cl.k, &|_| true));
+        lines.push(
+            "off-screen (positive absence: person known, every on-screen seat known, not among them):"
+                .into(),
+        );
         let mut b = 0usize;
         while b < n_bins {
-            if !offscreen[b] {
+            if !off[b] {
                 b += 1;
                 continue;
             }
             let (s0, c0) = (b, cluster[b].unwrap());
-            while b < n_bins && cluster[b] == Some(c0) && seat[b].is_none() {
+            while b < n_bins && off[b] && cluster[b] == Some(c0) {
                 b += 1;
             }
             let dur_run = (b - s0) as f64 * bin_s;
             if dur_run >= 0.5 {
                 lines.push(format!(
-                    "  {:>5.1}s..{:>5.1}s ({dur_run:.1}s): V{c0} speaks (mouth lane says {})",
+                    "  {:>5.1}s..{:>5.1}s ({dur_run:.1}s): V{c0} (P{}) speaks — visibly not seated here (mouth lane says {})",
                     s0 as f64 * bin_s,
                     b as f64 * bin_s,
+                    person[c0].map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
                     analysis.speaking[s0.min(n_bins - 1)]
                         .map(speaker::track_label)
                         .unwrap_or_else(|| "nobody".into())
                 ));
             }
         }
-    }
+        (seat, off)
+    } else {
+        // ANGLE-AWARE JOIN (measured necessity on the Deddy fixture): the same
+        // screen seat holds DIFFERENT humans in different camera angles — the
+        // source cuts between two-person angles of a 4+-person table, and the
+        // same-seat merge welds a position's framings into one track (ADR 0038:
+        // labels are seats, not identities). A voice cluster therefore joins a
+        // seat PER inter-cut segment; the whole-clip join is only the fallback
+        // where a segment lacks evidence.
+        //
+        // Group segments into ANGLES by seat geometry: jump cuts return to the
+        // same camera over and over, and within one camera each seat's face sits
+        // at the same position/size. Joining per (cluster, angle) accumulates
+        // identity evidence across ALL of an angle's segments — so a claim at
+        // one moment rests on other moments of the same camera, not only on the
+        // mouth lane's opinion of the moment being judged (a purely per-segment
+        // join just echoed the mouth lane: 99% "agreement" with no information).
+        let seg_angle: Vec<usize> = {
+            let mut sigs: Vec<String> = Vec::new();
+            let mut ids: Vec<usize> = Vec::new();
+            for g in 0..n_segs {
+                let (b0, b1) = (
+                    (seg_bounds[g] / bin_s).round() as usize,
+                    ((seg_bounds[g + 1] / bin_s).round() as usize).min(n_bins),
+                );
+                let len = b1.saturating_sub(b0).max(1);
+                let mut sig = String::new();
+                for t in &analysis.tracks {
+                    let mut xs: Vec<f32> = Vec::new();
+                    let mut ys: Vec<f32> = Vec::new();
+                    let mut hs: Vec<f32> = Vec::new();
+                    for b in b0..b1 {
+                        if let Some(f) = t.path.get(b).and_then(|p| p.as_ref()) {
+                            xs.push(f.cx());
+                            ys.push(f.cy());
+                            hs.push(f.h);
+                        }
+                    }
+                    if xs.len() * 5 < len * 2 {
+                        continue; // seat absent from this camera (<40%)
+                    }
+                    let med = |v: &mut Vec<f32>| -> f32 {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        v[v.len() / 2]
+                    };
+                    sig.push_str(&format!(
+                        "{}:{},{},{};",
+                        t.id,
+                        (med(&mut xs) / 60.0).round() as i32,
+                        (med(&mut ys) / 60.0).round() as i32,
+                        (med(&mut hs) / 40.0).round() as i32
+                    ));
+                }
+                let id = sigs.iter().position(|s| *s == sig).unwrap_or_else(|| {
+                    sigs.push(sig.clone());
+                    sigs.len() - 1
+                });
+                ids.push(id);
+            }
+            ids
+        };
+        let n_angles = seg_angle.iter().copied().max().map(|m| m + 1).unwrap_or(1);
+        let mut ang_counts =
+            vec![std::collections::HashMap::<(usize, usize), usize>::new(); n_angles];
+        let mut ang_totals = vec![std::collections::HashMap::<usize, usize>::new(); n_angles];
+        for b in 0..n_bins {
+            let (Some(c), Some(s)) = (cluster[b], genuine[b]) else { continue };
+            let a = seg_angle[seg_of(b)];
+            *ang_counts[a].entry((c, s)).or_default() += 1;
+            *ang_totals[a].entry(c).or_default() += 1;
+        }
+        // A single-segment angle's co-occurrence is pure echo of the mouth lane
+        // over that one stretch (it can never disagree with it, so it carries no
+        // identity information) — only an angle seen 2+ times may override the
+        // whole-clip join.
+        let ang_segments: Vec<usize> =
+            (0..n_angles).map(|a| seg_angle.iter().filter(|&&x| x == a).count()).collect();
+        let ang_join = |c: usize, a: usize| -> Option<usize> {
+            if ang_segments[a] < 2 {
+                return None;
+            }
+            let total = *ang_totals[a].get(&c)?;
+            let (&(_, s), &n) = ang_counts[a]
+                .iter()
+                .filter(|((cc, _), _)| *cc == c)
+                .max_by_key(|&(_, &n)| n)?;
+            (total >= JOIN_MIN_BINS_SEG && n as f32 >= JOIN_MIN_SHARE * total as f32).then_some(s)
+        };
+        lines.push("angles (segments grouped by seat geometry) + voice->seat per angle:".into());
+        for a in 0..n_angles {
+            let spans: Vec<String> = (0..n_segs)
+                .filter(|&g| seg_angle[g] == a)
+                .map(|g| format!("{:.1}-{:.1}", seg_bounds[g], seg_bounds[g + 1]))
+                .collect();
+            let items: Vec<String> = (0..cl.k)
+                .filter_map(|c| {
+                    ang_join(c, a).map(|s| format!("V{c}->{}", speaker::track_label(s)))
+                })
+                .collect();
+            lines.push(format!(
+                "  angle {a}: [{}]  {}",
+                spans.join(" "),
+                if items.is_empty() { "(no joined voice)".into() } else { items.join("  ") }
+            ));
+        }
+        // In the ATTRIBUTION regime with several camera angles, a seat track is a
+        // SCREEN POSITION shared by different humans across angles (proven on the
+        // Deddy fixture: V1's voice articulates as the left man of one angle and
+        // is off-screen in another, where the left seat is a different person) —
+        // so a whole-clip join must NOT leak across angles there. In the
+        // follow-visible regime each track is one person's framing, so the
+        // whole-clip join is the identity and stays.
+        let ban_global = attribution_regime && n_angles > 1;
+        let seat: Vec<Option<usize>> = (0..n_bins)
+            .map(|b| {
+                let c = cluster[b]?;
+                let a = seg_angle[seg_of(b)];
+                ang_join(c, a).or(if ban_global { None } else { joined[c] })
+            })
+            .collect();
+        // Off-screen SUSPECTS — diagnostic only (ADR 0044): "no learned seat
+        // here" is ignorance, not evidence of absence, and it minted the
+        // fixture's false off-screen calls. The suspects still print for the
+        // operator's ear, but the lane's off-screen bits stay clear — the
+        // production flag needs the occupant map's positive absence.
+        if ban_global {
+            let known_elsewhere = |c: usize| -> bool {
+                joined[c].is_some() || (0..n_angles).any(|a| ang_join(c, a).is_some())
+            };
+            lines.push(
+                "off-screen suspects (diagnostic only — the flag needs the occupant map):".into(),
+            );
+            let mut b = 0usize;
+            while b < n_bins {
+                let suspect = cluster[b]
+                    .filter(|&c| seat[b].is_none() && known_elsewhere(c))
+                    .is_some();
+                if !suspect {
+                    b += 1;
+                    continue;
+                }
+                let (s0, c0) = (b, cluster[b].unwrap());
+                while b < n_bins
+                    && cluster[b] == Some(c0)
+                    && seat[b].is_none()
+                    && known_elsewhere(c0)
+                {
+                    b += 1;
+                }
+                let dur_run = (b - s0) as f64 * bin_s;
+                if dur_run >= 0.5 {
+                    lines.push(format!(
+                        "  {:>5.1}s..{:>5.1}s ({dur_run:.1}s): V{c0} speaks (mouth lane says {})",
+                        s0 as f64 * bin_s,
+                        b as f64 * bin_s,
+                        analysis.speaking[s0.min(n_bins - 1)]
+                            .map(speaker::track_label)
+                            .unwrap_or_else(|| "nobody".into())
+                    ));
+                }
+            }
+        }
+        (seat, vec![false; n_bins])
+    };
     let (cov, agree, both) = score(&seat);
     lines.push(format!(
         "agreement with mouth attribution: {:.0}% over {:.1}s co-claimed ({:.1}s claimed total)",
@@ -1323,11 +1660,14 @@ mod tests {
     }
 
     #[test]
-    fn the_join_is_angle_scoped_and_flags_the_offscreen_voice() {
-        // Attribution regime, two angles: the voice joins seat A inside
-        // angle 0 (seen twice, solid co-occurrence) and must NOT leak that
-        // seat into angle 1 (the whole-clip join is banned there) — where it
-        // keeps speaking with no seat, it is the off-screen speaker.
+    fn the_join_is_angle_scoped_and_suspects_stay_diagnostic() {
+        // Attribution regime, two angles, NO occupant map: the voice joins
+        // seat A inside angle 0 (seen twice, solid co-occurrence) and must
+        // NOT leak that seat into angle 1 (the whole-clip join is banned
+        // there). Where it keeps speaking with no seat it prints as an
+        // off-screen SUSPECT — but the lane's off-screen bits stay clear:
+        // "no learned seat here" is ignorance, and the production flag needs
+        // the occupant map's positive absence (ADR 0044).
         let (analysis, cuts) = two_angle_fixture();
         let (embs, kept) = one_voice_windows(8.0);
         let (lane, diag) =
@@ -1335,12 +1675,15 @@ mod tests {
         assert_eq!(lane.seat[nb(1.0)], Some(0), "angle 0 joins seat A");
         assert_eq!(lane.seat[nb(5.0)], Some(0));
         assert_eq!(lane.seat[nb(3.0)], None, "the join must not leak across angles");
-        assert!(lane.offscreen[nb(3.0)], "a known voice with no seat = off-screen");
-        assert!(lane.offscreen[nb(7.0)]);
-        assert!(!lane.offscreen[nb(1.0)]);
+        assert!(lane.offscreen.iter().all(|o| !o), "no map, no off-screen bits");
         assert!(lane.overridden.iter().all(|o| !o), "build_lane never marks overrides");
-        assert!(diag.offscreen_s > 3.0, "both angle-1 visits flagged: {}", diag.offscreen_s);
-        assert!(diag.lines.iter().any(|l| l.contains("off-screen suspects")));
+        assert!((diag.offscreen_s - 0.0).abs() < 1e-9, "suspects carry no mass");
+        assert!(diag.lines.iter().any(|l| l.contains("off-screen suspects (diagnostic only")));
+        assert!(
+            diag.lines.iter().any(|l| l.contains("2.0s..") && l.contains("V0 speaks")),
+            "the angle-1 visit still prints for the operator's ear: {:?}",
+            diag.lines
+        );
     }
 
     #[test]
@@ -1384,11 +1727,15 @@ mod tests {
             }
         }
         let (embs, kept) = one_voice_windows(6.0);
-        let (lane, _) =
+        let (lane, diag) =
             build_lane(&embs, &kept, &analysis, &[2.0, 4.0], 6.0, true, None).expect("lane builds");
         assert_eq!(lane.seat[nb(1.0)], Some(0), "the twice-seen angle joins");
         assert_eq!(lane.seat[nb(3.0)], None, "a single-visit angle only echoes — no claim");
-        assert!(lane.offscreen[nb(3.0)], "it stays a suspect for the operator's ear");
+        assert!(!lane.offscreen[nb(3.0)], "ignorance sets no off-screen bit (ADR 0044)");
+        assert!(
+            diag.lines.iter().any(|l| l.contains("V0 speaks")),
+            "it stays a printed suspect for the operator's ear"
+        );
     }
 
     #[test]
@@ -1420,5 +1767,195 @@ mod tests {
         // Degenerate thresholds: 0 keeps singletons, 2.0 fuses everything.
         assert_eq!(cluster_cosine(&embs, 0.0).k, embs.len());
         assert_eq!(cluster_cosine(&embs, 2.0).k, 1);
+    }
+
+    // --- the person-scoped join (ADR 0044) ---------------------------------
+
+    use crate::occupant::{Occupant, OccupantMap};
+    use std::collections::BTreeMap;
+
+    /// Hand-built occupant map: `segs[g]` lists `(track, occupant)`, cameras
+    /// merged by the same fully-known rule production uses.
+    fn map_of(segs: &[&[(usize, Occupant)]]) -> OccupantMap {
+        let seats: Vec<BTreeMap<usize, Occupant>> =
+            segs.iter().map(|s| s.iter().copied().collect()).collect();
+        let mut keys: Vec<String> = Vec::new();
+        let mut seg_camera = vec![0usize; seats.len()];
+        let mut camera_visits: Vec<usize> = Vec::new();
+        for (g, m) in seats.iter().enumerate() {
+            let mergeable =
+                !m.is_empty() && m.values().all(|o| matches!(o, Occupant::Person(_)));
+            let key = if mergeable {
+                format!("{m:?}")
+            } else {
+                format!("<{g}>")
+            };
+            let cam = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+                keys.push(key.clone());
+                camera_visits.push(0);
+                keys.len() - 1
+            });
+            seg_camera[g] = cam;
+            camera_visits[cam] += 1;
+        }
+        let n_persons = seats
+            .iter()
+            .flat_map(|m| m.values())
+            .filter_map(|o| match o {
+                Occupant::Person(p) => Some(*p + 1),
+                Occupant::Unknown => None,
+            })
+            .max()
+            .unwrap_or(0);
+        OccupantMap {
+            seats,
+            n_persons,
+            seg_camera,
+            camera_visits,
+            merges: Vec::new(),
+            cut: 0.4,
+            assignment: Vec::new(),
+        }
+    }
+
+    /// Both tracks visible everywhere; clean genuine mouth for `speaker_of`
+    /// per bin (None = silence for the join's reference, still voiced).
+    fn person_fixture(
+        n_secs: f64,
+        speaker_of: impl Fn(usize) -> Option<usize>,
+        contested: impl Fn(usize) -> bool,
+    ) -> SpeakerAnalysis {
+        let n = nb(n_secs);
+        let mut ta = track_at(0, n, &[(0, n, 300.0, 325.0, 150.0)]);
+        let mut tb = track_at(1, n, &[(0, n, 1500.0, 325.0, 150.0)]);
+        let mut speaking: Vec<Option<usize>> = vec![None; n];
+        for b in 0..n {
+            match speaker_of(b) {
+                Some(0) => {
+                    ta.activity[b] = 0.05;
+                    if contested(b) {
+                        tb.activity[b] = 0.05;
+                    }
+                    speaking[b] = Some(0);
+                }
+                Some(1) => {
+                    tb.activity[b] = 0.05;
+                    if contested(b) {
+                        ta.activity[b] = 0.05;
+                    }
+                    speaking[b] = Some(1);
+                }
+                _ => {}
+            }
+        }
+        SpeakerAnalysis {
+            bin_s: BIN_S,
+            tracks: vec![ta, tb],
+            voiced: vec![true; n],
+            speaking,
+            confidence: vec![1.0; n],
+            voice: None,
+        }
+    }
+
+    #[test]
+    fn person_transfer_claims_the_mapped_seat_across_cameras() {
+        // Cameras alternate X (segs 0,2) / Y (segs 1,3), plus a single-visit
+        // tail segment. P0 sits at seat 0 in X and seat 1 in Y. The voice's
+        // only clean co-occurrence is in X — the map then places it in Y and
+        // even in the single-visit tail (face evidence is exempt from the
+        // single-visit rule), all without an off-screen bit.
+        let cam_x: &[(usize, Occupant)] = &[(0, Occupant::Person(0)), (1, Occupant::Person(1))];
+        let cam_y: &[(usize, Occupant)] = &[(0, Occupant::Person(2)), (1, Occupant::Person(0))];
+        let tail: &[(usize, Occupant)] = &[(0, Occupant::Person(0)), (1, Occupant::Person(3))];
+        let map = map_of(&[cam_x, cam_y, cam_x, cam_y, tail]);
+        // Mouth evidence only inside camera X's segments (0-2 s and 4-6 s).
+        let in_x = |b: usize| (0..nb(2.0)).contains(&b) || (nb(4.0)..nb(6.0)).contains(&b);
+        let analysis = person_fixture(10.0, |b| in_x(b).then_some(0), |_| false);
+        let (embs, kept) = one_voice_windows(10.0);
+        let (lane, diag) =
+            build_lane(&embs, &kept, &analysis, &[2.0, 4.0, 6.0, 8.0], 10.0, true, Some(&map))
+                .expect("lane builds");
+        assert_eq!(lane.seat[nb(1.0)], Some(0), "camera X: the evidenced seat");
+        assert_eq!(lane.seat[nb(3.0)], Some(1), "camera Y: P0's mapped seat — the transfer");
+        assert_eq!(lane.seat[nb(7.0)], Some(1));
+        assert_eq!(lane.seat[nb(9.0)], Some(0), "single-visit tail still places the person");
+        assert!(lane.offscreen.iter().all(|o| !o), "seated everywhere — nothing off-screen");
+        assert!(diag.lines.iter().any(|l| l.contains("person P0")), "{:?}", diag.lines);
+    }
+
+    #[test]
+    fn purity_gate_kills_contested_evidence() {
+        // Same camera twice; every genuine bin is CONTESTED (both mouths over
+        // the floor — the churn shape). The edge dies at the purity gate, so
+        // the voice claims nothing; with the map absent the old join would
+        // have blessed it (that is the poisoning ADR 0043 measured).
+        let cam_x: &[(usize, Occupant)] = &[(0, Occupant::Person(0)), (1, Occupant::Person(1))];
+        let map = map_of(&[cam_x, cam_x]);
+        let analysis = person_fixture(6.0, |_| Some(0), |_| true);
+        let (embs, kept) = one_voice_windows(6.0);
+        let (lane, diag) =
+            build_lane(&embs, &kept, &analysis, &[3.0], 6.0, true, Some(&map)).expect("lane");
+        assert!(lane.seat.iter().all(|s| s.is_none()), "contested evidence joins nothing");
+        assert!(lane.offscreen.iter().all(|o| !o));
+        assert!(
+            diag.lines.iter().any(|l| l.contains("contested") && l.contains("dead")),
+            "{:?}",
+            diag.lines
+        );
+        // Control: the identical shape with UNCONTESTED bins joins cleanly.
+        let clean = person_fixture(6.0, |_| Some(0), |_| false);
+        let (lane2, _) =
+            build_lane(&embs, &kept, &clean, &[3.0], 6.0, true, Some(&map)).expect("lane");
+        assert_eq!(lane2.seat[nb(1.0)], Some(0), "clean evidence still joins");
+    }
+
+    #[test]
+    fn refused_cluster_keeps_camera_local_claims_only() {
+        // One voice cluster with CLEAN edges in two cameras whose claimed
+        // seats hold different persons (P0 in X, P2 in Y): provably impure —
+        // no person identity, no off-screen powers, but each camera-local
+        // claim stands (today's seat semantics over cameras).
+        let cam_x: &[(usize, Occupant)] = &[(0, Occupant::Person(0)), (1, Occupant::Person(1))];
+        let cam_y: &[(usize, Occupant)] = &[(0, Occupant::Person(2)), (1, Occupant::Person(3))];
+        let map = map_of(&[cam_x, cam_y, cam_x, cam_y]);
+        let analysis = person_fixture(8.0, |_| Some(0), |_| false);
+        let (embs, kept) = one_voice_windows(8.0);
+        let (lane, diag) =
+            build_lane(&embs, &kept, &analysis, &[2.0, 4.0, 6.0], 8.0, true, Some(&map))
+                .expect("lane builds");
+        assert!(diag.lines.iter().any(|l| l.contains("REFUSED")), "{:?}", diag.lines);
+        assert_eq!(lane.seat[nb(1.0)], Some(0), "camera-local claim in X stands");
+        assert_eq!(lane.seat[nb(3.0)], Some(0), "camera-local claim in Y stands");
+        assert!(lane.offscreen.iter().all(|o| !o), "a refused cluster proves no absence");
+    }
+
+    #[test]
+    fn positive_absence_needs_full_known_coverage() {
+        // The voice's person P0 lives in camera X (segs 0,2). Seg 1's camera
+        // knows BOTH seats (P2, P3) — P0 is positively absent there: the flag
+        // fires. Seg 3's camera holds an Unknown (singleton pose extreme) —
+        // ignorance blocks the proof, no flag, no claim.
+        let cam_x: &[(usize, Occupant)] = &[(0, Occupant::Person(0)), (1, Occupant::Person(1))];
+        let known: &[(usize, Occupant)] = &[(0, Occupant::Person(2)), (1, Occupant::Person(3))];
+        let half: &[(usize, Occupant)] = &[(0, Occupant::Person(2)), (1, Occupant::Unknown)];
+        let map = map_of(&[cam_x, known, cam_x, half]);
+        let in_x = |b: usize| (0..nb(2.0)).contains(&b) || (nb(4.0)..nb(6.0)).contains(&b);
+        let analysis = person_fixture(8.0, |b| in_x(b).then_some(0), |_| false);
+        let (embs, kept) = one_voice_windows(8.0);
+        let (lane, diag) =
+            build_lane(&embs, &kept, &analysis, &[2.0, 4.0, 6.0], 8.0, true, Some(&map))
+                .expect("lane builds");
+        assert_eq!(lane.seat[nb(1.0)], Some(0));
+        assert!(lane.offscreen[nb(3.0)], "fully-known camera without P0: positive absence");
+        assert_eq!(lane.seat[nb(3.0)], None);
+        assert!(!lane.offscreen[nb(7.0)], "an Unknown occupant blocks the absence proof");
+        assert_eq!(lane.seat[nb(7.0)], None);
+        assert!(diag.offscreen_s > 1.0, "the flagged stretch carries mass: {}", diag.offscreen_s);
+        assert!(
+            diag.lines.iter().any(|l| l.contains("visibly not seated here")),
+            "{:?}",
+            diag.lines
+        );
     }
 }

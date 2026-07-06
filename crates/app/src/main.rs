@@ -45,6 +45,8 @@ fn main() -> eframe::Result<()> {
         llm_judge: paths.llm_judge(),
         face_model: paths.face_model(),
         voice_model: paths.voice_model(),
+        yunet_model: paths.yunet_model(),
+        sface_model: paths.sface_model(),
         sep_model: paths.sep_model(),
         deep_filter: paths.deep_filter(),
         mtmd_cli: paths.mtmd_cli(),
@@ -439,6 +441,18 @@ impl AppPaths {
     /// unless downloaded; the speaker analysis is then mouth-only.
     fn voice_model(&self) -> PathBuf {
         self.models.join("3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx")
+    }
+
+    /// YuNet landmark detector for the occupant map (ADR 0044). Absent unless
+    /// downloaded; the voice join is then seat-scoped (ADR 0042 behavior).
+    fn yunet_model(&self) -> PathBuf {
+        self.models.join("face_detection_yunet_2023mar.onnx")
+    }
+
+    /// SFace face-recognition embedder for the occupant map (ADR 0044).
+    /// Absent unless downloaded; the voice join is then seat-scoped.
+    fn sface_model(&self) -> PathBuf {
+        self.models.join("face_recognition_sface_2021dec.onnx")
     }
 
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). Absent unless
@@ -1306,6 +1320,20 @@ impl App {
             ),
             dep(
                 false,
+                "YuNet landmarks",
+                p.yunet_model(),
+                "occupant map: face landmarks for the person-scoped voice join (ADR 0044)",
+                &["yunet-model"],
+            ),
+            dep(
+                false,
+                "SFace embedder",
+                p.sface_model(),
+                "occupant map: face identity per (camera, seat) (ADR 0044) (~37 MB)",
+                &["sface-model"],
+            ),
+            dep(
+                false,
                 "SER model",
                 p.ser_model(),
                 "arousal Signal (ser builds, ADR 0008) (~610 MB)",
@@ -1454,6 +1482,26 @@ impl App {
                 sha256: "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
                 total_bytes: 28_281_164,
                 install: Install::File(p.voice_model()),
+            },
+            // The OpenCV-zoo face-id pair for the occupant map (ADR 0043/0044):
+            // pinned at the zoo commits the spike verified; the SHA-256s are the
+            // repo's own Git-LFS oids, re-verified against these exact URLs
+            // 2026-07-06.
+            DownloadSpec {
+                id: "yunet-model",
+                label: "YuNet face landmarks (occupant map)",
+                url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/f12e12798e8314f7c074a6656816c048dcc95b7a/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+                sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+                total_bytes: 232_589,
+                install: Install::File(p.yunet_model()),
+            },
+            DownloadSpec {
+                id: "sface-model",
+                label: "SFace face embedder (occupant map)",
+                url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/ba91a3b91d00d76e86540d4013f944bd6b514e39/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+                sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+                total_bytes: 38_696_353,
+                install: Install::File(p.sface_model()),
             },
             DownloadSpec {
                 id: "ser-model",

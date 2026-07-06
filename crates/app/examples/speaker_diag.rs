@@ -13,14 +13,17 @@
 //! intermediates); the range is the clip's VOD-absolute range from
 //! project.json. Without `--features face` this prints a hint and exits.
 //!
-//! The **voice lane** (ADR 0042, integrated) runs the PRODUCTION functions —
-//! `yc_frame::voice::{embed_windows, build_lane, fuse_attribution}` — per
-//! candidate CAM++ model, prints the evidence trail (CV-scored sweep, angle
-//! joins, off-screen suspects, disagreements), fuses the first model into
-//! the analysis exactly as `Job::AnalyzeSpeakers` does, and diffs the
-//! integrated plan against the mouth-only baseline. Lanes append to the CSV;
-//! `YC_INTEG_RENDER=1` renders the integrated plan to
-//! `../diar_integration.mp4` (the ADR 0042 integration gate artifact). Also:
+//! The **voice lane** (ADR 0042/0044, integrated) runs the PRODUCTION
+//! functions — `yc_frame::voice::{embed_windows, build_lane,
+//! fuse_attribution}` over the occupant map — per candidate CAM++ model,
+//! prints the evidence trail (CV-scored sweep, person-join edges with purity
+//! verdicts, positive-absence off-screen runs, disagreements), fuses the
+//! first model into the analysis exactly as `Job::AnalyzeSpeakers` does, and
+//! diffs the integrated plan against the mouth-only baseline. Lanes append
+//! to the CSV; `YC_INTEG_RENDER=1` renders the integrated plan to
+//! `../diar_integration.mp4` (the ADR 0042 gate artifact — do not clobber);
+//! `YC_PERSON_RENDER=1` renders to `../diar_person.mp4` (the ADR 0044
+//! person-join gate artifact). Also:
 //!
 //!   … speaker_diag --features face -- selftest <wav> <wav> [<wav>…]
 //!
@@ -28,13 +31,14 @@
 //! run it on known same/different-speaker recordings to validate the fbank +
 //! embedding path end-to-end before trusting fixture numbers.
 //!
-//! The **face lane** (ADR 0043 spike, harness-only) builds the OCCUPANT MAP:
-//! full-res face crops per (angle segment, seat), YuNet landmarks, SFace
-//! embeddings, agglomerative person clusters — printed as (segment × seat →
-//! person), segments merged into CAMERAS by identical occupants, a contact
-//! sheet written for the operator's eyes, and the voice join REPLAYED over
-//! the merged cameras as a printed diff. Production analysis/plan untouched;
-//! missing face-id models skip the lane. And:
+//! The **face lane** (ADR 0043/0044, production path) builds the OCCUPANT
+//! MAP with `yc_frame::occupant::build_occupant_map`: full-res face crops
+//! per (segment, seat), YuNet landmarks, SFace embeddings, person clusters
+//! cut at the largest dendrogram gap — printed as (segment × seat → person),
+//! segments merged into CAMERAS by identical fully-known occupants, and a
+//! contact sheet written for the operator's eyes. Computed exactly when
+//! production computes it (attribution regime + models present); the voice
+//! join above consumes it. And:
 //!
 //!   … speaker_diag --features face -- faceselftest <img> [<img>…]
 //!
@@ -298,20 +302,58 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- voice lanes (ADR 0042, INTEGRATED): the PRODUCTION functions —
-    // yc_frame::voice::{embed_windows, build_lane, fuse_attribution} — run
-    // here on the same inputs, so what this harness measures IS the analysis
-    // Job::AnalyzeSpeakers ships. Candidate models A/B beside the production
-    // one; a missing file skips its lane so the visual forensics still print.
-    println!("\n== voice lanes (production path):");
+    // --- face lane (ADR 0044, production path): the occupant map the person
+    // join runs over. Computed exactly when production computes it — the
+    // attribution regime with both face-id models present; otherwise the
+    // voice join runs the seat-scoped ADR 0042 fallback.
     let attribution = speaker::attribution_regime(&analysis);
+    let occupant_map: Option<yc_frame::occupant::OccupantMap> = {
+        let yunet = Path::new(YUNET_MODEL);
+        let sface = Path::new(SFACE_MODEL);
+        if !attribution {
+            println!(
+                "\n== face lane: follow-visible regime — occupant map not computed (the whole-clip join is the identity)"
+            );
+            None
+        } else if !yunet.is_file() || !sface.is_file() {
+            println!(
+                "\n== face lane: missing {} or {} — occupant map off, seat-scoped join (ADR 0042 fallback)",
+                yunet.display(),
+                sface.display()
+            );
+            None
+        } else {
+            match face_lane(
+                ffmpeg,
+                &segment,
+                seek_s,
+                probe.fps,
+                probe.width as usize,
+                probe.height as usize,
+                yunet,
+                sface,
+                &analysis,
+                &cuts,
+                dur,
+                &data_dir,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("\n== face lane FAILED: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+
+    // --- voice lanes (ADR 0042/0044, INTEGRATED): the PRODUCTION functions —
+    // yc_frame::voice::{embed_windows, build_lane, fuse_attribution} — run
+    // here on the same inputs (occupant map included), so what this harness
+    // measures IS the analysis Job::AnalyzeSpeakers ships. Candidate models
+    // A/B beside the production one; a missing file skips its lane so the
+    // visual forensics still print.
+    println!("\n== voice lanes (production path):");
     let mut lanes: Vec<(&'static str, yc_frame::voice::VoiceLane)> = Vec::new();
-    // Kept for the ADR 0043 face-lane replay: the analysis BEFORE fusion
-    // mutates it (the replay must join against the same reference the
-    // production lane did) and the production model's embedded windows.
-    let mut prefuse: Option<SpeakerAnalysis> = None;
-    let mut prod_windows: Option<(Vec<Vec<f32>>, Vec<(f64, f64)>)> = None;
-    let mut prod_stats: Option<(f64, f64, f64, f64)> = None; // claimed, agr, off, overridden
     for (i, &(tag, path, scale, cmn)) in VOICE_MODELS.iter().enumerate() {
         let model = Path::new(path);
         if !model.is_file() {
@@ -340,9 +382,15 @@ fn main() -> anyhow::Result<()> {
             yc_frame::voice::HOP_S,
             t0.elapsed().as_secs_f32()
         );
-        let Some((mut lane, diag)) =
-            yc_frame::voice::build_lane(&embs, &kept, &analysis, &cuts, dur, attribution, None)
-        else {
+        let Some((mut lane, diag)) = yc_frame::voice::build_lane(
+            &embs,
+            &kept,
+            &analysis,
+            &cuts,
+            dur,
+            attribution,
+            occupant_map.as_ref(),
+        ) else {
             println!("  [{tag}] only {} embeddable windows — lane skipped", embs.len());
             continue;
         };
@@ -363,8 +411,6 @@ fn main() -> anyhow::Result<()> {
         // analysis exactly as Job::AnalyzeSpeakers does — the plan below is
         // then the integrated production camera.
         if i == 0 {
-            prefuse = Some(analysis.clone());
-            prod_windows = Some((embs.clone(), kept.clone()));
             let (fspeak, fconf, overridden) =
                 yc_frame::voice::fuse_attribution(&analysis, &lane.seat);
             print!("  [{tag}] fused attribution (voice tiebreak) switches:");
@@ -385,18 +431,89 @@ fn main() -> anyhow::Result<()> {
                 diag.claimed_s,
                 100.0 * diag.agreement
             );
-            prod_stats = Some((
-                diag.claimed_s,
-                diag.agreement,
-                diag.offscreen_s,
-                overridden.iter().filter(|o| **o).count() as f64 * bin_s,
-            ));
             lane.overridden = overridden;
             analysis.speaking = fspeak;
             analysis.confidence = fconf;
             analysis.voice = Some(lane.clone());
         }
         lanes.push((tag, lane));
+    }
+
+    // Per-segment evidence table (ADR 0044 grammar forensics): what each
+    // inter-cut segment's voiced time is made of — the printed gaps any
+    // shared-class plan rule must derive its thresholds from.
+    {
+        let bounds = yc_frame::voice::segment_bounds(&cuts, dur);
+        println!("\n== per-segment voiced evidence (voiced / contested / voice-claimed / absent):");
+        for g in 0..bounds.len() - 1 {
+            let b0 = (bounds[g] / bin_s).round() as usize;
+            let b1 = (((bounds[g + 1] / bin_s).round() as usize).min(n_bins)).max(b0);
+            let voiced: Vec<usize> = (b0..b1).filter(|&b| analysis.voiced[b]).collect();
+            let nv = voiced.len().max(1);
+            let contested = voiced
+                .iter()
+                .filter(|&&b| {
+                    analysis
+                        .tracks
+                        .iter()
+                        .filter(|t| {
+                            t.activity.get(b).copied().unwrap_or(0.0) >= speaker::MIN_ACTIVITY
+                        })
+                        .count()
+                        >= 2
+                })
+                .count();
+            let (claimed, absent) = analysis
+                .voice
+                .as_ref()
+                .map(|v| {
+                    (
+                        voiced.iter().filter(|&&b| v.seat[b].is_some()).count(),
+                        voiced.iter().filter(|&&b| v.offscreen[b]).count(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            // The fused lane's dominant speaker over the segment's voiced bins.
+            let mut per: std::collections::HashMap<usize, usize> = Default::default();
+            for &b in &voiced {
+                if let Some(s) = analysis.speaking[b] {
+                    *per.entry(s).or_default() += 1;
+                }
+            }
+            let dom = per
+                .iter()
+                .max_by_key(|(_, &n)| n)
+                .map(|(&s, &n)| format!("{} {:.0}%", speaker::track_label(s), 100.0 * n as f64 / nv as f64))
+                .unwrap_or_else(|| "-".into());
+            // Cluster composition: which voice clusters carry this segment's
+            // voiced bins (the shared blob vs seat-pure voices).
+            let mut per_c: std::collections::HashMap<usize, usize> = Default::default();
+            if let Some(v) = analysis.voice.as_ref() {
+                for &b in &voiced {
+                    if let Some(c) = v.cluster[b] {
+                        *per_c.entry(c).or_default() += 1;
+                    }
+                }
+            }
+            let mut comp: Vec<(usize, usize)> = per_c.into_iter().collect();
+            comp.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            let comp_s: Vec<String> = comp
+                .iter()
+                .take(3)
+                .map(|(c, n)| format!("V{c} {:.0}%", 100.0 * *n as f64 / nv as f64))
+                .collect();
+            println!(
+                "  seg{g:>2} {:>5.1}-{:>5.1}s  voiced {:>4.1}s | contested {:>3.0}% | claimed {:>3.0}% | absent {:>3.0}% | mouth-dom {} | clusters [{}]",
+                bounds[g],
+                bounds[g + 1],
+                voiced.len() as f64 * bin_s,
+                100.0 * contested as f64 / nv as f64,
+                100.0 * claimed as f64 / nv as f64,
+                100.0 * absent as f64 / nv as f64,
+                dom,
+                comp_s.join(" ")
+            );
+        }
     }
 
     // The INTEGRATED production plan: plan_shots itself applies the
@@ -650,108 +767,6 @@ fn main() -> anyhow::Result<()> {
         solos.push((i, id, cx, cy, fh, plan.shots[i].pan_to.as_ref().unwrap_or(crop)));
     }
 
-    // --- face lane (ADR 0043 spike, harness-only): the OCCUPANT MAP — who
-    // occupies each seat, per angle segment. Full-res crops via targeted
-    // seeks, YuNet landmarks -> SFace embeddings -> person clusters; then the
-    // voice join replayed over occupant-merged cameras as a printed diff.
-    // Nothing above (analysis, plan, audit, fg) is touched by any of this.
-    let face_map: Option<Vec<usize>> = {
-        let yunet = Path::new(YUNET_MODEL);
-        let sface = Path::new(SFACE_MODEL);
-        if !yunet.is_file() || !sface.is_file() {
-            println!(
-                "\n== face lane: missing {} or {} — lane skipped",
-                yunet.display(),
-                sface.display()
-            );
-            None
-        } else {
-            let ref_analysis = prefuse.as_ref().unwrap_or(&analysis);
-            match face_lane(
-                ffmpeg,
-                &segment,
-                seek_s,
-                probe.fps,
-                probe.width as usize,
-                probe.height as usize,
-                yunet,
-                sface,
-                ref_analysis,
-                &cuts,
-                dur,
-                &data_dir,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    println!("\n== face lane FAILED: {e:#}");
-                    None
-                }
-            }
-        }
-    };
-    if let (Some(map), Some((embs, kept)), Some(pf)) = (&face_map, &prod_windows, &prefuse) {
-        println!("\n== voice join REPLAY over occupant cameras (ADR 0043 diagnostic — production untouched):");
-        match yc_frame::voice::build_lane(embs, kept, pf, &cuts, dur, attribution, Some(map)) {
-            Some((rlane, rdiag)) => {
-                for l in &rdiag.lines {
-                    println!("  [reid] {l}");
-                }
-                let (_, _, rover) = yc_frame::voice::fuse_attribution(pf, &rlane.seat);
-                let (pc, pa, po, pv) = prod_stats.unwrap_or((0.0, 0.0, 0.0, 0.0));
-                println!(
-                    "  [reid] claimed {:.1}s @ {:.0}% | off-screen {:.1}s | overridden {:.1}s   (production lane: {pc:.1}s @ {:.0}% | {po:.1}s | {pv:.1}s)",
-                    rdiag.claimed_s,
-                    100.0 * rdiag.agreement,
-                    rdiag.offscreen_s,
-                    rover.iter().filter(|o| **o).count() as f64 * bin_s,
-                    100.0 * pa,
-                );
-                // Reclassified off-screen mass: where the production lane
-                // cried off-screen and the occupant-merged join resolves the
-                // voice to an ON-SCREEN seat (or the flag just dissolves).
-                if let Some((_, plane)) = lanes.first() {
-                    let mut b = 0usize;
-                    while b < n_bins {
-                        let was = plane.offscreen.get(b).copied().unwrap_or(false);
-                        let now = rlane.offscreen.get(b).copied().unwrap_or(false);
-                        if was == now {
-                            b += 1;
-                            continue;
-                        }
-                        let s0 = b;
-                        while b < n_bins
-                            && plane.offscreen.get(b).copied().unwrap_or(false) == was
-                            && rlane.offscreen.get(b).copied().unwrap_or(false) == now
-                        {
-                            b += 1;
-                        }
-                        let run = (b - s0) as f64 * bin_s;
-                        if run < 0.4 {
-                            continue;
-                        }
-                        let what = if was {
-                            match rlane.seat[s0.min(n_bins - 1)] {
-                                Some(s) => format!(
-                                    "off-screen -> ON SCREEN as {}",
-                                    speaker::track_label(s)
-                                ),
-                                None => "off-screen -> dissolved (unjoined here)".into(),
-                            }
-                        } else {
-                            "newly off-screen".into()
-                        };
-                        println!(
-                            "  [reid]   {:>5.1}s..{:>5.1}s ({run:.1}s): {what}",
-                            s0 as f64 * bin_s,
-                            b as f64 * bin_s
-                        );
-                    }
-                }
-            }
-            None => println!("  [reid] lane skipped (too few windows)"),
-        }
-    }
-
     // --- the real filtergraph (render it with export_args-style ffmpeg flags
     // to SEE this plan; clip.ass + fonts live in the data dir) ----------------
     let fg = data_dir.join("camera_diag.fg");
@@ -789,6 +804,20 @@ fn main() -> anyhow::Result<()> {
             "../diar_integration.mp4",
         );
         println!("rendering ../diar_integration.mp4 ...");
+        yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+    }
+    //  - YC_PERSON_RENDER  -> ../diar_person.mp4  (the ADR 0044 person-join
+    //    gate artifact, watched against diar_integration.mp4)
+    if std::env::var_os("YC_PERSON_RENDER").is_some() {
+        let ffabs = std::fs::canonicalize(ffmpeg)?;
+        let args = yc_render::export_args_script(
+            Path::new("segment.mp4"),
+            seek_s,
+            dur,
+            "camera_diag.fg",
+            "../diar_person.mp4",
+        );
+        println!("rendering ../diar_person.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
     }
 
@@ -905,15 +934,6 @@ const YUNET_MODEL: &str = "models/face_detection_yunet_2023mar.onnx";
 #[cfg(feature = "face")]
 const SFACE_MODEL: &str = "models/face_recognition_sface_2021dec.onnx";
 
-/// Crops sampled per (segment, seat) — averaged into one embedding, so a
-/// blink or a motion-blurred sample can't mint its own person.
-#[cfg(feature = "face")]
-const FACE_SAMPLES_PER_SEG: usize = 4;
-/// Region around the tracked face box handed to YuNet (the warp needs
-/// forehead-to-chin plus air; the box is Ultraface-tight).
-#[cfg(feature = "face")]
-const FACE_REGION_EXPAND: f32 = 2.0;
-
 /// Fetch ONE full-res rgb24 frame at clip-relative `t` (segment seek
 /// `seek_s + t`). `None` when the stream yields nothing (end of segment).
 #[cfg(feature = "face")]
@@ -941,22 +961,6 @@ fn fetch_frame(
         },
     )?;
     Ok(out)
-}
-
-/// Copy a clamped rectangle out of an rgb24 frame.
-#[cfg(feature = "face")]
-fn crop_rgb(src: &[u8], sw: usize, sh: usize, x0: i32, y0: i32, w: usize, h: usize) -> (Vec<u8>, usize, usize, i32, i32) {
-    let x0 = x0.clamp(0, sw.saturating_sub(1) as i32);
-    let y0 = y0.clamp(0, sh.saturating_sub(1) as i32);
-    let x1 = ((x0 as usize) + w).min(sw);
-    let y1 = ((y0 as usize) + h).min(sh);
-    let (cw, ch) = (x1 - x0 as usize, y1 - y0 as usize);
-    let mut out = vec![0u8; cw * ch * 3];
-    for y in 0..ch {
-        let s = ((y0 as usize + y) * sw + x0 as usize) * 3;
-        out[y * cw * 3..(y + 1) * cw * 3].copy_from_slice(&src[s..s + cw * 3]);
-    }
-    (out, cw, ch, x0, y0)
 }
 
 /// Write an rgb24 buffer as a PNG through the sidecar ffmpeg (the repo has no
@@ -995,11 +999,12 @@ fn write_png_rgb(
     Ok(())
 }
 
-/// The ADR 0043 face lane: sample full-res crops per (segment, seat), embed
-/// through YuNet landmarks + SFace, cluster into PERSONS (threshold picked at
-/// the largest dendrogram gap — printed, not trusted silently), print the
-/// occupant map + camera merge, write the operator's contact sheet. Returns
-/// the segment→camera map for the voice-join replay (`None` when too few
+/// The face lane (ADR 0043/0044, production path): sample full-res crops per
+/// (segment, seat), embed through YuNet landmarks + SFace, and build the
+/// OCCUPANT MAP with the production `yc_frame::occupant::build_occupant_map`
+/// (person cut at the largest dendrogram gap — printed, not trusted
+/// silently). Prints the map + camera merge, writes the operator's contact
+/// sheet. Returns the map the voice join runs over (`None` when too few
 /// entries embedded to say anything).
 #[cfg(feature = "face")]
 #[allow(clippy::too_many_arguments)]
@@ -1016,7 +1021,7 @@ fn face_lane(
     cuts: &[f64],
     dur: f64,
     data_dir: &std::path::Path,
-) -> anyhow::Result<Option<Vec<usize>>> {
+) -> anyhow::Result<Option<yc_frame::occupant::OccupantMap>> {
     use yc_frame::face_id::{self, FaceIdentifier};
     let bin_s = analysis.bin_s;
     let n_bins = analysis.speaking.len();
@@ -1024,48 +1029,13 @@ fn face_lane(
     let n_segs = bounds.len() - 1;
     let t0 = std::time::Instant::now();
     let mut ident = FaceIdentifier::load(yunet, sface)?;
-    println!("\n== face lane (ADR 0043 spike): occupant map — who occupies each seat, per segment");
+    println!("\n== face lane (production path): occupant map — who occupies each seat, per segment");
 
-    // Sample times per segment: bins where the MOST tracks are present, at
-    // spread quantiles, inset from the cut edges (a cut-straddling decode
-    // would crop the wrong camera's pixels).
-    let seg_bins = |g: usize| -> (usize, usize) {
-        let b0 = (bounds[g] / bin_s).round() as usize;
-        let b1 = ((bounds[g + 1] / bin_s).round() as usize).min(n_bins);
-        (b0, b1.max(b0))
-    };
-    let count_at = |b: usize| -> usize {
-        analysis
-            .tracks
-            .iter()
-            .filter(|t| t.path.get(b).map(|p| p.is_some()).unwrap_or(false))
-            .count()
-    };
-    // (seg, sample time) — seek once per time, crop every present seat.
-    let mut samples: Vec<(usize, f64)> = Vec::new();
-    for g in 0..n_segs {
-        let (b0, b1) = seg_bins(g);
-        if b1 <= b0 {
-            continue;
-        }
-        // Inset one bin from each edge when the segment affords it.
-        let (lo, hi) = if b1 - b0 > 2 { (b0 + 1, b1 - 1) } else { (b0, b1) };
-        let max_c = (lo..hi).map(count_at).max().unwrap_or(0);
-        if max_c == 0 {
-            continue;
-        }
-        let cands: Vec<usize> = (lo..hi).filter(|&b| count_at(b) == max_c).collect();
-        let mut picked: Vec<usize> = Vec::new();
-        for q in [0.12, 0.38, 0.62, 0.88].iter().take(FACE_SAMPLES_PER_SEG) {
-            let b = cands[((cands.len() - 1) as f64 * q).round() as usize];
-            if !picked.contains(&b) {
-                picked.push(b);
-            }
-        }
-        for b in picked {
-            samples.push((g, (b as f64 + 0.5) * bin_s));
-        }
-    }
+    // Sample times per segment (production plan: most-present bins at spread
+    // quantiles, inset from the cut edges) — one seek per time, every present
+    // seat cropped from the same frame.
+    let samples =
+        yc_frame::occupant::plan_samples(analysis, &bounds, yc_frame::occupant::SAMPLES_PER_SEG);
 
     // Embed every (segment, seat) crop. One seek per sampled time.
     struct Entry {
@@ -1087,8 +1057,8 @@ fn face_lane(
         let b = ((t / bin_s) as usize).min(n_bins.saturating_sub(1));
         for tr in &analysis.tracks {
             let Some(fb) = tr.path.get(b).and_then(|p| p.as_ref()) else { continue };
-            let side = ((fb.w.max(fb.h) * FACE_REGION_EXPAND) as usize).max(64);
-            let (region, rw, rh, rx, ry) = crop_rgb(
+            let side = ((fb.w.max(fb.h) * yc_frame::occupant::REGION_EXPAND) as usize).max(64);
+            let (region, rw, rh, rx, ry) = yc_frame::occupant::crop_rgb(
                 &frame,
                 src_w,
                 src_h,
@@ -1098,20 +1068,8 @@ fn face_lane(
                 side,
             );
             let dets = ident.detect(&region, rw, rh)?;
-            // The intended face: nearest to the tracked box center (region
-            // coords), sane size relative to it — a neighbour leaking into
-            // the region or a poster face must not become this seat's crop.
             let (ecx, ecy) = (fb.cx() - rx as f32, fb.cy() - ry as f32);
-            let best = dets
-                .iter()
-                .filter(|d| d.bbox.h >= 0.4 * fb.h && d.bbox.h <= 2.5 * fb.h)
-                .map(|d| {
-                    let dc = ((d.bbox.cx() - ecx).powi(2) + (d.bbox.cy() - ecy).powi(2)).sqrt();
-                    (dc, d)
-                })
-                .filter(|(dc, _)| *dc < 0.9 * fb.h.max(1.0))
-                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let Some((_, det)) = best else {
+            let Some(det) = yc_frame::occupant::pick_track_face(&dets, ecx, ecy, fb.h) else {
                 n_nodet += 1;
                 continue;
             };
@@ -1142,84 +1100,76 @@ fn face_lane(
         return Ok(None);
     }
 
-    // Person clusters: run the agglomeration to ONE cluster, cut at the
-    // largest merge-distance gap (printed — the same-face/different-face
-    // margin is the evidence, not a magic threshold).
-    let embs: Vec<Vec<f32>> = entries.iter().map(|e| e.emb.clone()).collect();
-    let full = yc_frame::voice::cluster_cosine(&embs, 10.0);
-    let thr = if full.merges.len() < 2 {
-        0.5
-    } else {
-        let mut gap_at = 0usize;
-        let mut gap = 0f32;
-        for i in 0..full.merges.len() - 1 {
-            let d = full.merges[i + 1] - full.merges[i];
-            if d > gap {
-                gap = d;
-                gap_at = i;
-            }
-        }
-        (full.merges[gap_at] + full.merges[gap_at + 1]) * 0.5
+    // The PRODUCTION occupant map: person clusters cut at the largest
+    // dendrogram gap, singletons demoted to unknown occupants, segments
+    // merged into cameras only on identical fully-known maps (ADR 0044).
+    let face_entries: Vec<yc_frame::occupant::FaceEntry> = entries
+        .iter()
+        .map(|e| yc_frame::occupant::FaceEntry { seg: e.seg, track: e.track, emb: e.emb.clone() })
+        .collect();
+    let Some(map) = yc_frame::occupant::build_occupant_map(&face_entries, n_segs) else {
+        println!("  too few entries — occupant map skipped");
+        return Ok(None);
     };
-    let trail: Vec<String> = full.merges.iter().map(|d| format!("{d:.2}")).collect();
-    let cl = yc_frame::voice::cluster_cosine(&embs, thr);
+    let trail: Vec<String> = map.merges.iter().map(|d| format!("{d:.2}")).collect();
+    let n_clusters = map.assignment.iter().copied().max().map(|m| m + 1).unwrap_or(0);
     println!(
-        "  merge trail: [{}] -> cut at {:.2} -> {} persons",
+        "  merge trail: [{}] -> cut at {:.2} -> {} persons + {} singleton sighting(s)",
         trail.join(" "),
-        thr,
-        cl.k
+        map.cut,
+        map.n_persons,
+        n_clusters - map.n_persons
     );
     let seat_ch = |id: usize| (b'A' + (id % 26) as u8) as char;
-    for p in 0..cl.k {
+    let row_label = |p: usize| {
+        if p < map.n_persons {
+            format!("P{p}")
+        } else {
+            format!("?{p}") // a singleton sighting — unknown occupant, not an identity
+        }
+    };
+    for p in 0..n_clusters {
         let members: Vec<String> = entries
             .iter()
             .enumerate()
-            .filter(|(i, _)| cl.assignment[*i] == p)
+            .filter(|(i, _)| map.assignment[*i] == p)
             .map(|(_, e)| format!("seg{} {}@{:.1}s x{}", e.seg, seat_ch(e.track), e.t_first, e.n))
             .collect();
-        println!("  P{p}: {} entries [{}]", members.len(), members.join(", "));
+        println!("  {}: {} entries [{}]", row_label(p), members.len(), members.join(", "));
     }
-
-    // The occupant map + segments merged into CAMERAS by identical occupants.
-    let mut seg_map: Vec<std::collections::BTreeMap<usize, usize>> =
-        vec![Default::default(); n_segs];
-    for (i, e) in entries.iter().enumerate() {
-        seg_map[e.seg].insert(e.track, cl.assignment[i]);
-    }
-    println!("  occupant map (segment x seat -> person):");
-    let mut cam_keys: Vec<String> = Vec::new();
-    let mut seg_cam: Vec<usize> = vec![0; n_segs];
+    println!("  occupant map (segment x seat -> person; ? = unknown/singleton):");
     for g in 0..n_segs {
-        let desc: Vec<String> =
-            seg_map[g].iter().map(|(t, p)| format!("{}=P{p}", seat_ch(*t))).collect();
-        let key = if seg_map[g].is_empty() {
-            format!("<no faces:{g}>") // evidence-free segments never merge
-        } else {
-            desc.join(" ")
-        };
-        let cam = cam_keys.iter().position(|k| *k == key).unwrap_or_else(|| {
-            cam_keys.push(key.clone());
-            cam_keys.len() - 1
-        });
-        seg_cam[g] = cam;
+        let desc: Vec<String> = map.seats[g]
+            .iter()
+            .map(|(t, o)| match o {
+                yc_frame::occupant::Occupant::Person(p) => format!("{}=P{p}", seat_ch(*t)),
+                yc_frame::occupant::Occupant::Unknown => format!("{}=?", seat_ch(*t)),
+            })
+            .collect();
         println!(
-            "    seg{g:>2} {:>5.1}-{:>5.1}s  cam{cam} {}",
+            "    seg{g:>2} {:>5.1}-{:>5.1}s  cam{} {}{}",
             bounds[g],
             bounds[g + 1],
-            if seg_map[g].is_empty() { "(no faces sampled)".into() } else { desc.join("  ") }
+            map.seg_camera[g],
+            if desc.is_empty() { "(no faces sampled)".into() } else { desc.join("  ") },
+            if map.multi_visit(map.seg_camera[g]) { "" } else { "  (single visit)" }
         );
     }
-    let n_cams = cam_keys.len();
-    println!("  cameras by occupants: {n_cams} (the signature grouping saw its own count above)");
+    println!(
+        "  cameras by occupants: {} ({} multi-visit)",
+        map.camera_visits.len(),
+        map.camera_visits.iter().filter(|&&v| v >= 2).count()
+    );
 
-    // Contact sheet: one row per person, tiles time-ordered — the operator's
-    // eyes-gate ("every row is one human") without a render.
+    // Contact sheet: one row per cluster (persons first, then singleton
+    // sightings), tiles time-ordered — the operator's eyes-gate ("every row
+    // is one human") without a render.
     let tile = face_id::ALIGN_SIZE;
     let pad = 4usize;
     let max_cols = 16usize;
-    let mut rows: Vec<Vec<&Entry>> = vec![Vec::new(); cl.k];
+    let mut rows: Vec<Vec<&Entry>> = vec![Vec::new(); n_clusters];
     for (i, e) in entries.iter().enumerate() {
-        rows[cl.assignment[i]].push(e);
+        rows[map.assignment[i]].push(e);
     }
     for r in rows.iter_mut() {
         r.sort_by(|a, b| a.t_first.partial_cmp(&b.t_first).unwrap_or(std::cmp::Ordering::Equal));
@@ -1227,7 +1177,7 @@ fn face_lane(
     }
     let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if cols > 0 {
-        let (sw, sh) = (pad + cols * (tile + pad), pad + cl.k * (tile + pad));
+        let (sw, sh) = (pad + cols * (tile + pad), pad + n_clusters * (tile + pad));
         let mut sheet = vec![24u8; sw * sh * 3];
         for (p, row) in rows.iter().enumerate() {
             for (c, e) in row.iter().enumerate() {
@@ -1243,7 +1193,7 @@ fn face_lane(
         write_png_rgb(ffmpeg, &sheet_path, &sheet, sw, sh)?;
         println!("  contact sheet: {} (row = person, columns time-ordered)", sheet_path.display());
     }
-    Ok(Some(seg_cam))
+    Ok(Some(map))
 }
 
 /// `faceselftest <img> [<img>…]`: detect every face in each full frame and

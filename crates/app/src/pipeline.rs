@@ -67,6 +67,15 @@ pub struct PipelinePaths {
     /// the `face`-gated speaker analysis.
     #[cfg_attr(not(feature = "face"), allow(dead_code))]
     pub voice_model: PathBuf,
+    /// YuNet landmarks + SFace embedding models for the occupant map (ADR
+    /// 0044) — the person evidence the voice join is scoped by in the
+    /// attribution regime. Either absent: the join runs seat-scoped (the ADR
+    /// 0042 shipped behavior, off-screen flag off) and the Camera panel says
+    /// so. Only read by the `face`-gated speaker analysis.
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub yunet_model: PathBuf,
+    #[cfg_attr(not(feature = "face"), allow(dead_code))]
+    pub sface_model: PathBuf,
     /// htdemucs vocals model for the Vocal-stem captions (`sep`). May be absent:
     /// the export then captions the mixed analysis audio. Only read by the
     /// `sep`-gated caption pass.
@@ -2481,6 +2490,49 @@ fn do_analyze_speakers(
     let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
     tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
 
+    // --- occupant map (ADR 0044): who occupies each seat, per camera — the
+    // person evidence the voice join is scoped by. Computed only where it
+    // means something (the attribution regime; follow-visible ignores it by
+    // construction) and only when both face-id models are present — missing
+    // models degrade to the seat-scoped ADR 0042 join, never a failed job.
+    let attribution = speaker::attribution_regime(&analysis);
+    let mut face_note: Option<String> = None;
+    let occupant_map: Option<yc_frame::occupant::OccupantMap> = if !attribution {
+        None
+    } else if !(paths.yunet_model.is_file() && paths.sface_model.is_file()) {
+        face_note = Some(
+            "Person id off — face-id models missing (Diagnostics ▸ Downloads); seat-scoped voice join"
+                .into(),
+        );
+        tracing::info!("face-id models absent; voice join is seat-scoped");
+        None
+    } else {
+        let _ = tx.send(Progress::Stage("Mapping seat occupants (face id)"));
+        match build_occupant_map_via_seeks(paths, prepared, &analysis, &cuts, dur, cancel) {
+            Ok(Some(map)) => {
+                tracing::info!(
+                    persons = map.n_persons,
+                    cameras = map.camera_visits.len(),
+                    "speaker analysis: occupant map built"
+                );
+                Some(map)
+            }
+            Ok(None) => {
+                tracing::info!("occupant map: too few face entries; voice join is seat-scoped");
+                None
+            }
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    anyhow::bail!("cancelled");
+                }
+                face_note =
+                    Some(format!("Person id failed — seat-scoped voice join ({e:#})"));
+                tracing::warn!(error = %format!("{e:#}"), "occupant map failed; seat-scoped join");
+                None
+            }
+        }
+    };
+
     // --- voice lane (ADR 0042): the diarization tiebreak beside the mouth
     // lane. Additive by design — a missing or broken model yields exactly the
     // mouth-only analysis (plus a note for the Camera panel), never a failed
@@ -2505,8 +2557,8 @@ fn do_analyze_speakers(
                     &analysis,
                     &cuts,
                     dur,
-                    speaker::attribution_regime(&analysis),
-                    None,
+                    attribution,
+                    occupant_map.as_ref(),
                 ) {
                     Some((mut lane, diag)) => {
                         for l in &diag.lines {
@@ -2551,7 +2603,89 @@ fn do_analyze_speakers(
     for f in speaker::audit_camera_plan(&analysis, &plan) {
         tracing::warn!(finding = %f, "camera plan audit");
     }
-    Ok((analysis, plan, voice_note))
+    // One note string, one line per lane that is off/degraded — the Camera
+    // panel prints each line.
+    let note = match (voice_note, face_note) {
+        (Some(v), Some(f)) => Some(format!("{v}\n{f}")),
+        (Some(v), None) => Some(v),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
+    Ok((analysis, plan, note))
+}
+
+/// Build the occupant map from targeted full-res seeks (ADR 0044): the
+/// production twin of the harness face lane — the same sampling plan, region
+/// crops, landmark alignment, and aggregation, through the same pure
+/// functions. ~13 s per 70 s clip harness-measured (52 seeks + 50 embeddings,
+/// one core), sequential; only runs in the attribution regime with both
+/// models present, so follow-visible clips never pay it.
+#[cfg(feature = "face")]
+fn build_occupant_map_via_seeks(
+    paths: &PipelinePaths,
+    prepared: &PreparedClip,
+    analysis: &SpeakerAnalysis,
+    cuts: &[f64],
+    dur: f64,
+    cancel: &CancelToken,
+) -> Result<Option<yc_frame::occupant::OccupantMap>> {
+    use yc_frame::{face_id, occupant};
+    let bin_s = analysis.bin_s;
+    let n_bins = analysis.speaking.len();
+    let (src_w, src_h) = (prepared.src_w as usize, prepared.src_h as usize);
+    let bounds = yc_frame::voice::segment_bounds(cuts, dur);
+    let mut ident = face_id::FaceIdentifier::load(&paths.yunet_model, &paths.sface_model)?;
+    let samples = occupant::plan_samples(analysis, &bounds, occupant::SAMPLES_PER_SEG);
+    let mut acc: std::collections::HashMap<(usize, usize), Vec<Vec<f32>>> = Default::default();
+    for &(g, t) in &samples {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        // One full-res frame at the sampled time (a short window, first frame).
+        let mut frame: Option<Vec<u8>> = None;
+        yc_ingest::stream_frames_rgb(
+            &paths.ffmpeg,
+            &prepared.render_src,
+            prepared.seek_s + t,
+            (2.5 / prepared.src_fps.max(1.0)).max(0.05),
+            prepared.src_w as u32,
+            prepared.src_h as u32,
+            prepared.src_fps,
+            1,
+            &mut |rgb| {
+                frame = Some(rgb.to_vec());
+                false
+            },
+        )?;
+        let Some(frame) = frame else { continue };
+        let b = ((t / bin_s) as usize).min(n_bins.saturating_sub(1));
+        for tr in &analysis.tracks {
+            let Some(fb) = tr.path.get(b).and_then(|p| p.as_ref()) else { continue };
+            let side = ((fb.w.max(fb.h) * occupant::REGION_EXPAND) as usize).max(64);
+            let (region, rw, rh, rx, ry) = occupant::crop_rgb(
+                &frame,
+                src_w,
+                src_h,
+                (fb.cx() - side as f32 * 0.5) as i32,
+                (fb.cy() - side as f32 * 0.5) as i32,
+                side,
+                side,
+            );
+            let dets = ident.detect(&region, rw, rh)?;
+            let (ecx, ecy) = (fb.cx() - rx as f32, fb.cy() - ry as f32);
+            let Some(det) = occupant::pick_track_face(&dets, ecx, ecy, fb.h) else { continue };
+            let emb = ident.embed(&region, rw, rh, &det.kps)?;
+            acc.entry((g, tr.id)).or_default().push(emb);
+        }
+    }
+    let mut entries: Vec<occupant::FaceEntry> = acc
+        .into_iter()
+        .filter_map(|((seg, track), embs)| {
+            face_id::aggregate_unit(&embs).map(|emb| occupant::FaceEntry { seg, track, emb })
+        })
+        .collect();
+    entries.sort_by(|a, b| (a.seg, a.track).cmp(&(b.seg, b.track)));
+    Ok(occupant::build_occupant_map(&entries, bounds.len().saturating_sub(1)))
 }
 
 /// The `scene` value above which an inter-frame change is a source **cut**, not
