@@ -548,8 +548,15 @@ impl EditorState {
         });
 
         // --- Timeline (bottom) ---
+        // Resizable by the operator (drag the top edge, like the side panels):
+        // the fixed 150px strip squeezed the voice row + seat lanes into
+        // near-invisible bars (2026-07-06 feedback). The lanes flex to fill
+        // whatever height is dragged; min = the old size, so it never gets
+        // smaller than the pre-resize UI.
         egui::Panel::bottom("studio-timeline")
-            .exact_size(150.0)
+            .resizable(true)
+            .default_size(230.0)
+            .size_range(150.0..=420.0)
             .show_inside(ui, |ui| {
                 if let Some(a) = self.ui_timeline(ui, busy, rendering) {
                     action = a;
@@ -1199,19 +1206,26 @@ impl EditorState {
         });
         ui.add_space(4.0);
 
-        // The strip: ruler(16) + captions(22) + speakers(N*12) + voice(12) + cuts(10).
+        // The strip fills the height the operator dragged the panel to. The
+        // chrome rows (ruler, caption blocks, cut markers) keep their fixed
+        // sizes; the seat lanes + voice row split ALL the remaining height
+        // equally, floored at the old 13px — so the minimum panel degrades to
+        // exactly the old layout, and dragging taller always visibly fattens
+        // the lanes (no cap: the panel's own max bounds them).
         let n_tracks = self.speakers.as_ref().map(|a| a.tracks.len()).unwrap_or(0);
         let has_voice = self.speakers.as_ref().map(|a| a.voice.is_some()).unwrap_or(false);
-        let strip_h = 16.0
-            + 24.0
-            + (n_tracks as f32 * 13.0)
-            + if has_voice { 13.0 } else { 0.0 }
-            + 12.0
-            + 8.0;
+        let n_lanes = n_tracks + usize::from(has_voice);
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), strip_h.max(60.0)),
+            egui::vec2(ui.available_width(), ui.available_height().max(60.0)),
             Sense::click_and_drag(),
         );
+        // 64 = the chrome the painting below actually uses: ruler 18 +
+        // caption row 26 above the lanes, cut markers 20 below them.
+        let lane_h = if n_lanes == 0 {
+            13.0
+        } else {
+            ((rect.height() - 64.0) / n_lanes as f32).max(13.0)
+        };
         let p = ui.painter_at(rect);
         p.rect_filled(rect, CornerRadius::same(4), theme::WELL);
         let t_to_x = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
@@ -1317,7 +1331,7 @@ impl EditorState {
                         p.rect_filled(
                             Rect::from_min_max(
                                 egui::pos2(t_to_x(t0), lane_y),
-                                egui::pos2(t_to_x(t1), lane_y + 9.0),
+                                egui::pos2(t_to_x(t1), lane_y + lane_h - 4.0),
                             ),
                             CornerRadius::same(2),
                             color.gamma_multiply(0.75),
@@ -1327,7 +1341,7 @@ impl EditorState {
                         i += 1;
                     }
                 }
-                lane_y += 13.0;
+                lane_y += lane_h;
             }
             // The voice lane (ADR 0042): the diarization evidence itself,
             // beside the fused seat lanes above — spans where the voice
@@ -1349,7 +1363,7 @@ impl EditorState {
                         p.rect_filled(
                             Rect::from_min_max(
                                 egui::pos2(t_to_x(i as f64 * a.bin_s), lane_y + 1.0),
-                                egui::pos2(t_to_x(j as f64 * a.bin_s), lane_y + 8.0),
+                                egui::pos2(t_to_x(j as f64 * a.bin_s), lane_y + lane_h - 5.0),
                             ),
                             CornerRadius::same(2),
                             color,

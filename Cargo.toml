@@ -17,8 +17,9 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# UI
-eframe = "0.34"
+# UI — `persistence` keeps egui memory (panel sizes incl. the operator's
+# timeline height, window geometry) across launches, in the OS app-data dir.
+eframe = { version = "0.34", features = ["persistence"] }
 egui = "0.34"
 # Serialization
 serde = { version = "1", features = ["derive"] }

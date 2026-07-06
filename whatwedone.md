@@ -4,6 +4,34 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-06 (afternoon) — Studio timeline resizable, voice row visible, gate PASSED
+
+The operator's fresh-binary ask ("timeline is so small it doesnt visible
+there, maybe make a timeline size dragable or have a scroll?") shipped as a
+drag-to-resize strip. UI-only; zero analysis/render behavior change.
+
+- **The strip**: the Studio's bottom panel is now resizable exactly like
+  the side panels (drag its top edge), default 230 px, range 150–420. The
+  chrome rows (ruler, caption blocks, cut markers) keep their fixed sizes;
+  the seat lanes + voice row split ALL the remaining height equally,
+  floored at the old 13 px — so the minimum panel degrades to exactly the
+  old layout, and dragging taller always visibly fattens the lanes. A
+  proposed 34 px lane cap died during implementation: on ANTITESA's 3
+  lanes it was already saturated at the default height, so dragging would
+  have grown only dead space — no cap; the panel's own max bounds it.
+- **Persistence**: eframe's `persistence` feature (one Cargo.toml line) —
+  the timeline height, the side-panel widths, and the window geometry all
+  survive restarts via egui memory in
+  `AppData\Roaming\yt-clipper\data\app.ron`. Proven with a boot → resize
+  to 1111×777 → graceful close → boot round-trip restoring the size
+  byte-exactly. Deliberately no ADR: one panel builder + one cargo
+  feature, trivially reversible (grill call).
+- **Bars**: suites 327 green both ways; Deddy person-join bars intact
+  (occupant map 4+2 at cut 0.40, exactly one VALID edge V2×cam0→P1,
+  off-screen 1.5 s, audit clean); ANTITESA follow-visible + audit clean +
+  fg byte-pin `9e07d81f…` intact. **Operator gate: PASS — the voice row's
+  spans plainly visible on ANTITESA at their chosen height.**
+
 ## 2026-07-06 (mid-day) — Person-scoped voice join in production, gate PASSED ("honest evidence over lucky output")
 
 The ADR 0043 spike became production (ADR 0044): the voice⇄seat join
