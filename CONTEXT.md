@@ -136,6 +136,10 @@ _Avoid_: theme, template (both suggest something beyond field values)
 The operator's edited transcript from the Studio's caption panel (edit / add / delete / split / merge / censor, `m:ss.cc` timestamps), shipped with a Render and burned **verbatim** — no whisper, no harvest, no silence-drop, no re-timing (ADR 0039): the automated timing machinery exists to clean whisper's guesses, not the operator's words. Per-clip and immediate, unlike Dialect-store curation (durable per Creator, ADR 0031).
 _Avoid_: correction (that is the dialect/LLM pass over whisper output), custom captions
 
+**Publish bar**:
+The judgment a rendered Clip faces before posting, made by the operator as a publisher: *would I post this?* — a Clip ships when a naive viewer would notice nothing wrong with it. The bar is publisher-honest (ruled 2026-07-07): every defect the operator's eye catches is recorded with its clip-relative timestamp and what the eye saw, even on a Clip that still ships — ship-with-known-wart is allowed and recorded, and that record (not the ship/hold call) is what feeds the next slice.
+_Avoid_: gate (a gate is a pre-declared measured bar on an instrument; the publish bar is the operator's publisher eye on a finished Clip), quality check
+
 **Offline**:
 The core constraint: all analysis and rendering happens on the local machine. The only permitted network uses are user-initiated: ingesting a VOD, and fetching a missing tool or model from its pinned official source (the Diagnostics page's downloads).
 _Avoid_: air-gapped, local-only (both overstate it — ingestion and dependency fetches may use the network)

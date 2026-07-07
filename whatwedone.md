@@ -4,6 +4,52 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-07 — Ship shakedown: first fresh-material production run — 2 of 3 clips shipped
+
+The production tool ran as a production tool for the first time on
+fresh material (Deddy Corbuzier VIOR episode, o1SBOz5UK2Q, 5-person
+panel): headless `--detect` ranked 25 Moments (persisted; the GUI's M8
+re-import restored them), the top 3 went promote → Studio (Active
+Speaker, Qwen-ensemble captions) → render, and the operator judged each
+against the new **Publish bar** (CONTEXT.md term, ruled publisher-honest:
+ship when a naive viewer would notice nothing; every defect ledgered
+with its clip-relative timestamp regardless). **Clips 1 and 3 SHIPPED;
+Clip 2 HELD** (two fully-empty camera windows in 47 s).
+
+- **Worst defect, twin-confirmed across all 3 clips and both regimes**
+  (9 publisher-visible hits; the queued slice —
+  `nextprompt-solo-presence-gate.md`): a solo Shot never verifies that
+  what it frames is the attributed person's real, currently-visible
+  face. Sub-class A: subject undetected → the stale crop persists →
+  set dressing/sliced heads ship and the camera audit is BLIND (no
+  measurement, no finding). Sub-class B: in a new angle the seat's
+  position lands on set dressing, the track latches onto a face-like
+  blob (a guitar body, a pegboard), and the audit is FOOLED ("subject
+  in crop" passes). Operator's causal read verified on the harness twin:
+  the camera doesn't reframe after the previous person because nothing
+  measured triggers the dead-zone.
+- **The instruments earned their keep where their regime allowed**:
+  Clip 3 planned 31 shots with 6 reaction/off-screen diffs, caught a
+  head-thrown-back laugh ON-frame, and claimed 0.9 s off-screen — while
+  Clip 1 planned FOLLOW-VISIBLE (multicam close-up section; map + mask
+  structurally out of play) and Clip 2's voice join produced **0.0 s**
+  (rapid banter fragments into 1–2-window embedding scraps — ADR 0044's
+  texture generalizing; no off-screen rescue exactly when banter needs
+  it). Fresh material mixes regimes per-section; the fixtures never did.
+- **Infrastructure findings with measured evidence**: the production
+  binary has been face-only through the whole camera arc (`ser`/arousal
+  never in a release build despite the gate-passed model installed —
+  detect ranks without one Signal); YouTube's `web_safari` segment fetch
+  flaps in ~10-minute windows on player-rollout days and defeats the
+  4×3 s retry policy (3 separate 4/4 failures today), with the GUI
+  showing only a bare "Failed" chip (M8 error-surfacing gap, now
+  evidenced).
+- Session evidence of record (local): the defect ledger
+  `handoffs/2026-07-07-ship-shakedown-ledger.md` (F1–F9 + twin
+  verdicts) and `handoffs/2026-07-07-ship-shakedown.md` (operational
+  traps: regime mixing, fetch-flap probe recipe, GUI drive recipe,
+  twin commands + deterministic segment refetch args).
+
 ## 2026-07-07 — Shared-reaction wiring: the laughter mask ships into production (ADR 0046)
 
 ADR 0045's PASSED instrument gained its production caller: the
