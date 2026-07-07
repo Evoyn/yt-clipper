@@ -4,6 +4,30 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-08 — Reaction-phantom suppression: the laughter-pile captions now drop (ADR 0050)
+
+Fix #1 of the caption-overlap roadmap (ADR 0049), wired into the real render and
+gated. The caption stage was blind to the shared-reaction mask the camera already
+reads; now it recomputes that laughter mask over the clip's mixed audio and **drops
+the flash piles crammed onto group laughter** — your opening "YA SIAPA TAU MAU" that
+isn't really spoken. Quality-first: the extra tagger pass runs every render.
+Committed + pushed.
+
+- **What drops, precisely:** a *pile* — a run of ≥ 3 back-to-back cues that are each
+  too short to read AND sit on the laughter mask. On clip 3 that is exactly the 4-cue
+  opening pile; 97 of 101 cues survive, nothing else touched.
+- **What never drops (the promise):** a real word is never eaten. The 5 words you
+  flagged as mis-placed-early all survive — they are lone, held cues, not piles, and
+  re-placing them at the right moment is the next slice. Real fast back-and-forth talk
+  sits *below* the laughter mask, so it is untouched.
+- **The measure-first correction:** the plan was to spare cues that have "a clean
+  attributed speaker," but measuring showed the opening laugh is attributed with full
+  confidence (a laughing mouth moves) — that guard would have *protected* the pile. The
+  real signal is **density × laughter**, not who is attributed.
+- **Controls stay clean:** ANTITESA (which has real laughter, mask peak 0.70) drops 0;
+  the busy 3-person Deddy clip drops 0; the camera path is byte-identical (the ANTITESA
+  fingerprint and every fixture bar still pass); the test suites are green both ways.
+
 ## 2026-07-08 — Captions under overlapping speech: measured the defect, gate PASSED (ADR 0049)
 
 You found the shipped 4-person VIOR captions bad when several people talk at

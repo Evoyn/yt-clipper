@@ -589,6 +589,100 @@ pub fn refine_caption_timing_keep_verified(
     transcript
 }
 
+/// A reaction PILE is at least this many consecutive too-fast, reaction-masked
+/// cues — the density that separates hallucinated words crammed onto laughter
+/// from a lone real word mis-placed onto it. Matches the `caption_overlap_diag`
+/// phantom-pile auto-detection (ADR 0049), which named the signature on clip 3.
+const PILE_MIN: usize = 3;
+/// Laughter-family mask operating point (mirrors `speaker::REACTION_TAU`, ADR
+/// 0045): an onset whose bin scores at/above this sits on a shared reaction.
+const REACTION_TAU: f32 = 0.1;
+
+/// Per-cue suppression decision for [`suppress_reaction_phantoms`]: `true` =
+/// drop. Same order and length as `units`, so a caller can log exactly which
+/// cues (and their spans) a render dropped. A cue is a **pile member** when it
+/// is both too-fast (dwell < [`MIN_READ_S`]) and reaction-masked at its onset
+/// (`reaction >= REACTION_TAU`); a maximal run of `>= PILE_MIN` consecutive
+/// pile members is dropped, everything else kept.
+pub fn reaction_phantom_drops(units: &[CaptionUnit], reaction: &[f32], bin_s: f64) -> Vec<bool> {
+    let n = units.len();
+    let mut drop = vec![false; n];
+    if n == 0 || bin_s <= 0.0 || reaction.is_empty() {
+        return drop;
+    }
+    // A too-fast cue whose onset lands on the laughter mask. The `+ 1e-9` mirrors
+    // the instrument's floor test so a cue held to exactly MIN_READ_S is NOT fast
+    // (its dwell is readable); a cue past the mask's end reads as unmasked (0.0).
+    let pile_member = |u: &CaptionUnit| -> bool {
+        if (u.end_s - u.start_s) + 1e-9 >= MIN_READ_S {
+            return false;
+        }
+        let bin = (u.start_s / bin_s).floor();
+        if bin < 0.0 {
+            return false;
+        }
+        reaction.get(bin as usize).copied().unwrap_or(0.0) >= REACTION_TAU
+    };
+    let mut i = 0;
+    while i < n {
+        if !pile_member(&units[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < n && pile_member(&units[j]) {
+            j += 1;
+        }
+        if j - i >= PILE_MIN {
+            drop[i..j].iter_mut().for_each(|d| *d = true);
+        }
+        i = j;
+    }
+    drop
+}
+
+/// Reaction-phantom suppression (ADR 0050, the ADR 0049 fix #1): drop the flash
+/// PILES the caption stage crams onto a shared-reaction stretch. Measured on the
+/// VIOR clip 3 (ADR 0049): the opening group-laugh carried a tight pile of
+/// hallucinated one-word cues ("YA SIAPA TAU MAU"), each too short to read, all
+/// on the laughter mask — words the operator confirmed are laughter, not speech.
+///
+/// The separating signature is **density x reaction**, never attribution:
+/// - a PILE is a run of `>= PILE_MIN` consecutive too-fast, reaction-masked cues;
+/// - a REAL word mis-placed onto laughter is a LONE, gap-filled (held) cue, so it
+///   is never in such a run (measured: every mis-onset word on clip 3 held
+///   >= 0.58 s, and "gue buka" over the 29 s laugh is a run of only two);
+/// - real overlapping SPEECH sits BELOW the mask (measured: the contested
+///   "masalah gue mau nyobain" run scored laugh <= 0.05), so the mask excludes it.
+///
+/// The mouth/voice attribution deliberately plays no part: a laughing mouth
+/// moves, so the lane attributes a speaker at full confidence right through the
+/// laugh (the exact blindness the reaction lane exists to cover, ADR 0045) — the
+/// opening pile is attributed `speaker 3, conf 1.0`, so gating on "no clean
+/// attributed speaker" (the ADR 0049 roadmap's first guess) would PROTECT the
+/// pile. The measurement refuted that guard; density x reaction replaced it.
+///
+/// `reaction` is the per-bin laughter-family mask at `bin_s` (the ADR 0045/0046
+/// signal, recomputed on the clip's analysis.wav by the caller). Pure and
+/// order-preserving — only drops — so the survivors keep refine's onset-clamped,
+/// gap-filled timing untouched.
+pub fn suppress_reaction_phantoms(
+    mut transcript: Transcript,
+    reaction: &[f32],
+    bin_s: f64,
+) -> Transcript {
+    let drop = reaction_phantom_drops(&transcript.units, reaction, bin_s);
+    if drop.iter().any(|d| *d) {
+        let units = std::mem::take(&mut transcript.units);
+        transcript.units = units
+            .into_iter()
+            .zip(drop)
+            .filter_map(|(u, d)| (!d).then_some(u))
+            .collect();
+    }
+    transcript
+}
+
 /// Multi-word rolling-pop lines (M1): each [`PreviewLine`] is one Dialogue
 /// event in which every word pops in at its onset (grouping + line bounds come
 /// from [`preview_lines`]).
@@ -1299,5 +1393,151 @@ mod tests {
                 .all(|w| w.text.chars().all(|c| !c.is_lowercase()));
             assert!(all_upper, "preview words carry the burn-in's uppercasing");
         }
+    }
+
+    // --- reaction-phantom suppression (ADR 0050) ---------------------------
+
+    fn phantom_cu(text: &str, start_s: f64, end_s: f64) -> CaptionUnit {
+        CaptionUnit { text: text.into(), start_s, end_s }
+    }
+
+    /// A laughter mask at 0.25 s bins scoring `0.5` (>= tau) over the given
+    /// `[start, end)` second spans, `0.0` elsewhere.
+    fn laugh_mask(dur_s: f64, spans: &[(f64, f64)]) -> Vec<f32> {
+        let bin_s = 0.25;
+        let n = (dur_s / bin_s).ceil() as usize + 1;
+        let mut m = vec![0.0f32; n];
+        for &(a, b) in spans {
+            let (i0, i1) = ((a / bin_s) as usize, (b / bin_s).ceil() as usize);
+            for k in i0..i1.min(n) {
+                m[k] = 0.5;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn suppress_drops_the_opening_reaction_pile() {
+        // clip 3's signature: YA SIAPA TAU MAU crammed onto the opening laugh,
+        // each cue too short to read, all on the mask -> the whole run drops.
+        // COBA follows off-mask (laugh fell below tau) and survives.
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("ya", 1.64, 1.76),
+                phantom_cu("siapa", 1.76, 2.08),
+                phantom_cu("tau", 2.08, 2.20),
+                phantom_cu("mau", 2.20, 2.36),
+                phantom_cu("coba", 2.36, 2.56),
+            ],
+        };
+        let mask = laugh_mask(3.0, &[(1.5, 2.25)]); // covers YA..MAU, not COBA(2.36)
+        let out = suppress_reaction_phantoms(t, &mask, 0.25);
+        let texts: Vec<&str> = out.units.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, ["coba"]);
+    }
+
+    #[test]
+    fn suppress_keeps_a_lone_word_on_laughter() {
+        // A real word mis-placed onto laughter is ONE cue, never a pile: held
+        // (TAU, dwell 0.72) or flashed (GUE), a run below PILE_MIN survives —
+        // the false-positive killer for the mis-onset class. "gue buka" over the
+        // 29 s laugh is a run of only two, so it survives too.
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("tau", 5.40, 6.12),    // held, on the mask
+                phantom_cu("gue", 29.86, 30.00),  // flashed, on the mask
+                phantom_cu("buka", 30.00, 30.38), // flashed, on the mask -> run of 2
+                phantom_cu("umkm", 30.38, 31.32), // held -> breaks the run
+            ],
+        };
+        let mask = laugh_mask(32.0, &[(5.25, 6.25), (29.5, 30.5)]);
+        let out = suppress_reaction_phantoms(t, &mask, 0.25);
+        assert_eq!(out.units.len(), 4, "no lone / sub-PILE_MIN run dropped");
+    }
+
+    #[test]
+    fn suppress_keeps_dense_speech_below_the_mask() {
+        // The contested "masalah gue mau nyobain gak" run: five too-fast cues,
+        // but laugh <= 0.05 (below tau) -> not reaction, never a pile.
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("masalah", 14.26, 14.64),
+                phantom_cu("gue", 14.64, 14.86),
+                phantom_cu("mau", 14.86, 15.02),
+                phantom_cu("nyobain", 15.02, 15.36),
+                phantom_cu("gak", 15.36, 15.46),
+            ],
+        };
+        let mask = laugh_mask(16.0, &[]); // nothing on the mask
+        let out = suppress_reaction_phantoms(t, &mask, 0.25);
+        assert_eq!(out.units.len(), 5, "dense speech below the mask is untouched");
+    }
+
+    #[test]
+    fn reaction_phantom_drops_marks_only_the_pile_run() {
+        let units = vec![
+            phantom_cu("ya", 1.64, 1.76),
+            phantom_cu("siapa", 1.76, 2.08),
+            phantom_cu("tau", 2.08, 2.20),
+            phantom_cu("mau", 2.20, 2.36),
+            phantom_cu("coba", 2.36, 2.56),
+        ];
+        let mask = laugh_mask(3.0, &[(1.5, 2.25)]);
+        let drop = reaction_phantom_drops(&units, &mask, 0.25);
+        assert_eq!(drop, vec![true, true, true, true, false]);
+    }
+
+    #[test]
+    fn suppress_is_a_noop_without_a_mask() {
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("ya", 1.64, 1.76),
+                phantom_cu("siapa", 1.76, 2.08),
+                phantom_cu("tau", 2.08, 2.20),
+            ],
+        };
+        let out = suppress_reaction_phantoms(t, &[], 0.25);
+        assert_eq!(out.units.len(), 3, "no mask -> nothing to suppress");
+    }
+
+    #[test]
+    fn suppress_needs_a_contiguous_run_a_held_cue_splits_it() {
+        // Two fast masked cues, a held one, two more: two runs of two, neither
+        // reaches PILE_MIN, so nothing drops. Conservative by design — a split
+        // pile is spared, never a real word eaten.
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("a", 1.00, 1.12),
+                phantom_cu("b", 1.12, 1.24),
+                phantom_cu("c", 1.24, 1.70), // held (dwell 0.46) -> breaks the run
+                phantom_cu("d", 1.70, 1.82),
+                phantom_cu("e", 1.82, 1.94),
+            ],
+        };
+        let mask = laugh_mask(3.0, &[(0.75, 2.25)]);
+        let out = suppress_reaction_phantoms(t, &mask, 0.25);
+        assert_eq!(out.units.len(), 5, "a broken run never reaches PILE_MIN");
+    }
+
+    #[test]
+    fn suppress_treats_exactly_min_read_as_readable() {
+        // A cue held to exactly MIN_READ_S is readable, not a pile member, so the
+        // run around it never reaches PILE_MIN (guards the floor's `+1e-9`).
+        let t = Transcript {
+            language: Language::Id,
+            units: vec![
+                phantom_cu("a", 1.00, 1.12), // fast
+                phantom_cu("b", 1.12, 1.52), // dwell exactly 0.40 -> readable
+                phantom_cu("c", 1.52, 1.64), // fast
+            ],
+        };
+        let mask = laugh_mask(3.0, &[(0.75, 2.0)]);
+        let out = suppress_reaction_phantoms(t, &mask, 0.25);
+        assert_eq!(out.units.len(), 3, "a 0.40 s cue is not a pile member");
     }
 }
