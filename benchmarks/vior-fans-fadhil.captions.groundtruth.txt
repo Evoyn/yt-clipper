@@ -1,0 +1,42 @@
+# Operator caption ground truth (2026-07-07) for the VIOR "fans Fadhil" clip.
+# Clip: workspace/Deddy Corbuzier/MENUJU INDONESIA CEMAS BERSAMA VIOR.../data
+#       analysis.wav moment 3 [3592.0 - 3653.0 s], language id, qwen_ensemble,
+#       huge-word genre. Times below are CLIP-RELATIVE seconds (0 = 3592.0 s VOD).
+#
+# The operator watched the shipped clip and named, by ear, where the captions
+# fail under overlapping speech. Their ear is the bar (the enh-overclaim rule).
+# This is the must-fix list the instrument (caption_overlap_diag) must flag.
+#
+# Format, one item per line:   MODE  heard_s  shown_s | verbatim note
+#   MODE     = mis | drop | phantom | wrong
+#   heard_s  = clip-relative time the operator HEARD the word (the truth)
+#   shown_s  = clip-relative time the cue actually SHOWS it ('-' if no cue)
+#   mis      : a cue exists but is placed > tol from when the word is spoken
+#              (all of these read EARLY / leading, per the operator's notes)
+#   drop     : the word was spoken but NO cue carries it (a recall failure)
+#   phantom  : a cue appears where the operator heard laughter / no clean word
+#   wrong    : right time, wrong text (editor-fixable typo; OUT OF SCOPE here,
+#              listed only so the instrument doesn't miscount them as drops)
+
+mis      5.00   3.66  | laughter at 3-4s, cue "siapa" shows early; real "siapa" (then "tau") is at ~5s
+mis     23.00  21.00  | "siapa tau" (mis-heard "SDC") is placed ~2s early at 21s, belongs at 23s
+mis     28.00  26.00  | people laughing at 26s, cue "gue" shows there; the word is at ~28s
+mis     32.00  31.00  | "fadil" shows at 31s, belongs at ~32s
+mis     54.00  53.00  | "jalannya" shows at 53s, belongs at ~54s
+
+drop     6.50   -     | "yang itu isinya otot kayaknya" spoken; only "yang" captioned, rest dropped
+drop     8.50   -     | "yang keluar kreatin-kreatin" spoken; "yang" + "kreatin-kreatin" not carried
+drop    52.00   -     | "pinguin" spoken, never captioned
+
+phantom  3.70   3.66  | 3-4s is laughter; the early "siapa" cue sits on it
+phantom 12.00  12.00  | 12s is laughter; cue "ya" should be none (faint bg "itu yang keluar mungkin gatau")
+phantom 26.00  26.00  | 26s is laughter; cue "gue" sits on it (also mis-placed, see mis@28)
+
+wrong   10.50  10.50  | "proten whey" should be "protein whey"
+wrong   18.50  18.50  | "lu" should be "lucu"
+wrong   20.00  20.00  | "ya" should be "yakan"
+wrong   21.00  21.00  | "SDC" should be "siapa tau" (text; placement covered by mis@23)
+wrong   36.00  36.00  | "aslinya" should be "ASI" (mother's milk)
+wrong   49.00  49.00  | "pamu" should be "Pak muh"
+wrong   51.00  51.00  | "gemot" should be "gemes"
+wrong   60.00  60.00  | "duduk-duduk" should be "dodo"
