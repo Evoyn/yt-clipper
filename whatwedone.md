@@ -4,6 +4,39 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-08 — Captions under overlapping speech: measured the defect, gate PASSED (ADR 0049)
+
+You found the shipped 4-person VIOR captions bad when several people talk at
+once (delayed/leading, dropped words, flashing too fast), while turn-taking
+captions stay good. Instead of guessing a fix, this session **measured** where
+and why — the same measure-first discipline as the camera lanes (an unmeasured
+"fix" is the `enh` overclaim, caught twice). One implementation: the instrument
++ the gate; the fixes follow as their own measured slices. Committed + pushed.
+
+- **A caption-overlap inspector** (`caption_overlap_diag`) reads what actually
+  shipped — the burned `clip.ass` cues — and joins them against the overlap
+  signal the analysis already computes (who's talking + the laughter mask) and
+  your by-ear ground truth. Pure, no GPU, reproducible; kept in-tree for every
+  fix to re-measure against.
+- **The verdict, on your clip 3 (fans Fadhil):** four distinct failures, and a
+  cross-clip control proved **all four are overlap-specific** — turn-taking
+  clips flash 0–2% of cues sub-readably, the overlap clips **54–78%**:
+  - **too-fast** (52% of cues): overlapping speakers pack 2–3× the words/second,
+    and the timing floor gets defeated so half the words flash by.
+  - **mis-onset**: the mis-placed cues appear ~1.5 s **early, onto the laughter**
+    (you confirmed this matches — captions race ahead at the laughs, then the
+    real speech feels un-captioned).
+  - **phantom**: words hallucinated onto laughter (an opening "YA SIAPA TAU MAU"
+    pile that isn't really spoken).
+  - **drop**: words masked by the overlap and never transcribed — a recall
+    problem no re-timing can fix.
+- **The root**: the caption stage is blind to the overlap signal (who's speaking
+  + the laughter mask) that the rest of the analysis already has. Feed it in and
+  three of the four collapse. **Fix order (approved, each its own gated slice):**
+  phantom suppression → too-fast grouping → mis-onset re-anchor → the drop/recall
+  lane. Nothing shipped into the render this session — the caption path is
+  byte-untouched. (ADR 0049)
+
 ## 2026-07-07 — Solo-presence WIRING: the verified check heals the plan in production (ADR 0048)
 
 Wired the solo-presence measurement (ADR 0047's instrument) into the
