@@ -829,7 +829,7 @@ fn main() -> anyhow::Result<()> {
     // re-frame without cause / subject adrift). ZERO findings on the
     // production fixtures is the regression bar; a finding means this plan
     // would render with a visible camera defect.
-    let audit = speaker::audit_camera_plan(&analysis, &plan);
+    let audit = speaker::audit_camera_plan(&analysis, &plan, &[]);
     if audit.is_empty() {
         println!("\n== camera audit: clean (0 findings)");
     } else {
@@ -1013,7 +1013,7 @@ fn main() -> anyhow::Result<()> {
     // --- solo presence (the 2026-07-07 worst-defect instrument): per solo
     // shot, does the plan verifiably frame its subject's real face? Additive
     // only — bars are placed on this table after it exists (ADR 0045 pattern).
-    solo_presence(
+    let presence_plan = solo_presence(
         ffmpeg,
         &segment,
         seek_s,
@@ -1096,6 +1096,33 @@ fn main() -> anyhow::Result<()> {
         );
         println!("rendering ../diar_reaction.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+    }
+    //  - YC_PRESENCE_RENDER -> the solo-presence REWRITTEN plan (ADR 0048),
+    //    from its own `camera_presence.fg` (NOT the byte-pinned camera_diag.fg).
+    //    Fresh output name (default ../diar_presence.mp4), overridable via
+    //    YC_PRESENCE_OUT so a VIOR gate render never clobbers a shipped clip.
+    if std::env::var_os("YC_PRESENCE_RENDER").is_some() {
+        match &presence_plan {
+            Some(rp) => {
+                let fg2 = data_dir.join("camera_presence.fg");
+                std::fs::write(&fg2, yc_render::build_camera_filtergraph(rp, "clip.ass"))?;
+                let out = std::env::var("YC_PRESENCE_OUT")
+                    .unwrap_or_else(|_| "../diar_presence.mp4".to_string());
+                let ffabs = std::fs::canonicalize(ffmpeg)?;
+                let args = yc_render::export_args_script(
+                    Path::new("segment.mp4"),
+                    seek_s,
+                    dur,
+                    "camera_presence.fg",
+                    &out,
+                );
+                println!("rendering {out} (solo-presence rewritten plan) ...");
+                yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
+            }
+            None => println!(
+                "YC_PRESENCE_RENDER: no rewritten plan (follow-visible or models absent) — nothing to render"
+            ),
+        }
     }
 
     // --- per-bin CSV for deeper digging ---------------------------------------
@@ -1620,7 +1647,7 @@ fn solo_presence(
     centroids: &[Vec<f32>],
     yunet: &std::path::Path,
     sface: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<yc_core::CameraPlan>> {
     use yc_frame::face_id::FaceIdentifier;
     use yc_frame::speaker;
     let bin_s = analysis.bin_s;
@@ -1641,6 +1668,10 @@ fn solo_presence(
     }
     let cos = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
     let mut n_seeks = 0usize;
+    // Per solo shot: the tallest crop-face over all seeks (0.0 = MISS), fed to
+    // the PRODUCTION Bar P + rewrite below — this harness is the production
+    // twin for the wiring (ADR 0048), not just a table.
+    let mut heights: Vec<(usize, f32)> = Vec::new();
     for (i, s) in plan.shots.iter().enumerate() {
         let (Some(id), yc_core::Layout::FullFrame { crop }) = (s.track, &s.layout) else {
             continue;
@@ -1774,6 +1805,9 @@ fn solo_presence(
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         times.dedup_by(|a, b| (*a - *b).abs() < 0.15);
+        // Tallest crop-face over this shot's seeks (Bar P arm 2's evidence) and
+        // whether any frame decoded (so ignorance never flags downstream).
+        let (mut shot_max_h, mut shot_got) = (0.0f32, 0usize);
         for t in times {
             let Some(frame) = fetch_frame(ffmpeg, segment, seek_s + t, src_w, src_h, src_fps)?
             else {
@@ -1781,6 +1815,7 @@ fn solo_presence(
                 continue;
             };
             n_seeks += 1;
+            shot_got += 1;
             // crop scan: any real face visible in what renders? Center in
             // frame coords — a det hugging the crop's edge is a sliced face.
             let c = crop_at(t);
@@ -1794,21 +1829,26 @@ fn solo_presence(
                 c.h as usize,
             );
             let crop_cell = match ident.detect(&region, rw, rh) {
-                Ok(dets) => match dets
-                    .iter()
-                    .max_by(|a, b| {
+                Ok(dets) => {
+                    // Bar P arm 2 reads the tallest face, not the top-scoring:
+                    // any subject-scale face in the crop rescues the shot.
+                    for d in &dets {
+                        shot_max_h = shot_max_h.max(d.bbox.h);
+                    }
+                    match dets.iter().max_by(|a, b| {
                         a.bbox.score.partial_cmp(&b.bbox.score).unwrap_or(std::cmp::Ordering::Equal)
                     }) {
-                    Some(d) => format!(
-                        "{:.2} h{:.0} @({:.0},{:.0}) x{}",
-                        d.bbox.score,
-                        d.bbox.h,
-                        d.bbox.cx() + rx as f32,
-                        d.bbox.cy() + ry as f32,
-                        dets.len()
-                    ),
-                    None => "MISS".into(),
-                },
+                        Some(d) => format!(
+                            "{:.2} h{:.0} @({:.0},{:.0}) x{}",
+                            d.bbox.score,
+                            d.bbox.h,
+                            d.bbox.cx() + rx as f32,
+                            d.bbox.cy() + ry as f32,
+                            dets.len()
+                        ),
+                        None => "MISS".into(),
+                    }
+                }
                 Err(e) => format!("err {e}"),
             };
             // track scan: what did the track match here, and who is it?
@@ -1872,9 +1912,53 @@ fn solo_presence(
             };
             println!("    {t:>6.1}s  crop {crop_cell:<18} track {track_cell}");
         }
+        // Omit a shot with no decoded frame — measured absence flags,
+        // ignorance does not (matches the production pass's `got > 0` gate).
+        if shot_got > 0 {
+            heights.push((i, shot_max_h));
+        }
     }
     println!("  {} seeks in {:.1}s", n_seeks, t0.elapsed().as_secs_f32());
-    Ok(())
+
+    // --- production twin (ADR 0048): feed the SAME measured crop-face heights
+    // through the PRODUCTION Bar P + fallback rewrite (the exact yc_frame
+    // functions `pipeline.rs` calls) so the fixtures and VIOR clips are
+    // verified against production here, not a re-implementation. Attribution
+    // regime + models present only — mirrors the pipeline's own gate exactly,
+    // so a follow-visible clip's plan is proven byte-identical (never touched).
+    if ident.is_some() && speaker::attribution_regime(analysis) {
+        let mut verdicts = speaker::evaluate_solo_presence(analysis, plan, &heights);
+        let rewritten =
+            speaker::rewrite_for_presence(plan, analysis, &mut verdicts, cuts, src_w as f32, src_h as f32);
+        let flagged = verdicts.iter().filter(|v| v.flagged).count();
+        println!("\n== solo presence (production twin: Bar P + fallback rewrite):");
+        if flagged == 0 {
+            println!("  0 flagged — plan unchanged (fixture-clean)");
+        }
+        for v in verdicts.iter().filter(|v| v.flagged) {
+            println!(
+                "  #{:<3}{} {:>5.1}s..{:>5.1}s | meas {:>3.0}% | ref h{:.0} | crop h{:.0} | -> {:?}",
+                v.shot_idx,
+                speaker::track_label(v.track),
+                v.start_s,
+                v.end_s,
+                100.0 * (1.0 - v.unmeasured_share),
+                v.reference_fh,
+                v.max_crop_face_h,
+                v.rung,
+            );
+        }
+        let changed = rewritten.shots.iter().zip(&plan.shots).filter(|(a, b)| a != b).count();
+        println!("  rewrite changed {} of {} shots", changed, plan.shots.len());
+        for f in speaker::audit_camera_plan(analysis, &rewritten, &verdicts) {
+            println!("  audit: {f}");
+        }
+        return Ok(Some(rewritten));
+    }
+    println!(
+        "\n== solo presence (production twin): follow-visible or models absent — production skips the pass, plan byte-identical (ADR 0048)"
+    );
+    Ok(None)
 }
 
 /// `faceselftest <img> [<img>…]`: detect every face in each full frame and

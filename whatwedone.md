@@ -4,6 +4,38 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-07 — Solo-presence WIRING: the verified check heals the plan in production (ADR 0048)
+
+Wired the solo-presence measurement (ADR 0047's instrument) into the
+**production Camera plan**: a solo shot that frames no verifiable subject
+face is now caught at analyze time and rewritten to an honest framing,
+instead of shipping a stale crop on set dressing. Attribution regime only
+(the Occupant map is the robustness anchor; follow-visible's A-class waits,
+so its plans stay byte-identical). One implementation this session, shipped
+after the operator's manual re-test (which sharpened it twice).
+
+- **The wiring** (`crates/frame/speaker.rs` + `crates/app/pipeline.rs`): draft
+  `plan_shots` → a per-solo-shot **presence seek pass** (full-res YuNet over
+  each low-measured solo crop, reusing the occupant-map seek machinery; an
+  arm-1 pre-filter skips well-measured shots so the fixtures pay ~0 seeks) →
+  `evaluate_solo_presence` (**Bar P**, pure, unit-tested) → `rewrite_for_presence`
+  (the ladder: split → hold-verified → wide) → the audit consumes the artifact.
+  Pure decision in `yc_frame`, seeks in the pipeline glue.
+- **Bar P is two-sided** (the operator's re-test caught the miss): a solo flags
+  when majority-unmeasured AND no crop-face in `[0.35, 1.9]×` its reference —
+  too small (poster/figurine) OR too large (a back-of-head/guitar blob ~2×).
+  ADR 0047 had missed the oversized class by reading raw heights without
+  normalizing per seat, and mis-filed the 22–25 s windows as benign.
+- **A split never shows one person twice** (operator rule): two panels framing
+  the same source region (a tight-angle mis-track projecting a wide-shot seat
+  onto set dressing — the guitar beside the guest) collapse to the honest
+  centered wide — universal in `group_layout`, so every split obeys it.
+- **Gate PASSED**: every VIOR ship-truth defect heals (clip 3
+  #8/#12/#13/#14/#17/#27, clip 2 #2/#3/#7/#11) with zero false positives; both
+  fixtures untouched (ANTITESA `camera_diag.fg` byte-pin `9e07d81f…`, Deddy
+  15-shots + reaction split `vstack` intact); clip 1 (follow-visible)
+  byte-identical; suites **349 both ways**. No caption/transcribe code touched.
+
 ## 2026-07-07 — Solo-presence instrument + gate PASSED (the shakedown's worst defect, measured)
 
 Built the measurement the shakedown's worst defect was missing — **does

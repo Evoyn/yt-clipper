@@ -1653,9 +1653,29 @@ pub fn group_layout_span(
     }
 }
 
+/// A 2-panel split whose two panel crops share at least this fraction of the
+/// smaller panel's area is one person (or one region) framed TWICE — a tight-
+/// angle mis-track projecting a wide-shot seat onto set dressing (clip 3 cam9:
+/// seat A lands on the guitar beside the real guest, and both wide SPLIT_ZOOM
+/// panels then render guitar+guest and read as the same person). Never split
+/// that: **the same person must never appear on both split panels** (operator
+/// rule, 2026-07-07). Show the honest centered wide instead.
+const SPLIT_MAX_PANEL_OVERLAP: f32 = 0.5;
+
+/// Fraction of the smaller rectangle's area covered by the intersection.
+fn crop_overlap_frac(a: &Crop, b: &Crop) -> f32 {
+    let ix = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+    let iy = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+    if ix <= 0.0 || iy <= 0.0 {
+        return 0.0;
+    }
+    (ix * iy) / (a.w * a.h).min(b.w * b.h).max(1.0)
+}
+
 /// The group framing for every tracked face (focus: "Group Mode"):
 /// - 2 people: a stacked **split screen**, one panel each (a 9:16 window can't
-///   hold two people sitting apart in a 16:9 wide shot);
+///   hold two people sitting apart in a 16:9 wide shot) — UNLESS the two panels
+///   would show the same region (a mis-track), then the centered wide;
 /// - 1 person: their solo crop;
 /// - 0 or 3+: a centered 9:16 column over the table (the widest honest view).
 pub fn group_layout(tracks: &[SpeakerTrack], src_w: f32, src_h: f32) -> Layout {
@@ -1663,11 +1683,17 @@ pub fn group_layout(tracks: &[SpeakerTrack], src_w: f32, src_h: f32) -> Layout {
         [] => Layout::FullFrame { crop: crate::centered_fullcam_crop(src_w, src_h) },
         [t] => Layout::FullFrame { crop: solo_crop(&t.bbox, src_w, src_h) },
         [a, b] => {
-            let (_, half_aspect) = (0, CANVAS_W as f32 / (CANVAS_H as f32 * 0.5));
-            Layout::Stacked {
-                seam: 0.5,
-                gameplay: panel_crop(&a.bbox, src_w, src_h, half_aspect),
-                facecam: panel_crop(&b.bbox, src_w, src_h, half_aspect),
+            let half_aspect = CANVAS_W as f32 / (CANVAS_H as f32 * 0.5);
+            let (pa, pb) = (
+                panel_crop(&a.bbox, src_w, src_h, half_aspect),
+                panel_crop(&b.bbox, src_w, src_h, half_aspect),
+            );
+            // Two panels showing largely the same source region are one person
+            // framed twice — the honest centered wide, never a duplicate split.
+            if crop_overlap_frac(&pa, &pb) > SPLIT_MAX_PANEL_OVERLAP {
+                Layout::FullFrame { crop: crate::centered_fullcam_crop(src_w, src_h) }
+            } else {
+                Layout::Stacked { seam: 0.5, gameplay: pa, facecam: pb }
             }
         }
         many => {
@@ -1749,6 +1775,208 @@ const AUDIT_CREEP_MIN_S: f64 = 2.0;
 /// for longer than this.
 const AUDIT_ADRIFT_MIN_S: f64 = 1.0;
 
+// --- solo presence: verify a solo shot frames a real, visible subject face,
+// then rewrite the failures into an honest split/hold/wide (ADR 0047/0048) ----
+
+/// Bar P arm 1 (ADR 0047): a solo shot is a presence *candidate* only when at
+/// least this share of its bins carry no measurement — a mostly-measured shot
+/// with a momentary dip stays anchored by its real measurements and never
+/// flags (the Deddy fixture's benign 1.5 s laughing lean, 80% measured).
+pub const PRESENCE_UNMEASURED_FRAC: f32 = 0.5;
+
+/// Bar P arm 2 LOWER bound (ADR 0047): a crop-face at least this fraction of
+/// the subject's reference face height is large enough to be a real,
+/// subject-scale face. The measured separation is an order of magnitude —
+/// undersized defect crop-faces are MISS or h21–25 (≤ 0.1× ref, a
+/// poster/figurine) — so the floor sits well below any real face.
+pub const PRESENCE_FACE_FRAC: f32 = 0.35;
+
+/// Bar P arm 2 UPPER bound (ADR 0048): a crop-face MORE than this multiple of
+/// the reference is not the subject at a solo framing — it is an oversized
+/// false detection, the back-of-head / guitar-body blob that fires ~2× the
+/// subject's face and fooled the lower-only bound (clip 3 #12/#14, ref 138,
+/// crop h283–288 = 2.05–2.09×). ADR 0047 missed this class by reading RAW crop
+/// heights (h185–288) without dividing by the per-shot reference — it could
+/// not tell one seat's 2× blob (ref 138) from another's 1× real face (ref
+/// 271), and mis-adjudicated the 22–25 s windows as benign-by-luck.
+///
+/// Placed at 1.9: just above the largest REAL face the seek ever caught on an
+/// unmeasured shot — a leaned-in laughing close-up at 1.85× (clip 2 #8, Person
+/// E) — and below the blob class (2.05×). The gap is narrow: height alone
+/// cannot robustly separate a big lean-in from a head/guitar blob, so this is
+/// a stopgap for the CLEARLY oversized; per-crop face identity is the robust
+/// discriminator (the open B-class thread). The bias favours catching blobs (a
+/// missed blob ships a defect; an over-heal is only a split), so it sits
+/// nearer the real-face edge than mid-gap.
+pub const PRESENCE_FACE_MAX: f32 = 1.9;
+
+/// The fallback rung a flagged solo shot took (ADR 0048's ladder), recorded on
+/// the verdict so the audit can name the healing without touching a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceRung {
+    /// Passed presence — the draft framing stands.
+    Keep,
+    /// Rung 1: the split of the tracks measured ≥ [`GROUP_PRESENCE_FRAC`] in
+    /// the piece — nobody framed solo, so no claim on the absent subject.
+    Split,
+    /// Rung 2: held the last verified crop (same source angle, no cut crossed).
+    Hold,
+    /// Rung 3: an honest wide of the angle (no verified crop to hold).
+    Wide,
+}
+
+/// One solo shot's **solo presence** verdict (ADR 0048): the pure Bar P
+/// reading, combining the analysis (unmeasured share, reference face height)
+/// with the seek pass (the tallest real face found in the planned crop).
+/// Carries the shot's span and the rung the rewrite applied, so the audit can
+/// name the window without touching a frame.
+#[derive(Debug, Clone)]
+pub struct SoloPresence {
+    /// Index into the plan's `shots` (stable — the rewrite is 1:1 per shot).
+    pub shot_idx: usize,
+    pub start_s: f64,
+    pub end_s: f64,
+    /// The attributed seat this solo shot follows.
+    pub track: usize,
+    /// Arm 1: fraction of the shot's bins with no measurement.
+    pub unmeasured_share: f32,
+    /// The subject's reference face height (span-median measured face height,
+    /// else the track's whole-clip box height) — arm 2's yardstick.
+    pub reference_fh: f32,
+    /// The tallest face the seek pass found in the planned crop across every
+    /// sample (source px; `0.0` = every sample MISS). `None` in the field
+    /// below means the pass never evaluated this shot (a decode failure), which
+    /// never flags — the fallback acts on measured absence, not ignorance.
+    pub max_crop_face_h: f32,
+    /// Bar P: arm 1 AND arm 2 — the shot frames no verifiable subject face.
+    pub flagged: bool,
+    /// The rung [`rewrite_for_presence`] applied (`Keep` on an unflagged shot).
+    pub rung: PresenceRung,
+}
+
+/// Evaluate [Bar P](PRESENCE_UNMEASURED_FRAC) on every solo shot of a draft
+/// plan, fusing the pure analysis with the seek pass's crop-face heights
+/// (`seek_face_h`: `(shot_idx, tallest crop-face px)`; a shot absent from the
+/// list was not evaluated and never flags). Returns one verdict per solo
+/// `FullFrame` shot, in shot order; [`rewrite_for_presence`] reads them and
+/// fills each `rung`.
+pub fn evaluate_solo_presence(
+    analysis: &SpeakerAnalysis,
+    plan: &CameraPlan,
+    seek_face_h: &[(usize, f32)],
+) -> Vec<SoloPresence> {
+    let bin_s = if analysis.bin_s > 0.0 { analysis.bin_s } else { 1.0 / SPEAKER_FPS };
+    let n = analysis.speaking.len();
+    let mut out = Vec::new();
+    for (idx, s) in plan.shots.iter().enumerate() {
+        let (Some(id), Layout::FullFrame { .. }) = (s.track, &s.layout) else { continue };
+        let Some(tr) = analysis.tracks.iter().find(|t| t.id == id) else { continue };
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n);
+        let nb = (b1 - b0).max(1);
+        let meas_n =
+            (b0..b1).filter(|&b| tr.path.get(b).map(|p| p.is_some()).unwrap_or(false)).count();
+        let unmeasured_share = 1.0 - meas_n as f32 / nb as f32;
+        let reference_fh = span_median_box(&tr.path, b0, b1).map(|b| b.h).unwrap_or(tr.bbox.h);
+        let seen = seek_face_h.iter().find(|(i, _)| *i == idx).map(|(_, h)| *h);
+        let flagged = match seen {
+            Some(h) => {
+                // Arm 2: no subject-scale face in the crop — the tallest face
+                // is too SMALL to be the subject (a poster/figurine, ADR 0047)
+                // OR too LARGE (an oversized false detection ~2× the subject,
+                // ADR 0048). Only a face within the plausible band rescues it.
+                let no_subject_face = h < PRESENCE_FACE_FRAC * reference_fh
+                    || h > PRESENCE_FACE_MAX * reference_fh;
+                unmeasured_share >= PRESENCE_UNMEASURED_FRAC && no_subject_face
+            }
+            None => false,
+        };
+        out.push(SoloPresence {
+            shot_idx: idx,
+            start_s: s.start_s,
+            end_s: s.end_s,
+            track: id,
+            unmeasured_share,
+            reference_fh,
+            max_crop_face_h: seen.unwrap_or(0.0),
+            flagged,
+            rung: PresenceRung::Keep,
+        });
+    }
+    out
+}
+
+/// Rewrite a draft plan's flagged solo shots into honest framings (ADR 0048's
+/// fallback ladder), filling each verdict's `rung`. Unflagged solo shots and
+/// every group shot pass through **byte-identical** — a plan with no flags
+/// returns unchanged, so the production fixtures never move. Pure: the seek
+/// evidence already lives in `verdicts`.
+///
+/// Per flagged solo piece, in order: **(1) split** — the group framing of the
+/// tracks measured ≥ [`GROUP_PRESENCE_FRAC`] in the piece, when that set is
+/// non-empty; else **(2) hold** — the last *verified* crop when no source cut
+/// separates it from this piece; else **(3) wide** — the honest group view of
+/// the angle. The hold is the stale-crop bug's fix: it fires only with BOTH a
+/// verified prior crop AND no cut crossed, where the bug
+/// ([`plan_shots`] step 5) reused the previous framing unconditionally across
+/// source cuts.
+pub fn rewrite_for_presence(
+    plan: &CameraPlan,
+    analysis: &SpeakerAnalysis,
+    verdicts: &mut [SoloPresence],
+    cuts: &[f64],
+    src_w: f32,
+    src_h: f32,
+) -> CameraPlan {
+    let bin_s = if analysis.bin_s > 0.0 { analysis.bin_s } else { 1.0 / SPEAKER_FPS };
+    let n = analysis.speaking.len();
+    let vpos: std::collections::HashMap<usize, usize> =
+        verdicts.iter().enumerate().map(|(vi, v)| (v.shot_idx, vi)).collect();
+    // The last solo shot that PASSED presence, in the current source angle —
+    // dropped whenever a source cut begins a shot (the angle changed, so its
+    // crop is aimed elsewhere: exactly the stale-crop defect the bug shipped).
+    let mut held: Option<(usize, Layout, Option<Crop>)> = None;
+    let mut shots = Vec::with_capacity(plan.shots.len());
+    for (idx, s) in plan.shots.iter().enumerate() {
+        if cuts.iter().any(|&c| (c - s.start_s).abs() < 0.05) {
+            held = None;
+        }
+        let flagged = vpos.get(&idx).map(|&vi| verdicts[vi].flagged).unwrap_or(false);
+        if !flagged {
+            // A verified solo re-seeds the hold; a group shot passes through
+            // and never does (it is no crop to hold).
+            if vpos.contains_key(&idx) {
+                if let (Some(id), Layout::FullFrame { .. }) = (s.track, &s.layout) {
+                    held = Some((id, s.layout.clone(), s.pan_to));
+                }
+            }
+            shots.push(s.clone());
+            continue;
+        }
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n);
+        let nb = (b1 - b0).max(1);
+        let present = analysis.tracks.iter().any(|t| {
+            (b0..b1).filter(|&b| t.path.get(b).map(|p| p.is_some()).unwrap_or(false)).count() as f32
+                >= GROUP_PRESENCE_FRAC * nb as f32
+        });
+        let (track, layout, pan_to, rung) = if present {
+            let l = group_layout_span(&analysis.tracks, b0, b1, src_w, src_h);
+            (None, l, None, PresenceRung::Split)
+        } else if let Some((tid, hl, hp)) = held.clone() {
+            (Some(tid), hl, hp, PresenceRung::Hold)
+        } else {
+            let l = group_layout_span(&analysis.tracks, b0, b1, src_w, src_h);
+            (None, l, None, PresenceRung::Wide)
+        };
+        if let Some(&vi) = vpos.get(&idx) {
+            verdicts[vi].rung = rung;
+        }
+        shots.push(Shot { start_s: s.start_s, end_s: s.end_s, track, layout, pan_to });
+    }
+    CameraPlan { shots }
+}
+
 /// Audit a camera plan against the subject evidence: find stretches where
 /// the CAMERA does something the SUBJECT didn't cause — the defect class the
 /// operator reads as jitter. Three checks, each born from a shipped bug
@@ -1761,17 +1989,51 @@ const AUDIT_ADRIFT_MIN_S: f64 = 1.0;
 ///   changed (the jump-cut twitch the framing memory kills — audited so any
 ///   future planner path that regresses it is caught);
 /// - **subject adrift**: a subject riding outside a crop's safe region for
-///   a sustained stretch (a mis-parked or under-grown framing).
+///   a sustained stretch (a mis-parked or under-grown framing);
+/// - **solo presence** (ADR 0048): a solo window that framed no verifiable
+///   subject face (Bar P), read straight from the seek `verdicts` artifact —
+///   the class the audit was structurally BLIND to (no measurement, no
+///   finding), now named with the rung [`rewrite_for_presence`] healed it
+///   into. Pass `&[]` when no artifact exists (a re-audit of an
+///   operator-edited plan, follow-visible, or models absent) — the presence
+///   check is then simply skipped.
 ///
-/// Pure and cheap (O(shots × bins)). The diag harness prints it per plan,
-/// `AnalyzeSpeakers` logs each finding, and the Studio Camera panel shows
-/// them before an export — "detect first" (operator ask, 2026-07-05). Zero
-/// findings on the production fixtures is a regression bar; a finding on
-/// new footage means the plan would render with a visible camera defect.
-pub fn audit_camera_plan(analysis: &SpeakerAnalysis, plan: &CameraPlan) -> Vec<String> {
+/// Pure and cheap (O(shots × bins) + O(verdicts)). The diag harness prints it
+/// per plan, `AnalyzeSpeakers` logs each finding, and the Studio Camera panel
+/// shows them before an export — "detect first" (operator ask, 2026-07-05).
+/// Zero findings on the production fixtures is a regression bar (they never
+/// flag presence, so the artifact adds nothing there); a finding on new
+/// footage means the plan carried — and, for presence, healed — a defect.
+pub fn audit_camera_plan(
+    analysis: &SpeakerAnalysis,
+    plan: &CameraPlan,
+    verdicts: &[SoloPresence],
+) -> Vec<String> {
     let bin_s = if analysis.bin_s > 0.0 { analysis.bin_s } else { 1.0 / SPEAKER_FPS };
     let n = analysis.speaking.len();
     let mut findings = Vec::new();
+
+    // Solo presence (ADR 0048): the artifact already carries the verdict, so
+    // the audit only reports it. A flagged window is healed by the rewrite —
+    // the finding names the window, its measured absence, and the rung — while
+    // a flag left un-rewritten (`Keep`) is a real un-healed defect.
+    for v in verdicts.iter().filter(|v| v.flagged) {
+        let meas = 100.0 * (1.0 - v.unmeasured_share);
+        let healed = match v.rung {
+            PresenceRung::Split => " — reframed to the visible split",
+            PresenceRung::Hold => " — held the prior verified crop",
+            PresenceRung::Wide => " — reframed to a wide",
+            PresenceRung::Keep => " — UNHEALED (still a solo on an unverified subject)",
+        };
+        findings.push(format!(
+            "{:.1}-{:.1}s: {} solo framed no verifiable face (meas {:.0}%){}",
+            v.start_s,
+            v.end_s,
+            track_label(v.track),
+            meas,
+            healed
+        ));
+    }
     let track = |id: usize| analysis.tracks.iter().find(|t| t.id == id);
     let center = |id: usize, b: usize| -> Option<(f32, f32)> {
         track(id)?.path.get(b)?.as_ref().map(|f| (f.cx(), f.cy()))
@@ -2394,7 +2656,7 @@ mod tests {
                 pan_to: Some(Crop { x: 528.0, ..crop }),
             }],
         };
-        let f = audit_camera_plan(&a, &plan);
+        let f = audit_camera_plan(&a, &plan, &[]);
         assert!(f.iter().any(|l| l.contains("creeps")), "{f:?}");
     }
 
@@ -2424,7 +2686,7 @@ mod tests {
                 },
             ],
         };
-        let f = audit_camera_plan(&a, &plan);
+        let f = audit_camera_plan(&a, &plan, &[]);
         assert!(f.iter().any(|l| l.contains("without subject cause")), "{f:?}");
     }
 
@@ -2443,7 +2705,7 @@ mod tests {
                 pan_to: None,
             }],
         };
-        assert!(audit_camera_plan(&a, &plan).is_empty(), "{:?}", audit_camera_plan(&a, &plan));
+        assert!(audit_camera_plan(&a, &plan, &[]).is_empty(), "{:?}", audit_camera_plan(&a, &plan, &[]));
         // A subject genuinely travelling WITH the camera: also clean.
         let xs: Vec<f32> = (0..n).map(|i| 400.0 + 400.0 * i as f32 / n as f32).collect();
         let a = analysis(vec![Some(0); n], vec![track_with_path(0, &xs)]);
@@ -2457,7 +2719,232 @@ mod tests {
                 pan_to: Some(Crop { x: 648.0, ..c0 }),
             }],
         };
-        assert!(audit_camera_plan(&a, &plan).is_empty(), "{:?}", audit_camera_plan(&a, &plan));
+        assert!(audit_camera_plan(&a, &plan, &[]).is_empty(), "{:?}", audit_camera_plan(&a, &plan, &[]));
+    }
+
+    // --- solo presence: Bar P + the fallback ladder (ADR 0047/0048) ----------
+
+    /// A one-shot solo plan on `track` over `[0, dur)`.
+    fn solo_plan(track: usize, dur: f64, crop: Crop) -> CameraPlan {
+        CameraPlan {
+            shots: vec![Shot {
+                start_s: 0.0,
+                end_s: dur,
+                track: Some(track),
+                layout: Layout::FullFrame { crop },
+                pan_to: None,
+            }],
+        }
+    }
+
+    /// A track present (a face box centred at `x`) on exactly the first
+    /// `present` of `n` bins, unmeasured after — a measured head with a
+    /// trailing gap. `bbox` (the whole-clip landmark) stays h100 either way.
+    fn track_present_frac(id: usize, x: f32, present: usize, n: usize) -> SpeakerTrack {
+        let path: Vec<Option<FaceBox>> =
+            (0..n).map(|b| (b < present).then(|| fb(x - 50.0, 300.0, 100.0, 100.0))).collect();
+        SpeakerTrack {
+            id,
+            bbox: fb(x - 50.0, 300.0, 100.0, 100.0),
+            presence: present as f32 / n as f32,
+            activity: vec![0.0; n],
+            path,
+        }
+    }
+
+    #[test]
+    fn presence_flags_an_unmeasured_solo_with_no_crop_face() {
+        // The clip-3 #8/#13 class: meas 0% AND the crop scan finds no
+        // subject-scale face (a poster wall / a figurine h21-25 -> MISS).
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, 0, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 900.0, y: 20.0, w: 304.0, h: 540.0 });
+        let v = evaluate_solo_presence(&a, &plan, &[(0, 0.0)]);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].flagged, "meas 0% + MISS must flag: {:?}", v[0]);
+    }
+
+    #[test]
+    fn presence_spares_an_unmeasured_solo_that_still_holds_a_face() {
+        // The benign-by-luck class (#0/#2/#7/#12...): 100% unmeasured, but the
+        // persisted crop happens to hold a real subject-scale face (h90 vs
+        // ref 100). The face-height arm rescues it.
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, 0, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 900.0, y: 20.0, w: 304.0, h: 540.0 });
+        let v = evaluate_solo_presence(&a, &plan, &[(0, 90.0)]);
+        assert!(!v[0].flagged, "a subject-scale face rescues it: {:?}", v[0]);
+    }
+
+    #[test]
+    fn presence_flags_an_oversized_blob_detection() {
+        // The clip-3 #12/#14 class (ADR 0048): meas 0%, but the crop scan fires
+        // a huge false face ~2× the reference — a back-of-head / guitar blob.
+        // Too big to be the subject, so Bar P must flag; a plausible-size face
+        // (1.2×) still passes.
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, 0, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 900.0, y: 20.0, w: 304.0, h: 540.0 });
+        let blob = evaluate_solo_presence(&a, &plan, &[(0, 200.0)]); // 2.0× ref h100
+        assert!(blob[0].flagged, "an oversized blob is not the subject: {:?}", blob[0]);
+        let ok = evaluate_solo_presence(&a, &plan, &[(0, 120.0)]); // 1.2× ref h100
+        assert!(!ok[0].flagged, "a plausible-size face passes: {:?}", ok[0]);
+    }
+
+    #[test]
+    fn presence_spares_a_measured_solo_with_a_momentary_dip() {
+        // The Deddy #3 class: 80% measured with a head-down h20 at the gap.
+        // Arm 1 (< 50% unmeasured) excludes it even though the dip is sub-floor.
+        let n = nbins(5.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, (n * 4) / 5, n)]);
+        let plan = solo_plan(0, 5.0, Crop { x: 900.0, y: 20.0, w: 304.0, h: 540.0 });
+        let v = evaluate_solo_presence(&a, &plan, &[(0, 20.0)]);
+        assert!(v[0].unmeasured_share < PRESENCE_UNMEASURED_FRAC);
+        assert!(!v[0].flagged, "80% measured never flags: {:?}", v[0]);
+    }
+
+    #[test]
+    fn presence_never_flags_without_seek_evidence() {
+        // No entry for the shot = a decode failure = ignorance, never a flag.
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, 0, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 900.0, y: 20.0, w: 304.0, h: 540.0 });
+        let v = evaluate_solo_presence(&a, &plan, &[]);
+        assert!(!v[0].flagged, "measured absence, not ignorance: {:?}", v[0]);
+    }
+
+    #[test]
+    fn rewrite_splits_a_flagged_solo_when_others_are_present() {
+        // Rung 1: the absent subject's solo becomes the split of whoever IS on
+        // screen — no solo claim on the unverified subject.
+        let n = nbins(4.0);
+        let t0 = track_present_frac(0, 300.0, 0, n); // the flagged subject: absent
+        let t1 = track_present_frac(1, 1500.0, n, n); // a co-host present throughout
+        let a = analysis(vec![Some(0); n], vec![t0, t1]);
+        let plan = solo_plan(0, 4.0, Crop { x: 200.0, y: 20.0, w: 304.0, h: 540.0 });
+        let mut v = evaluate_solo_presence(&a, &plan, &[(0, 0.0)]);
+        assert!(v[0].flagged);
+        let out = rewrite_for_presence(&plan, &a, &mut v, &[], 1920.0, 1080.0);
+        assert_eq!(out.shots[0].track, None, "a flagged solo becomes a group shot");
+        assert_eq!(v[0].rung, PresenceRung::Split);
+    }
+
+    #[test]
+    fn rewrite_holds_a_verified_crop_within_one_angle() {
+        // Rung 2: shot 0 verified, shot 1 unmeasured in the SAME angle (no cut)
+        // -> hold shot 0's crop verbatim.
+        let n = nbins(8.0);
+        let half = n / 2;
+        let path: Vec<Option<FaceBox>> =
+            (0..n).map(|b| (b < half).then(|| fb(910.0, 300.0, 100.0, 100.0))).collect();
+        let t0 = SpeakerTrack {
+            id: 0,
+            bbox: fb(910.0, 300.0, 100.0, 100.0),
+            presence: 0.5,
+            activity: vec![0.0; n],
+            path,
+        };
+        let a = analysis(vec![Some(0); n], vec![t0]);
+        let crop = Crop { x: 860.0, y: 20.0, w: 304.0, h: 540.0 };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 4.0, track: Some(0), layout: Layout::FullFrame { crop }, pan_to: None },
+                Shot { start_s: 4.0, end_s: 8.0, track: Some(0), layout: Layout::FullFrame { crop: Crop { x: 700.0, ..crop } }, pan_to: None },
+            ],
+        };
+        let mut v = evaluate_solo_presence(&a, &plan, &[(0, 95.0), (1, 0.0)]);
+        assert!(!v[0].flagged && v[1].flagged);
+        let out = rewrite_for_presence(&plan, &a, &mut v, &[], 1920.0, 1080.0);
+        assert_eq!(out.shots[1].layout, out.shots[0].layout, "held the prior verified crop");
+        assert_eq!(out.shots[1].track, Some(0));
+        assert_eq!(v[1].rung, PresenceRung::Hold);
+    }
+
+    #[test]
+    fn rewrite_goes_wide_when_a_source_cut_severs_the_prior_crop() {
+        // Rung 3: the same gap, but a source cut at 4.0 severs shot 1 from the
+        // verified shot 0 — the stale-crop bug's exact failure. No hold: wide.
+        let n = nbins(8.0);
+        let half = n / 2;
+        let path: Vec<Option<FaceBox>> =
+            (0..n).map(|b| (b < half).then(|| fb(910.0, 300.0, 100.0, 100.0))).collect();
+        let t0 = SpeakerTrack {
+            id: 0,
+            bbox: fb(910.0, 300.0, 100.0, 100.0),
+            presence: 0.5,
+            activity: vec![0.0; n],
+            path,
+        };
+        let a = analysis(vec![Some(0); n], vec![t0]);
+        let crop = Crop { x: 860.0, y: 20.0, w: 304.0, h: 540.0 };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 4.0, track: Some(0), layout: Layout::FullFrame { crop }, pan_to: None },
+                Shot { start_s: 4.0, end_s: 8.0, track: Some(0), layout: Layout::FullFrame { crop }, pan_to: None },
+            ],
+        };
+        let mut v = evaluate_solo_presence(&a, &plan, &[(0, 95.0), (1, 0.0)]);
+        let out = rewrite_for_presence(&plan, &a, &mut v, &[4.0], 1920.0, 1080.0);
+        assert_eq!(out.shots[1].track, None, "no held crop survives a cut: honest wide");
+        assert_eq!(v[1].rung, PresenceRung::Wide);
+    }
+
+    #[test]
+    fn rewrite_leaves_a_verified_plan_byte_identical() {
+        // The fixture guarantee: a plan with no flags returns unchanged.
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, n, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 808.0, y: 20.0, w: 304.0, h: 540.0 });
+        let mut v = evaluate_solo_presence(&a, &plan, &[(0, 120.0)]);
+        assert!(!v[0].flagged);
+        let out = rewrite_for_presence(&plan, &a, &mut v, &[], 1920.0, 1080.0);
+        assert_eq!(out, plan, "a clean plan is byte-identical after the rewrite");
+    }
+
+    #[test]
+    fn audit_names_a_healed_presence_window() {
+        let n = nbins(4.0);
+        let t0 = track_present_frac(0, 300.0, 0, n);
+        let t1 = track_present_frac(1, 1500.0, n, n);
+        let a = analysis(vec![Some(0); n], vec![t0, t1]);
+        let plan = solo_plan(0, 4.0, Crop { x: 200.0, y: 20.0, w: 304.0, h: 540.0 });
+        let mut v = evaluate_solo_presence(&a, &plan, &[(0, 0.0)]);
+        let out = rewrite_for_presence(&plan, &a, &mut v, &[], 1920.0, 1080.0);
+        let f = audit_camera_plan(&a, &out, &v);
+        assert!(
+            f.iter().any(|l| l.contains("no verifiable face") && l.contains("split")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn audit_stays_clean_when_presence_passes() {
+        let n = nbins(4.0);
+        let a = analysis(vec![Some(0); n], vec![track_present_frac(0, 960.0, n, n)]);
+        let plan = solo_plan(0, 4.0, Crop { x: 808.0, y: 20.0, w: 304.0, h: 540.0 });
+        let v = evaluate_solo_presence(&a, &plan, &[(0, 120.0)]);
+        assert!(!v[0].flagged);
+        let f = audit_camera_plan(&a, &plan, &v);
+        assert!(!f.iter().any(|l| l.contains("verifiable")), "{f:?}");
+    }
+
+    #[test]
+    fn group_layout_never_splits_the_same_region_twice() {
+        // Operator rule (2026-07-07): the same person must never appear on both
+        // split panels. Two seats whose panels overlap (a tight-angle mis-track
+        // projecting a wide-shot seat onto set dressing) collapse to the honest
+        // centered wide; two people at distinct positions still split.
+        let t = |id, x| SpeakerTrack {
+            id,
+            bbox: fb(x, 300.0, 150.0, 150.0),
+            presence: 1.0,
+            activity: vec![],
+            path: vec![],
+        };
+        let split = group_layout(&[t(0, 200.0), t(1, 1500.0)], 1920.0, 1080.0);
+        assert!(matches!(split, Layout::Stacked { .. }), "distinct people split: {split:?}");
+        let wide = group_layout(&[t(0, 780.0), t(1, 900.0)], 1920.0, 1080.0);
+        assert!(matches!(wide, Layout::FullFrame { .. }), "overlapping panels collapse: {wide:?}");
     }
 
     #[test]

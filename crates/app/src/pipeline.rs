@@ -2664,11 +2664,50 @@ fn do_analyze_speakers(
         anyhow::bail!("cancelled");
     }
 
-    let plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
+    let mut plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
-    // Jitter-class defects (a crop moving without subject cause) are flagged
-    // here and in the Studio's Camera panel BEFORE any export renders them.
-    for f in speaker::audit_camera_plan(&analysis, &plan) {
+
+    // --- solo presence (ADR 0048): verify each solo shot frames a real,
+    // visible subject face, then rewrite the failures into an honest
+    // split/hold/wide. Attribution regime + both face-id models only — a
+    // follow-visible plan has no identity anchor (its A-class waits, ADR 0048)
+    // and a models-absent clip keeps the draft plan (the pre-0048 behaviour,
+    // covered by the person-id note the occupant map already set). The seek
+    // pass reuses the occupant map's targeted full-res decode; a shot measured
+    // for more than half its bins is never seeked (it can never flag).
+    let mut presence: Vec<speaker::SoloPresence> = Vec::new();
+    if attribution && paths.yunet_model.is_file() && paths.sface_model.is_file() {
+        let _ = tx.send(Progress::Stage("Verifying solo framing (face id)"));
+        match presence_seeks(paths, prepared, &analysis, &plan, cancel) {
+            Ok(heights) => {
+                let mut v = speaker::evaluate_solo_presence(&analysis, &plan, &heights);
+                let flagged = v.iter().filter(|x| x.flagged).count();
+                if flagged > 0 {
+                    plan = speaker::rewrite_for_presence(
+                        &plan,
+                        &analysis,
+                        &mut v,
+                        &cuts,
+                        prepared.src_w,
+                        prepared.src_h,
+                    );
+                    tracing::info!(flagged, "solo presence: healed flagged solo shots");
+                }
+                presence = v;
+            }
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    anyhow::bail!("cancelled");
+                }
+                tracing::warn!(error = %format!("{e:#}"), "solo presence pass failed; draft plan stands");
+            }
+        }
+    }
+
+    // Jitter-class defects (a crop moving without subject cause) and healed
+    // solo-presence windows (ADR 0048) are flagged here and in the Studio's
+    // Camera panel BEFORE any export renders them.
+    for f in speaker::audit_camera_plan(&analysis, &plan, &presence) {
         tracing::warn!(finding = %f, "camera plan audit");
     }
     // One note string, one line per lane that is off/degraded — the Camera
@@ -2751,6 +2790,142 @@ fn build_occupant_map_via_seeks(
         .collect();
     entries.sort_by(|a, b| (a.seg, a.track).cmp(&(b.seg, b.track)));
     Ok(occupant::build_occupant_map(&entries, bounds.len().saturating_sub(1)))
+}
+
+/// Verify **solo presence** (ADR 0048): for each solo shot whose subject is
+/// unmeasured for at least [`speaker::PRESENCE_UNMEASURED_FRAC`] of its bins
+/// (a mostly-measured shot is already anchored and can never flag, so it is
+/// never seeked), scan the PLANNED CROP for a real face at the shot's span
+/// quantiles and its largest unmeasured gap. Returns `(shot_idx, tallest
+/// crop-face px)` per SEEKED shot — the impure half of the presence pass (the
+/// pure Bar P and the fallback rewrite live in `yc_frame::speaker`). A shot
+/// with no decoded frame is omitted, so ignorance never flags. Reuses the
+/// occupant map's machinery: the same full-res targeted decode and `crop_rgb`,
+/// YuNet over the crop only (no SFace — the class-A trigger needs no identity).
+#[cfg(feature = "face")]
+fn presence_seeks(
+    paths: &PipelinePaths,
+    prepared: &PreparedClip,
+    analysis: &SpeakerAnalysis,
+    plan: &CameraPlan,
+    cancel: &CancelToken,
+) -> Result<Vec<(usize, f32)>> {
+    use yc_frame::{face_id, occupant, speaker};
+    let bin_s = analysis.bin_s;
+    let n_bins = analysis.speaking.len();
+    let (src_w, src_h) = (prepared.src_w as usize, prepared.src_h as usize);
+    let mut ident = face_id::FaceIdentifier::load(&paths.yunet_model, &paths.sface_model)?;
+    let mut out: Vec<(usize, f32)> = Vec::new();
+    let (mut n_shots, mut n_seeks) = (0usize, 0usize);
+    let t0 = std::time::Instant::now();
+    for (idx, s) in plan.shots.iter().enumerate() {
+        let (Some(id), Layout::FullFrame { crop }) = (s.track, &s.layout) else { continue };
+        let Some(tr) = analysis.tracks.iter().find(|t| t.id == id) else { continue };
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n_bins);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n_bins);
+        let nb = (b1 - b0).max(1);
+        let at = |b: usize| tr.path.get(b).and_then(|p| p.as_ref());
+        let meas_n = (b0..b1).filter(|&b| at(b).is_some()).count();
+        // Arm 1 pre-filter: measured for more than half its bins -> anchored ->
+        // can never flag. Skip its seeks (this is what keeps the pass cheap).
+        if ((nb - meas_n) as f32 / nb as f32) < speaker::PRESENCE_UNMEASURED_FRAC {
+            continue;
+        }
+        n_shots += 1;
+        // The largest unmeasured run — its midpoint is an extra probe time.
+        let (mut gs, mut gl, mut cl) = (0usize, 0usize, 0usize);
+        for k in b0..b1 {
+            if at(k).is_none() {
+                cl += 1;
+                if cl > gl {
+                    gl = cl;
+                    gs = k + 1 - cl;
+                }
+            } else {
+                cl = 0;
+            }
+        }
+        let (gap_t0, gap_t1) = (gs as f64 * bin_s, (gs + gl) as f64 * bin_s);
+        let sdur = (s.end_s - s.start_s).max(1e-6);
+        let crop_at = |t: f64| -> yc_core::Crop {
+            match &s.pan_to {
+                Some(p) => crop.lerp(p, (((t - s.start_s) / sdur) as f32).clamp(0.0, 1.0)),
+                None => *crop,
+            }
+        };
+        // Probe times: span quantiles + the gap midpoint, inset from the cut
+        // edges (a cut-straddling decode would crop the wrong angle's pixels).
+        let inset = bin_s.max(0.12);
+        let lo = s.start_s + inset;
+        let hi = (s.end_s - inset).max(lo);
+        let mut times: Vec<f64> = if sdur >= 1.2 {
+            [0.2f64, 0.5, 0.8].iter().map(|q| s.start_s + sdur * q).collect()
+        } else {
+            vec![s.start_s + sdur * 0.5]
+        };
+        if gl as f64 * bin_s >= 1.0 {
+            let gmid = (gap_t0 + gap_t1) * 0.5;
+            if times.iter().all(|t| (t - gmid).abs() > 0.25) {
+                times.push(gmid);
+            }
+        }
+        for t in times.iter_mut() {
+            *t = t.clamp(lo, hi);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        times.dedup_by(|a, b| (*a - *b).abs() < 0.15);
+        let (mut max_h, mut got) = (0.0f32, 0usize);
+        for t in times {
+            if cancel.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            let mut frame: Option<Vec<u8>> = None;
+            yc_ingest::stream_frames_rgb(
+                &paths.ffmpeg,
+                &prepared.render_src,
+                prepared.seek_s + t,
+                (2.5 / prepared.src_fps.max(1.0)).max(0.05),
+                prepared.src_w as u32,
+                prepared.src_h as u32,
+                prepared.src_fps,
+                1,
+                &mut |rgb| {
+                    frame = Some(rgb.to_vec());
+                    false
+                },
+            )?;
+            let Some(frame) = frame else { continue };
+            got += 1;
+            n_seeks += 1;
+            let c = crop_at(t);
+            let (region, rw, rh, _rx, _ry) = occupant::crop_rgb(
+                &frame,
+                src_w,
+                src_h,
+                c.x as i32,
+                c.y as i32,
+                c.w as usize,
+                c.h as usize,
+            );
+            if let Ok(dets) = ident.detect(&region, rw, rh) {
+                for d in &dets {
+                    max_h = max_h.max(d.bbox.h);
+                }
+            }
+        }
+        // Omit a shot with no decoded frame — measured absence flags, ignorance
+        // does not (`evaluate_solo_presence` never flags an absent shot).
+        if got > 0 {
+            out.push((idx, max_h));
+        }
+    }
+    tracing::info!(
+        shots = n_shots,
+        seeks = n_seeks,
+        secs = t0.elapsed().as_secs_f32(),
+        "solo presence: crop-face seeks"
+    );
+    Ok(out)
 }
 
 /// The `scene` value above which an inter-frame change is a source **cut**, not

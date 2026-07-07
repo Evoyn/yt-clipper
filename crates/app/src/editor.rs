@@ -304,7 +304,9 @@ impl EditorState {
     /// stale.
     fn refresh_camera_audit(&mut self) {
         self.camera_audit = match (&self.speakers, &self.plan) {
-            (Some(a), Some(p)) => yc_frame::speaker::audit_camera_plan(a, p),
+            // No presence artifact in the editor: a re-audit of an
+            // operator-edited plan reads jitter only (ADR 0048).
+            (Some(a), Some(p)) => yc_frame::speaker::audit_camera_plan(a, p, &[]),
             _ => Vec::new(),
         };
     }
