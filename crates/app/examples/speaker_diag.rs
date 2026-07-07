@@ -63,6 +63,16 @@
 //! image) and prints pairwise cosines for BOTH pipelines — YuNet-aligned and
 //! box-pseudo-landmarks — on known same/different faces: the model must
 //! order them correctly before any fixture number means anything.
+//!
+//! The **solo-presence table** (the 2026-07-07 worst-defect instrument)
+//! measures, per solo shot of the integrated plan, whether the shot
+//! verifiably frames its attributed subject's real, currently-visible face:
+//! measured-bin share + largest unmeasured run, in-crop share (the audit's
+//! safe-region insets), full-res seek scans (YuNet over the planned crop;
+//! YuNet+SFace on what the track matched, cosined against the occupant-map
+//! persons), the attributed seat's occupant, and the fallback ladder's
+//! structural pick. Diagnostics only: bars are placed on the printed table
+//! (ADR 0045 pattern), and no production behavior changes here.
 
 #[cfg(not(feature = "face"))]
 fn main() {
@@ -328,21 +338,21 @@ fn main() -> anyhow::Result<()> {
     // attribution regime with both face-id models present; otherwise the
     // voice join runs the seat-scoped ADR 0042 fallback.
     let attribution = speaker::attribution_regime(&analysis);
-    let occupant_map: Option<yc_frame::occupant::OccupantMap> = {
+    let (occupant_map, person_centroids): (Option<yc_frame::occupant::OccupantMap>, Vec<Vec<f32>>) = {
         let yunet = Path::new(YUNET_MODEL);
         let sface = Path::new(SFACE_MODEL);
         if !attribution {
             println!(
                 "\n== face lane: follow-visible regime — occupant map not computed (the whole-clip join is the identity)"
             );
-            None
+            (None, Vec::new())
         } else if !yunet.is_file() || !sface.is_file() {
             println!(
                 "\n== face lane: missing {} or {} — occupant map off, seat-scoped join (ADR 0042 fallback)",
                 yunet.display(),
                 sface.display()
             );
-            None
+            (None, Vec::new())
         } else {
             match face_lane(
                 ffmpeg,
@@ -358,10 +368,11 @@ fn main() -> anyhow::Result<()> {
                 dur,
                 &data_dir,
             ) {
-                Ok(m) => m,
+                Ok(Some((m, c))) => (Some(m), c),
+                Ok(None) => (None, Vec::new()),
                 Err(e) => {
                     println!("\n== face lane FAILED: {e:#}");
-                    None
+                    (None, Vec::new())
                 }
             }
         }
@@ -999,6 +1010,26 @@ fn main() -> anyhow::Result<()> {
         solos.push((i, id, cx, cy, fh, plan.shots[i].pan_to.as_ref().unwrap_or(crop)));
     }
 
+    // --- solo presence (the 2026-07-07 worst-defect instrument): per solo
+    // shot, does the plan verifiably frame its subject's real face? Additive
+    // only — bars are placed on this table after it exists (ADR 0045 pattern).
+    solo_presence(
+        ffmpeg,
+        &segment,
+        seek_s,
+        probe.fps,
+        probe.width as usize,
+        probe.height as usize,
+        &analysis,
+        &plan,
+        &cuts,
+        dur,
+        occupant_map.as_ref(),
+        &person_centroids,
+        Path::new(YUNET_MODEL),
+        Path::new(SFACE_MODEL),
+    )?;
+
     // --- the real filtergraph (render it with export_args-style ffmpeg flags
     // to SEE this plan; clip.ass + fonts live in the data dir) ----------------
     let fg = data_dir.join("camera_diag.fg");
@@ -1340,8 +1371,9 @@ fn write_png_rgb(
 /// OCCUPANT MAP with the production `yc_frame::occupant::build_occupant_map`
 /// (person cut at the largest dendrogram gap — printed, not trusted
 /// silently). Prints the map + camera merge, writes the operator's contact
-/// sheet. Returns the map the voice join runs over (`None` when too few
-/// entries embedded to say anything).
+/// sheet. Returns the map the voice join runs over plus each person's
+/// centroid unit embedding (the solo-presence table's identity reference)
+/// (`None` when too few entries embedded to say anything).
 #[cfg(feature = "face")]
 #[allow(clippy::too_many_arguments)]
 fn face_lane(
@@ -1357,7 +1389,7 @@ fn face_lane(
     cuts: &[f64],
     dur: f64,
     data_dir: &std::path::Path,
-) -> anyhow::Result<Option<yc_frame::occupant::OccupantMap>> {
+) -> anyhow::Result<Option<(yc_frame::occupant::OccupantMap, Vec<Vec<f32>>)>> {
     use yc_frame::face_id::{self, FaceIdentifier};
     let bin_s = analysis.bin_s;
     let n_bins = analysis.speaking.len();
@@ -1529,7 +1561,320 @@ fn face_lane(
         write_png_rgb(ffmpeg, &sheet_path, &sheet, sw, sh)?;
         println!("  contact sheet: {} (row = person, columns time-ordered)", sheet_path.display());
     }
-    Ok(Some(map))
+    // Per-person centroid unit embeddings (persons only — singletons carry no
+    // identity), the reference the solo-presence table's track-match cosines
+    // are read against.
+    let centroids: Vec<Vec<f32>> = (0..map.n_persons)
+        .map(|p| {
+            let embs: Vec<Vec<f32>> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| map.assignment[*i] == p)
+                .map(|(_, e)| e.emb.clone())
+                .collect();
+            face_id::aggregate_unit(&embs).unwrap_or_default()
+        })
+        .collect();
+    Ok(Some((map, centroids)))
+}
+
+/// The SOLO-PRESENCE instrument (the 2026-07-07 worst-defect spike, measure
+/// first): per solo shot of the integrated plan, measure whether the shot
+/// actually frames its attributed subject's real, currently-visible face —
+/// the verification the planner and audit never had. Sub-class A (no
+/// measurement in the shot): the stale crop persists and the audit is blind.
+/// Sub-class B (the track matched a face-like blob on set dressing in this
+/// angle): the audit reads "subject in crop" and is fooled. Lanes:
+///
+/// - `meas` / `max-gap`: measured bins over the span, largest unmeasured run;
+/// - `in-crop`: share of measured centers inside the crop's safe region
+///   (the audit's own [`speaker::REUSE_GUARD_X_FH`] insets, pan-aware);
+/// - seeks (span quantiles + the max-gap midpoint), per sampled frame:
+///   `crop` = YuNet over the PLANNED crop region — is a real face (landmarks)
+///   visible in what renders?; `track` = YuNet + SFace on the region around
+///   the track's own measurement — is what the track matched a real face,
+///   and which occupant-map person does it embed as (vs the map's expected
+///   occupant of the attributed seat)?;
+/// - `occ`: the occupant map's verdict for the attributed seat in this
+///   shot's segment (P# / ?=unknown singleton / -=no entry or no map);
+/// - `fb`: the fallback ladder's structural pick IF this shot failed a bar —
+///   split(tracks ≥40% present in the span) / hold(#prev; no source cut at
+///   the boundary) / wide (cut crossed, nobody measured).
+///
+/// Purely additive diagnostics: bars are placed on this table AFTER it
+/// exists (the ADR 0045 pattern) and nothing here alters the plan.
+#[cfg(feature = "face")]
+#[allow(clippy::too_many_arguments)]
+fn solo_presence(
+    ffmpeg: &std::path::Path,
+    segment: &std::path::Path,
+    seek_s: f64,
+    src_fps: f64,
+    src_w: usize,
+    src_h: usize,
+    analysis: &yc_frame::speaker::SpeakerAnalysis,
+    plan: &yc_core::CameraPlan,
+    cuts: &[f64],
+    dur: f64,
+    map: Option<&yc_frame::occupant::OccupantMap>,
+    centroids: &[Vec<f32>],
+    yunet: &std::path::Path,
+    sface: &std::path::Path,
+) -> anyhow::Result<()> {
+    use yc_frame::face_id::FaceIdentifier;
+    use yc_frame::speaker;
+    let bin_s = analysis.bin_s;
+    let n_bins = analysis.speaking.len();
+    let bounds = yc_frame::voice::segment_bounds(cuts, dur);
+    let seat_ch = |id: usize| (b'A' + (id % 26) as u8) as char;
+    let t0 = std::time::Instant::now();
+    let mut ident = if yunet.is_file() && sface.is_file() {
+        Some(FaceIdentifier::load(yunet, sface)?)
+    } else {
+        None
+    };
+    println!(
+        "\n== solo presence (per solo shot; crop= face in planned crop, track= what the track matched):"
+    );
+    if ident.is_none() {
+        println!("  (face-id models missing — seek lanes off)");
+    }
+    let cos = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let mut n_seeks = 0usize;
+    for (i, s) in plan.shots.iter().enumerate() {
+        let (Some(id), yc_core::Layout::FullFrame { crop }) = (s.track, &s.layout) else {
+            continue;
+        };
+        let Some(tr) = analysis.tracks.iter().find(|t| t.id == id) else { continue };
+        let b0 = ((s.start_s / bin_s).round() as usize).min(n_bins);
+        let b1 = ((s.end_s / bin_s).round() as usize).clamp(b0, n_bins);
+        let nb = (b1 - b0).max(1);
+        let at = |b: usize| tr.path.get(b).and_then(|p| p.as_ref());
+
+        // meas + largest unmeasured run (edges count — the shipped A-class
+        // windows sit at piece starts).
+        let meas_n = (b0..b1).filter(|&b| at(b).is_some()).count();
+        let (mut gs, mut gl, mut cl) = (0usize, 0usize, 0usize);
+        for k in b0..b1 {
+            if at(k).is_none() {
+                cl += 1;
+                if cl > gl {
+                    gl = cl;
+                    gs = k + 1 - cl;
+                }
+            } else {
+                cl = 0;
+            }
+        }
+        let (gap_t0, gap_t1) = (gs as f64 * bin_s, (gs + gl) as f64 * bin_s);
+
+        // in-crop share of measured centers, against the pan-aware crop with
+        // the audit's own safe-region insets.
+        let sdur = (s.end_s - s.start_s).max(1e-6);
+        let crop_at = |t: f64| -> yc_core::Crop {
+            match &s.pan_to {
+                Some(p) => crop.lerp(p, (((t - s.start_s) / sdur) as f32).clamp(0.0, 1.0)),
+                None => *crop,
+            }
+        };
+        let mut hs: Vec<f32> = (b0..b1).filter_map(|b| at(b).map(|f| f.h)).collect();
+        hs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let fh = hs.get(hs.len() / 2).copied().unwrap_or(0.0);
+        let in_crop = if meas_n > 0 {
+            let (ix, iy) = (speaker::REUSE_GUARD_X_FH * fh, speaker::REUSE_GUARD_Y_FH * fh);
+            let inside = (b0..b1)
+                .filter(|&b| {
+                    at(b)
+                        .map(|f| {
+                            let c = crop_at((b as f64 * bin_s).min(s.end_s));
+                            f.cx() >= c.x + ix
+                                && f.cx() <= c.x + c.w - ix
+                                && f.cy() >= c.y + iy
+                                && f.cy() <= c.y + c.h - iy
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            format!("{:>3.0}%", 100.0 * inside as f64 / meas_n as f64)
+        } else {
+            "  - ".into()
+        };
+
+        // occ: the attributed seat's occupant in this shot's segment.
+        let g_mid = {
+            let mid = (s.start_s + s.end_s) * 0.5;
+            (0..bounds.len().saturating_sub(1))
+                .find(|&g| bounds[g] <= mid && mid < bounds[g + 1])
+                .unwrap_or(0)
+        };
+        let occ = map
+            .and_then(|m| m.seats.get(g_mid))
+            .and_then(|seats| seats.get(&id))
+            .map(|o| match o {
+                yc_frame::occupant::Occupant::Person(p) => format!("P{p}"),
+                yc_frame::occupant::Occupant::Unknown => "?".into(),
+            })
+            .unwrap_or_else(|| "-".into());
+
+        // fb: the fallback ladder's structural pick.
+        let present: Vec<String> = analysis
+            .tracks
+            .iter()
+            .filter(|t2| {
+                (b0..b1).filter(|&b| t2.path.get(b).map(|p| p.is_some()).unwrap_or(false)).count()
+                    as f32
+                    >= speaker::GROUP_PRESENCE_FRAC * nb as f32
+            })
+            .map(|t2| seat_ch(t2.id).to_string())
+            .collect();
+        let cut_at_start = cuts.iter().any(|&c| (c - s.start_s).abs() < 0.05);
+        let fb = if !present.is_empty() {
+            format!("split({})", present.join(","))
+        } else if i > 0 && !cut_at_start {
+            format!("hold(#{})", i - 1)
+        } else {
+            "wide".into()
+        };
+
+        println!(
+            "  #{i:<3}{:<9} {:>5.1}s..{:>5.1}s | meas {:>3.0}% | max-gap {:>4.1}s{}{} | in-crop {} | occ {:<3} | fb {}",
+            speaker::track_label(id),
+            s.start_s,
+            s.end_s,
+            100.0 * meas_n as f64 / nb as f64,
+            gl as f64 * bin_s,
+            if gl > 0 { format!(" @ {gap_t0:.1}-{gap_t1:.1}") } else { String::new() },
+            // An unmeasured run touching a shot edge is minted-from-elsewhere
+            // territory; an interior run is bracketed by real measurements.
+            if gl > 0 && (gs == b0 || gs + gl == b1) { " EDGE" } else { "" },
+            in_crop,
+            occ,
+            fb
+        );
+
+        // Seek lanes: span quantiles + the max-gap midpoint, one full-res
+        // frame each, both scans per frame.
+        let Some(ident) = ident.as_mut() else { continue };
+        let inset = bin_s.max(0.12);
+        let lo = s.start_s + inset;
+        let hi = (s.end_s - inset).max(lo);
+        let mut times: Vec<f64> = if sdur >= 1.2 {
+            [0.2f64, 0.5, 0.8].iter().map(|q| s.start_s + sdur * q).collect()
+        } else {
+            vec![s.start_s + sdur * 0.5]
+        };
+        if gl as f64 * bin_s >= 1.0 {
+            let gmid = (gap_t0 + gap_t1) * 0.5;
+            if times.iter().all(|t| (t - gmid).abs() > 0.25) {
+                times.push(gmid);
+            }
+        }
+        for t in times.iter_mut() {
+            *t = t.clamp(lo, hi);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        times.dedup_by(|a, b| (*a - *b).abs() < 0.15);
+        for t in times {
+            let Some(frame) = fetch_frame(ffmpeg, segment, seek_s + t, src_w, src_h, src_fps)?
+            else {
+                println!("    {t:>6.1}s  crop n/a (decode)      track n/a");
+                continue;
+            };
+            n_seeks += 1;
+            // crop scan: any real face visible in what renders? Center in
+            // frame coords — a det hugging the crop's edge is a sliced face.
+            let c = crop_at(t);
+            let (region, rw, rh, rx, ry) = yc_frame::occupant::crop_rgb(
+                &frame,
+                src_w,
+                src_h,
+                c.x as i32,
+                c.y as i32,
+                c.w as usize,
+                c.h as usize,
+            );
+            let crop_cell = match ident.detect(&region, rw, rh) {
+                Ok(dets) => match dets
+                    .iter()
+                    .max_by(|a, b| {
+                        a.bbox.score.partial_cmp(&b.bbox.score).unwrap_or(std::cmp::Ordering::Equal)
+                    }) {
+                    Some(d) => format!(
+                        "{:.2} h{:.0} @({:.0},{:.0}) x{}",
+                        d.bbox.score,
+                        d.bbox.h,
+                        d.bbox.cx() + rx as f32,
+                        d.bbox.cy() + ry as f32,
+                        dets.len()
+                    ),
+                    None => "MISS".into(),
+                },
+                Err(e) => format!("err {e}"),
+            };
+            // track scan: what did the track match here, and who is it?
+            let b = ((t / bin_s) as usize).min(n_bins.saturating_sub(1));
+            let track_cell = match at(b) {
+                None => "gap".to_string(),
+                Some(fb2) => {
+                    let side =
+                        ((fb2.w.max(fb2.h) * yc_frame::occupant::REGION_EXPAND) as usize).max(64);
+                    let (region, rw, rh, rx, ry) = yc_frame::occupant::crop_rgb(
+                        &frame,
+                        src_w,
+                        src_h,
+                        (fb2.cx() - side as f32 * 0.5) as i32,
+                        (fb2.cy() - side as f32 * 0.5) as i32,
+                        side,
+                        side,
+                    );
+                    let dets = ident.detect(&region, rw, rh)?;
+                    let (ecx, ecy) = (fb2.cx() - rx as f32, fb2.cy() - ry as f32);
+                    match yc_frame::occupant::pick_track_face(&dets, ecx, ecy, fb2.h) {
+                        None => "no-face".to_string(),
+                        Some(det) if centroids.is_empty() => {
+                            format!("face {:.2} h{:.0} (no map)", det.bbox.score, det.bbox.h)
+                        }
+                        Some(det) => {
+                            let emb = ident.embed(&region, rw, rh, &det.kps)?;
+                            let best = centroids
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.len() == emb.len())
+                                .map(|(p, c)| (p, cos(&emb, c)))
+                                .max_by(|a, b| {
+                                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                            let exp = map
+                                .and_then(|m| m.seats.get(g_mid))
+                                .and_then(|seats| seats.get(&id))
+                                .and_then(|o| match o {
+                                    yc_frame::occupant::Occupant::Person(p) => Some(*p),
+                                    yc_frame::occupant::Occupant::Unknown => None,
+                                });
+                            match (best, exp) {
+                                (Some((bp, bc)), Some(ep)) if bp == ep => {
+                                    format!("P{bp} {bc:.2} (exp P{ep})")
+                                }
+                                (Some((bp, bc)), Some(ep)) => {
+                                    let ec = centroids
+                                        .get(ep)
+                                        .filter(|c| c.len() == emb.len())
+                                        .map(|c| cos(&emb, c))
+                                        .unwrap_or(f32::NAN);
+                                    format!("P{bp} {bc:.2} (exp P{ep} {ec:.2})")
+                                }
+                                (Some((bp, bc)), None) => format!("P{bp} {bc:.2} (exp {occ})"),
+                                (None, _) => format!("face {:.2} (no persons)", det.bbox.score),
+                            }
+                        }
+                    }
+                }
+            };
+            println!("    {t:>6.1}s  crop {crop_cell:<18} track {track_cell}");
+        }
+    }
+    println!("  {} seeks in {:.1}s", n_seeks, t0.elapsed().as_secs_f32());
+    Ok(())
 }
 
 /// `faceselftest <img> [<img>…]`: detect every face in each full frame and

@@ -4,6 +4,48 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-07 — Solo-presence instrument + gate PASSED (the shakedown's worst defect, measured)
+
+Built the measurement the shakedown's worst defect was missing — **does
+a solo shot verifiably frame its attributed person's real, currently-
+visible face?** — pinned its bars in a `/grill-with-docs` session BEFORE
+the instrument existed (the ADR 0045 pattern), then ran it on all three
+VIOR clips + both fixtures and **passed the gate** (ADR 0047).
+
+- **The instrument** (`speaker_diag`'s new `== solo presence` table,
+  diagnostics-only — production untouched): per solo shot it measures the
+  measured-bin share + largest unmeasured run, the in-crop share, and —
+  the load-bearing part — **full-res seek scans** that ask, at span
+  quantiles + the biggest gap's midpoint, "is a real face visible in
+  what actually renders?" (YuNet over the *planned crop*) and "is what
+  the tracker matched a real face, and whose?" (YuNet+SFace on the
+  track's own box, cosined against the occupant-map persons).
+- **The gate** (bars declared before the seeks were read): a solo shot
+  flags when it is ≥50% unmeasured AND no seek finds a subject-scale face
+  in the crop; plus an in-crop containment bar. **Both fixtures clean**
+  (Deddy + ANTITESA solo shots never flag; every standing bar green —
+  ANTITESA `camera_diag.fg` byte-identical, Deddy laughter PASS, 337
+  tests both ways). Every ship-truth defect flagged, **zero false
+  positives**, and it surfaced **two empty-crop windows the operator's
+  eye had missed** (Clip 2 ~5–10 s and ~41–45 s).
+- **The finding that shapes the next slice: the occupant map is the
+  robustness anchor.** In attribution regime (Clips 2, 3) the per-shot
+  identity check cleanly tells a stale crop parked on set dressing from
+  one that luckily still holds the subject — the same face-like-blob
+  class that fools the audit. Follow-visible (Clip 1) builds no map, so
+  YuNet false-fires a "face" on a *guitar body* (render-confirmed) and
+  the crop-face bar is fooled; that A-class defect is catchable only by
+  the cruder unmeasured-share bar. The defect is *easier* to verify where
+  the map exists — the inverse of the naive read.
+- **Ship-truth corrected two shakedown ledger entries**: the burned-in
+  source timecodes proved the prior session's "13.09 blank" and "22.19
+  guitar blob" were a screenshot→timestamp decode that crossed clips —
+  both dissolved, two genuinely-new hits recorded, one reclassified to a
+  Wide-layout framing wart. The publisher record stays honest.
+- **CONTEXT.md**: added **Solo presence** (the verified fact a solo Shot
+  owes before it ships). Wiring the fallback grammar + audit extension is
+  the next slice (`nextprompt-presence-wiring.md`).
+
 ## 2026-07-07 — Ship shakedown: first fresh-material production run — 2 of 3 clips shipped
 
 The production tool ran as a production tool for the first time on

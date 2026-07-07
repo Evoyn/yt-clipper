@@ -207,8 +207,8 @@ const SPAN_P_HI: f32 = 0.90;
 /// through a bobbing face.
 const REUSE_CENTER_FH: f32 = 0.30;
 const REUSE_H_FRAC: f32 = 0.12;
-const REUSE_GUARD_X_FH: f32 = 0.55;
-const REUSE_GUARD_Y_FH: f32 = 0.75;
+pub const REUSE_GUARD_X_FH: f32 = 0.55;
+pub const REUSE_GUARD_Y_FH: f32 = 0.75;
 
 /// One tracked person: a representative face box, how often they were
 /// visible, their per-bin mouth activity, and where the face actually was per
@@ -1612,7 +1612,7 @@ fn panel_crop(face: &FaceBox, src_w: f32, src_h: f32, panel_aspect: f32) -> Crop
 /// flicker (or the same person's *other* camera framing catching a few frames
 /// as they lean between two position tracks) does not — without this, those
 /// strays inflate a clean two-person split into a three-way column.
-const GROUP_PRESENCE_FRAC: f32 = 0.4;
+pub const GROUP_PRESENCE_FRAC: f32 = 0.4;
 
 /// [`group_layout`] framed from the tracks **substantially on screen during**
 /// bins `[lo, hi)` (present for at least [`GROUP_PRESENCE_FRAC`] of them), each
