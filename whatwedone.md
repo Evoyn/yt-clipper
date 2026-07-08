@@ -4,6 +4,38 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-08 — The dropped words + a real fix for the timing drift: forced alignment (ADR 0052/0053)
+
+Chased the words captions miss on overlapping speech ("otot", "kreatin", "pinguin", the
+"siapa tau" before "SDC"). Two findings, one small and one big.
+
+- **The dropped words are recoverable — the ensemble already hears them.** I built a
+  measure-first instrument (`caption_recall_diag`) that decodes all six views (whisper + the
+  5 Qwen variants) and localizes where a word is lost. It found these aren't a "the audio is
+  too masked to hear" problem — 3 of the 4 are heard by most decoders and the **current**
+  code already places them near the right time. The versions you'd seen drop them were older
+  renders. So the recall itself is mostly already there (ADR 0052).
+- **But a naive re-render felt worse — and you were right.** It recovered the words yet
+  brought back the mis-timing (your ADR 0051 pins were never saved, so a fresh render has
+  none) and added new phantoms from ensemble drift. So we did it **surgically** instead:
+  your clean shipped render + your pins + only the missing words inserted — no regeneration,
+  no new phantoms. You approved that clip. It proves the target, but it's a one-off (it
+  doesn't carry to other videos).
+- **The big win — the timing fix that GENERALIZES.** You asked the right question: how does
+  this carry forward? Hand-pins don't. So I researched and **spike-tested** the WhisperX
+  approach: **wav2vec2 forced alignment** — deriving each word's time from the audio itself
+  instead of whisper's drift-prone DTW. On clip 3 it **reproduced your hand-tuning
+  automatically, with zero pins**: "siapa" 3.66→**5.08**, "SDC" 20.78→**22.93** (the two
+  whisper got worst), and every recovered word placed accurately — 7 of 8 within ~0.8s, and
+  nothing fell through the cracks under laughter. One word ("gue", said many times) it timed
+  wrong — the same duplicated-word case pins struggle with. Burned it for your eye
+  (`_recall-lane clip3 (FORCED-ALIGN spike - no pins).mp4`), you approved the direction.
+- **What's next:** port forced alignment to native Rust (ONNX via `ort`, no Python) as the
+  new timing source, behind a flag, gated on your turn-taking clips before it becomes
+  default. That would make good caption timing **automatic on every video** and fold the
+  drop + mis-onset problems into one mechanism — a much bigger win than fixing clip 3 by
+  hand. `keratin→kreatin` stays a dialect-store spelling fix. (ADR 0053)
+
 ## 2026-07-08 — Mis-onset re-anchor: your time-pins now work on both caption engines (ADR 0051)
 
 The real fix for the mis-onset problem (a word shown early, onto a nearby laugh). First I

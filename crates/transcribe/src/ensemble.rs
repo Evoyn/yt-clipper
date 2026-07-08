@@ -310,6 +310,82 @@ pub fn apply(
     Ok(Transcript { language: whisper.language, units: fused })
 }
 
+/// One ensemble VARIANT's decode: its audio-view knobs + the words it produced
+/// (the raw inputs to [`vote_merge`]). Exposed for the recall instrument
+/// (`caption_recall_diag`, ADR 0052) so a dropped word's loss can be localized:
+/// **DECODE-loss** (no variant heard it — genuinely masked in the mix) vs
+/// **VOTE-loss** (a variant heard it, the strict-majority insert rule dropped it
+/// — reachable by a vote-rule change, no new audio processing).
+pub struct VariantDecode {
+    /// deep-filter attenuation limit (None = raw mix), mirroring [`Variant`].
+    pub atten: Option<u32>,
+    pub head_pad: bool,
+    /// The variant [`apply`] uses as its cleaned-onset source (first denoised
+    /// no-pad variant) — informational, so a diag can label the onset grid's origin.
+    pub onset_src: bool,
+    pub words: Vec<String>,
+}
+
+/// Decode every ensemble VARIANT for `range` and return each one's words — the
+/// exact per-variant lists [`vote_merge`] runs over. This is the measure-first
+/// entry point for the recall instrument (ADR 0052): [`apply`] performs the same
+/// decodes inline via the same `VARIANTS` / `variant_wav` / `decode_one`, so the
+/// instrument measures production exactly. A variant whose audio-prep or decode
+/// fails is skipped (as in `apply`); a decode timeout aborts (one crawl means all
+/// crawl — the GPU-oversubscription class).
+pub fn decode_variants(
+    cfg: &EnsembleConfig,
+    analysis_wav: &Path,
+    range: TimeRange,
+    language: Language,
+) -> Result<Vec<VariantDecode>> {
+    anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+    anyhow::ensure!(cfg.mtmd_cli.is_file(), "mtmd sidecar missing: {}", cfg.mtmd_cli.display());
+    anyhow::ensure!(cfg.qwen_model.is_file(), "qwen model missing: {}", cfg.qwen_model.display());
+    anyhow::ensure!(cfg.qwen_mmproj.is_file(), "qwen mmproj missing: {}", cfg.qwen_mmproj.display());
+    std::fs::create_dir_all(&cfg.work_dir)?;
+    let budget = Duration::from_secs_f64((30.0 + 1.5 * (range.duration_s() + HEAD_PAD_S)).max(120.0));
+    let mut out: Vec<VariantDecode> = Vec::new();
+    let mut onset_taken = false;
+    for (i, v) in VARIANTS.iter().enumerate() {
+        if v.atten.is_some() && cfg.deep_filter.is_none() {
+            continue;
+        }
+        anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+        (cfg.on_stage)(i + 1, VARIANTS.len());
+        let wav = match variant_wav(cfg, analysis_wav, range, v, i) {
+            Ok(w) => w,
+            Err(e) => {
+                anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+                tracing::warn!("recall: variant {i} audio prep failed: {e:#}");
+                continue;
+            }
+        };
+        // Mirror apply's onset-source choice (first denoised no-pad variant),
+        // captured on prep success regardless of the decode outcome.
+        let is_onset = v.atten.is_some() && !v.head_pad && !onset_taken;
+        if is_onset {
+            onset_taken = true;
+        }
+        match decode_one(cfg, &wav, language, budget) {
+            Ok(words) => out.push(VariantDecode {
+                atten: v.atten,
+                head_pad: v.head_pad,
+                onset_src: is_onset,
+                words,
+            }),
+            Err(e) if e.downcast_ref::<DecodeTimeout>().is_some() => {
+                return Err(e.context(format!("variant {i} decode timed out; aborting")));
+            }
+            Err(e) => {
+                anyhow::ensure!(!(cfg.should_cancel)(), "cancelled");
+                tracing::warn!("recall: variant {i} decode failed: {e:#}");
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Cut (and optionally denoise) one variant's audio view of the range.
 fn variant_wav(
     cfg: &EnsembleConfig,
@@ -1270,7 +1346,12 @@ fn align_weighted(a: &[String], b: &[String]) -> Vec<(Op, Option<usize>, Option<
 
 /// "Same word, different garble": edit distance <= 2, or one is a prefix of
 /// the other (whisper's multi-word store collapses keep only the first token).
-fn similar_word(a: &str, b: &str) -> bool {
+/// The module's canonical fuzzy token match: exact, prefix, or bounded
+/// Levenshtein (edit-≤2). Used by the timing fusion, the positional pin match,
+/// and — `pub` for the recall instrument (ADR 0052) — to score whether a decoder
+/// heard a dropped word's distinctive anchor (`penguin` ≈ `pinguin`), parity with
+/// the production `apply_store_fuzzy` cross-engine garble transfer.
+pub fn similar_word(a: &str, b: &str) -> bool {
     if a == b || a.starts_with(b) || b.starts_with(a) {
         return true;
     }
