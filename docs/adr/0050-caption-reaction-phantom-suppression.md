@@ -1,9 +1,27 @@
 # Reaction-phantom suppression: drop the caption piles crammed onto shared laughter (ADR 0049 fix #1)
 
+> **Status: REVERSED (2026-07-08), same day it shipped.** The premise was wrong.
+> Watching the real BEFORE/AFTER burn of clip 3, the operator ruled the "phantom"
+> opening — "YA SIAPA TAU MAU COBA (A)KU BAWA" — is **real speech, spoken fast and
+> placed too early**, not laughter. "Siapa tau mau coba ku bawa" is a real phrase
+> ("who knows, maybe I'll try to bring…"), and deleting it made the clip WORSE than
+> shipped ("BEFORE is better"). So the whole failure the operator reported is
+> **mis-onset** (real words on the wrong clock) + **mis-transcription** + **dropped
+> words** — hardly any of it is phantom. Suppression deleting real fast speech is
+> exactly the false-positive the hard rule forbids. Wiring + the pure functions +
+> the `caption_suppress_gate` example + the CONTEXT.md "Reaction phantom" term were
+> all removed (commit reverting this ADR); the `caption_overlap_diag` instrument and
+> the `segment_seek` re-burn helper stay. The real fix is the **mis-onset re-anchor**
+> (was ADR 0049 fix #3, now fix #1). **Lesson: a re-decode/instrument agreeing with a
+> hand-labelled "phantom" is NOT the operator's eye on the burned clip — gate on the
+> burn, not the label.** The record of the attempt is kept below.
+
 ADR 0049 measured the shipped 4-person VIOR captions and named four
 overlap-specific failure classes; **phantom** — words hallucinated onto a
-shared-reaction stretch — was the cheapest, highest-confidence, look-preserving
-fix. This ADR wires it into the production caption path and gates it.
+shared-reaction stretch — was *believed* the cheapest, highest-confidence,
+look-preserving fix. This ADR wired it into the production caption path and gated
+it against the instrument — which passed, but the operator's eye on the real burn
+did not (see the reversal banner above).
 
 ## Decision
 

@@ -10,10 +10,9 @@
 pub mod ass;
 pub mod export;
 pub use ass::{
-    generate_ass, preview_lines, reaction_phantom_drops, refine_caption_timing,
-    refine_caption_timing_keep_verified, refine_caption_timing_traced, resolve_placement,
-    suppress_reaction_phantoms, word_states, PreviewLine, PreviewWord, RefineTrace, UnitOutcome,
-    WordState,
+    generate_ass, preview_lines, refine_caption_timing, refine_caption_timing_keep_verified,
+    refine_caption_timing_traced, resolve_placement, word_states, PreviewLine, PreviewWord,
+    RefineTrace, UnitOutcome, WordState,
 };
 pub use export::{
     build_camera_filtergraph, build_filtergraph, export_args, export_args_script, run_export,

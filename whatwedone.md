@@ -4,30 +4,26 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
-## 2026-07-08 — Reaction-phantom suppression: the laughter-pile captions now drop (ADR 0050)
+## 2026-07-08 — Reaction-phantom suppression: TRIED, then REVERSED on your eye (ADR 0050)
 
-Fix #1 of the caption-overlap roadmap (ADR 0049), wired into the real render and
-gated. The caption stage was blind to the shared-reaction mask the camera already
-reads; now it recomputes that laughter mask over the clip's mixed audio and **drops
-the flash piles crammed onto group laughter** — your opening "YA SIAPA TAU MAU" that
-isn't really spoken. Quality-first: the extra tagger pass runs every render.
-Committed + pushed.
+Tried ADR 0049's "fix #1": drop the flash pile of words the caption stage seemed to
+cram onto the opening group-laugh ("YA SIAPA TAU MAU COBA AKU"). It passed the
+instrument gate — but when you watched the real BEFORE/AFTER burn, you ruled it wrong:
+**"Siapa tau mau coba ku bawa" is real speech**, just spoken fast and placed too early
+— deleting it made the clip **worse** than shipped. So I reverted the whole thing the
+same day; the captions are byte-identical to before again.
 
-- **What drops, precisely:** a *burst* — a run of back-to-back too-short cues with a
-  ≥ 3-word laughter core, dropped whole (so the sub-readable fade tail goes too, not
-  left as a lone wrong lead word — you caught that on the burn). On clip 3 that is the
-  6-word opening "YA SIAPA TAU MAU COBA AKU"; 95 of 101 cues survive, nothing else.
-- **What never drops (the promise):** a real word is never eaten. The 5 words you
-  flagged as mis-placed-early all survive — they are lone, held cues, not piles, and
-  re-placing them at the right moment is the next slice. Real fast back-and-forth talk
-  sits *below* the laughter mask, so it is untouched.
-- **The measure-first correction:** the plan was to spare cues that have "a clean
-  attributed speaker," but measuring showed the opening laugh is attributed with full
-  confidence (a laughing mouth moves) — that guard would have *protected* the pile. The
-  real signal is **density × laughter**, not who is attributed.
-- **Controls stay clean:** ANTITESA (which has real laughter, mask peak 0.70) drops 0;
-  the busy 3-person Deddy clip drops 0; the camera path is byte-identical (the ANTITESA
-  fingerprint and every fixture bar still pass); the test suites are green both ways.
+- **The lesson (worth more than the code):** an instrument agreeing with a
+  hand-labelled "phantom" is NOT your eye on the burned clip. The opening was never
+  laughter-noise — it was real words on the wrong clock. Gate on the burn, not the label.
+- **What this means for the real fix:** almost every caption problem you named is
+  **mis-onset** (right word, wrong time: siapa→5s, gue→28s, fadil→32s, SDC/siapa-tau→23s,
+  jalannya→54s), **wrong text** (lu→lucu, ya→yakan, aslinya→ASI, pamu→Pak muh, gemot→gemes,
+  duduk-duduk→dodo, proten→protein), or **dropped words** (otot kayaknya, kreatin-kreatin,
+  pinguin). Hardly any is a phantom. So the mis-onset re-anchor is now fix #1.
+- **Kept from the detour:** the `caption_overlap_diag` instrument and a new `segment_seek`
+  helper that re-burns a clip.ass over the fetched segment at the render's exact seek — so
+  we can eyeball any future caption change on the real surface without a GPU re-decode.
 
 ## 2026-07-08 — Captions under overlapping speech: measured the defect, gate PASSED (ADR 0049)
 

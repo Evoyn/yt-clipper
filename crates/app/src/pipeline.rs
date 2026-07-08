@@ -2055,7 +2055,7 @@ fn ensure_transcript(
             // Ensemble transcripts keep every unit: their words are vote-verified
             // across decoders, so a near-silent onset means fusion placed a real
             // word into a quiet span — re-time it, don't delete it (ADR 0034).
-            let refined = if ens_used {
+            if ens_used {
                 yc_render::refine_caption_timing_keep_verified(
                     transcript,
                     &samples,
@@ -2063,124 +2063,13 @@ fn ensure_transcript(
                 )
             } else {
                 yc_render::refine_caption_timing(transcript, &samples, yc_ingest::WHISPER_SR)
-            };
-            // Reaction-phantom suppression (ADR 0050, the ADR 0049 fix #1): the
-            // caption stage was blind to the shared-reaction mask the camera lanes
-            // already read. Recompute it here over THIS clip's analysis.wav and drop
-            // the flash PILES the caption stage crams onto the group laugh (clip 3's
-            // "YA SIAPA TAU MAU"). Fail-soft — a missing tagger leaves the captions
-            // untouched — and part of the cached transcript, so the editor preview
-            // and every re-render show the same suppressed cues on BOTH engines.
-            suppress_caption_phantoms(paths, session, range, refined, tx)
+            }
         };
         prepared.transcript = Some(transcript);
         prepared.transcript_ens = use_ensemble;
         prepared.transcript_operator = false;
     }
     Ok(engine)
-}
-
-/// Reaction-phantom suppression on the render path (ADR 0050, the ADR 0049 fix
-/// #1). The caption stage transcribes the raw/vocal audio blind to the
-/// shared-reaction mask the camera lanes read (ADR 0045/0046); here we recompute
-/// that mask over THIS clip's **mixed** analysis.wav — laughter lives in the room
-/// mix, not the vocal stem the words may come from — with the very same
-/// `yc_frame::reaction` tagger the Speaker analysis uses, and hand it to
-/// [`yc_render::reaction_phantom_drops`] to drop the flash PILES the caption stage
-/// crams onto the group laugh (clip 3's "YA SIAPA TAU MAU"). Additive and
-/// fail-soft exactly like the reaction lane: an empty transcript, a missing/broken
-/// tagger, or a mask failure yields the transcript untouched, never a failed
-/// render. The tagger is a CPU-EP ONNX, so it never contends with the whisper/Qwen
-/// GPU stage that just ran. Voice/`face`-feature only: the reaction tagger is
-/// the same `ort` session the camera lanes use — without it (the default build,
-/// and the byte-identical whisper-only path it guards) the twin below no-ops.
-#[cfg(feature = "face")]
-fn suppress_caption_phantoms(
-    paths: &PipelinePaths,
-    session: &Session,
-    range: TimeRange,
-    mut transcript: Transcript,
-    tx: &Sender<Progress>,
-) -> Transcript {
-    if transcript.units.is_empty() {
-        return transcript;
-    }
-    if !(paths.tag_model.is_file() && paths.tag_labels.is_file()) {
-        tracing::info!("caption: reaction tagger absent; no phantom suppression");
-        return transcript;
-    }
-    // Score the laughter-family mask over the clip's mixed analysis audio — the
-    // same steps `do_analyze_speakers` computes, at the tagger's native 0.25 s
-    // grid (a cue onset maps to its covering step; finer projection adds nothing).
-    let mask = || -> anyhow::Result<Vec<f32>> {
-        use yc_frame::reaction;
-        let labels = reaction::parse_class_labels(&std::fs::read_to_string(&paths.tag_labels)?);
-        let family = reaction::laughter_family(&labels);
-        anyhow::ensure!(
-            !family.is_empty(),
-            "no laughter-family classes in {}",
-            paths.tag_labels.display()
-        );
-        let samples = yc_ingest::read_range_samples(&session.analysis_wav, range)?;
-        let mut sess = reaction::TagSession::load(
-            &paths.tag_model,
-            yc_frame::voice::SampleScale::Unit,
-            reaction::TagOutput::Probs,
-        )?;
-        reaction::tag_steps(&mut sess, &samples, range.duration_s(), &family)
-    };
-    let steps = match mask() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("caption: reaction mask failed; no phantom suppression: {e:#}");
-            return transcript;
-        }
-    };
-    let drops = yc_render::reaction_phantom_drops(
-        &transcript.units,
-        &steps,
-        yc_frame::reaction::TAG_STEP_S,
-    );
-    let n_drop = drops.iter().filter(|d| **d).count();
-    if n_drop == 0 {
-        return transcript;
-    }
-    let _ = tx.send(Progress::Stage("Suppressing reaction phantoms"));
-    let before = transcript.units.len();
-    let units = std::mem::take(&mut transcript.units);
-    transcript.units = units
-        .into_iter()
-        .zip(drops)
-        .filter_map(|(u, d)| {
-            if d {
-                tracing::info!(
-                    text = %u.text,
-                    start_s = u.start_s,
-                    end_s = u.end_s,
-                    "caption: reaction-phantom suppressed"
-                );
-                None
-            } else {
-                Some(u)
-            }
-        })
-        .collect();
-    tracing::info!(before, after = transcript.units.len(), "caption: reaction-phantom suppression");
-    transcript
-}
-
-/// Without the `face`/voice feature there is no reaction tagger, so captions
-/// pass through unsuppressed — identical to a runtime-absent tagger, and the
-/// whole caption path stays byte-for-byte the pre-ADR-0050 output.
-#[cfg(not(feature = "face"))]
-fn suppress_caption_phantoms(
-    _paths: &PipelinePaths,
-    _session: &Session,
-    _range: TimeRange,
-    transcript: Transcript,
-    _tx: &Sender<Progress>,
-) -> Transcript {
-    transcript
 }
 
 /// Phase-2b (ADR 0012): render the operator's `layout` over the prepared
