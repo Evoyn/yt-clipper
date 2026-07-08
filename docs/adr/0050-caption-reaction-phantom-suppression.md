@@ -7,16 +7,29 @@ fix. This ADR wires it into the production caption path and gates it.
 
 ## Decision
 
-Drop a caption cue when it belongs to a **reaction pile**: a run of `>= 3`
-(`PILE_MIN`) consecutive cues that are each too short to read (dwell
-`< MIN_READ_S` = 0.40 s) AND whose onset sits on the shared-reaction mask
-(`laugh >= REACTION_TAU` = 0.1). The pure decision is
-`yc_render::reaction_phantom_drops` / `suppress_reaction_phantoms`; the render
-path (`ensure_transcript`, after the timing refine) recomputes the laughter mask
-over the clip's **mixed** analysis.wav with the same `yc_frame::reaction` tagger
-the camera lanes use, then applies it. Additive and fail-soft, exactly like the
-reaction lane: a missing/broken tagger (or the default non-`face` build) leaves
-captions untouched.
+Drop the cues of a **reaction pile**: a maximal run of consecutive too-fast cues
+(dwell `< MIN_READ_S` = 0.40 s) that holds a CORE of `>= PILE_MIN` (3)
+**consecutive masked** cues (onset `laugh >= REACTION_TAU` = 0.1). The whole fast
+run drops — the masked core is a genuine laughter burst, and dropping the run
+also absorbs the sub-readable **fade cues** on the burst's edges that dip just
+below the mask (clip 3's "COBA AKU" after "YA SIAPA TAU MAU"); a held (readable)
+cue breaks the run, so a real word after the laugh bounds the drop. The pure
+decision is `yc_render::reaction_phantom_drops` / `suppress_reaction_phantoms`;
+the render path (`ensure_transcript`, after the timing refine) recomputes the
+laughter mask over the clip's **mixed** analysis.wav with the same
+`yc_frame::reaction` tagger the camera lanes use, then applies it. Additive and
+fail-soft, exactly like the reaction lane: a missing/broken tagger (or the
+default non-`face` build) leaves captions untouched.
+
+**Why the whole fast run, not just the masked cues (operator eyeball, 2026-07-08):**
+a first cut dropped only the masked cues, which split the opening burst and left
+its below-mask tail "COBA AKU" orphaned as a lone wrong word LEADING the clip —
+the operator judged that worse than the buried pile. Absorbing the fast fade
+edges fixes it. The below-mask cues right after a `>= 3` laughter core are the
+same phantom; a genuinely-spoken word there is readable (held), which breaks the
+run. This does NOT reach held mistranscriptions on quiet/no-laugh spans (clip 3's
+"BAWA"@2.66, tagger laugh 0.004, and the early "SIAPA"@3.66) — those are the
+mis-onset re-anchor's job (fix #3), not a laughter-mask fix.
 
 ## Why density × reaction, not attribution (the measure-first correction)
 
@@ -43,8 +56,9 @@ moved by evidence, recorded, not quietly dropped.)
 
 ## The gate (re-run `caption_overlap_diag` on the suppressed clip.ass)
 
-- **Phantom gone:** the "YA SIAPA TAU MAU" pile drops; phantom-pile auto-detection
-  → none (was 1). Exactly 4 cues removed, 97/101 survive.
+- **Phantom gone:** the full opening burst "YA SIAPA TAU MAU COBA AKU" drops
+  (masked core + fade tail); phantom-pile auto-detection → none (was 1). 6 cues
+  removed, 95/101 survive, no orphaned lead word (operator-confirmed on the burn).
 - **No real word suppressed:** the 5 mis-onset words and every contested-speech and
   talk-over-laughter cue survive — only the pile went.
 - **Controls clean:** ANTITESA (real laughter, mask peak 0.70) → 0 drops; Deddy 3p

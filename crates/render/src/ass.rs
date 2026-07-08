@@ -600,40 +600,49 @@ const REACTION_TAU: f32 = 0.1;
 
 /// Per-cue suppression decision for [`suppress_reaction_phantoms`]: `true` =
 /// drop. Same order and length as `units`, so a caller can log exactly which
-/// cues (and their spans) a render dropped. A cue is a **pile member** when it
-/// is both too-fast (dwell < [`MIN_READ_S`]) and reaction-masked at its onset
-/// (`reaction >= REACTION_TAU`); a maximal run of `>= PILE_MIN` consecutive
-/// pile members is dropped, everything else kept.
+/// cues (and their spans) a render dropped.
+///
+/// A cue is **fast** when its dwell is sub-readable (`< MIN_READ_S`) and
+/// **masked** when its onset sits on the laughter mask (`reaction >=
+/// REACTION_TAU`). The unit of suppression is a maximal run of consecutive fast
+/// cues that holds a CORE of `>= PILE_MIN` **consecutive masked** cues — a
+/// genuine laughter burst, not a stray laugh in fast speech. The WHOLE fast run
+/// then drops, which absorbs the sub-readable fade cues on the burst's edges
+/// that dip just below the mask (clip 3's "COBA AKU" tail after "YA SIAPA TAU
+/// MAU") — they are the same phantom, and leaving them orphaned a lone wrong
+/// word to LEAD the clip is worse than the pile (operator eyeball, 2026-07-08).
+/// A held (readable) cue breaks the fast run, so a real word after the laugh
+/// bounds the drop.
 pub fn reaction_phantom_drops(units: &[CaptionUnit], reaction: &[f32], bin_s: f64) -> Vec<bool> {
     let n = units.len();
     let mut drop = vec![false; n];
     if n == 0 || bin_s <= 0.0 || reaction.is_empty() {
         return drop;
     }
-    // A too-fast cue whose onset lands on the laughter mask. The `+ 1e-9` mirrors
-    // the instrument's floor test so a cue held to exactly MIN_READ_S is NOT fast
-    // (its dwell is readable); a cue past the mask's end reads as unmasked (0.0).
-    let pile_member = |u: &CaptionUnit| -> bool {
-        if (u.end_s - u.start_s) + 1e-9 >= MIN_READ_S {
-            return false;
-        }
+    // `+ 1e-9` mirrors the instrument's floor test: a cue held to exactly
+    // MIN_READ_S is NOT fast (its dwell is readable). A cue past the mask's end
+    // reads as unmasked (0.0), so it never anchors a core.
+    let fast = |u: &CaptionUnit| (u.end_s - u.start_s) + 1e-9 < MIN_READ_S;
+    let masked = |u: &CaptionUnit| {
         let bin = (u.start_s / bin_s).floor();
-        if bin < 0.0 {
-            return false;
-        }
-        reaction.get(bin as usize).copied().unwrap_or(0.0) >= REACTION_TAU
+        bin >= 0.0 && reaction.get(bin as usize).copied().unwrap_or(0.0) >= REACTION_TAU
     };
     let mut i = 0;
     while i < n {
-        if !pile_member(&units[i]) {
+        if !fast(&units[i]) {
             i += 1;
             continue;
         }
+        // [i, j) is a maximal run of consecutive fast cues; track the longest
+        // sub-run of consecutive masked cues inside it (the burst core).
         let mut j = i;
-        while j < n && pile_member(&units[j]) {
+        let (mut longest_core, mut cur_core) = (0usize, 0usize);
+        while j < n && fast(&units[j]) {
+            cur_core = if masked(&units[j]) { cur_core + 1 } else { 0 };
+            longest_core = longest_core.max(cur_core);
             j += 1;
         }
-        if j - i >= PILE_MIN {
+        if longest_core >= PILE_MIN {
             drop[i..j].iter_mut().for_each(|d| *d = true);
         }
         i = j;
@@ -1417,10 +1426,12 @@ mod tests {
     }
 
     #[test]
-    fn suppress_drops_the_opening_reaction_pile() {
-        // clip 3's signature: YA SIAPA TAU MAU crammed onto the opening laugh,
-        // each cue too short to read, all on the mask -> the whole run drops.
-        // COBA follows off-mask (laugh fell below tau) and survives.
+    fn suppress_drops_the_whole_burst_including_the_fade_tail() {
+        // clip 3's signature: YA SIAPA TAU MAU sit on the laugh peak (masked);
+        // COBA AKU are the sub-readable fade tail that dips just below the mask.
+        // The 4-cue masked CORE drops the WHOLE fast run, so no orphaned "COBA"
+        // leads the clip (operator eyeball, 2026-07-08). A HELD real word after
+        // the burst breaks the fast run and survives.
         let t = Transcript {
             language: Language::Id,
             units: vec![
@@ -1428,13 +1439,15 @@ mod tests {
                 phantom_cu("siapa", 1.76, 2.08),
                 phantom_cu("tau", 2.08, 2.20),
                 phantom_cu("mau", 2.20, 2.36),
-                phantom_cu("coba", 2.36, 2.56),
+                phantom_cu("coba", 2.36, 2.56),    // fast, below mask (fade)
+                phantom_cu("aku", 2.56, 2.66),     // fast, below mask (fade)
+                phantom_cu("beneran", 3.20, 3.90), // HELD (0.70) -> breaks the run
             ],
         };
-        let mask = laugh_mask(3.0, &[(1.5, 2.25)]); // covers YA..MAU, not COBA(2.36)
+        let mask = laugh_mask(4.0, &[(1.5, 2.25)]); // covers YA..MAU only
         let out = suppress_reaction_phantoms(t, &mask, 0.25);
         let texts: Vec<&str> = out.units.iter().map(|u| u.text.as_str()).collect();
-        assert_eq!(texts, ["coba"]);
+        assert_eq!(texts, ["beneran"], "full burst + fade tail dropped; held word survives");
     }
 
     #[test]
@@ -1477,17 +1490,20 @@ mod tests {
     }
 
     #[test]
-    fn reaction_phantom_drops_marks_only_the_pile_run() {
+    fn reaction_phantom_drops_marks_the_full_fast_run() {
+        // The masked core (YA SIAPA TAU MAU) drops the whole fast run, so the
+        // below-mask fade cue COBA is dropped too; the HELD "beneran" survives.
         let units = vec![
             phantom_cu("ya", 1.64, 1.76),
             phantom_cu("siapa", 1.76, 2.08),
             phantom_cu("tau", 2.08, 2.20),
             phantom_cu("mau", 2.20, 2.36),
-            phantom_cu("coba", 2.36, 2.56),
+            phantom_cu("coba", 2.36, 2.56),    // fade tail: below mask, still dropped
+            phantom_cu("beneran", 3.20, 3.90), // held -> survives
         ];
-        let mask = laugh_mask(3.0, &[(1.5, 2.25)]);
+        let mask = laugh_mask(4.0, &[(1.5, 2.25)]);
         let drop = reaction_phantom_drops(&units, &mask, 0.25);
-        assert_eq!(drop, vec![true, true, true, true, false]);
+        assert_eq!(drop, vec![true, true, true, true, true, false]);
     }
 
     #[test]

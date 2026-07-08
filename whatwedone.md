@@ -13,9 +13,10 @@ the flash piles crammed onto group laughter** — your opening "YA SIAPA TAU MAU
 isn't really spoken. Quality-first: the extra tagger pass runs every render.
 Committed + pushed.
 
-- **What drops, precisely:** a *pile* — a run of ≥ 3 back-to-back cues that are each
-  too short to read AND sit on the laughter mask. On clip 3 that is exactly the 4-cue
-  opening pile; 97 of 101 cues survive, nothing else touched.
+- **What drops, precisely:** a *burst* — a run of back-to-back too-short cues with a
+  ≥ 3-word laughter core, dropped whole (so the sub-readable fade tail goes too, not
+  left as a lone wrong lead word — you caught that on the burn). On clip 3 that is the
+  6-word opening "YA SIAPA TAU MAU COBA AKU"; 95 of 101 cues survive, nothing else.
 - **What never drops (the promise):** a real word is never eaten. The 5 words you
   flagged as mis-placed-early all survive — they are lone, held cues, not piles, and
   re-placing them at the right moment is the next slice. Real fast back-and-forth talk
