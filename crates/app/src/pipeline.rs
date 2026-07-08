@@ -2047,6 +2047,26 @@ fn ensure_transcript(
                     tracing::info!("dialect: harvested {n} word(s) -> {}", clip_store.display());
                 }
             }
+            // Positional (`at_s`) store pins on the WHISPER path (engine parity,
+            // ADR 0051): the ensemble applies these inside `ensemble::apply`, but a
+            // whisper render never did — an operator's time-pin silently no-op'd on
+            // the default engine. Snap each pinned word onto its real speech onset
+            // here too, over the SAME `rms_onsets` grid the fusion uses, so a
+            // "cue shows early, the word is at ~28 s" correction works on BOTH
+            // engines. After harvest (whose `unit_index` addresses the pre-pin
+            // units) and before refine (which then gap-fills the moved word). A
+            // store with no `at_s` entries — the common case — is a no-op, so the
+            // default render stays byte-identical.
+            // The `any(at_s)` guard skips even the onset envelope in that case.
+            if !ens_used && lexicon.corrections.iter().any(|c| c.at_s.is_some()) {
+                yc_transcribe::ensemble::apply_store_positional(
+                    &mut transcript.units,
+                    &lexicon,
+                    range.start_s,
+                    &yc_transcribe::ensemble::rms_onsets(&samples, yc_ingest::WHISPER_SR),
+                    range.duration_s(),
+                );
+            }
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.

@@ -4,6 +4,38 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-08 — Mis-onset re-anchor: your time-pins now work on both caption engines (ADR 0051)
+
+The real fix for the mis-onset problem (a word shown early, onto a nearby laugh). First I
+measured **where** the early placement comes from: it's **whisper's own word timing**, not
+the ensemble — the shipped ensemble captions are byte-identical to plain whisper at every
+mis-timed cue. So the fix belongs in the shared caption path.
+
+- **Auto-detecting mis-onset is not safely possible — measured, not guessed.** I built an
+  instrument that tried to spot the early words from the laughter mask + whisper's timing.
+  It doesn't work: 3 of your 5 mis-timed words sit on *clean* audio at their wrong moment,
+  the mask fires on the opening pile you told me to keep, and the real speech is often
+  *under* the laughter. An early word before a gap is acoustically identical whether it's
+  mis-placed or correctly placed before a pause — only your ear separates them. An
+  auto-mover would shift correctly-placed words (the ADR 0050 trap). Recorded, not chased.
+- **The fix that IS safe: your time-pin.** You can pin a word's correct moment in the
+  dialect store and the code snaps it onto the real speech onset — but that only worked on
+  the **ensemble** engine; on the default **whisper** engine a time-pin silently did
+  nothing. Now it works on **both**. Zero risk: only a word you pin ever moves.
+- **Proved on your eye.** A BEFORE/AFTER re-burn of clip 3 (the BEFORE byte-identical to
+  your shipped Short) with 5 pins: SIAPA 3.66→5.06, SDC 20.78→22.78, GUE 25.84→28.12,
+  FADIL 31.32→32.26, JALANANNYA 53.48→53.60 — each on its real onset, and no other word
+  moved (the other GUE/FADILs stayed put). You ruled the timing fixed.
+- **Also fixed:** a caps word like "SDC" now matches your pin on the whisper engine (it was
+  silently case-mismatched before).
+- **Caveat:** a common word said many times (like "gue") is finicky to pin — the pin grabs
+  the occurrence nearest your time, so pin it toward where it *currently* shows. Distinctive
+  words (names, acronyms) — the ones worth a durable pin — just work.
+- **What's left (recorded for the next slices):** the drops you caught (siapa tau ~20s,
+  otot kayaknya, kreatin-kreatin, pinguin) are the **recall lane** — next session. The
+  wrong-text ones (proten→protein) are your store curation. "ya"@12 is the one phantom
+  candidate.
+
 ## 2026-07-08 — Reaction-phantom suppression: TRIED, then REVERSED on your eye (ADR 0050)
 
 Tried ADR 0049's "fix #1": drop the flash pile of words the caption stage seemed to

@@ -903,7 +903,12 @@ fn respread_flashes(fused: &mut [CaptionUnit], clip_dur_s: f64) {
 /// caption timing pass (hop 20 ms, win 40 ms) and the ADR 0021 bar
 /// (min(10% of the loud reference, absolute floor 0.006) — here max'd with the
 /// absolute floor so pure-noise clips don't sprout onsets everywhere).
-fn rms_onsets(samples: &[f32], sample_rate: u32) -> Vec<f64> {
+///
+/// `pub` because the whisper caption path runs the same [`apply_store_positional`]
+/// pass (engine parity for `at_s` time-pins, ADR 0051) and must snap to this
+/// exact onset grid — the ensemble computes it internally from its cleaned-onset
+/// source; the whisper path computes it over the mixed caption samples.
+pub fn rms_onsets(samples: &[f32], sample_rate: u32) -> Vec<f64> {
     if samples.is_empty() {
         return Vec::new();
     }
@@ -1078,10 +1083,18 @@ pub fn apply_store_positional(
             (0..(fused.len() + 1).saturating_sub(wrong.len()))
                 .filter(|&k| {
                     wrong.iter().enumerate().all(|(i, w)| {
+                        // Case-insensitive: `wrong` is normalized (lowercased),
+                        // and the ensemble's fused text already is — but the
+                        // whisper path (ADR 0051) carries whisper's mixed-case
+                        // units ("SDC", "Gue"), where a caps acronym is edit-3
+                        // from its lowercased pin and similar_word would miss it.
+                        // Lowercasing the unit is a no-op on the lowercase ensemble
+                        // stream, so this leaves ensemble renders byte-identical.
+                        let ft = fused[k + i].text.to_lowercase();
                         if exact {
-                            &fused[k + i].text == w
+                            &ft == w
                         } else {
-                            similar_word(&fused[k + i].text, w)
+                            similar_word(&ft, w)
                         }
                     })
                 })
@@ -1736,6 +1749,79 @@ mod tests {
         apply_store_positional(&mut fused, &pin_lex(&[("anjing", "anjing", 105.0)]), 100.0, &[5.2], 10.0);
         assert_eq!(fused[0].start_s, 1.0, "first occurrence untouched");
         assert!((fused[2].start_s - 5.2).abs() < 1e-9, "second pinned to onset, got {}", fused[2].start_s);
+    }
+
+    #[test]
+    fn positional_pin_reanchors_a_mis_onset_word_to_its_real_speech_onset() {
+        // The measured clip-3 case (ADR 0051): whisper's DTW anchored "gue" at
+        // 25.84 s — onto a laughter burst — but the operator hears the word at
+        // ~28 s. Automatic re-anchoring was refuted by measurement (an early onset
+        // before a laugh is acoustically identical to a correct word before a
+        // pause; only the ear separates them), so the fix is the operator's time
+        // pin snapping the word onto its real speech onset. The whisper path runs
+        // this SAME pass now (engine parity) — the ensemble always did. The words
+        // the pin did not name never move: the false-positive guarantee the
+        // auto-detector could not offer.
+        let mut fused = vec![
+            CaptionUnit { text: "corp".into(), start_s: 24.88, end_s: 25.84 },
+            CaptionUnit { text: "gue".into(), start_s: 25.84, end_s: 25.84 },
+            CaptionUnit { text: "kalo".into(), start_s: 28.64, end_s: 28.88 },
+        ];
+        // Clip VOD-range starts at 3592 s; the pin is gue at clip-relative 28.0 s.
+        // The real speech onset (measured) is 28.12; the wrong 25.84 is a laughter
+        // burst with no clean speech onset of its own.
+        apply_store_positional(
+            &mut fused,
+            &pin_lex(&[("gue", "gue", 3592.0 + 28.0)]),
+            3592.0,
+            &[24.36, 28.12],
+            61.0,
+        );
+        let gue = fused.iter().find(|u| u.text == "gue").expect("gue kept");
+        assert!(
+            (gue.start_s - 28.12).abs() < 1e-9,
+            "gue re-anchored to its real onset, got {}",
+            gue.start_s
+        );
+        // corp (before) and kalo (after) — words the pin never named — are untouched.
+        assert_eq!(fused[0].text, "corp");
+        assert!((fused[0].start_s - 24.88).abs() < 1e-9, "corp untouched, got {}", fused[0].start_s);
+        let kalo = fused.iter().find(|u| u.text == "kalo").expect("kalo kept");
+        assert!(
+            kalo.start_s >= 28.64 - 1e-9,
+            "kalo not dragged by the pin, got {}",
+            kalo.start_s
+        );
+        for w in fused.windows(2) {
+            assert!(w[0].start_s <= w[1].start_s + 1e-9, "monotonic");
+        }
+    }
+
+    #[test]
+    fn positional_pin_matches_a_whisper_caps_acronym() {
+        // Whisper-path parity (ADR 0051): whisper keeps a word's case ("SDC"),
+        // unlike the ensemble's normalized-lowercase stream. normalize() lowercases
+        // the pin's `wrong`, so an all-caps acronym is edit-3 from it — similar_word
+        // would miss it — and the operator's "SDC" mis-onset would silently no-op on
+        // the whisper engine. The match is case-insensitive; `right` keeps casing.
+        let mut fused = vec![
+            CaptionUnit { text: "juga".into(), start_s: 19.0, end_s: 19.5 },
+            CaptionUnit { text: "SDC".into(), start_s: 21.0, end_s: 22.0 },
+            CaptionUnit { text: "Susu".into(), start_s: 24.0, end_s: 24.4 },
+        ];
+        apply_store_positional(
+            &mut fused,
+            &pin_lex(&[("SDC", "SDC", 3592.0 + 23.0)]),
+            3592.0,
+            &[22.76],
+            61.0,
+        );
+        assert_eq!(fused[1].text, "SDC", "display casing preserved");
+        assert!(
+            (fused[1].start_s - 22.76).abs() < 1e-9,
+            "caps acronym matched case-insensitively and re-anchored, got {}",
+            fused[1].start_s
+        );
     }
 
     #[test]
