@@ -29,10 +29,18 @@ flip the knob.
   spike (which you approved) didn't. Measured both: normalization fixes "gue" but breaks
   "pinguin" (grabs the earlier duplicate). Raw input ships; the export script + module doc
   both say why, so nobody "fixes" it later.
-- **For your eye when you wake**: `_forced-align clip3 (RUST PORT - production).mp4` in the
-  VIOR folder — fresh ensemble words, aligner timing, zero pins. Judge TIMING only against
-  `_recall-lane clip3 (fresh current-code ensemble).mp4` (same words, old timing). If it
-  reads right, next session flips the ensemble default (nextprompt-forced-align-default-flip.md).
+- **Your ruling on the burn (same morning): "timing for rust port is right" — gate PASSED.**
+  The two things you flagged are both text-lane, and I measured them before touching anything:
+  the second "pinguin" (and "jalanannya", and the real ~51s word "gemes") were DROPPED by
+  today's vote — that's the recall lane (ADR 0052), timing can't invent words. The stray
+  GEMOY you saw at ~56 is the vote's garbled spelling of that "gemes" floating into the
+  5-second hole those drops left; I measured the two obvious auto-fixes and both are dead
+  ends (alignment confidence doesn't separate it from real fast words — 0.295 vs siapa's
+  0.006; a time-pin would grab the REAL gemoy at 49.7 instead — the twin trap). Honest
+  verdict in ADR 0054: fill the hole (recall lane) and the float has no room; then the
+  store fixes the spelling. Next session grills one question first: flip the default now
+  and do recall next (my recommendation), or recall first
+  (nextprompt-forced-align-default-flip.md).
 
 ## 2026-07-08 — The dropped words + a real fix for the timing drift: forced alignment (ADR 0052/0053)
 

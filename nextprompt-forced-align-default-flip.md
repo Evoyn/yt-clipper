@@ -17,16 +17,25 @@ fixed automatically: SIAPA -1.54s -> +0.08, SDC -2.22s -> -0.07. The
 turn-taking control (ANTITESA) numbers are in ADR 0054's gate table. A
 re-burn mp4 was left for the operator's eye (see below).
 
-## The gate that MUST come first (operator, before any code)
+## The burn gate: PASSED (operator, 2026-07-11)
 
-Watch `workspace/Deddy Corbuzier/MENUJU INDONESIA CEMAS BERSAMA VIOR…/
-_forced-align clip3 (RUST PORT - production).mp4` against
-`_recall-lane clip3 (fresh current-code ensemble).mp4` (same words, DTW
-timing) — the ONLY question is TIMING on the ear/eye (text drops are the
-recall lane, ADR 0052, unchanged by this). If the operator rules it worse,
-STOP — measure, don't flip.
+Operator ruling on the burn: **"timing for rust port is right"** — with two
+text-lane residuals named: the pinguin@52 drop, and a stray GEMOY cue
+floating to 56.06 (the garble-float — ADR 0054 §garble-float has the full
+measurement; confidence-gates and store-pins are REFUTED there, do not
+rebuild them; the structural fix is the recall lane filling the token hole).
 
-## The slice (if the burn gate passes)
+## The ordering decision to grill FIRST
+
+Two valid orders — the operator picks:
+1. **Flip now, recall lane next** (recommended): the siapa/SDC drift class
+   fixes on every ensemble render immediately; the float is a rare residual
+   the DTW path also had (hidden inside the hole), and the drops exist on
+   both engines regardless.
+2. **Recall lane first, then flip**: kills the float's room before the swap
+   becomes default — costs every render the timing win until that lands.
+
+## The slice (once the order is picked)
 
 1. **Flip the ensemble default**: forced alignment becomes the ensemble
    path's timing skeleton without the env knob (knob becomes the off-switch,

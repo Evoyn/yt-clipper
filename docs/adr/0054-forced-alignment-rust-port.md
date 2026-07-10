@@ -116,8 +116,38 @@ untouched by this slice). The `YC_ALIGN_EMIT=1` re-run through the REAL
 fusion (decode determinism held) — the burn artifact is production output:
 `_forced-align clip3 (RUST PORT - production).mp4`, judged against
 `_recall-lane clip3 (fresh current-code ensemble).mp4` (same words, DTW
-timing). **Operator-eye gate: PENDING (they were asleep; first thing next
-session).**
+timing). **Operator-eye gate (2026-07-11): PASSED — "timing for rust port
+is right."** Two residuals named on the same viewing, both text-lane:
+the pinguin@52 drop, and a stray `GEMOY` cue after PINGUIN (see below).
+
+## The garble-float residual (measured; naive fixes REFUTED)
+
+What the operator saw: after `PINGUIN`@50.60 a lone `GEMOY` appears at
+56.06 (under DTW the same token sat at 51.20). Mechanics: the vote kept a
+garbled `gemoy` for the real ~51.2 s word (`gemes`; the shipped decode
+wrote `gemot`) and DROPPED everything else in 51-56 s (`pinguin`@52,
+`jalanannya`@54) — a 5 s token hole over speechful audio. Forced to spell
+g-e-m-o-y somewhere in that hole, the CTC grabbed the best lookalike near
+56. This is ADR 0053's duplicated/garbled-word class wearing a new coat:
+the aligner is faithful to its token list; the token list is wrong.
+
+Two obvious guards were measured and are DEAD ENDS — do not rebuild them:
+
+- **Per-word alignment confidence** (mean char prob over the word's span):
+  the float scores p=0.295 while REAL fast/soft words score far lower
+  (`banget` 0.170, `kayak` 0.112, the correct opening `siapa` 0.006,
+  `nggak` 0.001; clip median 0.463, p10 0.022). No threshold separates
+  them — CTC emission mass is spiky and short real words starve.
+- **Store correction**: an `at_s` pin `gemoy->gemes`@51.2 targets the
+  NEAREST `gemoy` = the REAL one at 49.72 (1.5 s away, inside the ±3 s
+  guard) and would rename/move it — the twin-token trap. The un-pinned
+  fuzzy tier rewrites BOTH gemoys pre-fusion. Neither is safe here.
+
+The structural fix is the RECALL LANE (ADR 0052's vote-admission work):
+fill the token hole and the garble has no room to float (and the store can
+then fix its spelling in place). Re-measure this exact 51-56 s stretch when
+that lands. Until then the float is a rare, known residual of the timing
+swap — present under DTW too, merely less visible (it hid inside the hole).
 
 **ANTITESA "rebalance investasi"** (2-person turn-taking control, ADR 0049's
 "good" regime; 184 merged words): median |shift| **0.08 s**, p90 **0.35 s**,
