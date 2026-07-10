@@ -101,6 +101,11 @@ pub struct PipelinePaths {
     pub mtmd_cli: PathBuf,
     pub qwen_model: PathBuf,
     pub qwen_mmproj: PathBuf,
+    /// wav2vec2-CTC forced-alignment model dir (`models/w2v2-align-id`, ADR
+    /// 0054) for the opt-in `YC_FORCED_ALIGN=1` ensemble timing skeleton. May
+    /// be absent: the ensemble then fuses on the whisper DTW skeleton as
+    /// before (the aligner is double-gated on the `align` feature + the env).
+    pub align_model: PathBuf,
     /// Directory of per-language dialect/slang correction stores (`<lang>.json`,
     /// see `yc_transcribe::DialectLexicon`). Primes whisper + patches known
     /// mishears; a missing file just disables the fix-ups for that language.
@@ -1944,6 +1949,7 @@ fn ensure_transcript(
                             let _ = tx.send(Progress::Stage(ens_stage_label(i, n)));
                         }
                     }),
+                    align_model: Some(paths.align_model.clone()),
                 };
                 match yc_transcribe::ensemble::apply(
                     &cfg,

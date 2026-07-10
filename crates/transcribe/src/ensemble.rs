@@ -54,6 +54,20 @@ fn override_from(raw: Option<&str>) -> Option<bool> {
     }
 }
 
+/// The forced-alignment timing knob (ADR 0054): `YC_FORCED_ALIGN=1` swaps the
+/// ensemble's timing skeleton from whisper DTW to the wav2vec2-CTC aligner.
+/// Plain opt-in (not tri-state — there is no Creator-level setting to
+/// override yet), read inside [`apply`] so a render and any diag calling the
+/// same entry point cannot diverge (the ADR 0033 discipline).
+pub fn forced_align_requested() -> bool {
+    forced_align_from(std::env::var("YC_FORCED_ALIGN").ok().as_deref())
+}
+
+/// Pure parse of the `YC_FORCED_ALIGN` value (unit-testable without env).
+fn forced_align_from(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1") | Some("true") | Some("on"))
+}
+
 /// Everything the ensemble needs from the caller (paths are derived by the
 /// caller from its own sidecar/model layout; nothing here reads global state).
 pub struct EnsembleConfig {
@@ -78,6 +92,10 @@ pub struct EnsembleConfig {
     /// decode, so the UI can show "decode 2/5" instead of one static label
     /// over the longest stage the app has.
     pub on_stage: Box<dyn Fn(usize, usize) + Send + Sync>,
+    /// `models/w2v2-align-id` (ONNX + vocab.json) for the opt-in
+    /// forced-alignment timing pass (ADR 0054, `YC_FORCED_ALIGN=1`). `None`
+    /// or missing files means the DTW skeleton stands — never an error.
+    pub align_model: Option<PathBuf>,
 }
 
 /// A sidecar decode that exceeded its wall-clock budget. Typed (not just a
@@ -281,20 +299,41 @@ pub fn apply(
         }
     });
     let onset_src: &[f32] = onset_samples.as_deref().unwrap_or(samples);
-    let mut fused = fuse_onto_timing(
-        &merged,
-        whisper,
-        timing_extra,
-        onset_src,
-        sample_rate,
-        range.duration_s(),
-    );
-    tracing::info!(
-        "qwen ensemble: fused {} units (whisper had {}, extra skeleton {})",
-        fused.len(),
-        whisper.units.len(),
-        timing_extra.map(|t| t.units.len()).unwrap_or(0)
-    );
+    // Timing source (ADR 0054): with `YC_FORCED_ALIGN=1` (+ the `align`
+    // feature + the pinned model) each word's time comes from wav2vec2-CTC
+    // forced alignment over the SAME caption samples whisper heard — a
+    // per-word re-anchor instead of DTW's one global path, which is the
+    // root of the operator's "drifts out of sync" (ADR 0053's measurement).
+    // Any failure logs and falls through to the DTW fusion; captions never
+    // go missing because the aligner did.
+    let aligned = if forced_align_requested() {
+        forced_align_fusion(cfg, &merged, samples, onset_src, sample_rate, range.duration_s())
+    } else {
+        None
+    };
+    let mut fused = match aligned {
+        Some(f) => {
+            tracing::info!("qwen ensemble: forced-align timing skeleton ({} units)", f.len());
+            f
+        }
+        None => {
+            let f = fuse_onto_timing(
+                &merged,
+                whisper,
+                timing_extra,
+                onset_src,
+                sample_rate,
+                range.duration_s(),
+            );
+            tracing::info!(
+                "qwen ensemble: fused {} units (whisper had {}, extra skeleton {})",
+                f.len(),
+                whisper.units.len(),
+                timing_extra.map(|t| t.units.len()).unwrap_or(0)
+            );
+            f
+        }
+    };
 
     // --- 5. positional (time-anchored) store pass ----------------------------
     // Corrections with an `at_s` pin apply AFTER fusion, to the occurrence
@@ -794,6 +833,127 @@ fn edit1(a: &str, b: &str) -> bool {
         i += 1;
     }
     long[i + 1..] == short[i..]
+}
+
+/// The forced-alignment timing pass (ADR 0054): align the voted words to the
+/// caption audio with the wav2vec2-CTC model and build the units straight from
+/// the per-word spans. Returns `None` (with a warn) on ANY failure — model
+/// missing, session error, alignment infeasible, or under half the words
+/// aligned — and the DTW fusion stands. `samples` is the caption audio the
+/// words were decoded from (the spike validated on exactly this view);
+/// `onset_src` is the cleaned-onset audio for placing the rare unaligned run.
+#[cfg(feature = "align")]
+fn forced_align_fusion(
+    cfg: &EnsembleConfig,
+    merged: &[String],
+    samples: &[f32],
+    onset_src: &[f32],
+    sample_rate: u32,
+    clip_dur_s: f64,
+) -> Option<Vec<CaptionUnit>> {
+    let Some(dir) = cfg.align_model.as_ref() else {
+        tracing::warn!("YC_FORCED_ALIGN=1 but no align model dir configured - DTW timing stands");
+        return None;
+    };
+    if !dir.join("model.onnx").is_file() {
+        tracing::warn!(
+            "YC_FORCED_ALIGN=1 but {} has no model.onnx (fetch-models.ps1) - DTW timing stands",
+            dir.display()
+        );
+        return None;
+    }
+    let started = Instant::now();
+    let mut aligner = match crate::align::Aligner::load(dir) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("forced-align: model load failed ({e:#}) - DTW timing stands");
+            return None;
+        }
+    };
+    let spans = match aligner.align_words(merged, samples, sample_rate) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("forced-align: alignment failed ({e:#}) - DTW timing stands");
+            return None;
+        }
+    };
+    let aligned_n = spans.iter().filter(|s| s.is_some()).count();
+    // Under half aligned means the model/vocab and the words disagree
+    // wholesale (the spike measured 111/111 on the worst clip) — distrust.
+    if aligned_n * 2 < merged.len() {
+        tracing::warn!(
+            "forced-align: only {aligned_n}/{} words aligned - DTW timing stands",
+            merged.len()
+        );
+        return None;
+    }
+    tracing::info!(
+        "forced-align: {aligned_n}/{} words in {:.1}s",
+        merged.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Some(fuse_onto_alignment(merged, &spans, onset_src, sample_rate, clip_dur_s))
+}
+
+/// Feature-off stub: the operator flipped the env on a build without the
+/// aligner compiled in — say so instead of silently ignoring the knob.
+#[cfg(not(feature = "align"))]
+fn forced_align_fusion(
+    _cfg: &EnsembleConfig,
+    _merged: &[String],
+    _samples: &[f32],
+    _onset_src: &[f32],
+    _sample_rate: u32,
+    _clip_dur_s: f64,
+) -> Option<Vec<CaptionUnit>> {
+    tracing::warn!(
+        "YC_FORCED_ALIGN=1 but this build lacks the `align` feature - DTW timing stands"
+    );
+    None
+}
+
+/// Build caption units from per-word forced-alignment spans: an aligned word
+/// IS its span (the audio said so — no anchor adoption, no DP, no respread);
+/// a run of unaligned words (all-OOV tokens, e.g. digits) lays onto speech
+/// onsets inside the gap between its aligned neighbors, exactly like the DTW
+/// path's inserted runs. Spans are monotonic by CTC construction; the clamp
+/// only defends against a degenerate emission.
+pub fn fuse_onto_alignment(
+    merged: &[String],
+    spans: &[Option<(f64, f64)>],
+    onset_src: &[f32],
+    sample_rate: u32,
+    clip_dur_s: f64,
+) -> Vec<CaptionUnit> {
+    debug_assert_eq!(merged.len(), spans.len());
+    let onsets = rms_onsets(onset_src, sample_rate);
+    let mut fused: Vec<CaptionUnit> = Vec::with_capacity(merged.len());
+    let mut i = 0;
+    let mut prev_end = 0.0_f64;
+    while i < merged.len() {
+        if let Some((s, e)) = spans[i] {
+            let s = s.max(prev_end.min(clip_dur_s)).min(clip_dur_s);
+            let e = e.min(clip_dur_s).max(s);
+            fused.push(CaptionUnit { text: merged[i].clone(), start_s: s, end_s: e });
+            prev_end = e;
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < merged.len() && spans[j].is_none() {
+            j += 1;
+        }
+        let gap_start = prev_end;
+        let gap_end = if j < merged.len() {
+            spans[j].expect("loop bound").0.max(gap_start)
+        } else {
+            clip_dur_s.max(gap_start)
+        };
+        place_run(&merged[i..j], gap_start, gap_end, &onsets, &mut fused);
+        prev_end = fused.last().map(|u| u.end_s).unwrap_or(gap_start).max(gap_start);
+        i = j;
+    }
+    fused
 }
 
 /// Align the voted words onto a TIMED ANCHOR skeleton and lay the rest onto
@@ -1399,6 +1559,7 @@ mod tests {
             work_dir: PathBuf::from("."),
             should_cancel: Box::new(|| true),
             on_stage: Box::new(|_, _| {}),
+            align_model: None,
         };
         let whisper = Transcript { language: Language::Id, units: Vec::new() };
         let err = apply(
@@ -1486,6 +1647,51 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn forced_align_flag_parses_like_the_other_knobs() {
+        assert!(forced_align_from(Some("1")));
+        assert!(forced_align_from(Some(" true ")));
+        assert!(forced_align_from(Some("on")));
+        assert!(!forced_align_from(Some("0")));
+        assert!(!forced_align_from(Some("yes")));
+        assert!(!forced_align_from(None));
+    }
+
+    #[test]
+    fn fuse_onto_alignment_units_are_the_spans() {
+        let merged = words("mana bangke");
+        let spans = vec![Some((1.0, 1.4)), Some((3.0, 3.5))];
+        let fused = fuse_onto_alignment(&merged, &spans, &silence(5.0), 16000, 5.0);
+        assert_eq!(fused.len(), 2);
+        assert_eq!((fused[0].start_s, fused[0].end_s), (1.0, 1.4));
+        assert_eq!((fused[1].start_s, fused[1].end_s), (3.0, 3.5));
+    }
+
+    #[test]
+    fn fuse_onto_alignment_places_unaligned_run_in_its_gap() {
+        // "77" is all-OOV for the character CTC — it must land between its
+        // aligned neighbors (on the burst onset at 2.5), not vanish.
+        let merged = words("keren 77 banget");
+        let spans = vec![Some((1.0, 2.0)), None, Some((6.0, 6.5))];
+        let samples = bursts(8.0, &[(2.5, 3.0)]);
+        let fused = fuse_onto_alignment(&merged, &spans, &samples, 16000, 8.0);
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[1].text, "77");
+        assert!(fused[1].start_s >= 2.0 - 1e-9 && fused[1].end_s <= 6.0 + 1e-9);
+        assert!((fused[1].start_s - 2.5).abs() < 0.1, "lands on the burst onset");
+    }
+
+    #[test]
+    fn fuse_onto_alignment_clamps_degenerate_spans_monotonic() {
+        // A (theoretically impossible) backwards span must not produce a
+        // caption that starts before its predecessor ends.
+        let merged = words("a b");
+        let spans = vec![Some((2.0, 2.4)), Some((1.0, 1.2))];
+        let fused = fuse_onto_alignment(&merged, &spans, &silence(5.0), 16000, 5.0);
+        assert!(fused[1].start_s >= fused[0].end_s - 1e-9);
+        assert!(fused[1].end_s >= fused[1].start_s);
     }
 
     #[test]

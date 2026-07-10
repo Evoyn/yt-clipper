@@ -4,6 +4,36 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-11 — Forced-alignment timing is now IN THE APP, native Rust, opt-in (ADR 0054)
+
+The Python spike from last session became shipped code: the wav2vec2 aligner now runs
+inside yt-clipper itself (ONNX via `ort`, the same runtime the face models already use —
+no Python anywhere). It's behind `YC_FORCED_ALIGN=1` on an `align` build (build-release.bat
+now compiles it in), OFF by default — your normal renders are byte-identical until you
+flip the knob.
+
+- **The port is exact, not approximate.** The Rust Viterbi reproduces torchaudio's
+  alignment span-for-span (650/650 identical on the spike's emission), and the full Rust
+  chain (ONNX session → log-softmax → Viterbi) lands every one of the spike's 111 word
+  onsets with **0.0000 s** difference from the Python that you approved on the burn.
+- **On a fresh production decode of clip 3** (real vote, no hand-picked text) the two
+  worst mis-onsets fixed themselves: "siapa" was 1.5 s early → now +0.08 s off your ear;
+  "SDC" was 2.2 s early → now −0.07 s. 117/117 words aligned, ~25 s on CPU per clip.
+  ("jalanannya" and the second "pinguin" are missing from TODAY'S vote on both engines —
+  that's the recall/text lane, ADR 0052, a different problem timing can't invent.)
+- **Turn-taking control (ANTITESA, the "this is good" regime)**: the aligner agrees with
+  the current timing where it's already right — median difference 0.08 s across 184 words,
+  9 in 10 words within 0.35 s, and dwell doesn't regress. Eight words moved >0.5 s (named
+  in ADR 0054) — those are for your ear at the flip gate.
+- **Input contract pinned by measurement**: the model card says normalize the audio; the
+  spike (which you approved) didn't. Measured both: normalization fixes "gue" but breaks
+  "pinguin" (grabs the earlier duplicate). Raw input ships; the export script + module doc
+  both say why, so nobody "fixes" it later.
+- **For your eye when you wake**: `_forced-align clip3 (RUST PORT - production).mp4` in the
+  VIOR folder — fresh ensemble words, aligner timing, zero pins. Judge TIMING only against
+  `_recall-lane clip3 (fresh current-code ensemble).mp4` (same words, old timing). If it
+  reads right, next session flips the ensemble default (nextprompt-forced-align-default-flip.md).
+
 ## 2026-07-08 — The dropped words + a real fix for the timing drift: forced alignment (ADR 0052/0053)
 
 Chased the words captions miss on overlapping speech ("otot", "kreatin", "pinguin", the

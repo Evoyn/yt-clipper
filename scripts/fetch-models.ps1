@@ -55,6 +55,23 @@ foreach ($qf in $qwenFiles) {
     }
 }
 
+# Forced-alignment caption timing (ADR 0053/0054, opt-in YC_FORCED_ALIGN=1 on an
+# `align` build): cahya/wav2vec2-large-xlsr-indonesian exported to ONNX. No
+# hosted ONNX exists for this model, so the pin is source weights + a local
+# export (scripts/export-align-onnx.py via uv, ~1.2 GB download, ~1.3 GB out).
+$alignDir = Join-Path $models "w2v2-align-id"
+$alignOnnx = Join-Path $alignDir "model.onnx"
+if (Test-Path $alignOnnx) {
+    $agb = [math]::Round((Get-Item $alignOnnx).Length / 1GB, 2)
+    Write-Host "w2v2-align-id/model.onnx already present ($agb GB) -- skipping. Delete it to re-export."
+} else {
+    $uv = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
+    if (-not (Test-Path $uv)) { $uv = "uv" }
+    Write-Host "Exporting w2v2-align-id (downloads the HF weights on first run)..."
+    & $uv run --with torch --with transformers --with onnx python (Join-Path $PSScriptRoot "export-align-onnx.py") $alignDir
+    if ($LASTEXITCODE -ne 0) { throw "align model export failed with exit code $LASTEXITCODE (is uv installed? https://docs.astral.sh/uv/)" }
+}
+
 Write-Host "Recording versions..."
 $gb = [math]::Round((Get-Item $out).Length / 1GB, 2)
 $versions = @(
@@ -65,6 +82,8 @@ $versions = @(
     "vad source: $vadUri",
     "qwen3-asr: Qwen3-ASR-1.7B-Q8_0.gguf + mmproj (multimodal; ASR A/B trial - ROADMAP)",
     "qwen3-asr source: $qwenRepo",
+    "align model: w2v2-align-id/model.onnx + vocab.json (cahya/wav2vec2-large-xlsr-indonesian, fp32 opset17 - ADR 0054, YC_FORCED_ALIGN=1)",
+    "align source: https://huggingface.co/cahya/wav2vec2-large-xlsr-indonesian (rev fe66c9f1) via scripts/export-align-onnx.py",
     "fetched: $(Get-Date -Format o)"
 )
 $versions | Out-File (Join-Path $models "VERSIONS.txt") -Encoding utf8

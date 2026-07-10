@@ -19,6 +19,7 @@ use whisper_rs::{
 };
 use yc_core::{CaptionUnit, Language, Transcript};
 
+pub mod align;
 pub mod ensemble;
 
 mod correct;

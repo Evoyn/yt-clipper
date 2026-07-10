@@ -148,6 +148,7 @@ fn main() -> anyhow::Result<()> {
         work_dir: std::env::temp_dir().join("yc_recall_diag"),
         should_cancel: Box::new(|| false),
         on_stage: Box::new(|i, n| eprintln!("[recall_diag] qwen variant decode {i}/{n}...")),
+        align_model: Some(models.join("w2v2-align-id")),
     };
     anyhow::ensure!(cfg.mtmd_cli.is_file(), "mtmd sidecar missing: {}", cfg.mtmd_cli.display());
     anyhow::ensure!(cfg.qwen_model.is_file(), "qwen model missing: {}", cfg.qwen_model.display());

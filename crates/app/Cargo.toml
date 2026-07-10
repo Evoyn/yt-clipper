@@ -69,3 +69,17 @@ enh = []
 # NO new deps (the sidecar already exists for the detect judge). Off by default; the
 # default build captions exactly as before. Operator A/Bs the real render first.
 correct = []
+# Forced-alignment caption timing (ADR 0053/0054): pulls `ort` via yc-transcribe
+# for the wav2vec2-CTC aligner (models/w2v2-align-id). The compiled code is
+# additionally gated at runtime on YC_FORCED_ALIGN=1 — with the env unset the
+# ensemble fuses on the whisper DTW skeleton exactly as before (byte-identical).
+align = ["yc-transcribe/align"]
+
+# The forced-alignment parity/gate harnesses need the ort session compiled in.
+[[example]]
+name = "align_parity"
+required-features = ["align"]
+
+[[example]]
+name = "caption_align_diag"
+required-features = ["align"]

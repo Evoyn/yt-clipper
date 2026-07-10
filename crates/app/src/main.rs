@@ -54,6 +54,7 @@ fn main() -> eframe::Result<()> {
         mtmd_cli: paths.mtmd_cli(),
         qwen_model: paths.qwen_model(),
         qwen_mmproj: paths.qwen_mmproj(),
+        align_model: paths.align_model(),
         dialect_dir: paths.dialect_dir(),
         font: paths.font(),
         workspace: paths.workspace.clone(),
@@ -498,6 +499,13 @@ impl AppPaths {
 
     fn qwen_mmproj(&self) -> PathBuf {
         self.models.join("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf")
+    }
+
+    /// wav2vec2-CTC forced-alignment model DIR (`model.onnx` + `vocab.json`,
+    /// fetch-models.ps1) for the opt-in ensemble timing skeleton (ADR 0054,
+    /// `YC_FORCED_ALIGN=1` on an `align` build). Absent: DTW timing stands.
+    fn align_model(&self) -> PathBuf {
+        self.models.join("w2v2-align-id")
     }
 
     /// Silero VAD ggml (whisper.cpp's pinned release) for the `YC_VAD=1` trial
