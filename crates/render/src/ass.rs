@@ -6,11 +6,7 @@
 //! - **Huge-word** (the M2 default): one word per caption — each unit is its own
 //!   Dialogue event, appearing at its own spoken onset and clearing before the
 //!   next word. Sync tracks the spoken word, and there is never more than one
-//!   *cue* on screen. EN/ID; JA character chunking is later. Exception (ADR
-//!   0057): a **cramped run** — onsets packed tighter than the `MIN_READ_S`
-//!   floor, where the next-onset clamp would leave sub-readable flashes —
-//!   falls back to one compact ≤3-word line at the line genres' scale,
-//!   sharing the reading window the run physically has.
+//!   word on screen. EN/ID; JA character chunking is later.
 //! - **Rolling-pop** (M1): units grouped into on-screen lines by a character
 //!   budget; each line is one Dialogue event in which every unit is laid out
 //!   from the first frame but stays invisible until its spoken onset, when it
@@ -48,21 +44,6 @@ const MAX_GAP_S: f64 = 1.0;
 const WORD_MIN_S: f64 = 0.10;
 const MIN_READ_S: f64 = 0.40;
 const MAX_HOLD_S: f64 = 1.2;
-
-/// Too-fast grouping (ADR 0057, the ADR 0049 fix-#2 slice): when the next
-/// onset arrives inside a word's read floor (`MIN_READ_S`), the next-onset
-/// clamp defeats the floor by design and a huge-word cue flashes sub-readably
-/// (measured 62% of cues on the 4-person overlap clip). Such a **cramped**
-/// word falls back from one-word-per-cue to a compact line — grown until the
-/// window to the next onset can hold `MIN_READ_S`, capped at
-/// `MAX_GROUP_WORDS` words within the line genres' proven `MAX_LINE_CHARS`
-/// budget — sharing one reading window. Grouped lines render at
-/// `GROUP_FS_FRAC` of the resolved style size (96/150: the line genres'
-/// 22-char fit at the huge-word default), carried on
-/// [`PreviewLine::font_scale`] so the ASS `\fs` override and the editor
-/// overlay consume the SAME number (ADR 0036: preview cannot drift).
-const MAX_GROUP_WORDS: usize = 3;
-const GROUP_FS_FRAC: f32 = 0.64;
 
 /// Onset clamp (ADR 0019): whisper's DTW word onset occasionally lands slightly
 /// *before* the word's audio, so the caption appears before it is spoken (an
@@ -156,11 +137,6 @@ pub struct PreviewWord {
 pub struct PreviewLine {
     pub start_s: f64,
     pub end_s: f64,
-    /// Per-line font scale relative to the resolved style size: 1.0 everywhere
-    /// except huge-word grouped lines (ADR 0057), which render compact at
-    /// [`GROUP_FS_FRAC`]. Consumed by BOTH the ASS emitter (inline `\fs`) and
-    /// the editor overlay, so preview and burn cannot disagree (ADR 0036).
-    pub font_scale: f32,
     pub words: Vec<PreviewWord>,
 }
 
@@ -173,84 +149,29 @@ pub fn preview_lines(transcript: &Transcript, genre: CaptionGenre) -> Vec<Previe
     match genre {
         CaptionGenre::HugeWord => {
             let units = &transcript.units;
-            // The verbatim pre-grouping cue: show until the gap-filled end
-            // (ADR 0013), floor first as a zero-duration guard, then clamp to
-            // the next onset LAST — so the floor can never push the end past
-            // the next word's start. A transcript with no cramped unit takes
-            // only this path and renders byte-identical to pre-ADR-0057.
-            let singleton = |i: usize| {
-                let u = &units[i];
-                let mut end = u.end_s.max(u.start_s + WORD_MIN_S);
-                if let Some(next) = units.get(i + 1) {
-                    end = end.min(next.start_s);
-                }
-                PreviewLine {
-                    start_s: u.start_s,
-                    end_s: end,
-                    font_scale: 1.0,
-                    words: vec![PreviewWord {
-                        text: u.text.to_uppercase(),
+            units
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    // `end_s` is the word's gap-filled end (ADR 0013); show until
+                    // then, one word at a time. Floor first as a zero-duration
+                    // guard, then clamp to the next onset LAST — so the floor can
+                    // never push the end past the next word's start.
+                    let mut end = u.end_s.max(u.start_s + WORD_MIN_S);
+                    if let Some(next) = units.get(i + 1) {
+                        end = end.min(next.start_s);
+                    }
+                    PreviewLine {
                         start_s: u.start_s,
                         end_s: end,
-                    }],
-                }
-            };
-            let mut lines = Vec::with_capacity(units.len());
-            let mut i = 0;
-            while i < units.len() {
-                // Cramped (ADR 0057): the next onset lands inside this word's
-                // read floor, so the clamp would leave a sub-readable flash.
-                // Grow a group until the window to the next onset can hold
-                // MIN_READ_S, or the word cap / char budget stops it. Every
-                // absorbed word starts < MIN_READ_S after the group start, so
-                // a group can never bridge a real pause.
-                let gs = units[i].start_s;
-                let mut j = i;
-                let mut chars = units[i].text.chars().count();
-                while let Some(next) = units.get(j + 1) {
-                    if next.start_s - gs >= MIN_READ_S {
-                        break; // the group now dwells readably to this onset
-                    }
-                    if j + 1 - i >= MAX_GROUP_WORDS {
-                        break;
-                    }
-                    let add = next.text.chars().count() + 1;
-                    if chars + add > MAX_LINE_CHARS {
-                        break;
-                    }
-                    chars += add;
-                    j += 1;
-                }
-                if j == i {
-                    // Not cramped — or cramped but nothing could join (caps):
-                    // the singleton path, byte-for-byte the old behavior.
-                    lines.push(singleton(i));
-                    i += 1;
-                    continue;
-                }
-                // Grouped cue: floor at the group start (the shared reading
-                // budget), clamp to the next onset LAST — the ADR 0013
-                // discipline lifted to the group.
-                let end = units[j]
-                    .end_s
-                    .max(gs + MIN_READ_S)
-                    .min(units.get(j + 1).map_or(f64::INFINITY, |n| n.start_s));
-                lines.push(PreviewLine {
-                    start_s: gs,
-                    end_s: end,
-                    font_scale: GROUP_FS_FRAC,
-                    words: units[i..=j]
-                        .iter()
-                        .map(|u| PreviewWord {
+                        words: vec![PreviewWord {
                             text: u.text.to_uppercase(),
                             start_s: u.start_s,
-                            end_s: u.end_s.min(end),
-                        })
-                        .collect(),
-                });
-                i = j + 1;
-            }
-            lines
+                            end_s: end,
+                        }],
+                    }
+                })
+                .collect()
         }
         CaptionGenre::RollingPop | CaptionGenre::KaraokeFill => {
             let lines = group_lines(transcript, MAX_LINE_CHARS);
@@ -269,7 +190,6 @@ pub fn preview_lines(transcript: &Transcript, genre: CaptionGenre) -> Vec<Previe
                     PreviewLine {
                         start_s: start,
                         end_s: end,
-                        font_scale: 1.0,
                         words: line
                             .iter()
                             .map(|u| PreviewWord {
@@ -439,7 +359,7 @@ pub fn generate_ass(
 
     let lines = preview_lines(transcript, style.genre);
     let events = match style.genre {
-        CaptionGenre::HugeWord => huge_word_events(&lines, pos_x, pos_y, font_size),
+        CaptionGenre::HugeWord => huge_word_events(&lines, pos_x, pos_y),
         CaptionGenre::RollingPop => rolling_pop_events(&lines, pos_x, pos_y),
         CaptionGenre::KaraokeFill => karaoke_fill_events(&lines, style, pos_x, pos_y),
     };
@@ -448,31 +368,15 @@ pub fn generate_ass(
     s
 }
 
-/// One cue per line (huge-word): a singleton word's Dialogue is byte-identical
-/// to the pre-grouping output — appearing at its spoken onset, clearing before
-/// the next word. A grouped line (cramped run, ADR 0057) joins its words and
-/// renders compact via an inline `\fs` at the line's `font_scale` of the
-/// resolved style size — the same number the editor overlay multiplies in, so
-/// the two surfaces cannot drift (ADR 0036). Timing (floor + next-onset clamp,
-/// ADR 0013; the group-level floor, ADR 0057) is already applied by
-/// [`preview_lines`].
-fn huge_word_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32, font_size: u32) -> String {
+/// One word per caption (huge-word): each line is a single word's Dialogue
+/// event, appearing at its spoken onset and clearing before the next word, so
+/// exactly one word is on screen and timing tracks speech. Timing (floor +
+/// next-onset clamp, ADR 0013) is already applied by [`preview_lines`].
+fn huge_word_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
     for l in lines {
-        if l.words.is_empty() {
-            continue;
-        }
-        let fs = if (l.font_scale - 1.0).abs() > 1e-6 {
-            format!("\\fs{}", ((font_size as f32 * l.font_scale).round() as u32).max(1))
-        } else {
-            String::new()
-        };
-        let words: Vec<&str> = l.words.iter().map(|w| w.text.as_str()).collect();
-        let text = format!(
-            "{{\\an5\\pos({pos_x},{pos_y}){fs}}}{}{}",
-            rolling_pop_tags(0),
-            words.join(" ")
-        );
+        let Some(w) = l.words.first() else { continue };
+        let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), w.text);
         s.push_str(&format!(
             "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
             ass_time(l.start_s),
@@ -874,9 +778,9 @@ mod tests {
 
     #[test]
     fn huge_word_floor_never_overlaps_the_next_onset() {
-        // ADR 0013 overlap bug, ADR 0057 shape: a word whose next onset (0.50)
-        // arrives inside its read floor is CRAMPED — it now shares one grouped
-        // Dialogue with that word (never two overlapping cues).
+        // ADR 0013 overlap bug: a word whose end sits at the next onset (0.50) but
+        // whose start (0.46) is < WORD_MIN_S before it. The floor must not push the
+        // end past the next word's start - the next-onset clamp is applied LAST.
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
         let t = Transcript {
@@ -887,124 +791,9 @@ mod tests {
             ],
         };
         let ass = generate_ass(&t, &st, None);
-        let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
-        assert_eq!(dialogues.len(), 1, "cramped pair groups into one cue: {dialogues:?}");
-        assert!(dialogues[0].contains("A B"), "{}", dialogues[0]);
-        // When the char budget blocks grouping, the cramped word stays a
-        // singleton and keeps the pre-grouping rule verbatim: the floor must
-        // not push its end past the next word's start — the clamp is LAST.
-        let t = Transcript {
-            language: Language::En,
-            units: vec![
-                CaptionUnit { text: "a".into(), start_s: 0.46, end_s: 0.50 },
-                CaptionUnit { text: "bbbbbbbbbbbbbbbbbbbbbb".into(), start_s: 0.50, end_s: 0.90 },
-            ],
-        };
-        let ass = generate_ass(&t, &st, None);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
-        assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.86
-    }
-
-    #[test]
-    fn huge_word_cramped_run_groups_into_a_readable_compact_line() {
-        // ADR 0057: onsets 0.2 s apart pack tighter than MIN_READ_S — the two
-        // cramped words share one cue that dwells past the floor (clamped to
-        // the next onset LAST), joined text at the compact scale; the sparse
-        // word after them stays a full-size singleton. Text is preserved in
-        // order (presentation-only), and grouped words are all Base (static
-        // line) for the preview overlay.
-        let t = Transcript {
-            language: Language::En,
-            units: vec![
-                CaptionUnit { text: "ya".into(), start_s: 0.0, end_s: 0.20 },
-                CaptionUnit { text: "siapa".into(), start_s: 0.20, end_s: 0.55 },
-                CaptionUnit { text: "tau".into(), start_s: 0.55, end_s: 1.75 },
-            ],
-        };
-        let lines = preview_lines(&t, CaptionGenre::HugeWord);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].words.len(), 2);
-        assert!((lines[0].end_s - lines[0].start_s) >= MIN_READ_S);
-        assert_eq!(lines[0].end_s, 0.55); // next group's onset, clamped LAST
-        assert!((lines[0].font_scale - GROUP_FS_FRAC).abs() < 1e-6);
-        assert!((lines[1].font_scale - 1.0).abs() < 1e-6);
-        let texts: Vec<&str> =
-            lines.iter().flat_map(|l| l.words.iter().map(|w| w.text.as_str())).collect();
-        assert_eq!(texts, vec!["YA", "SIAPA", "TAU"]);
-        assert_eq!(
-            word_states(CaptionGenre::HugeWord, &lines[0], 0.0),
-            vec![WordState::Base, WordState::Base]
-        );
-        // The emitted Dialogue joins the words and carries the compact \fs on
-        // the resolved size (150 * 0.64 = 96, the line genres' proven fit);
-        // the singleton carries none.
-        let st = CaptionStyle::for_genre(CaptionGenre::HugeWord);
-        let ass = generate_ass(&t, &st, None);
-        let d: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
-        assert_eq!(d.len(), 2);
-        assert!(d[0].contains("YA SIAPA"), "{}", d[0]);
-        assert!(d[0].contains("\\fs96}"), "{}", d[0]);
-        // The singleton carries no size override — its only `\fs` hits are the
-        // pop animation's `\fscx`/`\fscy` scale tags.
-        assert_eq!(
-            d[1].matches("\\fs").count(),
-            d[1].matches("\\fscx").count() + d[1].matches("\\fscy").count(),
-            "{}",
-            d[1]
-        );
-    }
-
-    #[test]
-    fn huge_word_group_caps_at_three_words_and_never_bridges_a_pause() {
-        // A five-word burst at 0.1 s spacing: the word cap closes the first
-        // group at 3 (its window is still cramped — the residual the
-        // instrument counts), the tail regroups, and no grouped word starts
-        // MIN_READ_S or later after its group's start (a group cannot bridge
-        // a real pause by construction).
-        let t = Transcript {
-            language: Language::En,
-            units: (0..5)
-                .map(|k| CaptionUnit {
-                    text: ((b'a' + k as u8) as char).to_string(),
-                    start_s: k as f64 * 0.1,
-                    end_s: k as f64 * 0.1 + 0.1,
-                })
-                .collect(),
-        };
-        let lines = preview_lines(&t, CaptionGenre::HugeWord);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].words.len(), 3);
-        assert_eq!(lines[1].words.len(), 2);
-        for l in &lines {
-            for w in &l.words {
-                assert!(w.start_s - l.start_s < MIN_READ_S, "bridged a pause: {w:?}");
-            }
-        }
-        // Cap-limited residual: group 1 is clamped by "d"'s onset at 0.3.
-        assert!((lines[0].end_s - 0.3).abs() < 1e-9);
-        // Cues never overlap: each line ends by the next line's start.
-        assert!(lines[0].end_s <= lines[1].start_s);
-    }
-
-    #[test]
-    fn huge_word_sparse_transcript_stays_one_word_per_cue_without_fs() {
-        // The 0.5 s-spaced fixture has no cramped unit: every cue is one word
-        // at full size (no \fs anywhere) — the byte-identity control's shape.
-        let mut st = style();
-        st.genre = CaptionGenre::HugeWord;
-        let t = units(&["satu", "dua", "tiga"]);
-        let lines = preview_lines(&t, CaptionGenre::HugeWord);
-        assert!(lines.iter().all(|l| l.words.len() == 1 && l.font_scale == 1.0));
-        let ass = generate_ass(&t, &st, None);
-        // No size override anywhere — every `\fs` hit is the pop animation's
-        // `\fscx`/`\fscy`, exactly as before ADR 0057.
-        assert_eq!(
-            ass.matches("\\fs").count(),
-            ass.matches("\\fscx").count() + ass.matches("\\fscy").count(),
-            "sparse output must carry no \\fs override"
-        );
-        assert_eq!(ass.lines().filter(|l| l.starts_with("Dialogue:")).count(), 3);
+        assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.56
     }
 
     #[test]

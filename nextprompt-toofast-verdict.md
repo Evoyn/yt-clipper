@@ -1,5 +1,12 @@
 # Session prompt — ADR 0057 verdict: your eye on the too-fast regroup burn
 
+> **RESOLVED (2026-07-12): branch 2 — "i dont like grouped".** ADR 0057 is
+> REVERSED (banner in the ADR records the full reversal: code byte-exact
+> pre-0057, instrument removed, glossary term removed, approved artifact
+> restored, both burns kept). The too-fast class is CLOSED as
+> accepted-by-the-eye. Do not act on the branches below again; the next
+> session starts from `nextprompt-recall-menu.md`.
+
 One sitting decides the ADR 0057 gate. The A/B pair sits in the VIOR stream
 folder (`workspace/Deddy Corbuzier/MENUJU INDONESIA CEMAS.../`):
 

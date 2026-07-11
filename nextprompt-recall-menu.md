@@ -1,9 +1,11 @@
 # Session prompt — Recall arc closed; the operator picks the next lane
 
-> **UPDATE 2026-07-12: the ADR 0049 #2 dwell lane below was TAKEN** under the
-> operator's "do this automatically" (ADR 0057 — cramped huge-word runs group
-> into compact lines; 62%→1% sub-0.40 on clip 3). Its burn gate is open:
-> **read `nextprompt-toofast-verdict.md` first.** The other items stay valid.
+> **UPDATE 2026-07-12: the ADR 0049 #2 dwell lane is DONE — shipped and
+> REVERSED the same night on the operator's eye** ("i dont like grouped";
+> ADR 0057 records the measured negative: grouping fixed the numbers,
+> 62%→1% sub-0.40, but the eye keeps one-word-at-a-time purity — the flash
+> is accepted as the genre's nature). **The too-fast class is CLOSED; strike
+> the roadmap-#2 item below.** The other items stay valid picks.
 
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read the
 context below, then run /grill-with-docs BEFORE any code — the grill's first

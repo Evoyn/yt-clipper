@@ -4,6 +4,28 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (verdict) — You ruled: no grouping. ADR 0057 reversed the same night, one-word-at-a-time stays
+
+You watched the A/B and said "i dont like grouped" — the pre-committed
+reversal branch ran in one sitting: the caption code is restored byte-exact
+to the state your eye approved yesterday (the revert is total because sparse
+words were never touched by design), the burn artifact is back to the
+approved one (checksum-verified), the instrument and glossary term are
+removed, and both burns stay in the stream folder for reference. 372 tests
+green on the restored code.
+
+What the record keeps (the honest negative, the ADR 0050 pattern): grouping
+genuinely fixed the numbers — 62% of cues flashing under 0.40 s fell to 1% —
+but the numbers were never the gate. Your eye keeps huge-word's
+one-word-at-a-time purity, and the sub-0.40 flash at dense speech is
+accepted as the genre's nature (with the early-cue and dropped-word classes
+already fixed by the align and recall arcs, it is the tradeoff you chose).
+The ADR 0049 too-fast class is CLOSED; the roadmap is fully dispatched.
+Next session: the remaining menu (connective words, dedikornya spelling,
+3p clip re-render, whisper parity) — nextprompt-recall-menu.md.
+
+---
+
 ## 2026-07-12 — The flashing captions are gone: cramped word-runs share a compact line (ADR 0057, your eye pending)
 
 You said "do this automatically" and went to watch anime, so this session took

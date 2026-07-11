@@ -1,5 +1,28 @@
 # Too-fast grouping: cramped huge-word runs fall back to a compact 2–3 word line (ADR 0049 fix #2)
 
+> **Status: REVERSED (2026-07-12), the same night it shipped.** The operator's
+> eye on the A/B burn ruled **"i dont like grouped"** — the compact multi-word
+> line is rejected as a presentation, full stop (branch 2 of the pre-committed
+> verdict script). The instrument numbers were real (62%→1% sub-0.40) but the
+> gate is the burn, not the numbers (the ADR 0050 lesson, now twice): the
+> operator prefers one-word-at-a-time purity over dwell — the flash is the
+> huge-word genre's nature at dense speech, and with the mis-onset (ADR
+> 0053–0055) and recall (ADR 0052–0056) classes fixed, it is the tradeoff they
+> keep. Reversal: `preview_lines`/`huge_word_events`/editor overlay restored
+> byte-exact to pre-0057 (`git checkout` of the prior commit — singletons were
+> verbatim by design, so the revert is total); `caption_regroup_diag` removed
+> (the fix's own harness, meaningless without the walk — git history keeps
+> it); the CONTEXT.md "Cramped run" term removed; the emitted
+> `clip_alignburn.ass` restored byte-exact to the eye-approved artifact
+> (sha ad208751…). Both burns stay in the stream folder (prefer-keep). The
+> measured record below is kept as the negative result. **The ADR 0049
+> too-fast class is hereby CLOSED as accepted-by-the-eye**: the remaining
+> in-genre shapes were weighed and none survive the ruling — a rolling-reveal
+> inside a shared line is still multiple words on screen (same objection),
+> and thinning (showing fewer words) deletes real speech from display, the
+> exact opposite of the recall arc the operator just closed. Do not reopen
+> without the operator naming the flash as a problem again.
+
 ADR 0049 measured the shipped 4-person VIOR captions and pre-declared the
 **too-fast** class: a cue on screen `< MIN_READ_S` (0.40 s) is sub-readable.
 The approved fix roadmap queued **grouping** as fix #2 — "when onsets are
