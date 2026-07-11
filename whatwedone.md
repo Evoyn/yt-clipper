@@ -4,6 +4,24 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-11 (fifth) — Your eye CLOSED the ADR 0056 gate: JALANANNYA at 54.40
+
+You picked B over A, called 53.60 "still a touch early", and the second
+iteration read right: the pin re-aimed to 54.4 — deliberately past the onset
+snap's 0.75 s radius so nothing could pull it back toward 53.60 — landed the
+cue at exactly **54.40**, and your eye passed
+`_recall-hole-fill clip3 (ADR 0056 - AB2 jalanannya 54.4).mp4`. The pin
+(`jalanannya @3646.4`, clip-scoped, delete-anytime) is live in the per-clip
+store beside your gue/gemes pins, and the burn artifact matches it, so any
+re-render of this clip reproduces exactly what you approved.
+
+That closes the whole recall arc (ADR 0052 → 0056) on your eye. Next is
+whichever menu item you pick: connective words (`lucu aku banget mereka`),
+the dedikornya→"deddy corp" spelling, the 3p overlap clip's admissions, the
+whisper-engine parity question, or the too-fast dwell lane (ADR 0049 #2).
+
+---
+
 ## 2026-07-11 (fourth) — Your JALANANNYA A/B is ready: 52.76 vs 53.60, one sitting decides
 
 You said "do this automatically" and went gaming, so this session pre-staged the one

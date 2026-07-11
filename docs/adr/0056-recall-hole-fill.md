@@ -281,3 +281,17 @@ those are the diag's own dtw/align diagnostic passes, whose word lists
 are pre-admission (no jalanannya exists there); the burn artifact's pass
 runs inside the real `apply` post-admission and its success line is
 info-level (suppressed at the diag's default `warn` filter).
+
+**Verdict — GATE CLOSED (2026-07-11, same evening, iter 2).** The eye
+picked B over A, called 53.60 "still a touch early", and passed
+`_recall-hole-fill clip3 (ADR 0056 - AB2 jalanannya 54.4).mp4`: the pin
+re-aimed to `at_s` 3646.4 (clip 54.4) — deliberately past the 0.75 s
+snap radius of the 53.60 onset, so with no onset within radius the
+operator's value applied verbatim (the emit landed the cue at exactly
+54.40; one-cue diff on both iterations). Final state: `jalanannya ->
+jalanannya @3646.4` (clip_only) lives in the per-clip store beside the
+gue/gemes pins and `clip_alignburn.ass` matches it, so a re-render
+reproduces the approved read. The recall-lane arc (ADR 0052 -> 0056)
+is closed on the operator's eye; the standing menu (connective words,
+dedikornya, the 3p overlap clip, whisper parity, ADR 0049 roadmap #2)
+carries forward unchanged.

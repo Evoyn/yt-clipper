@@ -1,5 +1,11 @@
 # Session prompt — Recall lane: the eye's A/B verdict closes the ADR 0056 gate
 
+> **RESOLVED 2026-07-11 (same evening):** the eye picked B, then iter 2 —
+> pin re-aimed to `at_s` 3646.4 (clip 54.4, past the 53.60 onset's snap
+> radius) — read right and CLOSED the gate. The pin below was applied and
+> then superseded by the 3646.4 value; do NOT paste it again. Current
+> session prompt: `nextprompt-recall-menu.md`.
+
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read the
 context below, then run /grill-with-docs BEFORE any code — the grill's first
 question is the operator's A/B pick.
