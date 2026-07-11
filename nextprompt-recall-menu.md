@@ -1,5 +1,11 @@
 # Session prompt — Recall arc closed; the operator picks the next lane
 
+> **SUPERSEDED IN PRIORITY 2026-07-12: the operator redirected to GENERAL
+> caption accuracy ("fix captions apply to all future video... most accurate
+> timing") — the active queue head is `nextprompt-caption-general.md`.**
+> Items below stay valid history; the whisper-parity item moved into the
+> new arc's menu. Per-clip curation is no longer session work by default.
+
 > **UPDATE 2026-07-12: the ADR 0049 #2 dwell lane is DONE — shipped and
 > REVERSED the same night on the operator's eye** ("i dont like grouped";
 > ADR 0057 records the measured negative: grouping fixed the numbers,
