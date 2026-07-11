@@ -6,6 +6,12 @@
 > 62%→1% sub-0.40, but the eye keeps one-word-at-a-time purity — the flash
 > is accepted as the genre's nature). **The too-fast class is CLOSED; strike
 > the roadmap-#2 item below.** The other items stay valid picks.
+>
+> **UPDATE 2026-07-12 (second session): the dedikornya item is STAGED —
+> verdict pending the eye** (`nextprompt-deddy-verdict.md`): at_s pin
+> @3617.10 in the per-clip store, burn beside the approved AB2. The global
+> fuzzy shape was measured OFF the table (it re-routes the aligner through
+> the laughter span — handoff 2026-07-12-deddy-corp-curation.md).
 
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read the
 context below, then run /grill-with-docs BEFORE any code — the grill's first
@@ -35,9 +41,9 @@ cue).
   (whisper + raw V4 agree on the whole phrase; both unpadded). Was a recorded
   ADR 0056 NON-GOAL awaiting the eye's ask. Needs its own pre-registration +
   the ADR 0052 controls (zero words on turn-taking).
-- **dedikornya -> "deddy corp"** (the SDC brand spelling in the vote):
-  curation lane, operator's spelling call, per-clip store entry (maybe
-  Creator-level if they want it everywhere).
+- **dedikornya -> "deddy corp"** — **STAGED 2026-07-12, eye pending**
+  (`nextprompt-deddy-verdict.md`); Creator-level "everywhere" remains their
+  call and needs per-clip emit-diff measurement (the global-shape trap).
 - **3p overlap clip admissions** (maksudnya/bingung/parah measured on
   Tretan/Coki 1559.6-1629.7): re-render + their eye, if they want it.
 - **Whisper-engine recall parity** (ADR 0052 scoped it out): whisper users

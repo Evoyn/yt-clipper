@@ -4,6 +4,40 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (second) — DEDIKORNYA now reads DEDDY CORP: the SDC brand spelled right, your eye pending
+
+You said "do this automatically" again, so this session applied the same pick
+rubric as last time: connective words stays a recorded NON-GOAL until your eye
+asks for it, whisper parity needs its own grill, the 3p re-render is your call
+— which leaves the one item whose ask is already on record: the **dedikornya →
+"deddy corp"** spelling (ADR 0056 routed it to the curation lane when its
+admission guard correctly refused to re-admit whisper's respelling).
+
+- **The fix**: a per-clip store pin renames the agglutinated vote token in
+  place — on glass the brand now reads **SUSU → DEDDY → CORP** (three huge
+  words, one at a time; no grouped line — your ADR 0057 ruling held the pen).
+- **Two mechanisms were measured and the obvious one LOST**: feeding "deddy
+  corp" as a normal (global) correction re-times the words BEFORE alignment,
+  and the two extra-token change re-routed the aligner through the
+  laughter-masked 25–28 s stretch — KALAU/SAMPAI walked onto the laugh at 26 s
+  your ear already named (the mis@28/phantom@26 class). Withdrawn on the spot;
+  the shipped shape is an `at_s` pin that renames AFTER all timing, leaving
+  every other cue byte-identical (your GUE/GEMES/JALANANNYA pins land
+  byte-exact; 119 → 120 cues and nothing else moves).
+- **Placement honesty**: the aligner's true "deddy" onset (24.61) is
+  unreachable by the pin — the only speech onset nearby belongs to SUSU
+  (24.28), and pinning below ~25.08 snaps onto it and drags SUSU early. So
+  DEDDY pops at **25.10** (measured-verbatim landing, ~0.5 s into the spoken
+  phrase) and CORP holds the genre's standard 1.2 s. If your ear wants it
+  shifted, the pin value is the lever — verbatim side only; the geometry is
+  written into the store entry's note.
+- **Your call is staged**: watch `_deddy-corp clip3 (store curation -
+  dedikornya at_s 25.10).mp4` against the approved AB2 burn, then read
+  `nextprompt-deddy-verdict.md` — approve / nudge by ear / respell / full
+  restore are all pre-committed (backups checksummed in the kit).
+
+---
+
 ## 2026-07-12 (verdict) — You ruled: no grouping. ADR 0057 reversed the same night, one-word-at-a-time stays
 
 You watched the A/B and said "i dont like grouped" — the pre-committed
