@@ -4,6 +4,44 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-11 (third) — The 51–56s caption hole is filled and the floating GEMOY is dead (ADR 0056)
+
+The two things you named on the forced-align burn — the pinguin/jalanannya gap and
+the stray GEMOY floating at 56 — are both fixed on a fresh burn waiting for your
+eye: `_recall-hole-fill clip3 (ADR 0056 - production).mp4` in the VIOR stream
+folder. The 48–58s stretch now reads GEMOY·PINGUIN·**GEMES**·**JALANANNYA**·
+**NGEFANS** where before it was gemoy·pinguin·(5 seconds of nothing)·GEMOY-at-56.
+
+- **What the instrument found first** (two full decode runs, byte-identical =
+  no decode luck): the hole was one six-word phrase from the co-speaker
+  (`jalanannya lucu aku ngefans banget mereka`) that ONLY whisper and the raw-mix
+  qwen heard — all four denoised variants are deaf to it because the denoiser
+  treats the overlapping co-speaker as noise. The strict-majority vote killed it
+  2-vs-3. (Your pinguin was never actually dropped this time: it's voted and
+  placed at 50.6, same as the surgical clip you approved.)
+- **The fix** (`admit_recall`, ensemble step 2b): a distinctive word whisper
+  heard (5+ chars, not a filler word) that the vote carries fewer copies of gets
+  re-admitted, text-only, into its whisper position. Three guards keep it honest,
+  each one earned by a real false positive the instrument caught before you had
+  to: no filler words, no re-spelling words the vote already has (whisper's
+  `deddy corp` vs the vote's `dedikornya` stays curation, and your gt's own
+  `duduk-duduk`→`dodo` garble stays OUT), and nothing at the clip edges (the
+  range cuts words in half; whisper transcribes the stumps).
+- **Controls**: your guru gembul solo clip and the ANTITESA 2-person clip admit
+  NOTHING (the clean-speech bar). On the dense Tretan/Coki overlap clip it admits
+  3 words incl. `maksudnya` — which 4 of 6 decoders heard and the vote still
+  dropped — i.e. the rule doing its job on exactly the clips that need it.
+- **The GEMOY float**: with jalanannya back at 52.76 the aligner has no room to
+  float the garbled token — it lands at 51.2, and a new clip-scoped pin renames
+  it **GEMES** (the real `gemoy` at 49.7 is untouched; the twin-token trap from
+  ADR 0054 is structurally gone now that the position is stable).
+- 372 tests green. Decode measured deterministic run-to-run, so the "different
+  votes on different days" mystery reduces to: the code changed between the
+  07-07 render and now, the decodes themselves don't wobble.
+- **One thing to check with your ear**: JALANANNYA shows at 52.76; you called it
+  ~54. If it reads early on glass, say so — it's a one-line `at_s` pin like the
+  gue one.
+
 ## 2026-07-11 (later) — Forced alignment is the DEFAULT ensemble timing now (ADR 0055)
 
 You passed the burn gate in the morning ("timing for rust port is right"), so this

@@ -288,14 +288,25 @@ pub fn apply(
     let backbone = decodes[0].clone();
     let mut voters: Vec<Vec<String>> = decodes[1..].to_vec();
     if !whisper_words.is_empty() {
-        voters.push(whisper_words);
+        voters.push(whisper_words.clone());
     }
-    let merged = vote_merge(&backbone, &voters);
+    let mut merged = vote_merge(&backbone, &voters);
     tracing::info!(
         "qwen ensemble: vote over {} voters + backbone -> {} words",
         voters.len(),
         merged.len()
     );
+
+    // --- 2b. recall admission (ADR 0056) --------------------------------------
+    // The strict-majority insert rule kills a distinctive word only whisper
+    // hears (measured: jalanannya@54, whisper-timed 53.5, zero qwen witnesses
+    // — a 5 s token hole the aligner then floats garbles into). Re-admit that
+    // class text-only, before the store tier so admitted words still get
+    // corrections. Inert on clean speech: no count-deficit, no fire.
+    let admitted = admit_recall(&mut merged, &whisper_words, whisper.language);
+    if !admitted.is_empty() {
+        tracing::info!("qwen ensemble: recall admitted {:?}", admitted);
+    }
 
     // --- 3. fuzzy store application (the curation-survives-engine-swap tier) ---
     // The dialect store's `wrong` keys are whisper's exact garbles (ADR 0033),
@@ -735,6 +746,152 @@ pub fn vote_merge(backbone: &[String], voters: &[Vec<String>]) -> Vec<String> {
         }
     }
     merged
+}
+
+/// High-frequency words the recall admission must never carry alone — the
+/// function/filler class is exactly what the strict-majority insert rule
+/// exists to kill (hallucination runs), so a single-witness re-admission of
+/// one would reopen that door. Language-level and generic (the bias_context
+/// contract: never per-clip or per-Creator). Only words ≥5 chars matter here
+/// (shorter ones fail the distinctiveness length bar outright).
+fn common_words(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Id => &[
+            "banget", "nggak", "kayak", "emang", "memang", "sudah", "belum",
+            "masih", "tidak", "bukan", "kalau", "karena", "sampai",
+            "sampe", "terus", "dengan", "untuk", "dalam", "semua", "orang",
+            "punya", "bilang", "kenapa", "gimana", "begitu", "gitulah",
+            "katanya", "soalnya", "pokoknya", "makanya", "berarti", "banyak",
+            "sebenarnya", "sekarang", "habis", "jangan", "kalian",
+            "mereka", "adalah", "harus", "boleh", "pernah", "lagian",
+        ],
+        Language::En => &[
+            "really", "gonna", "wanna", "about", "because", "actually",
+            "literally", "right", "there", "these", "those", "think",
+            "would", "could", "should", "gotta", "every", "thing",
+        ],
+        Language::Ja => &[],
+    }
+}
+
+/// Text-only recall admission (ADR 0052 branch, measured live by ADR 0056):
+/// after the vote, re-admit a **distinctive** word the pool heard but the
+/// strict-majority insert rule dropped. The 2026-07-11 measurement localized
+/// the live drop class to a **whisper-only witness** (`jalanannya`@54: whisper
+/// hears it timed at 53.5, zero qwen variants produce it in any spelling), so
+/// whisper — a full production decode, the only decoder with its own timing
+/// skeleton — counts as a sufficient single witness. Guards keep it inert on
+/// clean speech:
+///
+/// - **distinctive**: ≥5 chars and not in the language's [`common_words`]
+///   (function/filler runs are the hallucination class `vote_merge`'s strict
+///   majority exists to kill — never single-witness those);
+/// - **count-deficit, fuzzy-family** ([`similar_word`]): the witness carries
+///   MORE family occurrences than `merged` does — presence alone is wrong both
+///   ways (a duplicated word needs its second copy; a garble family already in
+///   merged, e.g. gemoy/gemot, must not be double-admitted under a new
+///   spelling);
+/// - **max one occurrence** admitted per family per vote (the minimal fill);
+/// - **time-blind**: the insert position comes from token alignment against
+///   `merged` (ADR 0050's lesson — no mask, no clock at admission). Timing is
+///   the fusion's job afterwards.
+///
+/// On clean speech every decoder agrees, so merged already carries each word
+/// at full count — no deficit, no fire (the structural-inertness argument the
+/// turn-taking control gate measures). Returns the admitted words for logs.
+pub fn admit_recall(
+    merged: &mut Vec<String>,
+    whisper_words: &[String],
+    language: Language,
+) -> Vec<String> {
+    if whisper_words.is_empty() || merged.is_empty() {
+        return Vec::new();
+    }
+    let common = common_words(language);
+    let distinctive = |w: &str| w.chars().count() >= 5 && !common.contains(&w);
+    let family_count = |hay: &[String], w: &str| -> usize {
+        hay.iter().filter(|t| similar_word(t, w)).count()
+    };
+
+    // Candidates: whisper's distinctive words whose fuzzy family is carried
+    // by merged in FEWER copies than whisper itself carries. Deduped by
+    // family (gemoy + gemot are one candidate, not two).
+    let mut candidates: Vec<String> = Vec::new();
+    for w in whisper_words {
+        if !distinctive(w) || candidates.iter().any(|c| similar_word(c, w)) {
+            continue;
+        }
+        if family_count(whisper_words, w) > family_count(merged, w) {
+            candidates.push(w.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Insert positions from the whisper↔merged token alignment: the first
+    // unmatched (Ins) occurrence of each candidate lands at the merged index
+    // its pending run flushes into. [`align_weighted`], not the vote's exact
+    // `align`: family-blind sub costs let the DP pair a candidate crosswise
+    // onto a foreign token (jalanannya↔gemoy) while the real family partner
+    // (gemot↔gemoy) becomes the Ins — the weighted costs make a dissimilar
+    // pairing impossible. Positions are computed once on the pre-admission
+    // merged, then applied back-to-front so earlier indices stay valid;
+    // (pos, whisper-order) sorting keeps same-gap words in whisper's order.
+    let ops = align_weighted(merged, whisper_words);
+    let mut inserts: Vec<(usize, usize, String)> = Vec::new(); // (merged_pos, seq, word)
+    let mut cursor = 0usize;
+    for idx in 0..ops.len() {
+        let (op, bi, ci) = ops[idx];
+        match op {
+            Op::Ins => {
+                let w = &whisper_words[ci.expect("ins keeps a voter index")];
+                // Family match, not exact: whisper's unmatched occurrence may
+                // spell the family differently than the candidate surface did.
+                if let Some(k) = candidates.iter().position(|c| similar_word(c, w)) {
+                    // Disagreement-zone guard (measured on clip 3): an Ins run
+                    // bounded by a Del means merged ALREADY carries its own
+                    // unpairable token there — whisper is re-spelling a word
+                    // the vote kept (whisper `deddy corp` vs merged
+                    // `dedikornya`; whisper `duduk duduk` vs merged `dodo`,
+                    // the gt's own wrong-row garble), which is the curation
+                    // lane, not a hole. A true hole inserts between two
+                    // cleanly matched neighbors. The candidate stays live for
+                    // a cleaner later occurrence.
+                    let prev_del = ops[..idx]
+                        .iter()
+                        .rev()
+                        .find(|(o, _, _)| !matches!(*o, Op::Ins))
+                        .is_some_and(|(o, _, _)| matches!(*o, Op::Del));
+                    let next_del = ops[idx + 1..]
+                        .iter()
+                        .find(|(o, _, _)| !matches!(*o, Op::Ins))
+                        .is_some_and(|(o, _, _)| matches!(*o, Op::Del));
+                    // Edge guard (measured on the guru gembul control): the
+                    // range boundary cuts words mid-utterance; whisper
+                    // transcribes the partial (a trailing "diri" for the cut
+                    // "dirinya...") while the one-shot qwen decodes emit no
+                    // boundary partials at all — so a whisper word admitting
+                    // at the extreme ends of the stream is a truncation
+                    // artifact, not a hole. Interior gaps only.
+                    let interior = cursor > 0 && cursor < merged.len();
+                    if !prev_del && !next_del && interior {
+                        inserts.push((cursor, inserts.len(), candidates.swap_remove(k)));
+                    }
+                }
+            }
+            _ => cursor = bi.expect("ok/sub/del keeps a backbone index") + 1,
+        }
+    }
+    inserts.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let admitted: Vec<String> = inserts.iter().map(|(_, _, w)| w.clone()).collect();
+    for (pos, _, w) in inserts.into_iter().rev() {
+        tracing::info!(
+            "qwen ensemble: recall admit \"{w}\" (whisper-witness, count-deficit) at word {pos}"
+        );
+        merged.insert(pos, w);
+    }
+    admitted
 }
 
 /// How a Creator's confirmed corrections split across the engine boundary
@@ -1655,6 +1812,118 @@ mod tests {
         let backbone = words("ada nggak itu kebuka");
         let voters = vec![words("kebuka"), words("kebuka"), words("kebuka")];
         assert_eq!(vote_merge(&backbone, &voters), words("kebuka"));
+    }
+
+    #[test]
+    fn admit_recall_fills_whisper_only_distinctive_drop_in_place() {
+        // The measured live class (ADR 0056): whisper hears "jalanannya"
+        // between gemoy and kamu; the vote dropped it (zero qwen witnesses).
+        // Admission inserts it at the whisper-alignment gap, text-only.
+        let mut merged = words("pinguin gemoy kamu tuh");
+        let whisper = words("pinguin gemot jalanannya kamu tuh");
+        let admitted = admit_recall(&mut merged, &whisper, Language::Id);
+        assert_eq!(admitted, words("jalanannya"));
+        assert_eq!(merged, words("pinguin gemoy jalanannya kamu tuh"));
+    }
+
+    #[test]
+    fn admit_recall_is_inert_when_counts_match() {
+        // pinguin-shaped: whisper 1x, merged 1x — presence-based "absent"
+        // logic is wrong both ways; count-deficit must not fire. gemoy-family:
+        // whisper spells the pair gemoy+gemot, merged carries gemoy+gemoy —
+        // family counting (similar_word) sees 2 == 2, no double admission.
+        let mut merged = words("pinguin gemoy gemoy kamu");
+        let whisper = words("pinguin gemoy gemot kamu");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("pinguin gemoy gemoy kamu"));
+    }
+
+    #[test]
+    fn admit_recall_never_carries_common_or_short_words() {
+        // Function/filler words are the hallucination class the strict
+        // majority exists to kill — a single witness never re-admits them,
+        // whatever the deficit. Short words fail the length bar.
+        let mut merged = words("pusing kan dibilang");
+        let whisper = words("pusing banget kan tau dibilang memang");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("pusing kan dibilang"));
+    }
+
+    #[test]
+    fn admit_recall_caps_at_one_occurrence_per_family() {
+        // Whisper looping a distinctive word (its repeated-text hallucination
+        // class) must gain at most ONE admitted copy — the minimal fill.
+        let mut merged = words("kamu tuh");
+        let whisper = words("jalanannya kamu jalanannya tuh jalanannya");
+        let admitted = admit_recall(&mut merged, &whisper, Language::Id);
+        assert_eq!(admitted, words("jalanannya"));
+        assert_eq!(merged.iter().filter(|w| *w == "jalanannya").count(), 1);
+    }
+
+    #[test]
+    fn admit_recall_is_structurally_inert_on_agreement() {
+        // Clean speech: every decoder agrees, merged already carries every
+        // word at full count — the control-clip zero-added bar, structurally.
+        let mut merged = words("mereka sombong luar biasa sekali pintar");
+        let whisper = merged.clone();
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("mereka sombong luar biasa sekali pintar"));
+    }
+
+    #[test]
+    fn admit_recall_skips_disagreement_zones_not_holes() {
+        // Measured on clip 3 (ADR 0056): whisper "deddy corp" where merged
+        // kept the qwen agglutination "dedikornya" — the word is PRESENT,
+        // differently garbled (>2 edits, outside the fuzzy family). The Ins
+        // run sits beside the Del of merged's own token: a disagreement zone
+        // (curation lane), not a hole. Admission must stay out.
+        let mut merged = words("susu dedikornya gue");
+        let whisper = words("susu deddy corp gue");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("susu dedikornya gue"));
+    }
+
+    #[test]
+    fn admit_recall_never_admits_whisper_garble_beside_voted_word() {
+        // The gt's own wrong-row: whisper garbles the real "dodo" into
+        // "duduk-duduk" (edit-3, outside the family). Admitting whisper's
+        // spelling would put a known-wrong cue beside the correct one.
+        let mut merged = words("kan ada ada dodo");
+        let whisper = words("kan ada duduk duduk");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("kan ada ada dodo"));
+    }
+
+    #[test]
+    fn admit_recall_skips_range_edge_truncation_partials() {
+        // Measured on the guru gembul turn-taking control: the range cuts
+        // "dirinya..." mid-word at the clip edge; whisper emits the partial
+        // ("diri", prefix-matching the family), the qwen one-shots emit
+        // nothing there — a count-deficit at the stream END that is a
+        // truncation artifact, not a hole. The zero-added control bar.
+        // The interior "dirinya" is matched 1:1; the trailing partial "diri"
+        // (prefix-family) creates the count-deficit, and its Ins op sits at
+        // the stream end — the edge guard must refuse it.
+        let mut merged = words("dia membuktikan dirinya penyendiri");
+        let whisper = words("dia membuktikan dirinya penyendiri diri");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("dia membuktikan dirinya penyendiri"));
+        // Same at the stream head.
+        let mut merged = words("gerakan tasawuf itu justru");
+        let whisper = words("gerakannya gerakan tasawuf itu justru");
+        assert!(admit_recall(&mut merged, &whisper, Language::Id).is_empty());
+        assert_eq!(merged, words("gerakan tasawuf itu justru"));
+    }
+
+    #[test]
+    fn admit_recall_orders_same_gap_admissions_by_whisper_order() {
+        // Two distinctive whisper-only words in one gap keep whisper's own
+        // order after the back-to-front insert.
+        let mut merged = words("kamu tuh");
+        let whisper = words("kamu pinguin jalanannya tuh");
+        let admitted = admit_recall(&mut merged, &whisper, Language::Id);
+        assert_eq!(admitted, words("pinguin jalanannya"));
+        assert_eq!(merged, words("kamu pinguin jalanannya tuh"));
     }
 
     /// n seconds of silence at 16 kHz (no onsets -> proportional placement).

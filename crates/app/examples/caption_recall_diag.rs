@@ -52,8 +52,21 @@ const DROPS: &[DroppedPhrase] = &[
     DroppedPhrase { label: "otot @6.5 (isinya otot kayaknya)", anchor: &["otot"], heard_s: 6.5, spoken: 1, secondary: &["isinya", "kayaknya"] },
     // "yang keluar kreatin-kreatin" — kreatin = creatine (gym supplement), distinctive.
     DroppedPhrase { label: "kreatin @8.5 (keluar kreatin)", anchor: &["kreatin"], heard_s: 8.5, spoken: 2, secondary: &["keluar"] },
-    // "pinguin" spoken, never captioned.
-    DroppedPhrase { label: "pinguin @52", anchor: &["pinguin"], heard_s: 52.0, spoken: 1, secondary: &[] },
+    // "pinguin" spoken, never captioned. Spoken TWICE per ADR 0054/0055 (the
+    // ~50.5s occurrence today's vote keeps + the @52 one the operator named);
+    // the shipped clip's vote carried both, today's carries one — the count
+    // decides PARTIAL VOTE-loss.
+    DroppedPhrase { label: "pinguin @52", anchor: &["pinguin"], heard_s: 52.0, spoken: 2, secondary: &[] },
+    // The 51-56s token-hole rows (ADR 0054 §garble-float / nextprompt 2026-07-11):
+    // "jalanannya" @54 — carried at 53 on the shipped clip (gt `mis` row), DROPPED
+    // by the 2026-07-11 fresh votes. 10 chars: `similar_word` edit-2 also matches
+    // whisper's "jalannya" spelling.
+    DroppedPhrase { label: "jalanannya @54 (hole)", anchor: &["jalanannya"], heard_s: 54.0, spoken: 1, secondary: &[] },
+    // The garble-family row: real "gemoy" @49.7 + "gemes" @51.2 that decoders
+    // garble (shipped: gemot; today: gemoy — the float). `similar_word` groups
+    // gemes/gemoy/gemot (edit-<=2), so hits count the FAMILY; spoken=2 means the
+    // vote should keep two family tokens (one per spoken word).
+    DroppedPhrase { label: "gemes @51.2 (garble family gemoy/gemot)", anchor: &["gemes"], heard_s: 51.2, spoken: 2, secondary: &[] },
 ];
 
 /// Whisper time-gate: a timed unit this close to the heard moment, fuzzy-matching
@@ -206,8 +219,40 @@ fn main() -> anyhow::Result<()> {
         voters.push(whisper_words.clone());
     }
     let mut merged = yc_transcribe::ensemble::vote_merge(&backbone, &voters);
+    // The raw vote output, dumped for the two-run variance diff — admission
+    // output would otherwise mix into the byte comparison.
+    let merged_preadmit = merged.clone();
+    // Production step 2b (ADR 0056): the whisper-witness recall admission, in
+    // the same slot apply runs it (post-vote, pre-store). The report below is
+    // the control-clip gate's output: on clean turn-taking clips it must be
+    // empty.
+    let admitted = yc_transcribe::ensemble::admit_recall(&mut merged, &whisper_words, lang);
     yc_transcribe::ensemble::apply_store_fuzzy(&mut merged, &lexicon);
     println!("\nvote: backbone V0 + {} voters -> merged {} words", voters.len(), merged.len());
+    println!(
+        "recall admission (ADR 0056): {}",
+        if admitted.is_empty() { "NOTHING admitted".to_string() } else { format!("admitted {admitted:?}") }
+    );
+
+    // Decode-variance dump (nextprompt 2026-07-11): write every decoder's exact
+    // word list so two runs of this binary diff byte-precisely — byte-identical
+    // dumps = deterministic decode TODAY (any 07-08 vs 07-11 delta is cross-day
+    // drift); differing dumps = live run-to-run nondeterminism, measured per
+    // variant. Gated on YC_RECALL_DUMP=<path> so normal runs stay quiet.
+    if let Ok(dump) = std::env::var("YC_RECALL_DUMP") {
+        let mut s = String::new();
+        for (i, v) in variants.iter().enumerate() {
+            s.push_str(&format!(
+                "V{i} atten={:?} pad={}: {}\n",
+                v.atten, v.head_pad, v.words.join(" ")
+            ));
+        }
+        s.push_str(&format!("whisper: {}\n", whisper_words.join(" ")));
+        s.push_str(&format!("merged: {}\n", merged_preadmit.join(" ")));
+        s.push_str(&format!("admitted: {}\n", admitted.join(" ")));
+        std::fs::write(&dump, s)?;
+        println!("dumped per-decoder word lists -> {dump}");
+    }
 
     // Reproduce the DTW-fusion placement locally (the steps apply ran after
     // the vote pre-ADR-0055; production ensemble timing is the forced aligner
@@ -226,6 +271,14 @@ fn main() -> anyhow::Result<()> {
         &mut fused, &lexicon, range.start_s, &onsets, range.duration_s(),
     );
     println!("fused (local repro of production placement): {} units", fused.len());
+
+    // The 48-58s hole window (ADR 0054 §garble-float): every fused unit in the
+    // stretch the operator flagged, so the token hole (and what floats into it)
+    // is visible as a timeline, not inferred from per-drop rows.
+    println!("\n--- fused units 48.0-58.0s (the operator's 51-56s hole + margins) ---");
+    for u in fused.iter().filter(|u| u.start_s >= 48.0 && u.start_s <= 58.0) {
+        println!("  {:>6.2}s  {}", u.start_s, u.text);
+    }
 
     let shipped = shipped_ass.as_deref().map(parse_ass).transpose()?;
     if let Some(cues) = &shipped {
@@ -358,6 +411,13 @@ fn main() -> anyhow::Result<()> {
                 .map(|u| format!("{}@{:.2}", u.text, u.start_s))
                 .collect();
             println!("  {:<30} {}", d.label, if hits.is_empty() { "ABSENT".into() } else { hits.join(" ") });
+        }
+        // The float gate (ADR 0054 §garble-float): the REAL apply output's
+        // 48-58s timeline — production timing (the aligner on align builds),
+        // where the GEMOY float either lands ~51.2 or still floats.
+        println!("--- real apply, units 48.0-58.0s ---");
+        for u in refined.units.iter().filter(|u| u.start_s >= 48.0 && u.start_s <= 58.0) {
+            println!("  {:>6.2}s  {}", u.start_s, u.text);
         }
     }
 
