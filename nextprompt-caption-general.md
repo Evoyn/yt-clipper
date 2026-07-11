@@ -7,11 +7,20 @@
 > (nextprompt-deddy-verdict.md, ~2 min of their eye, no urgency); do NOT
 > propose more per-clip curation as session work.
 >
-> **OPERATOR RULE (2026-07-12): never do manual timing corrections through
-> store JSON** (no agent-placed or agent-tuned `at_s`/timing values —
-> memory: no-manual-timing-pins-in-store-json). A timing residual is fuel
-> for a general lane below or gets surfaced with its measurement; it is
-> never patched per-clip.
+> **OPERATOR RULE (2026-07-12, broadened the same day): NEVER correct
+> captions through store JSON — of any kind** ("dont touch any json to make
+> correction for the captions, leave it just like what the llm produce it,
+> so we can tune the code" — memory:
+> captions-no-json-corrections-tune-code-only). No timing pins, no spelling
+> entries, no multiword rewrites. A caption defect is fuel for a code lane
+> below or gets surfaced with its measurement. Auto-harvested unverified
+> rows are machine output and stay; the review queue is the operator's own
+> product feature, not a session mechanism. **Fixture note:** the clip-3
+> per-clip store was cleaned to raw the same day (all 4 confirmed entries
+> removed; the eye-approved burns are reference videos only), so clip-3
+> instruments now measure the pipeline's true output with no store layer —
+> and `data\clip_alignburn.ass` there is a stale pinned emit until the next
+> diag run refreshes it.
 
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read
 the context below, then run /grill-with-docs BEFORE any code — the grill's

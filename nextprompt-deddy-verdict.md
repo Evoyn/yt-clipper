@@ -1,13 +1,18 @@
-# Session prompt — the DEDDY CORP verdict (one sitting, branches pre-committed)
+# Session prompt — the DEDDY CORP verdict — **WITHDRAWN, do not run**
 
-> **OPERATOR RULE (2026-07-12, after this kit was staged): no manual timing
-> corrections through store JSON, ever again** (memory:
-> no-manual-timing-pins-in-store-json). **Branch B below is therefore
-> WITHDRAWN** — do not tune the pin's at_s by ear or otherwise. The live
-> branches are A (approve as-is: the staged pin is grandfathered by the
-> verdict), C text-only respell (keeps the staged at_s untouched), and
-> D (full restore). If the placement bothers the eye, the answer is D plus
-> the general-timing arc (nextprompt-caption-general.md), not pin-tuning.
+> **RESOLVED 2026-07-12 (same day, operator rule): "dont touch any json to
+> make correction for the captions... so we can tune the code."** The staged
+> entry AND the three older pins (gue/gemes/jalanannya) were REMOVED from
+> the per-clip store — it now holds only machine-harvested rows, so clip 3
+> re-renders produce the RAW pipeline output (an unpolluted fixture for the
+> general lanes). There is NO verdict to make; never paste any entry from
+> this file back into a store. The burns (production / AB2 / deddy-corp)
+> stay in the stream folder as reference videos only — their reads are no
+> longer reproducible by re-render, by design. Backups if ever needed:
+> `C:\Users\Nebu\AppData\Local\Temp\yc_deddy\store.allpins.bak.json`
+> (sha 7C2A2779; pins also recorded verbatim in ADR 0055/0056 + handoffs).
+> Active queue head: `nextprompt-caption-general.md`. Historical content
+> below is kept for the record.
 
 You are working in F:\yt-clipper. The 2026-07-12 menu-curation session staged
 the `dedikornya → deddy corp` spelling (the SDC brand) on clip 3 as a per-clip

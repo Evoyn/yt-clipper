@@ -4,6 +4,36 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (ruling) — You banned JSON caption curation: the stores are now raw, the code is the only tuning surface
+
+You ruled it twice, sharper the second time: "dont touch any json to make
+correction for the captions, leave it just like what the llm produce it, so
+we can tune the code." Executed immediately:
+
+- **All 4 hand-placed entries removed** from the clip-3 per-clip store — the
+  staged DEDDY CORP pin AND the three older ones (gue, gemes, jalanannya).
+  The store now holds only the machine-harvested to-do rows, which is
+  exactly "what the llm produced". A sha-recorded backup sits in the
+  yc_deddy kit and every pin value is preserved verbatim in ADR 0055/0056,
+  so nothing is lost — but they are history, not live state.
+- **What this means for clip 3**: a re-render now produces the pipeline's
+  raw output (jalanannya back at the aligner's 52.76, gemoy unrenamed,
+  dedikornya as voted). Your approved burns stay in the stream folder as
+  reference videos; they are no longer reproducible by re-render — by
+  design. In exchange, clip 3 becomes an unpolluted fixture: every
+  instrument in the upcoming general-accuracy arc measures the true code
+  path, no store layer in the way.
+- **The DEDDY CORP verdict is withdrawn** (nothing to judge — the entry is
+  gone); nextprompt-deddy-verdict.md is bannered RESOLVED.
+- The rule is saved to agent memory as standing law: caption defects get
+  fixed in code (alignment, vote rules, decode configs, LLM pass, engine
+  choice), gated on your eye on a burn — never by store entries. The in-app
+  review queue remains yours to use if you ever want it; sessions won't.
+
+Next: the general caption-accuracy arc — nextprompt-caption-general.md.
+
+---
+
 ## 2026-07-12 (second) — DEDIKORNYA now reads DEDDY CORP: the SDC brand spelled right, your eye pending
 
 You said "do this automatically" again, so this session applied the same pick
