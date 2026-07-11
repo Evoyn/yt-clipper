@@ -4,6 +4,33 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-11 (fourth) — Your JALANANNYA A/B is ready: 52.76 vs 53.60, one sitting decides
+
+You said "do this automatically" and went gaming, so this session pre-staged the one
+verdict branch that had a pre-committed fix — "JALANANNYA reads early → the at_s pin"
+— as an A/B pair in the VIOR stream folder. Watch both, pick one:
+
+- **A**: `_recall-hole-fill clip3 (ADR 0056 - production).mp4` — JALANANNYA at
+  **52.76** (the aligner's placement; the pending ADR 0056 burn, untouched).
+- **B**: `_recall-hole-fill clip3 (ADR 0056 - AB jalanannya at 54).mp4` — NEW, same
+  clip with the one-line pin at your by-ear ~54: JALANANNYA lands at **53.60**
+  (snapped to the measured speech onset; whisper's own skeleton said 53.5). The
+  emit's cue diff shows exactly ONE cue moved — everything else is byte-identical.
+
+The pin is **not** applied anywhere: the store is byte-exact shipped state, so
+production still renders A until your eye says otherwise. If B reads right, the pin
+block sits ready-to-paste in `nextprompt-recall-eye-verdict.md` (clip-scoped,
+delete-anytime, the gue shape). Both GPU passes (one emit, one NVENC burn) ran
+behind the idle gate only while your game was closed.
+
+Also: CONTEXT.md now defines **Time pin** and **Recall admission** — the two terms
+ADR 0051/0055/0056 lean on that the glossary never had. Ops scar for the record:
+this harness kills background waits after ~25–40 min (three gate-wait attempts died
+mid-sleep, each leaving an orphan bash+sleep pair to sweep) — the shape that works
+is wakeup-polling plus a short foreground gate+burn burst; saved to memory.
+
+---
+
 ## 2026-07-11 (third) — The 51–56s caption hole is filled and the floating GEMOY is dead (ADR 0056)
 
 The two things you named on the forced-align burn — the pinguin/jalanannya gap and

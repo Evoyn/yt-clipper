@@ -266,3 +266,18 @@ viewing are addressed on glass, and the pinned GUE sits at 28.14.
 this burn is the one gate still open** — named check: `jalanannya` at
 52.76 vs their by-ear ~54 (the `at_s` pin lane is the override if it
 reads early).
+
+**A/B addendum (2026-07-11 evening, eye-followthrough session):** the pin
+lane was pre-staged so one sitting decides — `_recall-hole-fill clip3
+(ADR 0056 - AB jalanannya at 54).mp4` burns the identical clip with the
+`jalanannya -> jalanannya @3646.0` clip_only pin applied: JALANANNYA
+52.76 -> **53.60** (the positional pass onset-snapped the operator's
+~54.0 pin; whisper's own skeleton had said 53.5), emit cue-diff exactly
+that ONE cue, decode determinism holding elsewhere. The pin is **not**
+in the store — production state is untouched; the verdict picks A
+(aligner) or B (pin). Instrument note for future readers: the diag's
+stderr shows two `at_s pin ... no such word` WARNs per pinned-emit run —
+those are the diag's own dtw/align diagnostic passes, whose word lists
+are pre-admission (no jalanannya exists there); the burn artifact's pass
+runs inside the real `apply` post-admission and its success line is
+info-level (suppressed at the diag's default `warn` filter).
