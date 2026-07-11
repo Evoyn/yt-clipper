@@ -6,6 +6,12 @@
 > accurate timing available.** The dedikornya verdict stays staged
 > (nextprompt-deddy-verdict.md, ~2 min of their eye, no urgency); do NOT
 > propose more per-clip curation as session work.
+>
+> **OPERATOR RULE (2026-07-12): never do manual timing corrections through
+> store JSON** (no agent-placed or agent-tuned `at_s`/timing values —
+> memory: no-manual-timing-pins-in-store-json). A timing residual is fuel
+> for a general lane below or gets surfaced with its measurement; it is
+> never patched per-clip.
 
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read
 the context below, then run /grill-with-docs BEFORE any code — the grill's
@@ -64,7 +70,9 @@ first question is which lane, the second is the new-Creator engine default.
 4. **Garble generality**: the layered store + fuzzy cross-engine transfer +
    LLM pass + harvest/review queue ARE the general machinery (ADR
    0030/0031/0033). No new lane unless the operator names a specific
-   generalizing class; per-clip pins remain the tail for overlap-hard clips.
+   generalizing class. Text-only spelling entries stay legitimate curation;
+   anything needing a TIMING value in a store file is banned (operator rule
+   above) — surface it instead.
 
 ## Hard rules (unchanged)
 

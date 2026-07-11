@@ -1,5 +1,14 @@
 # Session prompt — the DEDDY CORP verdict (one sitting, branches pre-committed)
 
+> **OPERATOR RULE (2026-07-12, after this kit was staged): no manual timing
+> corrections through store JSON, ever again** (memory:
+> no-manual-timing-pins-in-store-json). **Branch B below is therefore
+> WITHDRAWN** — do not tune the pin's at_s by ear or otherwise. The live
+> branches are A (approve as-is: the staged pin is grandfathered by the
+> verdict), C text-only respell (keeps the staged at_s untouched), and
+> D (full restore). If the placement bothers the eye, the answer is D plus
+> the general-timing arc (nextprompt-caption-general.md), not pin-tuning.
+
 You are working in F:\yt-clipper. The 2026-07-12 menu-curation session staged
 the `dedikornya → deddy corp` spelling (the SDC brand) on clip 3 as a per-clip
 `at_s` pin. Everything is reversible; the operator's eye decides. Full state +
