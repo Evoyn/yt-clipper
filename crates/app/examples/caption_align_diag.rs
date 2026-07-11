@@ -18,10 +18,14 @@
 //! the burn gate uses (never trust the instrument alone; the enh overclaim).
 //!
 //!   cargo run -p yt-clipper --features align --example caption_align_diag -- \
-//!     <analysis.wav> <start_s> <end_s> [lang] [gtwords.txt]
+//!     <analysis.wav> <start_s> <end_s> [lang] [gtwords.txt] [store.json ...]
 //!
 //! `gtwords.txt`: optional `word<space>heard_s` lines (# comments), the
-//! operator's by-ear onsets for the clip.
+//! operator's by-ear onsets for the clip. Pass `-` to skip it when store
+//! layers follow. `store.json ...`: optional extra dialect store layers in
+//! production order (creator store, then per-clip store — pipeline.rs loads
+//! the same two on top of the bundled base), so `at_s` pins apply here
+//! exactly as on a render (the ADR 0055 pin-over-aligner check).
 
 use std::path::{Path, PathBuf};
 
@@ -92,7 +96,13 @@ fn main() -> anyhow::Result<()> {
         Some("id") | None => Language::Id,
         Some(other) => anyhow::bail!("unknown lang {other:?}"),
     };
-    let gt = a.next().map(PathBuf::from).map(|p| parse_gt(&p)).transpose()?.unwrap_or_default();
+    let gt = match a.next().as_deref() {
+        None | Some("-") => Vec::new(),
+        Some(p) => parse_gt(Path::new(p))?,
+    };
+    // Remaining args: extra dialect store layers, production order (creator
+    // store, then per-clip store), most-specific last = winning (ADR 0031).
+    let extra_stores: Vec<PathBuf> = a.map(PathBuf::from).collect();
     let range = TimeRange { start_s, end_s };
 
     let model = PathBuf::from("models/ggml-large-v3.bin");
@@ -122,8 +132,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // --- the production decode set, once --------------------------------------
-    let lexicon =
-        yc_transcribe::DialectLexicon::load_layered(&PathBuf::from("assets/dialect"), &[], lang);
+    let lexicon = yc_transcribe::DialectLexicon::load_layered(
+        &PathBuf::from("assets/dialect"),
+        &extra_stores,
+        lang,
+    );
+    let pins = lexicon.corrections.iter().filter(|c| c.at_s.is_some()).count();
+    if !extra_stores.is_empty() {
+        println!("store layers: +{} (at_s pins in play: {pins})", extra_stores.len());
+    }
     eprintln!("[align_diag] whisper + DTW (GPU)...");
     let (raw, _) =
         yc_transcribe::transcribe_range_harvesting(&model, &samples, lang, &lexicon, || false)?;
@@ -256,15 +273,27 @@ fn main() -> anyhow::Result<()> {
 
     // --- optional: the REAL production entry point, end-to-end -----------------
     if std::env::var("YC_ALIGN_EMIT").ok().as_deref() == Some("1") {
-        eprintln!("[align_diag] emit: real ensemble::apply with YC_FORCED_ALIGN=1 (5 decodes)...");
+        eprintln!("[align_diag] emit: real ensemble::apply, aligned timing (5 decodes)...");
+        // Pin the knob ON for the burn artifact even if the ambient env says
+        // off — this arm EXISTS to burn the aligned fusion. (Default-on since
+        // ADR 0055; the explicit set only guards an operator-set =0.)
         let prev = std::env::var("YC_FORCED_ALIGN").ok();
         std::env::set_var("YC_FORCED_ALIGN", "1");
+        // Production (pipeline.rs) skips the suppress_nst skeleton decode when
+        // alignment will run — hand apply the same None it would get.
+        let emit_extra = if yc_transcribe::ensemble::forced_align_active(
+            cfg.align_model.as_deref(),
+        ) {
+            None
+        } else {
+            timing_extra.as_ref()
+        };
         let fused = yc_transcribe::ensemble::apply(
             &cfg,
             &wav,
             range,
             &raw,
-            timing_extra.as_ref(),
+            emit_extra,
             &samples,
             WHISPER_SR,
             &lexicon,

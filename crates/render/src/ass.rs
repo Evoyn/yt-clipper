@@ -1132,6 +1132,33 @@ mod tests {
     }
 
     #[test]
+    fn karaoke_snap_handles_forced_alignment_span_shapes() {
+        // The forced-alignment fusion (ADR 0054/0055) emits HONEST per-word
+        // spans: non-overlapping, monotonic, with real inter-word gaps where
+        // the speaker pauses — unlike the DTW fusion's abutting units (each
+        // word ended where the next began). The karaoke cursor must dwell
+        // across a gap to the NEXT word's onset (the snap lands on the spoken
+        // moment, not the previous word's end), and a zero-width span (a CTC
+        // single-frame word) must still advance the cursor (the \k1 floor).
+        let t = Transcript {
+            language: Language::En,
+            units: vec![
+                CaptionUnit { text: "a".into(), start_s: 0.0, end_s: 0.2 },
+                // 0.8 s silence before b — the dwell spans it: \k from 0.0 to 1.0
+                CaptionUnit { text: "b".into(), start_s: 1.0, end_s: 1.3 },
+                // zero-width span right after b
+                CaptionUnit { text: "c".into(), start_s: 1.3, end_s: 1.3 },
+            ],
+        };
+        let ass = generate_ass(&t, &karaoke_style(), None);
+        let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
+        assert_eq!(d.matches("{\\k").count(), 3);
+        assert!(d.contains("\\k100"), "a dwells across the gap to b's onset: {d}");
+        assert!(d.contains("\\k30"), "b dwells to c's onset: {d}");
+        assert!(d.contains("\\k1}"), "zero-width c floors at 1 cs, never \\k0: {d}");
+    }
+
+    #[test]
     fn karaoke_fill_groups_into_lines_like_rolling_pop() {
         // Same character budget as rolling-pop: a long run splits into >1 line,
         // each its own Dialogue, and the count matches group_lines.

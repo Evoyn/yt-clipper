@@ -1,6 +1,6 @@
 //! wav2vec2-CTC **forced alignment** — the caption TIMING skeleton that
-//! replaces whisper's DTW token times on the ensemble path (ADR 0053/0054,
-//! opt-in `YC_FORCED_ALIGN=1`).
+//! replaces whisper's DTW token times on the ensemble path (ADR 0053/0054;
+//! the DEFAULT since the ADR 0055 flip, `YC_FORCED_ALIGN=0` = off-switch).
 //!
 //! Why: whisper's DTW is one GLOBAL path per segment; non-speech (laughter,
 //! pauses) has no matching tokens, the path smears across it and the offset
@@ -265,8 +265,8 @@ pub fn align_words_on_emission(
 
 /// Resident forced-alignment model (ONNX via `ort`, CPU execution provider —
 /// deterministic, and the emission is the cheap half next to the ensemble's
-/// five sidecar decodes). Loaded per clip by `ensemble::apply` when
-/// `YC_FORCED_ALIGN=1`.
+/// five sidecar decodes). Loaded per clip by `ensemble::apply` — by default
+/// since ADR 0055 (`YC_FORCED_ALIGN=0` disables).
 #[cfg(feature = "align")]
 pub use infer::Aligner;
 

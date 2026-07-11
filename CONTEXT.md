@@ -97,7 +97,7 @@ The per-Clip override of where the caption block sits on the canvas and how larg
 _Avoid_: caption position (underspecifies — placement also scales), caption style (that is the shared look/animation preset; placement is one Clip's geometry)
 
 **Caption engine**:
-The per-Creator choice of how a Clip's caption words are transcribed: **Whisper** (the single-decode default) or the **Qwen ensemble** (a five-variant vote with whisper as a voter, timing fused onto skeleton anchors and speech onsets — ADR 0034). A closed enum, not a model picker — the ensemble is a measured recipe, and a new model earns entry only through ADR 0034's gate. Remembered in the Creator store like Caption Style (ADR 0016); switching it for a curated Creator is a deliberate act (ADR 0033): the app states which of their existing corrections carry across (ADR 0035).
+The per-Creator choice of how a Clip's caption words are transcribed: **Whisper** (the single-decode default) or the **Qwen ensemble** (a five-variant vote with whisper as a voter — ADR 0034; timing from wav2vec2-CTC forced alignment on production `align` builds since ADR 0055, with the whisper-DTW fusion as the fallback skeleton and `YC_FORCED_ALIGN=0` as the off-switch). A closed enum, not a model picker — the ensemble is a measured recipe, and a new model earns entry only through ADR 0034's gate. Remembered in the Creator store like Caption Style (ADR 0016); switching it for a curated Creator is a deliberate act (ADR 0033): the app states which of their existing corrections carry across (ADR 0035).
 _Avoid_: model picker (a recipe, not a GGUF choice), decoder (ambiguous with whisper's internal decode config), ASR toggle
 
 **Studio**:

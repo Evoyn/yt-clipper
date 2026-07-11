@@ -1,5 +1,6 @@
 //! Qwen3-ASR ensemble captions (opt-in, `YC_QWEN_ENS=1`) — words from a
-//! multi-decode vote, timing from whisper.
+//! multi-decode vote, timing from wav2vec2-CTC forced alignment (whisper DTW
+//! is the fallback skeleton).
 //!
 //! Measured basis (2026-07-02, the "Diskusi biasa" benchmark, operator ground
 //! truth in `benchmarks/diskusi-biasa.groundtruth.txt`): near whisper's limit
@@ -12,13 +13,16 @@
 //! recovered a 3 s missed-speech hole, "bangke", "bajingan bajingan", and
 //! "pusing cok" from the plain mix — with zero dialect-store input.
 //!
-//! Shape: whisper still decodes the clip (it owns TIMING — DTW word onsets,
-//! the karaoke path); the Qwen ensemble owns WORDS. The merged word stream is
-//! aligned back onto whisper's units: matched words adopt whisper's span,
-//! whisper-only units DROP (they are the hallucination class the vote
-//! outvoted), ensemble-only runs get character-proportional spans inside the
-//! enclosing whisper gap. Downstream (refine, ASS, karaoke, LLM correct) is
-//! unchanged.
+//! Shape: whisper still decodes the clip (its words join the vote; its DTW
+//! units are the FALLBACK timing skeleton); the Qwen ensemble owns WORDS; the
+//! forced aligner owns TIMING (ADR 0054/0055 — per-word re-anchoring from the
+//! audio itself, which killed the DTW drift class the operator hand-pinned
+//! every clip). When the aligner is unavailable (off-switch, feature, model,
+//! or a runtime failure) the merged word stream falls back onto whisper's
+//! units: matched words adopt whisper's span, whisper-only units DROP (they
+//! are the hallucination class the vote outvoted), ensemble-only runs get
+//! character-proportional spans inside the enclosing whisper gap. Downstream
+//! (refine, ASS, karaoke, LLM correct) is unchanged either way.
 //!
 //! ADR 0033 compliance: strictly opt-in (env knob, default OFF = byte-identical
 //! renders), read here so the render and any diag can't diverge; the dialect
@@ -54,18 +58,36 @@ fn override_from(raw: Option<&str>) -> Option<bool> {
     }
 }
 
-/// The forced-alignment timing knob (ADR 0054): `YC_FORCED_ALIGN=1` swaps the
-/// ensemble's timing skeleton from whisper DTW to the wav2vec2-CTC aligner.
-/// Plain opt-in (not tri-state — there is no Creator-level setting to
-/// override yet), read inside [`apply`] so a render and any diag calling the
-/// same entry point cannot diverge (the ADR 0033 discipline).
+/// The forced-alignment timing knob (ADR 0054/0055): the wav2vec2-CTC aligner
+/// IS the ensemble's timing skeleton by default since the operator-eye burn
+/// gate passed (2026-07-11, "timing for rust port is right"); `YC_FORCED_ALIGN=0`
+/// is the off-switch back to the whisper-DTW fusion. Plain on/off (not
+/// tri-state — there is no Creator-level setting to override yet), read inside
+/// [`apply`] so a render and any diag calling the same entry point cannot
+/// diverge (the ADR 0033 discipline).
 pub fn forced_align_requested() -> bool {
     forced_align_from(std::env::var("YC_FORCED_ALIGN").ok().as_deref())
 }
 
-/// Pure parse of the `YC_FORCED_ALIGN` value (unit-testable without env).
+/// Pure parse of the `YC_FORCED_ALIGN` value (unit-testable without env):
+/// anything but an explicit off is ON — the flip inverted the ADR 0054
+/// opt-in truth table.
 fn forced_align_from(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1") | Some("true") | Some("on"))
+    !matches!(raw.map(str::trim), Some("0") | Some("false") | Some("off"))
+}
+
+/// Will [`apply`] actually attempt forced alignment? — the knob, the `align`
+/// feature, and the exported model all present. This mirrors EXACTLY the
+/// preconditions [`forced_align_fusion`] checks before touching the ONNX
+/// session (keep the two in lockstep), exposed so the caller can skip work
+/// that only feeds the DTW fallback — the `suppress_nst` timing-skeleton
+/// decode, a whole GPU pass per render (ADR 0055). A `true` here can still
+/// fall back at runtime (session error, infeasible alignment, <50% aligned);
+/// that rare class then fuses on the default whisper skeleton alone.
+pub fn forced_align_active(align_model: Option<&Path>) -> bool {
+    forced_align_requested()
+        && cfg!(feature = "align")
+        && align_model.is_some_and(|d| d.join("model.onnx").is_file())
 }
 
 /// Everything the ensemble needs from the caller (paths are derived by the
@@ -92,9 +114,10 @@ pub struct EnsembleConfig {
     /// decode, so the UI can show "decode 2/5" instead of one static label
     /// over the longest stage the app has.
     pub on_stage: Box<dyn Fn(usize, usize) + Send + Sync>,
-    /// `models/w2v2-align-id` (ONNX + vocab.json) for the opt-in
-    /// forced-alignment timing pass (ADR 0054, `YC_FORCED_ALIGN=1`). `None`
-    /// or missing files means the DTW skeleton stands — never an error.
+    /// `models/w2v2-align-id` (ONNX + vocab.json) for the forced-alignment
+    /// timing pass — the ensemble default since ADR 0055 (`YC_FORCED_ALIGN=0`
+    /// is the off-switch). `None` or missing files means the DTW skeleton
+    /// stands — never an error.
     pub align_model: Option<PathBuf>,
 }
 
@@ -299,13 +322,13 @@ pub fn apply(
         }
     });
     let onset_src: &[f32] = onset_samples.as_deref().unwrap_or(samples);
-    // Timing source (ADR 0054): with `YC_FORCED_ALIGN=1` (+ the `align`
-    // feature + the pinned model) each word's time comes from wav2vec2-CTC
-    // forced alignment over the SAME caption samples whisper heard — a
-    // per-word re-anchor instead of DTW's one global path, which is the
-    // root of the operator's "drifts out of sync" (ADR 0053's measurement).
-    // Any failure logs and falls through to the DTW fusion; captions never
-    // go missing because the aligner did.
+    // Timing source (ADR 0054/0055): by default (on an `align` build with the
+    // pinned model; `YC_FORCED_ALIGN=0` is the off-switch) each word's time
+    // comes from wav2vec2-CTC forced alignment over the SAME caption samples
+    // whisper heard — a per-word re-anchor instead of DTW's one global path,
+    // which is the root of the operator's "drifts out of sync" (ADR 0053's
+    // measurement). Any failure logs and falls through to the DTW fusion;
+    // captions never go missing because the aligner did.
     let aligned = if forced_align_requested() {
         forced_align_fusion(cfg, &merged, samples, onset_src, sample_rate, range.duration_s())
     } else {
@@ -852,12 +875,12 @@ fn forced_align_fusion(
     clip_dur_s: f64,
 ) -> Option<Vec<CaptionUnit>> {
     let Some(dir) = cfg.align_model.as_ref() else {
-        tracing::warn!("YC_FORCED_ALIGN=1 but no align model dir configured - DTW timing stands");
+        tracing::warn!("forced-align: no model dir configured - DTW timing stands");
         return None;
     };
     if !dir.join("model.onnx").is_file() {
         tracing::warn!(
-            "YC_FORCED_ALIGN=1 but {} has no model.onnx (fetch-models.ps1) - DTW timing stands",
+            "forced-align: {} has no model.onnx (fetch-models.ps1) - DTW timing stands",
             dir.display()
         );
         return None;
@@ -895,8 +918,9 @@ fn forced_align_fusion(
     Some(fuse_onto_alignment(merged, &spans, onset_src, sample_rate, clip_dur_s))
 }
 
-/// Feature-off stub: the operator flipped the env on a build without the
-/// aligner compiled in — say so instead of silently ignoring the knob.
+/// Feature-off stub: this build has no aligner compiled in, so an ensemble
+/// render's timing is the DTW fallback, NOT what a production (`align`)
+/// build ships — say so instead of silently diverging.
 #[cfg(not(feature = "align"))]
 fn forced_align_fusion(
     _cfg: &EnsembleConfig,
@@ -907,7 +931,8 @@ fn forced_align_fusion(
     _clip_dur_s: f64,
 ) -> Option<Vec<CaptionUnit>> {
     tracing::warn!(
-        "YC_FORCED_ALIGN=1 but this build lacks the `align` feature - DTW timing stands"
+        "forced-align: this build lacks the `align` feature (production builds \
+         compile it in) - DTW timing stands"
     );
     None
 }
@@ -1650,13 +1675,18 @@ mod tests {
     }
 
     #[test]
-    fn forced_align_flag_parses_like_the_other_knobs() {
+    fn forced_align_flag_defaults_on_with_an_off_switch() {
+        // ADR 0055: unset = ON (the flipped default); only an explicit
+        // 0/false/off disables. The pre-flip opt-in spellings still read ON.
+        assert!(forced_align_from(None));
         assert!(forced_align_from(Some("1")));
         assert!(forced_align_from(Some(" true ")));
         assert!(forced_align_from(Some("on")));
         assert!(!forced_align_from(Some("0")));
-        assert!(!forced_align_from(Some("yes")));
-        assert!(!forced_align_from(None));
+        assert!(!forced_align_from(Some(" false ")));
+        assert!(!forced_align_from(Some("off")));
+        // Unrecognized values are NOT an off-switch — the default wins.
+        assert!(forced_align_from(Some("yes")));
     }
 
     #[test]

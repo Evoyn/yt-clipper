@@ -55,10 +55,11 @@ foreach ($qf in $qwenFiles) {
     }
 }
 
-# Forced-alignment caption timing (ADR 0053/0054, opt-in YC_FORCED_ALIGN=1 on an
-# `align` build): cahya/wav2vec2-large-xlsr-indonesian exported to ONNX. No
-# hosted ONNX exists for this model, so the pin is source weights + a local
-# export (scripts/export-align-onnx.py via uv, ~1.2 GB download, ~1.3 GB out).
+# Forced-alignment caption timing (ADR 0053/0054; the ensemble DEFAULT on an
+# `align` build since ADR 0055 - YC_FORCED_ALIGN=0 is the off-switch):
+# cahya/wav2vec2-large-xlsr-indonesian exported to ONNX. No hosted ONNX exists
+# for this model, so the pin is source weights + a local export
+# (scripts/export-align-onnx.py via uv, ~1.2 GB download, ~1.3 GB out).
 $alignDir = Join-Path $models "w2v2-align-id"
 $alignOnnx = Join-Path $alignDir "model.onnx"
 if (Test-Path $alignOnnx) {
@@ -82,7 +83,7 @@ $versions = @(
     "vad source: $vadUri",
     "qwen3-asr: Qwen3-ASR-1.7B-Q8_0.gguf + mmproj (multimodal; ASR A/B trial - ROADMAP)",
     "qwen3-asr source: $qwenRepo",
-    "align model: w2v2-align-id/model.onnx + vocab.json (cahya/wav2vec2-large-xlsr-indonesian, fp32 opset17 - ADR 0054, YC_FORCED_ALIGN=1)",
+    "align model: w2v2-align-id/model.onnx + vocab.json (cahya/wav2vec2-large-xlsr-indonesian, fp32 opset17 - ADR 0054/0055, ensemble default)",
     "align source: https://huggingface.co/cahya/wav2vec2-large-xlsr-indonesian (rev fe66c9f1) via scripts/export-align-onnx.py",
     "fetched: $(Get-Date -Format o)"
 )

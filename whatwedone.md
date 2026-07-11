@@ -4,6 +4,44 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-11 (later) — Forced alignment is the DEFAULT ensemble timing now (ADR 0055)
+
+You passed the burn gate in the morning ("timing for rust port is right"), so this
+session flipped the switch. You were gaming, so per your "do this automatically" the
+one open decision — flip first vs recall lane first — went with the recommended order:
+**flip now, recall next** (ADR 0055 records why; `YC_FORCED_ALIGN=0` is the exact
+escape hatch if you disagree).
+
+- **Your ensemble renders now time by the wav2vec2 aligner with no knob.** Unset =
+  on (production `align` build + the fetched model); `YC_FORCED_ALIGN=0` brings back
+  the old DTW fusion render-for-render. Whisper-engine renders untouched either way.
+- **Each ensemble render got a whole GPU decode cheaper**: the second whisper pass
+  (suppress_nst) only fed the old DTW skeleton, so it now runs only when the DTW
+  fallback would actually be used.
+- **Cross-clip widening measured before trusting the flip beyond huge-word**
+  (fresh production decodes, the gate instrument):
+  - clip 3 re-check: the drift-class numbers reproduce exactly (siapa +0.08,
+    SDC −0.07; 117/117 aligned); the leftovers (pinguin@50.6, missing jalanannya)
+    are the recall/text lane, same on both engines.
+  - guru gembul karaoke-genre clip (your solo-lecture regime): 164/164 aligned,
+    aligner-vs-DTW shift median 0.09 s, max 0.66 s — it agrees wherever timing was
+    already good, dwell doesn't regress. Karaoke/rolling builders were also audited
+    for span-shape assumptions (none; +1 unit test).
+  - Tretan/Coki 3-person overlap clip (the densest in the workspace, ~3 words/s):
+    211/211 aligned, shift median 0.08 s, dwell 80%→80% — the movers (21 words,
+    up to 2.5 s) are the drift class the aligner exists to fix; nothing else budges.
+- **Your time-pins still beat the aligner** (the gue class it can miss): a real
+  gue@3620 pin now sits in clip 3's per-clip store (clip-scoped, never promotes —
+  the note inside says delete if unwanted), and both fusions log the override:
+  the aligner had gue at 28.55, the pin lands it at 28.12 — exactly where your ear
+  and ADR 0051's measurement put it.
+- Ops note: your gaming session and the ensemble share the GPU badly — decodes hit
+  their crawl-watchdog twice and simply re-ran clean once the GPU freed. That's the
+  watchdog doing its job; don't raise the budget.
+
+Next: the recall lane (`nextprompt-recall-hole-fill.md`) — fill the 51–56 s token hole
+(pinguin/jalanannya/gemes) that today's vote drops; the floating GEMOY dies with it.
+
 ## 2026-07-11 — Forced-alignment timing is now IN THE APP, native Rust, opt-in (ADR 0054)
 
 The Python spike from last session became shipped code: the wav2vec2 aligner now runs

@@ -7,7 +7,8 @@ Rust in the shipped app** — no Python, offline, self-contained — wired as an
 opt-in timing skeleton for the ensemble caption path, plus the measured
 parity + gate evidence. Default renders are byte-identical (flag unset =
 the whisper-DTW fusion exactly as before); the operator-eye burn gate on
-the default flip is the NEXT slice.
+the default flip is the NEXT slice. *(Done: the gate passed and the default
+flipped same-day — ADR 0055; `YC_FORCED_ALIGN` is the off-switch now.)*
 
 ## What shipped
 

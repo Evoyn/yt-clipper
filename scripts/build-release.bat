@@ -16,8 +16,10 @@ REM `face` is on by default here: M6 auto-framing AND the podcast speaker
 REM detection (Active Speaker camera) both need Ultraface via ort. Drop it only
 REM for a build that must not carry the ONNX Runtime binary.
 REM `align` compiles the forced-alignment caption timing pass (ADR 0054) into
-REM the same ort runtime `face` already ships; it stays inert until the
-REM operator sets YC_FORCED_ALIGN=1 (default renders stay byte-identical).
+REM the same ort runtime `face` already ships. Since the ADR 0055 flip it is
+REM the ensemble path's DEFAULT timing skeleton (YC_FORCED_ALIGN=0 is the
+REM off-switch back to the whisper DTW fusion); whisper-engine renders are
+REM untouched either way.
 
 call "%~dp0cargo-cuda.bat" build --release -p yt-clipper -p yc-llm-judge --features face,align
 exit /b %ERRORLEVEL%

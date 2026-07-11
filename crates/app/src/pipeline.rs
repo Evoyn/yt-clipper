@@ -102,9 +102,10 @@ pub struct PipelinePaths {
     pub qwen_model: PathBuf,
     pub qwen_mmproj: PathBuf,
     /// wav2vec2-CTC forced-alignment model dir (`models/w2v2-align-id`, ADR
-    /// 0054) for the opt-in `YC_FORCED_ALIGN=1` ensemble timing skeleton. May
-    /// be absent: the ensemble then fuses on the whisper DTW skeleton as
-    /// before (the aligner is double-gated on the `align` feature + the env).
+    /// 0054) — the ensemble's DEFAULT timing skeleton since ADR 0055
+    /// (`YC_FORCED_ALIGN=0` is the off-switch). May be absent: the ensemble
+    /// then fuses on the whisper DTW skeleton as before (the aligner is
+    /// double-gated on the `align` feature + the model being fetched).
     pub align_model: PathBuf,
     /// Directory of per-language dialect/slang correction stores (`<lang>.json`,
     /// see `yc_transcribe::DialectLexicon`). Primes whisper + patches known
@@ -1879,26 +1880,39 @@ fn ensure_transcript(
             // rolls on into the (long) ensemble below.
             anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
             // Qwen3-ASR ensemble captions (ADR 0034/0035): words from a
-            // multi-decode vote, timing from the whisper transcript above (whose
-            // one-shot model is already dropped — GPU staging stays sequential).
-            // Runs when the resolved Caption engine is the ensemble (Creator's
-            // saved engine / rail pick / YC_QWEN_ENS override). Fails soft:
-            // whisper captions stand if the sidecar/models are absent or any
-            // stage errors. Whisper Creators stay byte-identical (this block
-            // never runs; ADR 0033's opt-in contract, now at the Creator level).
+            // multi-decode vote; timing from wav2vec2-CTC forced alignment on
+            // `align` builds (the ADR 0055 default), falling back to the
+            // whisper transcript above (whose one-shot model is already
+            // dropped — GPU staging stays sequential). Runs when the resolved
+            // Caption engine is the ensemble (Creator's saved engine / rail
+            // pick / YC_QWEN_ENS override). Fails soft: whisper captions stand
+            // if the sidecar/models are absent or any stage errors. Whisper
+            // Creators stay byte-identical (this block never runs; ADR 0033's
+            // opt-in contract, now at the Creator level).
             let mut ens_used = false;
             if use_ensemble {
                 let _ = tx.send(Progress::Stage("Ensemble captions (Qwen3-ASR)"));
-                // Second whisper decode for the TIMING skeleton only: on masked
-                // clips the default decode's spans are as wrong as its words
-                // (phantom multi-second units, holes over real speech), while
-                // suppress_nst places units exactly where the default is blind
-                // (ADR 0033's measurement). Its words never enter the vote —
-                // they re-garble, which is why the knob stays off for caption
-                // TEXT — only its time grid feeds the fusion. Scoped env write:
-                // the knobs are env-based by design (ADR 0033) and renders are
-                // serialized, so save/restore keeps an operator-set value.
-                let timing_extra = {
+                // Second whisper decode for the DTW TIMING skeleton only: on
+                // masked clips the default decode's spans are as wrong as its
+                // words (phantom multi-second units, holes over real speech),
+                // while suppress_nst places units exactly where the default is
+                // blind (ADR 0033's measurement). Its words never enter the
+                // vote — they re-garble, which is why the knob stays off for
+                // caption TEXT — only its time grid feeds the fusion. Since the
+                // forced-alignment default flip (ADR 0055) this skeleton only
+                // feeds the FALLBACK fusion, so the decode — a whole GPU pass —
+                // runs only when that fallback will actually be the timing
+                // source (off-switch set, `align` feature absent, or model not
+                // fetched). A RUNTIME aligner failure after we skipped it fuses
+                // on the default whisper skeleton alone: rare, degraded,
+                // captions never missing. Scoped env write: the knobs are
+                // env-based by design (ADR 0033) and renders are serialized,
+                // so save/restore keeps an operator-set value.
+                let timing_extra = if yc_transcribe::ensemble::forced_align_active(Some(
+                    &paths.align_model,
+                )) {
+                    None
+                } else {
                     let prev = std::env::var("YC_SUPPRESS_NST").ok();
                     std::env::set_var("YC_SUPPRESS_NST", "1");
                     let r = yc_transcribe::transcribe_range(

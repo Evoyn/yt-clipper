@@ -209,13 +209,15 @@ fn main() -> anyhow::Result<()> {
     yc_transcribe::ensemble::apply_store_fuzzy(&mut merged, &lexicon);
     println!("\nvote: backbone V0 + {} voters -> merged {} words", voters.len(), merged.len());
 
-    // Reproduce production PLACEMENT locally (the steps apply runs after the vote):
+    // Reproduce the DTW-fusion placement locally (the steps apply ran after
+    // the vote pre-ADR-0055; production ensemble timing is the forced aligner
+    // now — this instrument localizes TEXT loss, and word PRESENCE is
+    // fusion-independent, so the DTW repro stays adequate for "was it heard /
+    // did the vote keep it"; use caption_align_diag for timing questions):
     // fuse the merged words onto the whisper ∪ suppress_nst skeleton + speech
     // onsets, then the positional pass (base lexicon has no at_s pins -> no-op).
     // Onset source: apply prefers the cleaned no-pad variant's audio; the mix
-    // samples are close enough to LOCATE where a word lands. This is the ground
-    // truth of WHERE production puts each heard word — the layer the shipped
-    // clip.ass reflects (modulo decode variance between renders).
+    // samples are close enough to LOCATE where a word lands.
     let onsets = yc_transcribe::ensemble::rms_onsets(&samples, WHISPER_SR);
     let mut fused = yc_transcribe::ensemble::fuse_onto_timing(
         &merged, &raw, timing_extra.as_ref(), &samples, WHISPER_SR, range.duration_s(),
