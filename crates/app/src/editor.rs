@@ -2091,7 +2091,10 @@ impl EditorState {
         // one factor converts PlayRes pixels to canvas points.
         let (ass_x, ass_y, ass_font) = resolve_placement(self.placement, style.font_size);
         let px = canvas_rect.width() / CANVAS_W as f32;
-        let font_px = (ass_font as f32 * px * Self::ASS_TO_EGUI_FONT).max(4.0);
+        // `font_scale` is the render's own per-line compact scale (huge-word
+        // grouped lines, ADR 0057) — multiplying it here is what keeps the
+        // overlay's size the burn's size (ADR 0036), same as `ass_font`.
+        let font_px = (ass_font as f32 * line.font_scale * px * Self::ASS_TO_EGUI_FONT).max(4.0);
         let font_id = FontId::new(font_px, theme::display_family());
         let mul = if ghost { 0.35 } else { 1.0 };
         let tint = |c: [u8; 4]| {

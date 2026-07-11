@@ -4,6 +4,37 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 — The flashing captions are gone: cramped word-runs share a compact line (ADR 0057, your eye pending)
+
+You said "do this automatically" and went to watch anime, so this session took
+the one menu item you had already approved in principle — the ADR 0049 fix #2
+too-fast lane (2026-07-08: "grouping bends the huge-word look in dense
+stretches", accepted as a tradeoff to weigh at the gate) — and ran it
+measure-first, end to end.
+
+- **The defect, on your approved clip 3 burn**: 62% of caption cues were on
+  screen under 0.40 s — the fast banter at 14–19 s was 12 consecutive
+  sub-readable flashes. The floor exists in the code, but the one-cue-on-screen
+  clamp defeats it whenever people talk faster than 2.5 words/s.
+- **The fix (ADR 0057)**: a cramped run now falls back to a compact 2–3 word
+  line at the line-genre size. Same words, same order, nothing added or
+  dropped; a group can never bridge a pause; sparse words render byte-identical
+  to before. Your three pins land byte-exact (GUE 28.14, GEMES 51.48,
+  JALANANNYA 54.40) and PINGUIN keeps its approved 50.60.
+- **Measured across the corpus** (new `caption_regroup_diag`, CPU-only):
+  clip 3 sub-0.40 cues **62% → 1%** (median dwell 0.32 → 0.65 s);
+  Tretan/Coki 3p **80% → 5%**; guru gembul solo **72% → 3%**; ANTITESA 2p
+  **73% → 1%**. Production-path proof: a fresh 5-decode emit reproduced the
+  instrument's prediction except ONE pre-registered centisecond-edge case
+  (recorded in the ADR). 375 workspace tests + 4 new, all green.
+- **Your call is staged**: watch `_toofast-regroup clip3 (ADR 0057 -
+  grouped).mp4` against the approved AB2 burn, then read
+  `nextprompt-toofast-verdict.md` — every verdict branch is pre-committed,
+  including one-const levers (compact size, max words) and the full reversal
+  path if one-word-at-a-time was better after all.
+
+---
+
 ## 2026-07-11 (fifth) — Your eye CLOSED the ADR 0056 gate: JALANANNYA at 54.40
 
 You picked B over A, called 53.60 "still a touch early", and the second

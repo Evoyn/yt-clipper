@@ -1,5 +1,10 @@
 # Session prompt — Recall arc closed; the operator picks the next lane
 
+> **UPDATE 2026-07-12: the ADR 0049 #2 dwell lane below was TAKEN** under the
+> operator's "do this automatically" (ADR 0057 — cramped huge-word runs group
+> into compact lines; 62%→1% sub-0.40 on clip 3). Its burn gate is open:
+> **read `nextprompt-toofast-verdict.md` first.** The other items stay valid.
+
 You are working in F:\yt-clipper (pure-Rust egui app). Fresh session: read the
 context below, then run /grill-with-docs BEFORE any code — the grill's first
 question is which menu item the operator wants.
