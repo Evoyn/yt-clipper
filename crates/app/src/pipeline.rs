@@ -377,7 +377,8 @@ struct Session {
 
 /// How `Prepare` obtains the video to render from, and where it seeks.
 enum PromoteSource {
-    /// Fetch a padded Segment per-promote (web_safari HLS); seek the offset.
+    /// Fetch a padded Segment per-promote (section-seekable format, ADR 0059);
+    /// seek the offset.
     YouTube(String),
     /// Use the local file directly as the "Segment"; seek the range start.
     Local(PathBuf),

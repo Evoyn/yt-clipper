@@ -4,6 +4,40 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (hotfix) — YouTube killed the Segment fetch under you mid-test; Promote works again (360p stopgap, you picked it), 1080p fix queued
+
+You promoted a Moment on the new ECA podcast and the editor wouldn't open.
+Diagnosis: **YouTube switched off the `web_safari` HLS client** (the SABR
+wave ADR 0006 predicted) — it now returns storyboard thumbnails only, for
+new AND old VODs, on old AND new yt-dlp. Every Promote on every VOD was
+dead; your import/detection was fine (25 Moments saved).
+
+- **Measured before deciding**: no token-free client serves HLS anymore
+  (ios dead, tv inside YouTube's DRM experiment, android/web SABR-only,
+  mweb PO-token-gated); 1080p DASH *sections* re-create the old M1 hang
+  (ffmpeg can't seek moov-at-end files — a "30 s section" pulls the whole
+  1.5 GiB; measured twice); **itag 18 progressive still section-fetches
+  perfectly** — a real 53 s moment range in 4 s / 3.6 MB, clean audio+video.
+- **You picked (in-session)**: 360p stopgap now + a native DASH section
+  fetcher as the next slice. Shipped (ADR 0059): the fetch now tiers by
+  section-seekability — muxed HLS first (auto-heals to 1080p the moment
+  YouTube re-serves it anywhere), else muxed progressive (360p today);
+  DASH merges are structurally excluded (a unit test pins the selector so
+  the hang class can't sneak back). The dead client pin is gone; the
+  yt-dlp sidecar + its Diagnostics pin bumped to 2026.07.04 (validated on
+  the exact build; old exe kept as .bak).
+- **Quality honesty**: interim exports are test-grade (360p + itag-18
+  audio) — good for editor/framing/caption verification, not for
+  publishing. Captions are untouched (they read analysis.wav). The 1080p
+  fix is the new queue head: `nextprompt-segment-native-dash.md` (sidx
+  parse + ranged reads — ADR 0006's title, finally for real; whole-VOD
+  cache is your ranked fallback if the spike refutes ranged reads).
+- Release rebuilt (the running app was holding the exe lock — closed
+  gracefully, moments all saved). Launch `target\release\yt-clipper.exe`
+  and Promote again; the ECA VOD's 25 Moments are waiting.
+
+---
+
 ## 2026-07-12 (general arc, lane 1) — Whisper-engine alignment measured, and it REFUSED itself at its own bar: without the vote, the aligner amplifies whisper's wrong tokens
 
 You said "do this automatically" and went to watch anime, so this session ran

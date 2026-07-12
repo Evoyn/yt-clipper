@@ -1409,9 +1409,13 @@ impl App {
             DownloadSpec {
                 id: "yt-dlp",
                 label: "yt-dlp",
-                url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.06.09/yt-dlp.exe",
-                sha256: "3a48cb955d55c8821b60ccbdbbc6f61bc958f2f3d3b7ad5eaf3d83a543293a27",
-                total_bytes: 18_202_192,
+                // 2026.07.04: bumped the day YouTube cut off web_safari HLS
+                // (ADR 0059) — in the SABR arms race a month-old extractor is
+                // a liability; the segment fetch was re-validated on this
+                // exact build.
+                url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp.exe",
+                sha256: "52fe3c26dcf71fbdc85b528589020bb0b8e383155cfa81b64dd447bbe35e24b8",
+                total_bytes: 18_226_085,
                 install: Install::File(p.ytdlp()),
             },
             DownloadSpec {

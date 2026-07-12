@@ -4,11 +4,13 @@
 //!   `android_vr` client - a direct DASH audio-only stream downloaded whole, so
 //!   no seek is involved), the raw `live_chat` replay JSON (tolerating its
 //!   absence; parsed at M3), and metadata.
-//! - **Promote** fetches the padded Segment as token-free **HLS via the
-//!   `web_safari` client**: HLS is fragmented, so `--download-sections` pulls
-//!   only the in-range fragments through yt-dlp's native downloader - no ffmpeg
-//!   seek (the M1 "hang" was ffmpeg trying to range-seek a moov-not-at-front
-//!   DASH file). The format is 1080p60 H.264, muxed (itag 301).
+//! - **Promote** fetches the padded Segment with `--download-sections` over
+//!   whatever SECTION-SEEKABLE format YouTube still serves (ADR 0059): muxed
+//!   HLS first (the fragmented fast path — dried up server-side 2026-07-12,
+//!   auto-heals if it returns), else muxed progressive (itag 18, 360p — the
+//!   quality stopgap until the native DASH section fetcher). Never a DASH
+//!   merge: the M1 "hang" was ffmpeg trying to range-seek a moov-not-at-front
+//!   DASH file, re-measured the day web_safari died.
 //!
 //! Every child runs with deno on its PATH (nsig / anti-throttle) under a
 //! killable [`CancelToken`]: yt-dlp shells out to ffmpeg, so a cancel kills the
@@ -356,17 +358,33 @@ fn chat_args(url: &str, workdir: &Path) -> Vec<String> {
     ]
 }
 
-/// Padded Segment as HLS via `web_safari` (token-free m3u8). `--download-sections`
-/// pulls only the in-range fragments natively (no ffmpeg seek). `best[...avc1]`
-/// selects the muxed 1080p60 H.264 (itag 301). Output `<workdir>/segment.<ext>`.
+/// Padded Segment via `--download-sections` (ADR 0006, re-decided ADR 0059).
+///
+/// YouTube cut the `web_safari` HLS client off on 2026-07-12 (SABR
+/// enforcement, yt-dlp #12482) — measured: storyboards-only on every VOD, so
+/// the old pinned fetch failed every Promote. The selector now tiers by
+/// SECTION-SEEKABILITY, because that is the property a section download
+/// actually needs:
+///   1. muxed HLS (`protocol^=m3u8`, any client) — the old fast path;
+///      matches nothing today but AUTO-HEALS the moment any client serves
+///      m3u8 again;
+///   2. muxed progressive (`acodec!=none`, moov-at-front, ffmpeg range-seeks
+///      cleanly) — today that is itag 18, 360p: the ADR 0059 quality
+///      STOPGAP until the native DASH section fetcher lands.
+/// Deliberately NEVER `bv*+ba` DASH merges or bare `best`: YouTube's DASH
+/// https files cannot be range-seeked (moov at the end), so a "section"
+/// degenerates into pulling the whole multi-GB VOD — the M1 hang, re-measured
+/// 2026-07-12 (150 s, zero bytes). No client pin: the default client mix is
+/// yt-dlp's maintained pick and survives per-client cutoffs.
 fn segment_args(url: &str, padded: TimeRange, ffmpeg: &Path, workdir: &Path) -> Vec<String> {
     vec![
         "--download-sections".into(),
         format!("*{:.3}-{:.3}", padded.start_s, padded.end_s),
         "-f".into(),
-        "best[height<=1080][vcodec^=avc1]/best[height<=1080]/best".into(),
-        "--extractor-args".into(),
-        "youtube:player_client=web_safari".into(),
+        "best[protocol^=m3u8][height<=1080][vcodec^=avc1]/best[protocol^=m3u8][height<=1080]/\
+         best[acodec!=none][vcodec^=avc1][height<=1080]/best[acodec!=none][height<=1080]/\
+         best[acodec!=none]"
+            .into(),
         "--socket-timeout".into(),
         "30".into(),
         "--ffmpeg-location".into(),
@@ -632,15 +650,28 @@ mod tests {
     }
 
     #[test]
-    fn segment_uses_web_safari_hls_section_download() {
+    fn segment_selects_only_section_seekable_formats() {
         let padded = TimeRange { start_s: 598.0, end_s: 662.5 };
         let a = segment_args("URL", padded, Path::new("F:/sc/ffmpeg.exe"), Path::new("F:/ws"));
         let ds = a.iter().position(|s| s == "--download-sections").unwrap();
         assert_eq!(a[ds + 1], "*598.000-662.500");
-        let x = a.iter().position(|s| s == "--extractor-args").unwrap();
-        assert_eq!(a[x + 1], "youtube:player_client=web_safari");
+        // No client pin since ADR 0059 (web_safari died server-side, 2026-07-12):
+        // the default client mix survives per-client cutoffs.
+        assert!(!a.iter().any(|s| s.contains("player_client")));
         let f = a.iter().position(|s| s == "-f").unwrap();
-        assert!(a[f + 1].contains("vcodec^=avc1"));
+        let sel = &a[f + 1];
+        // HLS first (auto-heal), then muxed progressive (the 360p stopgap).
+        assert!(sel.starts_with("best[protocol^=m3u8]"), "selector: {sel}");
+        assert!(sel.contains("[acodec!=none]"), "selector: {sel}");
+        // Every tier is muxed-only; a DASH merge or bare `best` re-creates the
+        // whole-file section hang (ADR 0006's M1 scar, re-measured 2026-07-12).
+        for tier in sel.split('/') {
+            assert!(
+                tier.contains("protocol^=m3u8") || tier.contains("acodec!=none"),
+                "unseekable tier in selector: {tier}"
+            );
+        }
+        assert!(!sel.contains('+'), "DASH merge in selector: {sel}");
     }
 
     #[test]
