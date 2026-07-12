@@ -192,6 +192,40 @@ fn shot_chain(shot: &Shot, in_label: &str, out_label: &str) -> String {
     layout_chain(&shot.layout, in_label, out_label)
 }
 
+/// Wrap a finished graph with the thumbnail-intro prepend (ADR 0067, plan #5):
+/// the image (ffmpeg input **1**, see [`export_args`]' `intro`) scales/pads to
+/// the canvas (aspect-fit, black bars), matches `fps`+SAR+format, gains
+/// `anullsrc` silence, and concats AHEAD of the main stream — **after** its
+/// ASS burn, so every caption/camera/razor time stays source-relative by
+/// construction (the operator's "everything below should follow"). Both audio
+/// branches pass `aformat` (fltp/48k/stereo) so concat's same-parameters rule
+/// holds for any source. The main chain survives byte-for-byte modulo its
+/// terminal labels (`[out]`→`[mainv]`, razor `[aout]`→`[maina]`); the wrapped
+/// graph re-terminates in `[out]`+`[aout]`, so the arg mapping is unchanged.
+///
+/// `fps` is the probed source rate (≤ 0 falls back to 30 — concat still
+/// timestamps correctly, the container is VFR-tolerant). `razor_audio` says
+/// the graph already produces `[aout]` (the razor's per-piece audio concat);
+/// otherwise the main audio joins from the raw `[0:a]`.
+pub fn prepend_intro(graph: &str, intro_d: f64, fps: f64, razor_audio: bool) -> String {
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
+    let g = graph.replace("[out]", "[mainv]");
+    let (g, main_a) =
+        if razor_audio { (g.replace("[aout]", "[maina]"), "[maina]") } else { (g, "[0:a]") };
+    format!(
+        "{g};\
+         [1:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:.3},format=yuv420p[thumbv];\
+         anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={d:.3},\
+         aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[thumba];\
+         {main_a}aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[mainaf];\
+         [thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[out][aout]",
+        w = CANVAS_W,
+        h = CANVAS_H,
+        d = intro_d,
+    )
+}
+
 /// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks `seek_s` into
 /// the source; `-t` bounds the output to `duration_s` (frame-accurate under
 /// re-encode). The burned ASS timeline is 0-based, matching the reset output
@@ -201,14 +235,30 @@ fn shot_chain(shot: &Shot, in_label: &str, out_label: &str) -> String {
 /// seek different sources: the M1 local file is the whole VOD, so `seek_s` is
 /// the range start; the M2 Segment is a padded slice, so `seek_s` is the
 /// in-segment offset (`range.start - segment_start`; see `yc_ingest`).
+///
+/// `intro` is the thumbnail intro (ADR 0067): `Some((image, duration))` adds
+/// the image as input 1 (`-loop 1 -t D`), extends the output `-t` bound to
+/// `duration_s + D`, and maps the graph's `[aout]` (the wrapped graph carries
+/// the intro's silence — see [`prepend_intro`]). `None` — always in headless /
+/// batch — leaves every arg byte-identical to the pre-intro export.
 pub fn export_args(
     source: &Path,
     seek_s: f64,
     duration_s: f64,
     filtergraph: &str,
     out_name: &str,
+    intro: Option<(&Path, f64)>,
 ) -> Vec<String> {
-    export_args_inner(source, seek_s, duration_s, "-filter_complex", filtergraph, out_name, false)
+    export_args_inner(
+        source,
+        seek_s,
+        duration_s,
+        "-filter_complex",
+        filtergraph,
+        out_name,
+        false,
+        intro,
+    )
 }
 
 /// [`export_args`] with the graph in a **script file** (`-filter_complex_script`,
@@ -223,6 +273,7 @@ pub fn export_args_script(
     script_name: &str,
     out_name: &str,
     filtered_audio: bool,
+    intro: Option<(&Path, f64)>,
 ) -> Vec<String> {
     export_args_inner(
         source,
@@ -232,9 +283,11 @@ pub fn export_args_script(
         script_name,
         out_name,
         filtered_audio,
+        intro,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_args_inner(
     source: &Path,
     seek_s: f64,
@@ -243,20 +296,39 @@ fn export_args_inner(
     graph: &str,
     out_name: &str,
     filtered_audio: bool,
+    intro: Option<(&Path, f64)>,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-ss".into(),
         format!("{seek_s:.3}"),
         "-i".into(),
         source.display().to_string(),
+    ];
+    let mut out_t = duration_s;
+    // With an intro the audio ALWAYS comes from the graph: the prepend's
+    // concat pairs the intro's silence with the main audio into `[aout]`.
+    let mut audio_from_graph = filtered_audio;
+    if let Some((image, intro_d)) = intro {
+        args.extend([
+            "-loop".into(),
+            "1".into(),
+            "-t".into(),
+            format!("{intro_d:.3}"),
+            "-i".into(),
+            image.display().to_string(),
+        ]);
+        out_t += intro_d;
+        audio_from_graph = true;
+    }
+    args.extend([
         "-t".into(),
-        format!("{duration_s:.3}"),
+        format!("{out_t:.3}"),
         graph_flag.into(),
         graph.into(),
         "-map".into(),
         "[out]".into(),
         "-map".into(),
-        if filtered_audio { "[aout]".into() } else { "0:a:0".into() },
+        if audio_from_graph { "[aout]".into() } else { "0:a:0".into() },
         "-c:v".into(),
         "h264_nvenc".into(),
         "-preset".into(),
@@ -277,7 +349,8 @@ fn export_args_inner(
         "+faststart".into(),
         "-y".into(),
         out_name.into(),
-    ]
+    ]);
+    args
 }
 
 /// Run the export. ffmpeg runs with `workdir` as cwd so the relative ASS and
@@ -474,18 +547,19 @@ mod tests {
         assert!(g.contains("[s0][a0][s1][a1]concat=n=2:v=1:a=1[cat][aout]"), "graph: {g}");
         assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once, post-concat");
         let args =
-            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", true);
+            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", true, None);
         assert!(args.contains(&"[aout]".to_string()), "maps the cut audio");
         assert!(!args.contains(&"0:a:0".to_string()), "raw source audio must not be mapped");
         // The contiguous camera path keeps the raw audio map.
         let plain =
-            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false);
+            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None);
         assert!(plain.contains(&"0:a:0".to_string()));
     }
 
     #[test]
     fn export_args_script_uses_the_script_flag() {
-        let args = export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false);
+        let args =
+            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None);
         let f = args.iter().position(|a| a == "-filter_complex_script").unwrap();
         assert_eq!(args[f + 1], "camera.fg");
         assert!(!args.contains(&"-filter_complex".to_string()));
@@ -495,7 +569,7 @@ mod tests {
     #[test]
     fn export_seeks_before_input_and_uses_nvenc() {
         // M2 promote: seek the in-segment offset (2.0s), not the VOD range start.
-        let args = export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4");
+        let args = export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4", None);
         let ss = args.iter().position(|a| a == "-ss").unwrap();
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i for fast seek");
@@ -503,5 +577,94 @@ mod tests {
         assert!(args.contains(&"h264_nvenc".to_string()));
         let t = args.iter().position(|a| a == "-t").unwrap();
         assert_eq!(args[t + 1], "7.500"); // -t bounds the output to the clip duration
+    }
+
+    // ---- thumbnail intro (ADR 0067) ----------------------------------------
+
+    #[test]
+    fn intro_prepends_after_the_single_burn_and_concats_av() {
+        // The pre-registered bar: the prepend sits AFTER the one subtitles=
+        // (count stays 1), the main chain survives byte-for-byte modulo its
+        // terminal label, and the wrapped graph re-terminates in [out]+[aout].
+        let layout = Layout::FullFrame {
+            crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 },
+        };
+        let base = build_filtergraph(&layout, "clip.ass");
+        let g = prepend_intro(&base, 1.0, 23.976, false);
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once: {g}");
+        // The main chain is intact — only its terminal label renamed.
+        assert!(g.starts_with(&base.replace("[out]", "[mainv]")), "main chain rewritten: {g}");
+        // The image (input 1) aspect-fits the canvas and matches the grid.
+        assert!(g.contains("[1:v]scale=1080:1920:force_original_aspect_ratio=decrease"), "{g}");
+        assert!(g.contains("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"), "{g}");
+        assert!(g.contains("fps=23.976"), "intro runs on the source grid: {g}");
+        // Silence + aformat on BOTH branches (concat's same-parameters rule).
+        assert!(g.contains("anullsrc="), "{g}");
+        assert!(g.contains("atrim=duration=1.000"), "{g}");
+        assert_eq!(g.matches("aformat=sample_fmts=fltp").count(), 2, "{g}");
+        // Intro FIRST, then the burned main — one v+a concat into [out]/[aout].
+        assert!(
+            g.contains("[thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[out][aout]"),
+            "graph: {g}"
+        );
+        // Unknown fps degrades to the 30 fallback, never a broken filter.
+        assert!(prepend_intro(&base, 1.0, 0.0, false).contains("fps=30.000"));
+    }
+
+    #[test]
+    fn intro_composes_with_the_razor_camera_graph() {
+        // Razor + camera + intro in ONE graph: the per-piece a/v pairing
+        // stays, the burn stays post-concat and single, and the razor's
+        // [aout] feeds the intro concat instead of the raw source audio.
+        use yc_core::Shot;
+        let solo = |x: f32| Layout::FullFrame { crop: Crop { x, y: 0.0, w: 608.0, h: 1080.0 } };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 3.0, track: None, layout: solo(100.0), pan_to: None },
+                Shot { start_s: 6.0, end_s: 10.0, track: None, layout: solo(100.0), pan_to: None },
+            ],
+        };
+        let base = build_camera_filtergraph(&plan, "clip.ass", true);
+        let g = prepend_intro(&base, 1.5, 30.0, true);
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once: {g}");
+        assert_eq!(g.matches("atrim=start=").count(), 2, "razor audio pairing intact: {g}");
+        assert!(g.contains("[s0][a0][s1][a1]concat=n=2:v=1:a=1[cat][maina]"), "graph: {g}");
+        assert!(g.contains("[maina]aformat="), "razor audio feeds the intro concat: {g}");
+        assert!(!g.contains("[0:a]aformat="), "raw audio must not bypass the razor: {g}");
+        assert!(
+            g.contains("[thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[out][aout]"),
+            "graph: {g}"
+        );
+    }
+
+    #[test]
+    fn intro_args_add_the_image_input_extend_t_and_map_aout() {
+        let img = Path::new("F:/covers/thumb.png");
+        let args = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)));
+        // The image is input 1: -loop 1 -t D ahead of ITS -i, after the source.
+        let loops: Vec<usize> =
+            args.iter().enumerate().filter(|(_, a)| *a == "-loop").map(|(i, _)| i).collect();
+        assert_eq!(loops.len(), 1);
+        let l = loops[0];
+        assert!(args[..l].contains(&"F:/seg.mp4".to_string()), "source input first");
+        assert_eq!(args[l + 1], "1");
+        assert_eq!(args[l + 2], "-t");
+        assert_eq!(args[l + 3], "1.000");
+        assert_eq!(args[l + 4], "-i");
+        assert_eq!(args[l + 5], img.display().to_string());
+        // The OUTPUT -t (after both inputs) covers intro + clip.
+        let last_i = args.iter().rposition(|a| a == "-i").unwrap();
+        let t = last_i + args[last_i..].iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t + 1], "8.500", "output bound = intro + clip: {args:?}");
+        // Audio comes from the wrapped graph, never the raw source.
+        assert!(args.contains(&"[aout]".to_string()));
+        assert!(!args.contains(&"0:a:0".to_string()));
+        // And WITHOUT an intro the args stay byte-identical to today (the
+        // headless/batch pin: None means untouched).
+        let plain = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None);
+        assert!(!plain.contains(&"-loop".to_string()));
+        assert!(plain.contains(&"0:a:0".to_string()));
+        let t = plain.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(plain[t + 1], "7.500");
     }
 }

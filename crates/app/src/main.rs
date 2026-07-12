@@ -119,6 +119,7 @@ fn main() -> eframe::Result<()> {
                             transcript_override: None,
                             keep: None,
                             manual_captions: Vec::new(),
+                            intro: None,
                         })
                         .expect("send render");
                 }
@@ -268,6 +269,7 @@ fn main() -> eframe::Result<()> {
                             transcript_override: None,
                             keep: None,
                             manual_captions: Vec::new(),
+                            intro: None,
                         })
                         .expect("send render");
                 }
@@ -930,6 +932,7 @@ impl eframe::App for App {
                             transcript_override: None,
                             keep: None,
                             manual_captions: Vec::new(),
+                            intro: None,
                         });
                         self.rendering = true;
                         continue;
@@ -1159,6 +1162,7 @@ impl eframe::App for App {
                     transcript_override: spec.transcript_override,
                     keep: spec.keep,
                     manual_captions: spec.manual_captions,
+                    intro: spec.intro,
                 });
                 self.rendering = true;
                 // While a pre-pass job still runs, this Render only QUEUES

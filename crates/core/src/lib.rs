@@ -375,9 +375,36 @@ pub struct Clip {
     /// style's size, so pre-editor renders are untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_placement: Option<CaptionPlacement>,
+    /// The thumbnail intro prepended ahead of the finished stream (ADR 0067;
+    /// plan #5). `None` — the default, and always pre-intro / headless —
+    /// renders exactly today's output. The ADR 0066 decision-6 moment: track
+    /// CONTENTS becoming project.json data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<ThumbnailIntro>,
     /// Padded video segment downloaded for this Clip (ADR 0001).
     pub segment_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
+}
+
+/// The thumbnail intro (ADR 0067): a still image shown for `duration_s` AHEAD
+/// of the clip, concat-prepended after the ASS burn so captions/camera/razor
+/// stay source-relative by construction. The image is REFERENCED, not copied;
+/// a missing file on load drops the intro with a note (never a crash), and a
+/// missing file at render time fails loudly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThumbnailIntro {
+    pub path: PathBuf,
+    pub duration_s: f64,
+}
+
+impl ThumbnailIntro {
+    /// The legal intro duration bounds + default (ADR 0067: plan #5's 1 s
+    /// default inside the operator's spoken 1–2 s window, headroom below).
+    /// Shared by the editor's trim clamp and the render, so the block the
+    /// strip shows and the head the export carries can never disagree.
+    pub const MIN_S: f64 = 0.5;
+    pub const MAX_S: f64 = 2.0;
+    pub const DEFAULT_S: f64 = 1.0;
 }
 
 /// Caption placement (ADR 0036): the per-Clip override of where the caption
@@ -783,6 +810,24 @@ mod tests {
         assert_eq!(clip.caption_placement, None);
         let out = serde_json::to_string(&clip).unwrap();
         assert!(!out.contains("caption_placement"), "None is skipped, not written: {out}");
+        // Same contract for the thumbnail intro (ADR 0067): absent key loads
+        // as None and a None never invents the key on re-save.
+        assert_eq!(clip.thumbnail, None);
+        assert!(!out.contains("thumbnail"), "None is skipped, not written: {out}");
+    }
+
+    #[test]
+    fn thumbnail_intro_round_trips_and_pins_its_bounds() {
+        let intro = ThumbnailIntro { path: PathBuf::from("F:/covers/thumb.png"), duration_s: 1.5 };
+        let json = serde_json::to_string(&intro).unwrap();
+        let back: ThumbnailIntro = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, intro);
+        // The clamp the editor and render share (ADR 0067): plan #5's 1 s
+        // default inside the operator's spoken 1–2 s window, headroom below.
+        assert_eq!(
+            (ThumbnailIntro::MIN_S, ThumbnailIntro::DEFAULT_S, ThumbnailIntro::MAX_S),
+            (0.5, 1.0, 2.0)
+        );
     }
 
     #[test]
@@ -795,6 +840,7 @@ mod tests {
             layout: Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 } },
             caption_style: "Huge".into(),
             caption_placement: Some(p),
+            thumbnail: None,
             segment_path: None,
             export_path: None,
         };

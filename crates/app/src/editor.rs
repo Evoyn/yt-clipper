@@ -100,6 +100,21 @@ enum TimelineDrag {
     Razor { idx: usize, orig_t: f64, grab_t: f64 },
     /// Move the razor's ▼ cut marker (the ✂←/→✂ reference point).
     Marker { orig_t: f64, grab_t: f64 },
+    /// Trim the thumbnail intro's duration by its right edge (ADR 0067) —
+    /// the edge at output `D` IS the duration control. `grab_t` is in the
+    /// source domain like every gesture; the delta converges even though the
+    /// output span breathes with `D` (the mapping shift opposes the drag).
+    IntroTrim { orig_d: f64, grab_t: f64 },
+}
+
+/// The editor's thumbnail intro (ADR 0067, plan #5): the picked image, how
+/// long it holds ahead of the clip, and its preview texture — decoded by the
+/// pinned ffmpeg through THE SAME scale/pad geometry as the render (at half
+/// resolution), so the canvas during the intro IS the burn's frame.
+struct IntroState {
+    path: std::path::PathBuf,
+    duration_s: f64,
+    tex: Option<egui::TextureHandle>,
 }
 
 /// The timeline viewport (plan #13, ADR 0066): horizontal zoom + scroll.
@@ -504,6 +519,10 @@ pub struct RenderSpec {
     /// auto captions) — captions may share TIME because the two streams do
     /// not share SPACE.
     pub manual_captions: Vec<yc_core::ManualCaption>,
+    /// The thumbnail intro (ADR 0067, plan #5): `Some` concat-prepends the
+    /// image AHEAD of the finished stream, after its ASS burn — `None`
+    /// renders byte-identically to pre-intro output.
+    pub intro: Option<yc_core::ThumbnailIntro>,
 }
 
 /// What `show` reports back to the app each frame.
@@ -539,7 +558,10 @@ pub struct EditorState {
     /// the playhead shows the nearest frame.
     frames: Vec<egui::TextureHandle>,
     frame_fps: f64,
-    /// Clip-relative playhead (seconds) everything draws at.
+    /// The playhead, in OUTPUT time `[0 .. intro + clip]` (ADR 0067): with a
+    /// thumbnail intro the first `intro_d()` seconds are the held image;
+    /// source-domain consumers (captions, camera, razor, decode seeks) read
+    /// [`Self::src_t`]. Without an intro the two domains are identical.
     playhead_s: f64,
     /// `Some((anchor, offset))` while playing: playhead = offset + since(anchor).
     playing: Option<(Instant, f64)>,
@@ -644,6 +666,10 @@ pub struct EditorState {
     drag: Option<TimelineDrag>,
     /// The timeline razor: segment cuts + removed spans (feature plan #3).
     razor: RazorState,
+    /// The thumbnail intro (ADR 0067, plan #5): a block at Video 1's head
+    /// occupying output `[0..D]`; the render concat-prepends it AFTER the ASS
+    /// burn so every other artifact stays source-relative by construction.
+    intro: Option<IntroState>,
     /// The strip's zoom + horizontal scroll window (plan #13, ADR 0066).
     /// Session-only view state, deliberately never persisted.
     viewport: Viewport,
@@ -746,6 +772,7 @@ impl EditorState {
             panel_sort_pending: false,
             drag: None,
             razor: RazorState::default(),
+            intro: None,
             viewport: Viewport::default(),
             trk_auto: TrackFlags::default(),
             trk_manual: TrackFlags::default(),
@@ -837,10 +864,66 @@ impl EditorState {
         }
     }
 
-    /// The absolute VOD range audio playback covers when started at a
-    /// clip-relative offset: `offset` into the Clip, through its end.
-    fn play_range_from(&self, offset_s: f64) -> TimeRange {
-        TimeRange { start_s: self.range.start_s + offset_s, end_s: self.range.end_s }
+    /// The thumbnail intro's duration — the OUTPUT-time offset every source-
+    /// anchored artifact displays at (ADR 0067). 0 without an intro, so every
+    /// pre-intro code path is numerically untouched.
+    fn intro_d(&self) -> f64 {
+        self.intro.as_ref().map(|i| i.duration_s).unwrap_or(0.0)
+    }
+
+    /// The OUTPUT duration the playhead/ruler span: intro + clip.
+    fn out_dur(&self) -> f64 {
+        self.intro_d() + self.range.duration_s()
+    }
+
+    /// The playhead in SOURCE time (what captions/camera/razor/decodes use).
+    /// Parked inside the intro this clamps to 0 — nothing source-anchored
+    /// exists there.
+    fn src_t(&self) -> f64 {
+        (self.playhead_s - self.intro_d()).max(0.0)
+    }
+
+    /// The absolute VOD range audio playback covers when started at an
+    /// OUTPUT-time offset: the offset past the intro, through the clip end.
+    fn play_range_from(&self, out_offset_s: f64) -> TimeRange {
+        let src = (out_offset_s - self.intro_d()).max(0.0);
+        TimeRange { start_s: self.range.start_s + src, end_s: self.range.end_s }
+    }
+
+    /// Restart playback from OUTPUT time `out_t` — the one seek/scrub/jump
+    /// contract: past the intro, audio and the live decode restart together;
+    /// inside it the image holds silently (nothing burns there — ADR 0067)
+    /// and the crossing in `show` starts both.
+    fn restart_playback(&mut self, out_t: f64) -> EditorAction {
+        self.playing = Some((Instant::now(), out_t));
+        self.start_video();
+        if out_t < self.intro_d() {
+            EditorAction::StopAudio
+        } else {
+            EditorAction::Play(self.play_range_from(out_t))
+        }
+    }
+
+    /// Insert or replace the thumbnail intro from a picked image (ADR 0067):
+    /// decode the preview texture through the pinned ffmpeg (render-matched
+    /// aspect-fit + pad — the app deliberately ships no image decoder). A
+    /// file ffmpeg cannot decode is refused here, BEFORE it can sink a
+    /// render. A replace keeps the trimmed duration.
+    fn set_intro_image(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+        let Some((w, h, rgb)) = decode_thumb_rgb(&self.ffmpeg, &path) else {
+            tracing::warn!("thumbnail rejected: ffmpeg could not decode {}", path.display());
+            return;
+        };
+        let img = egui::ColorImage::from_rgb([w, h], &rgb);
+        let tex = ctx.load_texture("thumb-intro", img, egui::TextureOptions::LINEAR);
+        let duration_s = self
+            .intro
+            .as_ref()
+            .map(|i| i.duration_s)
+            .unwrap_or(yc_core::ThumbnailIntro::DEFAULT_S);
+        // The playhead keeps its OUTPUT position; a changed D shifts what it
+        // points at, which the next frame's clamp handles.
+        self.intro = Some(IntroState { path, duration_s, tex: Some(tex) });
     }
 
     /// The static Layout the operator's manual edits describe.
@@ -954,7 +1037,7 @@ impl EditorState {
         let layout = if camera.is_some() && self.camera_mode == CameraMode::Manual {
             self.manual_layout()
         } else {
-            self.effective_layout(self.playhead_s)
+            self.effective_layout(self.src_t())
         };
         RenderSpec {
             layout,
@@ -987,6 +1070,10 @@ impl EditorState {
             } else {
                 Vec::new()
             },
+            intro: self.intro.as_ref().map(|i| yc_core::ThumbnailIntro {
+                path: i.path.clone(),
+                duration_s: i.duration_s,
+            }),
         }
     }
 
@@ -1028,55 +1115,82 @@ impl EditorState {
         // frame-by-frame with the video. Filmstrip fallback (no live decode, or
         // > 1.5 s with no frame) keeps wall-clock so playback is never frozen.
         let dur = self.range.duration_s();
+        let d_intro = self.intro_d();
+        let out_dur = self.out_dur();
         if let Some((_, offset)) = self.playing {
-            let video_secs = self.live.as_ref().and_then(|l| l.video_secs());
-            let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
-            let stalled = self.live.is_none() || (video_secs.is_none() && waited > 1.5);
-            if !self.video_aligned && (video_secs.is_some() || stalled) {
-                // First frame on screen (or give-up): start the audio here so it
-                // runs with the video, not the ~0.1-0.5 s-earlier Play instant.
-                self.video_aligned = true;
-                self.playing = Some((Instant::now(), offset));
-                action = EditorAction::Play(self.play_range_from(offset));
-            }
-            self.playhead_s = if !self.video_aligned {
-                offset // frozen on the first frame's content until it is on screen
-            } else if let Some(v) = self.live.as_ref().and_then(|l| l.video_secs()) {
-                offset + v // follow the video, frame for frame
+            if offset < d_intro && self.live.is_none() {
+                // Inside the thumbnail intro (ADR 0067): the image holds on
+                // the wall-clock anchor — no decode, no audio (nothing burns
+                // there). Crossing D starts both: the live decode spawns at
+                // source 0 and the audio starts through the video_aligned
+                // re-anchor below, the machinery that already models "video
+                // not started yet".
+                let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
+                self.playhead_s = offset + waited;
+                if self.playhead_s >= d_intro {
+                    self.playhead_s = d_intro;
+                    self.playing = Some((Instant::now(), d_intro));
+                    self.start_video();
+                    action = EditorAction::Play(self.play_range_from(d_intro));
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                }
             } else {
-                offset + self.playing.expect("playing").0.elapsed().as_secs_f64() // filmstrip
-            };
-            if self.playhead_s >= dur {
-                self.playhead_s = dur;
-                self.playing = None;
-                self.stop_video();
-                action = EditorAction::StopAudio;
-            } else if let Some((_, span_end)) =
-                self.razor.removed_span_at(self.playhead_s, dur).filter(|_| {
-                    // Skip only while the live decode is actually delivering:
-                    // during a scrub drag (live stopped) the pointer owns the
-                    // playhead — a skip would yank it out from under the drag.
-                    self.live.as_ref().and_then(|l| l.video_secs()).is_some()
-                })
-            {
-                // Playback entered a razor-removed span: skip to where the
-                // export resumes, exactly like a scrub (the preview must play
-                // what the render will show). The clip END being removed
-                // stops playback outright.
-                if span_end >= dur - 1e-6 {
-                    self.playhead_s = dur;
+                let video_secs = self.live.as_ref().and_then(|l| l.video_secs());
+                let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
+                let stalled = self.live.is_none() || (video_secs.is_none() && waited > 1.5);
+                if !self.video_aligned && (video_secs.is_some() || stalled) {
+                    // First frame on screen (or give-up): start the audio here
+                    // so it runs with the video, not the ~0.1-0.5 s-earlier
+                    // Play instant.
+                    self.video_aligned = true;
+                    self.playing = Some((Instant::now(), offset));
+                    action = EditorAction::Play(self.play_range_from(offset));
+                }
+                self.playhead_s = if !self.video_aligned {
+                    offset // frozen on the first frame's content until it is on screen
+                } else if let Some(v) = self.live.as_ref().and_then(|l| l.video_secs()) {
+                    offset + v // follow the video, frame for frame
+                } else {
+                    offset + self.playing.expect("playing").0.elapsed().as_secs_f64() // filmstrip
+                };
+                if self.playhead_s >= out_dur {
+                    self.playhead_s = out_dur;
                     self.playing = None;
                     self.stop_video();
                     action = EditorAction::StopAudio;
+                } else if let Some((_, span_end)) = self
+                    .razor
+                    .removed_span_at((self.playhead_s - d_intro).max(0.0), dur)
+                    .filter(|_| {
+                        // Skip only while the live decode is actually
+                        // delivering: during a scrub drag (live stopped) the
+                        // pointer owns the playhead — a skip would yank it
+                        // out from under the drag.
+                        self.live.as_ref().and_then(|l| l.video_secs()).is_some()
+                    })
+                {
+                    // Playback entered a razor-removed span: skip to where the
+                    // export resumes, exactly like a scrub (the preview must
+                    // play what the render will show). The clip END being
+                    // removed stops playback outright. Razor spans are SOURCE
+                    // times; the playhead is output — the intro offset
+                    // converts.
+                    if span_end >= dur - 1e-6 {
+                        self.playhead_s = out_dur;
+                        self.playing = None;
+                        self.stop_video();
+                        action = EditorAction::StopAudio;
+                    } else {
+                        self.playhead_s = span_end + d_intro;
+                        self.playing = Some((Instant::now(), span_end + d_intro));
+                        self.start_video();
+                        action = EditorAction::Play(self.play_range_from(span_end + d_intro));
+                    }
                 } else {
-                    self.playhead_s = span_end;
-                    self.playing = Some((Instant::now(), span_end));
-                    self.start_video();
-                    action = EditorAction::Play(self.play_range_from(span_end));
+                    // 60 fps visual tick (vsync-capped).
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                 }
-            } else {
-                // 60 fps visual tick (vsync-capped).
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
 
@@ -1204,7 +1318,6 @@ impl EditorState {
 
     /// Keyboard shortcuts. Returns an action when one needs the app (play).
     fn handle_keys(&mut self, ui: &egui::Ui) -> Option<EditorAction> {
-        let dur = self.range.duration_s();
         let (space, esc, left, right, up, down, plus, minus, zero, shift, del) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
@@ -1230,10 +1343,12 @@ impl EditorState {
         if space {
             return Some(self.toggle_play());
         }
-        if del {
+        if del && self.playhead_s >= self.intro_d() {
             // The razor's remove verb (CapCut Delete): drop the segment
-            // under the playhead from the export.
-            self.razor.remove_segment_at(self.playhead_s);
+            // under the playhead from the export. Refused inside the intro —
+            // it is not razor-able source (ADR 0067); its right edge is its
+            // duration control.
+            self.razor.remove_segment_at(self.src_t());
         }
         let crop_mode = self.view == ViewMode::Source && self.camera_mode == CameraMode::Manual;
         let step = if shift { 20.0 } else { 4.0 };
@@ -1257,16 +1372,15 @@ impl EditorState {
                 self.reset_to_auto();
             }
         } else {
-            // Scrub the playhead.
+            // Scrub the playhead (output time — the intro is scrubbable too).
+            let out_dur = self.out_dur();
             let step_s = if shift { 5.0 } else { 1.0 };
             if left || right {
                 self.playhead_s =
-                    (self.playhead_s + if right { step_s } else { -step_s }).clamp(0.0, dur);
-                self.viewport.ensure_visible(self.playhead_s, dur);
+                    (self.playhead_s + if right { step_s } else { -step_s }).clamp(0.0, out_dur);
+                self.viewport.ensure_visible(self.playhead_s, out_dur);
                 if self.playing.is_some() {
-                    self.playing = Some((Instant::now(), self.playhead_s));
-                    self.start_video();
-                    return Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                    return Some(self.restart_playback(self.playhead_s));
                 }
             }
         }
@@ -1280,27 +1394,34 @@ impl EditorState {
             EditorAction::StopAudio
         } else {
             let dur = self.range.duration_s();
-            if self.playhead_s >= dur {
+            if self.playhead_s >= self.out_dur() {
                 self.playhead_s = 0.0;
             }
             // Never START inside a razor-removed span — begin where the
-            // export would resume.
-            if let Some((_, span_end)) = self.razor.removed_span_at(self.playhead_s, dur) {
-                self.playhead_s = span_end.min(dur);
+            // export would resume (source → output through the intro offset;
+            // starting inside the intro itself is fine, it plays first).
+            if self.playhead_s >= self.intro_d() {
+                if let Some((_, span_end)) = self.razor.removed_span_at(self.src_t(), dur) {
+                    self.playhead_s = (span_end + self.intro_d()).min(self.out_dur());
+                }
             }
-            self.playing = Some((Instant::now(), self.playhead_s));
-            self.start_video();
-            EditorAction::Play(self.play_range_from(self.playhead_s))
+            self.restart_playback(self.playhead_s)
         }
     }
 
     /// Spawn the live decode at the current playhead (Play, or a seek while
     /// playing). Failure is soft: the filmstrip keeps carrying playback.
+    /// Inside the thumbnail intro nothing decodes — `show`'s intro hold owns
+    /// `[0..D)` and spawns the stream at the crossing (ADR 0067).
     fn start_video(&mut self) {
         self.live = None; // kill any previous stream first
         self.video_aligned = false; // re-align the playhead to the new stream's first frame
-        let abs = self.seek_s + self.playhead_s;
-        let remaining = (self.range.duration_s() - self.playhead_s).max(0.05);
+        if self.playhead_s < self.intro_d() {
+            return;
+        }
+        let src_t = self.src_t();
+        let abs = self.seek_s + src_t;
+        let remaining = (self.range.duration_s() - src_t).max(0.05);
         match PreviewPlayer::spawn(
             &self.ffmpeg,
             &self.render_src,
@@ -1370,9 +1491,11 @@ impl EditorState {
         self.frames[self.strip_idx()].id()
     }
 
-    /// The filmstrip frame [`Self::frame_tex`] shows for the current playhead.
+    /// The filmstrip frame [`Self::frame_tex`] shows for the current playhead
+    /// (source time — the strip frames are source content; inside the intro
+    /// the canvas shows the thumbnail instead, see `draw_output`).
     fn strip_idx(&self) -> usize {
-        ((self.playhead_s * self.frame_fps).round() as usize)
+        ((self.src_t() * self.frame_fps).round() as usize)
             .min(self.frames.len().saturating_sub(1))
     }
 
@@ -1390,15 +1513,55 @@ impl EditorState {
     fn display_time(&self) -> f64 {
         if let Some((_, offset)) = self.playing {
             if let Some(mid) = self.live.as_ref().and_then(|l| l.shown_frame_mid_s()) {
-                return offset + mid;
+                // The play anchor is OUTPUT time; the decode started at its
+                // source twin — the shown frame's SOURCE time re-bases it.
+                return (offset - self.intro_d()).max(0.0) + mid;
             }
         }
         strip_frame_time_s(self.strip_idx(), self.frame_fps)
     }
 
+    /// Draw the thumbnail intro over the canvas when the playhead is parked
+    /// inside `[0..D)` (ADR 0067): the ffmpeg-decoded texture IS the burn's
+    /// frame (same aspect-fit + pad geometry), and nothing else draws — no
+    /// caption overlay, no camera chip: nothing burns there. Returns true
+    /// when it drew (the caller stops).
+    fn draw_intro_frame(&self, ui: &mut egui::Ui, canvas: Rect) -> bool {
+        let Some(intro) = &self.intro else { return false };
+        if self.playhead_s >= intro.duration_s {
+            return false;
+        }
+        let painter = ui.painter_at(canvas);
+        painter.rect_filled(canvas, CornerRadius::same(4), Color32::BLACK);
+        if let Some(tex) = &intro.tex {
+            painter.image(
+                tex.id(),
+                canvas,
+                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        painter.rect_stroke(
+            canvas,
+            CornerRadius::same(4),
+            Stroke::new(1.0, Color32::from_gray(70)),
+            StrokeKind::Inside,
+        );
+        chip(
+            &painter,
+            canvas.min + egui::vec2(8.0, 8.0),
+            &format!("Thumbnail intro · {:.1}s", intro.duration_s),
+            theme::INFO,
+        );
+        true
+    }
+
     /// Output view: the composited 9:16 result at the playhead — panels,
     /// captions, safe area, tracking chip.
     fn draw_output(&mut self, ui: &mut egui::Ui, canvas: Rect) {
+        if self.draw_intro_frame(ui, canvas) {
+            return;
+        }
         let tex = self.frame_tex(ui.ctx());
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, CornerRadius::same(4), Color32::BLACK);
@@ -1518,6 +1681,9 @@ impl EditorState {
 
     /// Source view: the whole frame, the crop box tool, and face overlays.
     fn draw_source(&mut self, ui: &mut egui::Ui, frame_rect: Rect) {
+        if self.draw_intro_frame(ui, frame_rect) {
+            return; // parked in the intro: there is no source to frame
+        }
         let tex = self.frame_tex(ui.ctx());
         let painter = ui.painter_at(frame_rect);
         painter.rect_filled(frame_rect, CornerRadius::same(4), Color32::BLACK);
@@ -1541,7 +1707,7 @@ impl EditorState {
         };
 
         // Dim everything outside the effective crop(s), so the kept region pops.
-        let layout = self.effective_layout(self.playhead_s);
+        let layout = self.effective_layout(self.src_t());
         let crops: Vec<(Crop, &str, Color32)> = match &layout {
             Layout::Stacked { gameplay, facecam, .. } => vec![
                 (*gameplay, "Top panel", theme::INFO),
@@ -1732,7 +1898,9 @@ impl EditorState {
         if self.transcript.is_none() {
             return; // the pre-pass still owns captions
         }
-        let at = self.playhead_s;
+        // Captions are source artifacts: inserted from inside the intro the
+        // caption lands at the clip's first burnable instant (source 0).
+        let at = self.src_t();
         let idx =
             self.manual_units.iter().position(|u| u.start_s > at).unwrap_or(self.manual_units.len());
         self.manual_units
@@ -1770,7 +1938,7 @@ impl EditorState {
     /// (per-shot framing) or clicking a face. Framing only — no time removed
     /// (that is the razor's job).
     fn split_shot_at_playhead(&mut self) {
-        let mut t = self.playhead_s;
+        let mut t = self.src_t();
         if self.src_fps > 0.0 {
             t = (t * self.src_fps).round() / self.src_fps;
         }
@@ -1799,7 +1967,10 @@ impl EditorState {
     /// the chip beside the pointer).
     fn apply_timeline_drag(&mut self, pointer_t: f64, tol_t: f64) -> (Option<f64>, f64) {
         let dur = self.range.duration_s();
-        let playhead = self.playhead_s;
+        // Snap anchors live in SOURCE time (captions, cuts, razors), so the
+        // playhead anchor is its source twin (`pointer_t` arrives in source
+        // time too — the strip converts at its t↔x boundary, ADR 0067).
+        let playhead = self.src_t();
         // Cut boundaries double as caption-snap anchors; a dragged cut snaps
         // to the playhead only (it IS the boundary set).
         let cuts: Vec<f64> = self
@@ -1989,6 +2160,18 @@ impl EditorState {
                 self.cut_marker = Some(v);
                 shown = v;
             }
+            Some(TimelineDrag::IntroTrim { orig_d, grab_t }) => {
+                // The intro's right edge IS its duration (ADR 0067). Clamped
+                // to the shared bounds; no magnet — the clamp is the guard
+                // rail. The source-domain delta converges even though D
+                // itself shifts the mapping (the shift opposes the drag).
+                if let Some(intro) = &mut self.intro {
+                    let d = (orig_d + (pointer_t - grab_t))
+                        .clamp(yc_core::ThumbnailIntro::MIN_S, yc_core::ThumbnailIntro::MAX_S);
+                    intro.duration_s = d;
+                    shown = d;
+                }
+            }
             None => {}
         }
         (snapped, shown)
@@ -2001,7 +2184,9 @@ impl EditorState {
     fn finish_timeline_drag(&mut self) {
         match self.drag.take() {
             Some(TimelineDrag::Cut { .. }) => self.refresh_camera_audit(),
-            Some(TimelineDrag::Razor { .. }) | Some(TimelineDrag::Marker { .. }) => {}
+            Some(TimelineDrag::Razor { .. })
+            | Some(TimelineDrag::Marker { .. })
+            | Some(TimelineDrag::IntroTrim { .. }) => {}
             Some(_) => {
                 if let Some(t) = &mut self.transcript {
                     let sorted = t.units.windows(2).all(|w| w[0].start_s <= w[1].start_s);
@@ -2037,6 +2222,11 @@ impl EditorState {
     ) -> Option<EditorAction> {
         let mut action = None;
         let dur = self.range.duration_s().max(0.001);
+        // The strip runs in OUTPUT time (ADR 0067): the ruler, playhead, and
+        // scrub span intro + clip; source-anchored content converts through
+        // the intro offset at the t↔x boundary below.
+        let d_intro = self.intro_d();
+        let out_dur = self.out_dur().max(0.001);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let label = if self.playing.is_some() { "⏸" } else { "▶" };
@@ -2047,7 +2237,7 @@ impl EditorState {
             {
                 action = Some(self.toggle_play());
             }
-            ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(dur)));
+            ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(out_dur)));
             // Master playback volume (feature plan #7): every preview sink,
             // never the export. The app owns the sink; it applies + persists
             // any change after this frame.
@@ -2093,54 +2283,95 @@ impl EditorState {
             // per-cut framing real function — operator call 2026-07-13; the
             // strip's right-click menu still carries it for AS clips.)
             let dur_full = self.range.duration_s();
+            // The razor verbs act on SOURCE time; inside the thumbnail intro
+            // they disable — it is not razor-able source (ADR 0067); its
+            // right edge is its duration control.
+            let in_intro = self.playhead_s < d_intro;
+            let intro_refusal = "The thumbnail intro can't be cut — drag its right edge \
+                                 to set its length";
             ui.add_space(6.0);
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 if ui
-                    .add(egui::Button::new("✂⏴").corner_radius(CornerRadius {
-                        nw: 4,
-                        sw: 4,
-                        ne: 0,
-                        se: 0,
-                    }))
+                    .add_enabled(
+                        !in_intro,
+                        egui::Button::new("✂⏴").corner_radius(CornerRadius {
+                            nw: 4,
+                            sw: 4,
+                            ne: 0,
+                            se: 0,
+                        }),
+                    )
                     .on_hover_text(
                         "Cut LEFT of the playhead: removes back to the marker (or the clip \
                          start when no marker is on the left)",
                     )
+                    .on_disabled_hover_text(intro_refusal)
                     .clicked()
                 {
-                    self.razor.cut_left(self.playhead_s, self.cut_marker, dur_full);
+                    self.razor.cut_left(self.src_t(), self.cut_marker, dur_full);
                 }
                 if ui
-                    .add(egui::Button::new("⏷ Mark").corner_radius(CornerRadius::ZERO))
+                    .add_enabled(
+                        !in_intro,
+                        egui::Button::new("⏷ Mark").corner_radius(CornerRadius::ZERO),
+                    )
                     .on_hover_text(
                         "Place the cut marker at the playhead — the point both scissors cut \
                          to. Drag it on the timeline to adjust; right-click it to clear.",
                     )
+                    .on_disabled_hover_text(intro_refusal)
                     .clicked()
                 {
                     self.cut_marker = Some(if self.src_fps > 0.0 {
-                        (self.playhead_s * self.src_fps).round() / self.src_fps
+                        (self.src_t() * self.src_fps).round() / self.src_fps
                     } else {
-                        self.playhead_s
+                        self.src_t()
                     });
                 }
                 if ui
-                    .add(egui::Button::new("⏵✂").corner_radius(CornerRadius {
-                        nw: 0,
-                        sw: 0,
-                        ne: 4,
-                        se: 4,
-                    }))
+                    .add_enabled(
+                        !in_intro,
+                        egui::Button::new("⏵✂").corner_radius(CornerRadius {
+                            nw: 0,
+                            sw: 0,
+                            ne: 4,
+                            se: 4,
+                        }),
+                    )
                     .on_hover_text(
                         "Cut RIGHT of the playhead: removes up to the marker (or the clip \
                          end when no marker is on the right)",
                     )
+                    .on_disabled_hover_text(intro_refusal)
                     .clicked()
                 {
-                    self.razor.cut_right(self.playhead_s, self.cut_marker, dur_full);
+                    self.razor.cut_right(self.src_t(), self.cut_marker, dur_full);
                 }
             });
+            // The thumbnail intro (ADR 0067, plan #5): pick an image; it
+            // holds ahead of the clip while every caption/cut keeps its own
+            // time. Re-picking replaces; the block's menu also removes.
+            ui.add_space(6.0);
+            if ui
+                .add(egui::Button::new("+ Thumbnail"))
+                .on_hover_text(if self.intro.is_some() {
+                    "Replace the thumbnail intro image (the block at the timeline's head; \
+                     right-click it to remove)"
+                } else {
+                    "Insert a thumbnail intro: an image shown for the first 1s (drag its \
+                     right edge, 0.5–2.0s) ahead of the clip — captions and cuts keep \
+                     their own times"
+                })
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("image", &["jpg", "jpeg", "png", "webp"])
+                    .pick_file()
+                {
+                    self.set_intro_image(ui.ctx(), path);
+                }
+            }
             // Say WHAT the worker is doing — a mystery-disabled UI reads as a
             // hang (operator feedback). Everything here stays usable meanwhile.
             if busy {
@@ -2246,24 +2477,32 @@ impl EditorState {
             if let Some(pos) = pos {
                 if (zoomf - 1.0).abs() > 1e-4 {
                     let frac = ((pos.x - lanes.left()) / lanes.width().max(1.0)).clamp(0.0, 1.0);
-                    let anchor = self.viewport.x_to_t(pos.x, lanes.left(), lanes.width(), dur);
-                    self.viewport.zoom_about(anchor, frac as f64, zoomf as f64, dur);
+                    let anchor = self.viewport.x_to_t(pos.x, lanes.left(), lanes.width(), out_dur);
+                    self.viewport.zoom_about(anchor, frac as f64, zoomf as f64, out_dur);
                 } else if !mods.ctrl
                     && !mods.command
                     && (scroll.x != 0.0 || scroll.y != 0.0)
                 {
                     // Wheel-up = earlier (scroll left), matching ScrollArea.
-                    self.viewport.scroll_px(-(scroll.x + scroll.y), lanes.width(), dur);
+                    self.viewport.scroll_px(-(scroll.x + scroll.y), lanes.width(), out_dur);
                 }
             }
         }
         // Playback follow: page the window when the playhead runs off it.
         if self.playing.is_some() {
-            self.viewport.follow(self.playhead_s, dur);
+            self.viewport.follow(self.playhead_s, out_dur);
         }
         let vp = self.viewport;
-        let t_to_x = |t: f64| vp.t_to_x(t, lanes.left(), lanes.width(), dur);
-        let x_to_t = |x: f32| vp.x_to_t(x, lanes.left(), lanes.width(), dur);
+        // OUTPUT-domain window (ruler, playhead, scrub) …
+        let t_to_x = |t: f64| vp.t_to_x(t, lanes.left(), lanes.width(), out_dur);
+        let x_to_t = |x: f32| vp.x_to_t(x, lanes.left(), lanes.width(), out_dur);
+        // … and its SOURCE-domain twins for every source-anchored artifact
+        // (captions, rails, speaker bins, camera cuts, razors, the marker):
+        // the ONE place the intro's display offset exists (ADR 0067).
+        // `x_to_s` goes slightly negative over the intro region; gestures
+        // clamp, and the strip menu gates its verbs on it.
+        let s_to_x = |t: f64| vp.t_to_x(t + d_intro, lanes.left(), lanes.width(), out_dur);
+        let x_to_s = |x: f32| vp.x_to_t(x, lanes.left(), lanes.width(), out_dur) - d_intro;
 
         // Row bands mirror the header cards across the lanes (the operator's
         // symmetry verdict, ADR 0066 round 2): a whisper of fill + a hairline
@@ -2305,9 +2544,9 @@ impl EditorState {
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 // Snap tolerance stays in POINTS: convert through the
                 // VISIBLE span, so zooming in tightens the time tolerance.
-                let tol_t = SNAP_PX as f64 * vp.span(dur) / lanes.width().max(1.0) as f64;
-                let (snapped, shown) = self.apply_timeline_drag(x_to_t(pos.x), tol_t);
-                snap_x = snapped.map(t_to_x);
+                let tol_t = SNAP_PX as f64 * vp.span(out_dur) / lanes.width().max(1.0) as f64;
+                let (snapped, shown) = self.apply_timeline_drag(x_to_s(pos.x), tol_t);
+                snap_x = snapped.map(s_to_x);
                 drag_chip_t = Some(shown);
             }
             if ui.input(|i| !i.pointer.primary_down()) {
@@ -2318,10 +2557,11 @@ impl EditorState {
 
         // Ruler ticks: a major every ~1/8 of the VISIBLE span, rounded to a
         // nice step (sub-second rungs appear zoomed in — labels grow cs).
-        let span = vp.span(dur);
+        // Output time: with an intro the ruler spans D + dur (ADR 0067).
+        let span = vp.span(out_dur);
         let step = nice_step(span / 8.0);
         let mut t = (vp.left_t / step).ceil() * step;
-        while t <= (vp.left_t + span).min(dur) + 1e-9 {
+        while t <= (vp.left_t + span).min(out_dur) + 1e-9 {
             let x = t_to_x(t);
             p.line_segment(
                 [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.top() + 12.0)],
@@ -2355,7 +2595,13 @@ impl EditorState {
                     egui::pos2(x0, film.top()),
                     egui::pos2((x0 + thumb_w).min(film.right()), film.bottom()),
                 );
-                let t_mid = x_to_t(x0 + thumb_w * 0.5);
+                // Filmstrip thumbs are SOURCE frames; a slot whose center
+                // falls inside the intro region shows none — the intro
+                // block below owns that span (ADR 0067).
+                let t_mid = x_to_s(x0 + thumb_w * 0.5);
+                if t_mid < 0.0 {
+                    continue;
+                }
                 let idx = ((t_mid * self.frame_fps).round() as usize)
                     .min(self.frames.len().saturating_sub(1));
                 // A partial rightmost slot crops the thumb instead of
@@ -2374,6 +2620,138 @@ impl EditorState {
                 Stroke::new(1.0, Color32::from_gray(60)),
                 StrokeKind::Inside,
             );
+        }
+
+        // The thumbnail intro block (ADR 0067, plan #5): Video 1's head,
+        // output [0..D] — the CapCut prepend idiom, no dead Images track
+        // (ADR 0066 decision 1). Registered after the strip's scrub response
+        // so it wins the pointer; body click parks the playhead at 0; the
+        // right edge trims the duration; right-click replaces/removes.
+        let mut intro_replace = false;
+        let mut intro_remove = false;
+        if let Some(d) = self.intro.as_ref().map(|i| i.duration_s) {
+            let r = Rect::from_min_max(
+                egui::pos2(t_to_x(0.0), film_y0),
+                egui::pos2(t_to_x(d), film_y1),
+            );
+            if r.max.x >= lanes.left() && r.min.x <= lanes.right() {
+                const EDGE_W: f32 = 6.0;
+                let body = Rect::from_min_max(
+                    r.min,
+                    egui::pos2((r.right() - EDGE_W).max(r.left()), r.bottom()),
+                )
+                .intersect(lanes);
+                let resp = ui
+                    .interact(body, ui.id().with("intro-block"), Sense::click())
+                    .on_hover_text(format!(
+                        "Thumbnail intro · {:.1}s — plays ahead of the clip; captions and \
+                         cuts keep their own times\nDrag the right edge to set its length \
+                         ({:.1}–{:.1}s) · click to park the playhead on it · right-click \
+                         to replace or remove",
+                        d,
+                        yc_core::ThumbnailIntro::MIN_S,
+                        yc_core::ThumbnailIntro::MAX_S,
+                    ));
+                if resp.clicked() {
+                    self.playhead_s = 0.0;
+                    self.viewport.ensure_visible(0.0, out_dur);
+                    if self.playing.is_some() {
+                        action = Some(self.restart_playback(0.0));
+                    }
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Replace image…").clicked() {
+                        intro_replace = true;
+                        ui.close();
+                    }
+                    if ui.button("🗑 Remove thumbnail").clicked() {
+                        intro_remove = true;
+                        ui.close();
+                    }
+                });
+                let er = Rect::from_min_max(
+                    egui::pos2(r.right() - EDGE_W, r.top()),
+                    r.right_bottom(),
+                )
+                .intersect(lanes);
+                let eresp = ui.interact(er, ui.id().with("intro-edge"), Sense::drag());
+                let edge_hot = eresp.hovered()
+                    || eresp.dragged()
+                    || matches!(self.drag, Some(TimelineDrag::IntroTrim { .. }));
+                if eresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if eresp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                    if let Some(pos) = eresp.interact_pointer_pos() {
+                        self.drag =
+                            Some(TimelineDrag::IntroTrim { orig_d: d, grab_t: x_to_s(pos.x) });
+                    }
+                }
+                // Paint: dark card, the decoded image aspect-fit at the left,
+                // the duration, an INFO accent (Video 1's kind color).
+                let hot = resp.hovered() || edge_hot;
+                p.rect_filled(r, CornerRadius::same(4), Color32::from_rgb(0x12, 0x1A, 0x26));
+                if let Some(tex) = self.intro.as_ref().and_then(|i| i.tex.as_ref()) {
+                    let tw = ((r.height() - 4.0) * (CANVAS_W as f32 / CANVAS_H as f32))
+                        .min((r.width() - 6.0).max(0.0));
+                    if tw > 2.0 {
+                        p.image(
+                            tex.id(),
+                            Rect::from_min_size(
+                                r.min + egui::vec2(2.0, 2.0),
+                                egui::vec2(tw, r.height() - 4.0),
+                            ),
+                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+                if r.width() > 46.0 {
+                    p.text(
+                        egui::pos2(r.left() + (r.height() * 0.6).min(r.width() * 0.5) + 6.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{d:.1}s"),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(200),
+                    );
+                }
+                p.rect_stroke(
+                    r,
+                    CornerRadius::same(4),
+                    Stroke::new(
+                        if hot { 1.5 } else { 1.0 },
+                        theme::INFO.gamma_multiply(if hot { 1.0 } else { 0.6 }),
+                    ),
+                    StrokeKind::Inside,
+                );
+                if edge_hot {
+                    p.line_segment(
+                        [
+                            egui::pos2(r.right() - 1.5, r.top() + 2.0),
+                            egui::pos2(r.right() - 1.5, r.bottom() - 2.0),
+                        ],
+                        Stroke::new(3.0, theme::GOLD),
+                    );
+                }
+            }
+        }
+        if intro_replace {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("image", &["jpg", "jpeg", "png", "webp"])
+                .pick_file()
+            {
+                self.set_intro_image(ui.ctx(), path);
+            }
+        }
+        if intro_remove {
+            // The playhead was OUTPUT time under the old D: what it pointed
+            // at keeps playing — a park inside the removed intro lands on
+            // the clip head, everything after shifts left by D.
+            self.playhead_s = (self.playhead_s - d_intro).max(0.0);
+            self.intro = None;
+            if self.playing.is_some() {
+                action = Some(self.restart_playback(self.playhead_s));
+            }
         }
 
         // Caption blocks — ONE BLOCK PER UNIT (= per panel row) on TWO lanes:
@@ -2452,8 +2830,8 @@ impl EditorState {
                 match lane { CapLane::Auto => self.sel_unit, CapLane::Manual => self.sel_manual };
             for (i, u) in units.iter().enumerate() {
                 let r = Rect::from_min_max(
-                    egui::pos2(t_to_x(u.start_s), y0 + 2.0),
-                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 20.0),
+                    egui::pos2(s_to_x(u.start_s), y0 + 2.0),
+                    egui::pos2(s_to_x(u.end_s).max(s_to_x(u.start_s) + 3.0), y0 + 20.0),
                 );
                 if r.min.x > lanes.right() || r.max.x < lanes.left() {
                     continue; // scrolled out of the viewport window
@@ -2471,8 +2849,8 @@ impl EditorState {
                     (if edges { r.shrink2(egui::vec2(5.0, 0.0)) } else { r }).intersect(lanes);
                 let mut tip = format!(
                     "{} – {}  ·  {}\n{}",
-                    fmt_mmss_cc(u.start_s),
-                    fmt_mmss_cc(u.end_s),
+                    fmt_mmss_cc(u.start_s + d_intro),
+                    fmt_mmss_cc(u.end_s + d_intro),
                     u.text,
                     if flags.lock {
                         "Track locked — unlock in its header to edit (click still selects)"
@@ -2527,7 +2905,7 @@ impl EditorState {
                         begin_drag = Some(TimelineDrag::CapMove {
                             targets: vec![(lane, i)],
                             orig: vec![(u.start_s, u.end_s)],
-                            grab_t: x_to_t(pos.x),
+                            grab_t: x_to_s(pos.x),
                         });
                     }
                 }
@@ -2562,14 +2940,14 @@ impl EditorState {
                                         lane,
                                         unit: i,
                                         orig_start: u.start_s,
-                                        grab_t: x_to_t(pos.x),
+                                        grab_t: x_to_s(pos.x),
                                     }
                                 } else {
                                     TimelineDrag::CapTrimEnd {
                                         lane,
                                         unit: i,
                                         orig_end: u.end_s,
-                                        grab_t: x_to_t(pos.x),
+                                        grab_t: x_to_s(pos.x),
                                     }
                                 });
                             }
@@ -2645,8 +3023,8 @@ impl EditorState {
                 let targets: Vec<(CapLane, usize)> =
                     (range.0..range.1).map(|i| (CapLane::Auto, i)).collect();
                 let rr = Rect::from_min_max(
-                    egui::pos2(t_to_x(l.start_s), rail_y),
-                    egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), rail_y + 4.0),
+                    egui::pos2(s_to_x(l.start_s), rail_y),
+                    egui::pos2(s_to_x(l.end_s).max(s_to_x(l.start_s) + 2.0), rail_y + 4.0),
                 );
                 if rr.min.x > lanes.right() || rr.max.x < lanes.left() {
                     continue; // scrolled out of the viewport window
@@ -2680,7 +3058,7 @@ impl EditorState {
                                 .iter()
                                 .map(|u| (u.start_s, u.end_s))
                                 .collect(),
-                            grab_t: x_to_t(pos.x),
+                            grab_t: x_to_s(pos.x),
                         });
                     }
                 }
@@ -2721,8 +3099,9 @@ impl EditorState {
                 CapLane::Manual => self.manual_units.get(i).map(|u| u.start_s),
             };
             if let Some(start) = start {
-                self.playhead_s = start.clamp(0.0, dur);
-                self.viewport.ensure_visible(self.playhead_s, dur);
+                // Caption times are source; the playhead is output (ADR 0067).
+                self.playhead_s = (start + d_intro).clamp(0.0, out_dur);
+                self.viewport.ensure_visible(self.playhead_s, out_dur);
                 match lane {
                     CapLane::Auto => {
                         self.sel_unit = Some(i);
@@ -2733,9 +3112,7 @@ impl EditorState {
                 // Same contract as the scrub: playing audio + video restart
                 // at the jump.
                 if self.playing.is_some() {
-                    self.playing = Some((Instant::now(), self.playhead_s));
-                    self.start_video();
-                    action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                    action = Some(self.restart_playback(self.playhead_s));
                 }
             }
         }
@@ -2757,8 +3134,8 @@ impl EditorState {
                         let t1 = j as f64 * a.bin_s;
                         p.rect_filled(
                             Rect::from_min_max(
-                                egui::pos2(t_to_x(t0), lane_y),
-                                egui::pos2(t_to_x(t1), lane_y + lane_h - 4.0),
+                                egui::pos2(s_to_x(t0), lane_y),
+                                egui::pos2(s_to_x(t1), lane_y + lane_h - 4.0),
                             ),
                             CornerRadius::same(2),
                             color.gamma_multiply(0.75),
@@ -2790,8 +3167,8 @@ impl EditorState {
                         }
                         p.rect_filled(
                             Rect::from_min_max(
-                                egui::pos2(t_to_x(i as f64 * a.bin_s), lane_y + 1.0),
-                                egui::pos2(t_to_x(j as f64 * a.bin_s), lane_y + lane_h - 5.0),
+                                egui::pos2(s_to_x(i as f64 * a.bin_s), lane_y + 1.0),
+                                egui::pos2(s_to_x(j as f64 * a.bin_s), lane_y + lane_h - 5.0),
                             ),
                             CornerRadius::same(2),
                             color,
@@ -2825,7 +3202,7 @@ impl EditorState {
             let mut delete_cut: Option<usize> = None;
             if let Some(plan) = &self.plan {
                 for (i, s) in plan.shots.iter().enumerate().skip(1) {
-                    let x = t_to_x(s.start_s);
+                    let x = s_to_x(s.start_s);
                     if x < lanes.left() - 6.0 || x > lanes.right() + 6.0 {
                         continue; // scrolled out of the viewport window
                     }
@@ -2844,14 +3221,14 @@ impl EditorState {
                             begin_cut = Some(TimelineDrag::Cut {
                                 boundary: i,
                                 orig_t: s.start_s,
-                                grab_t: x_to_t(pos.x),
+                                grab_t: x_to_s(pos.x),
                             });
                         }
                     }
                     resp.on_hover_text(format!(
                         "Camera cut at {} — the framing changes here (no time removed)\n\
                          Drag to move · right-click to delete",
-                        fmt_mmss_cc(s.start_s)
+                        fmt_mmss_cc(s.start_s + d_intro)
                     ))
                     .context_menu(|ui| {
                         if ui.button("🗑 Delete camera cut").clicked() {
@@ -2899,8 +3276,8 @@ impl EditorState {
                     continue;
                 }
                 let r = Rect::from_min_max(
-                    egui::pos2(t_to_x(*a), rect.top() + 14.0),
-                    egui::pos2(t_to_x(*b), content_bottom - 2.0),
+                    egui::pos2(s_to_x(*a), rect.top() + 14.0),
+                    egui::pos2(s_to_x(*b), content_bottom - 2.0),
                 );
                 let vis = r.intersect(lanes);
                 if vis.width() <= 0.0 {
@@ -2920,7 +3297,7 @@ impl EditorState {
             let mut begin_razor: Option<TimelineDrag> = None;
             let mut delete_razor: Option<usize> = None;
             for (k, c) in self.razor.cuts.iter().enumerate() {
-                let x = t_to_x(*c);
+                let x = s_to_x(*c);
                 if x < lanes.left() - 6.0 || x > lanes.right() + 6.0 {
                     continue; // scrolled out of the viewport window
                 }
@@ -2937,12 +3314,12 @@ impl EditorState {
                 if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         begin_razor =
-                            Some(TimelineDrag::Razor { idx: k, orig_t: *c, grab_t: x_to_t(pos.x) });
+                            Some(TimelineDrag::Razor { idx: k, orig_t: *c, grab_t: x_to_s(pos.x) });
                     }
                 }
                 resp.on_hover_text(format!(
                     "Clip cut at {}\nDrag to move · right-click to delete (merges the segments)",
-                    fmt_mmss_cc(*c)
+                    fmt_mmss_cc(*c + d_intro)
                 ))
                 .context_menu(|ui| {
                     if ui.button("🗑 Delete clip cut").clicked() {
@@ -2975,7 +3352,7 @@ impl EditorState {
         // clears it. Culled (not cleared) when scrolled out of the window.
         if let Some((m, x)) = self
             .cut_marker
-            .map(|m| (m, t_to_x(m)))
+            .map(|m| (m, s_to_x(m)))
             .filter(|(_, x)| *x >= lanes.left() - 7.0 && *x <= lanes.right() + 7.0)
         {
             let handle = Rect::from_min_max(
@@ -2989,14 +3366,14 @@ impl EditorState {
             }
             if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    self.drag = Some(TimelineDrag::Marker { orig_t: m, grab_t: x_to_t(pos.x) });
+                    self.drag = Some(TimelineDrag::Marker { orig_t: m, grab_t: x_to_s(pos.x) });
                 }
             }
             let mut clear_marker = false;
             resp.on_hover_text(format!(
                 "Cut marker at {} — ✂← / →✂ cut from the playhead to here\n\
                  Drag to move · right-click to clear",
-                fmt_mmss_cc(m)
+                fmt_mmss_cc(m + d_intro)
             ))
             .context_menu(|ui| {
                 if ui.button("🗑 Clear marker").clicked() {
@@ -3027,14 +3404,20 @@ impl EditorState {
 
         // The strip's right-click menu: razor verbs at the click position
         // (recorded when the menu opened — the pointer moves once it's open).
+        // Stored in SOURCE time; a click inside the intro region (< 0) gets
+        // no cut verbs — the intro is not razor-able source (ADR 0067).
         if resp.secondary_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                self.strip_menu_t = Some(x_to_t(pos.x));
+                self.strip_menu_t = Some(x_to_s(pos.x));
             }
         }
         resp.context_menu(|ui| {
-            let at = self.strip_menu_t.unwrap_or(self.playhead_s);
-            if ui.button(format!("✂ Cut clip here ({})", fmt_mmss(at))).clicked() {
+            let at = self.strip_menu_t.unwrap_or_else(|| self.src_t());
+            if at < 0.0 {
+                ui.label("Thumbnail intro — no cuts here (drag its right edge to resize)");
+                return;
+            }
+            if ui.button(format!("✂ Cut clip here ({})", fmt_mmss(at + d_intro))).clicked() {
                 let t = if self.src_fps > 0.0 {
                     (at * self.src_fps).round() / self.src_fps
                 } else {
@@ -3061,8 +3444,10 @@ impl EditorState {
                 && self.plan.is_some()
                 && ui.button("Camera cut here (framing change)").clicked()
             {
+                // split_shot_at_playhead reads the playhead's SOURCE twin, so
+                // the parked click position travels as output time.
                 let keep_playhead = self.playhead_s;
-                self.playhead_s = at;
+                self.playhead_s = at + d_intro;
                 self.split_shot_at_playhead();
                 self.playhead_s = keep_playhead;
                 ui.close();
@@ -3100,9 +3485,7 @@ impl EditorState {
                 }
             }
             if presp.drag_stopped() && self.playing.is_some() {
-                self.playing = Some((Instant::now(), self.playhead_s));
-                self.start_video();
-                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                action = Some(self.restart_playback(self.playhead_s));
             }
             ph_hot = presp.hovered() || presp.dragged();
         }
@@ -3126,13 +3509,21 @@ impl EditorState {
             );
         }
         if let Some(t) = drag_chip_t.filter(|_| self.drag.is_some()) {
+            // Gesture times are source; the chip prints the strip's OUTPUT
+            // clock (ADR 0067). The intro trim is a DURATION — its chip says
+            // so, parked at the edge (output t = D).
+            let (cx, label) = if matches!(self.drag, Some(TimelineDrag::IntroTrim { .. })) {
+                (t_to_x(t), format!("{t:.2}s"))
+            } else {
+                (s_to_x(t), fmt_mmss_cc(t + d_intro))
+            };
             chip(
                 &p,
                 egui::pos2(
-                    (t_to_x(t) + 8.0).clamp(lanes.left() + 2.0, rect.right() - 64.0),
+                    (cx + 8.0).clamp(lanes.left() + 2.0, rect.right() - 64.0),
                     rect.top() + 16.0,
                 ),
-                &fmt_mmss_cc(t),
+                &label,
                 theme::GOLD,
             );
         }
@@ -3149,22 +3540,19 @@ impl EditorState {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.playhead_s = x_to_t(pos.x);
                 if self.playing.is_some() {
-                    self.playing = Some((Instant::now(), self.playhead_s));
                     if resp.clicked() {
-                        self.start_video();
-                        action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                        action = Some(self.restart_playback(self.playhead_s));
                     } else {
                         // Mid-drag: the filmstrip tracks the pointer (the live
                         // stream would show the OLD position until release).
+                        self.playing = Some((Instant::now(), self.playhead_s));
                         self.stop_video();
                     }
                 }
             }
         }
         if self.drag.is_none() && resp.drag_stopped() && self.playing.is_some() {
-            self.playing = Some((Instant::now(), self.playhead_s));
-            self.start_video();
-            action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+            action = Some(self.restart_playback(self.playhead_s));
         }
 
         // ---- Header column (plan #13, ADR 0066): names + painted toggles,
@@ -3188,7 +3576,7 @@ impl EditorState {
         let name_font = FontId::proportional(12.0);
         let name_col = Color32::from_gray(208);
         // Corner: zoom verbs — the discoverable fallback for ctrl+wheel.
-        let center_t = vp.left_t + vp.span(dur) * 0.5;
+        let center_t = vp.left_t + vp.span(out_dur) * 0.5;
         let btn_r = |x0: f32, w: f32| {
             Rect::from_min_max(
                 egui::pos2(hdr.left() + x0, hdr.top() + 2.0),
@@ -3203,7 +3591,7 @@ impl EditorState {
             "zoom-out",
             "Zoom out (or ctrl+wheel on the timeline)",
         ) {
-            self.viewport.zoom_about(center_t, 0.5, 1.0 / 1.5, dur);
+            self.viewport.zoom_about(center_t, 0.5, 1.0 / 1.5, out_dur);
         }
         if mini_btn(
             ui,
@@ -3213,7 +3601,7 @@ impl EditorState {
             "zoom-in",
             "Zoom in (ctrl+wheel zooms about the pointer)",
         ) {
-            self.viewport.zoom_about(center_t, 0.5, 1.5, dur);
+            self.viewport.zoom_about(center_t, 0.5, 1.5, out_dur);
         }
         if mini_btn(ui, &ph, btn_r(50.0, 30.0), "Fit", "fit", "Show the whole clip") {
             self.viewport = Viewport::default();
@@ -3358,22 +3746,22 @@ impl EditorState {
             let sresp = ui.interact(sb, ui.id().with("tl-scrollbar"), Sense::click_and_drag());
             if sresp.clicked() || sresp.dragged() {
                 if let Some(pos) = sresp.interact_pointer_pos() {
-                    let frac_w = (vp.span(dur) / dur).clamp(0.0, 1.0) as f32;
+                    let frac_w = (vp.span(out_dur) / out_dur).clamp(0.0, 1.0) as f32;
                     let thumb_w = (sb.width() * frac_w).clamp(24.0_f32.min(sb.width()), sb.width());
                     let f = ((pos.x - sb.left() - thumb_w * 0.5)
                         / (sb.width() - thumb_w).max(1.0))
                     .clamp(0.0, 1.0);
-                    self.viewport.left_t = f as f64 * (dur - vp.span(dur)).max(0.0);
-                    self.viewport.clamp(dur);
+                    self.viewport.left_t = f as f64 * (out_dur - vp.span(out_dur)).max(0.0);
+                    self.viewport.clamp(out_dur);
                 }
             }
             let hot = sresp.hovered() || sresp.dragged();
             p.rect_filled(sb, CornerRadius::same(3), Color32::from_gray(28));
             // Thumb geometry from the post-drag viewport so the drag is 1:1.
             let cur = self.viewport;
-            let frac_w = (cur.span(dur) / dur).clamp(0.0, 1.0) as f32;
+            let frac_w = (cur.span(out_dur) / out_dur).clamp(0.0, 1.0) as f32;
             let thumb_w = (sb.width() * frac_w).clamp(24.0_f32.min(sb.width()), sb.width());
-            let denom = (dur - cur.span(dur)).max(1e-9);
+            let denom = (out_dur - cur.span(out_dur)).max(1e-9);
             let tf = (cur.left_t / denom).clamp(0.0, 1.0) as f32;
             let tx = sb.left() + tf * (sb.width() - thumb_w);
             p.rect_filled(
@@ -3397,6 +3785,12 @@ impl EditorState {
     fn ui_transcript_panel(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<EditorAction> {
         let mut action = None;
         theme::section(ui, "Captions");
+        // Hoisted ahead of the `&mut self.transcript` borrow below.
+        let playhead = self.src_t();
+        // Panel timestamps DISPLAY the strip's output clock (ADR 0067: one
+        // timeline, one clock — a caption "at 3.2" must not sit under ruler
+        // 4.2); the data underneath stays source time.
+        let d_show = self.intro_d();
         let Some(transcript) = &mut self.transcript else {
             ui.add_space(6.0);
             // Name the engine actually running (ADR 0035) — "whisper" here
@@ -3449,7 +3843,6 @@ impl EditorState {
         let mut merge: Option<usize> = None;
         let mut censor: Option<usize> = None;
         let mut delete_manual: Option<usize> = None;
-        let playhead = self.playhead_s;
         let n = transcript.units.len();
         let dur = self.range.duration_s();
 
@@ -3487,8 +3880,10 @@ impl EditorState {
                                 egui::DragValue::new(&mut start)
                                     .speed(0.02)
                                     .range(0.0..=dur)
-                                    .custom_formatter(|v, _| fmt_mmss_cc(v))
-                                    .custom_parser(parse_mmss_cc),
+                                    .custom_formatter(move |v, _| fmt_mmss_cc(v + d_show))
+                                    .custom_parser(move |s| {
+                                        parse_mmss_cc(s).map(|v| (v - d_show).max(0.0))
+                                    }),
                             );
                             if resp.changed() {
                                 let d = u.end_s - u.start_s;
@@ -3506,8 +3901,10 @@ impl EditorState {
                                     egui::DragValue::new(&mut end)
                                         .speed(0.02)
                                         .range(0.0..=dur)
-                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
-                                        .custom_parser(parse_mmss_cc),
+                                        .custom_formatter(move |v, _| fmt_mmss_cc(v + d_show))
+                                        .custom_parser(move |s| {
+                                            parse_mmss_cc(s).map(|v| (v - d_show).max(0.0))
+                                        }),
                                 )
                                 .on_hover_text(
                                     "When this caption leaves the screen (the next caption's \
@@ -3603,8 +4000,10 @@ impl EditorState {
                                     egui::DragValue::new(&mut start)
                                         .speed(0.02)
                                         .range(0.0..=dur)
-                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
-                                        .custom_parser(parse_mmss_cc),
+                                        .custom_formatter(move |v, _| fmt_mmss_cc(v + d_show))
+                                        .custom_parser(move |s| {
+                                            parse_mmss_cc(s).map(|v| (v - d_show).max(0.0))
+                                        }),
                                 );
                                 if resp.changed() {
                                     let d = u.end_s - u.start_s;
@@ -3618,8 +4017,10 @@ impl EditorState {
                                     egui::DragValue::new(&mut end)
                                         .speed(0.02)
                                         .range(0.0..=dur)
-                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
-                                        .custom_parser(parse_mmss_cc),
+                                        .custom_formatter(move |v, _| fmt_mmss_cc(v + d_show))
+                                        .custom_parser(move |s| {
+                                            parse_mmss_cc(s).map(|v| (v - d_show).max(0.0))
+                                        }),
                                 );
                                 if eresp.changed() {
                                     u.end_s = end.max(u.start_s + CAP_MIN_S);
@@ -3755,14 +4156,13 @@ impl EditorState {
             self.add_caption_at_playhead();
         }
         if let Some(t) = seek {
-            self.playhead_s = t.clamp(0.0, self.range.duration_s());
-            self.viewport.ensure_visible(self.playhead_s, self.range.duration_s());
+            // Row times are source; the playhead is output (ADR 0067).
+            self.playhead_s = (t + self.intro_d()).clamp(0.0, self.out_dur());
+            self.viewport.ensure_visible(self.playhead_s, self.out_dur());
             // Seeking during playback restarts audio + video at the row's
             // time — same contract as the timeline scrub.
             if self.playing.is_some() {
-                self.playing = Some((Instant::now(), self.playhead_s));
-                self.start_video();
-                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                action = Some(self.restart_playback(self.playhead_s));
             }
         }
         action
@@ -4162,6 +4562,21 @@ impl EditorState {
                     });
                 };
                 row(ui, "Clip length", format!("{}  ({dur:.1}s)", fmt_mmss_cc(dur)));
+                // Thumbnail intro (ADR 0067): prepended AHEAD of the clip —
+                // the summary names it so the export's head is never a
+                // surprise.
+                if let Some(i) = &self.intro {
+                    let name = i
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "image".into());
+                    row(
+                        ui,
+                        "Thumbnail intro",
+                        format!("{} · +{:.1}s ahead", ellipsize(&name, 24), i.duration_s),
+                    );
+                }
                 row(ui, "Resolution", "1080 × 1920 (9:16)".into());
                 row(
                     ui,
@@ -4304,7 +4719,8 @@ impl EditorState {
             return;
         }
         self.sync_lines();
-        let p = self.playhead_s;
+        // Caption lines live in source time (the playhead is output).
+        let p = self.src_t();
         // The auto line under (or nearest) the playhead — picked only when
         // the auto track's eye is on: the preview shows what burns
         // (ADR 0066), and an eye-off stream burns nothing.
@@ -5332,6 +5748,90 @@ mod tests {
         assert_eq!(spec.manual_captions.len(), 1);
     }
 
+    // ---- thumbnail intro (ADR 0067) ----------------------------------------
+
+    fn with_intro(ed: &mut EditorState, d: f64) {
+        ed.intro = Some(IntroState {
+            path: std::path::PathBuf::from("F:/covers/t.png"),
+            duration_s: d,
+            tex: None,
+        });
+    }
+
+    #[test]
+    fn intro_offsets_the_output_clock_and_round_trips_the_display() {
+        let mut ed = editor_state(); // 60 s clip
+        assert_eq!(ed.intro_d(), 0.0);
+        assert_eq!(ed.out_dur(), 60.0);
+        with_intro(&mut ed, 1.5);
+        assert_eq!(ed.out_dur(), 61.5);
+        // The playhead is OUTPUT time; its source twin subtracts the intro
+        // and clamps inside it (nothing source-anchored exists there).
+        ed.playhead_s = 0.7;
+        assert_eq!(ed.src_t(), 0.0);
+        ed.playhead_s = 4.2;
+        assert!((ed.src_t() - 2.7).abs() < 1e-9);
+        // Display round-trip at the strip's t↔x boundary (the ONE offset,
+        // ADR 0067): a block at source t draws at t+D; a gesture at that x
+        // edits source t again.
+        let vp = Viewport::default();
+        let (left, width, out_dur) = (0.0_f32, 800.0_f32, ed.out_dur());
+        let d = ed.intro_d();
+        let src = 12.34_f64;
+        let x = vp.t_to_x(src + d, left, width, out_dur);
+        let back = vp.x_to_t(x, left, width, out_dur) - d;
+        assert!((back - src).abs() < 1e-3, "round trip drifted: {back}");
+    }
+
+    #[test]
+    fn intro_trim_clamps_to_the_shared_bounds() {
+        let mut ed = editor_state();
+        with_intro(&mut ed, 1.0);
+        // Drag the right edge way out: clamps at MAX_S.
+        ed.drag = Some(TimelineDrag::IntroTrim { orig_d: 1.0, grab_t: 0.0 });
+        let (_, shown) = ed.apply_timeline_drag(30.0, 0.1);
+        assert_eq!(shown, yc_core::ThumbnailIntro::MAX_S);
+        assert_eq!(ed.intro.as_ref().unwrap().duration_s, yc_core::ThumbnailIntro::MAX_S);
+        // And way in: clamps at MIN_S.
+        ed.drag = Some(TimelineDrag::IntroTrim { orig_d: 2.0, grab_t: 0.0 });
+        let (_, shown) = ed.apply_timeline_drag(-30.0, 0.1);
+        assert_eq!(shown, yc_core::ThumbnailIntro::MIN_S);
+        assert_eq!(ed.intro.as_ref().unwrap().duration_s, yc_core::ThumbnailIntro::MIN_S);
+    }
+
+    #[test]
+    fn render_spec_carries_the_intro_only_when_set() {
+        let mut ed = editor_state();
+        assert!(ed.render_spec().intro.is_none(), "no intro: the spec stays pre-intro");
+        with_intro(&mut ed, 1.2);
+        let spec = ed.render_spec();
+        let intro = spec.intro.expect("intro rides the spec");
+        assert_eq!(intro.duration_s, 1.2);
+        assert_eq!(intro.path, std::path::PathBuf::from("F:/covers/t.png"));
+    }
+
+    #[test]
+    fn playback_from_inside_the_intro_holds_silent_and_audio_maps_past_it() {
+        let mut ed = editor_state();
+        with_intro(&mut ed, 1.0);
+        // Audio ranges: inside the intro they clamp to the clip head; past
+        // it they subtract the offset (the razor/caption times never moved).
+        let r = ed.play_range_from(0.4);
+        assert_eq!(r.start_s, ed.range.start_s);
+        let r = ed.play_range_from(1.5);
+        assert!((r.start_s - (ed.range.start_s + 0.5)).abs() < 1e-9);
+        // Restarting inside the intro is SILENT (nothing burns there); the
+        // crossing in `show` starts audio+video. Past it, audio restarts.
+        ed.playing = Some((Instant::now(), 0.0));
+        assert!(matches!(ed.restart_playback(0.4), EditorAction::StopAudio));
+        assert!(ed.live.is_none(), "no decode spawns inside the intro");
+        assert!(matches!(ed.restart_playback(1.5), EditorAction::Play(_)));
+        // The razor's verbs refuse inside the intro: the source twin clamps
+        // to 0 and removing the only segment is already refused.
+        ed.playhead_s = 0.5;
+        assert!(!ed.razor.remove_segment_at(ed.src_t()), "refused in the intro");
+    }
+
     fn plan(bounds: &[f64]) -> yc_core::CameraPlan {
         let shots = bounds
             .windows(2)
@@ -5670,6 +6170,50 @@ fn draw_lock(p: &egui::Painter, c: egui::Pos2, locked: bool) {
         pts.push(egui::pos2(top.x + 2.6 * ang.cos(), top.y - 2.6 * ang.sin()));
     }
     p.add(egui::Shape::line(pts, Stroke::new(1.1, col)));
+}
+
+/// The thumbnail preview texture's canvas — half the render's 1080×1920, the
+/// SAME aspect-fit + black-pad geometry (`prepend_intro`), so the editor
+/// canvas during the intro shows exactly the burn's frame (ADR 0036/0067).
+const THUMB_W: usize = 540;
+const THUMB_H: usize = 960;
+
+/// Decode a picked thumbnail image to raw rgb24 through the pinned ffmpeg —
+/// the app deliberately ships no image decoder (every texture is ffmpeg-fed;
+/// ffmpeg also covers plan #5's JPG/PNG/WebP for free). One frame, blocking
+/// (an image decode is fast; the file dialog just blocked far longer).
+/// `None` on any failure — the caller refuses the pick.
+fn decode_thumb_rgb(
+    ffmpeg: &std::path::Path,
+    image: &std::path::Path,
+) -> Option<(usize, usize, Vec<u8>)> {
+    use yc_core::NoConsole;
+    let out = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args([
+            "-i",
+            &image.display().to_string(),
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!(
+                "scale={w}:{h}:force_original_aspect_ratio=decrease,\
+                 pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+                w = THUMB_W,
+                h = THUMB_H
+            ),
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let expected = THUMB_W * THUMB_H * 3;
+    (out.status.success() && out.stdout.len() >= expected)
+        .then(|| (THUMB_W, THUMB_H, out.stdout[..expected].to_vec()))
 }
 
 /// A point on the quadratic Bézier (a, ctrl, b) at parameter `t`.

@@ -16,5 +16,6 @@ pub use ass::{
     UnitOutcome, WordState,
 };
 pub use export::{
-    build_camera_filtergraph, build_filtergraph, export_args, export_args_script, run_export,
+    build_camera_filtergraph, build_filtergraph, export_args, export_args_script, prepend_intro,
+    run_export,
 };

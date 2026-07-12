@@ -4,6 +4,48 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-13 — Thumbnail intro: a `+ Thumbnail` button, and everything below follows automatically
+
+Plan #5, your queue-jump ruling: *"add new button to insert thumbnail, it
+will always insert for the first 1s-2s of the video, and make sure if
+user insert a thumbnail, everything bellow should follow how many seconds
+thumnail add, so the caption and camera cut doesnt error."* Pinned in
+**ADR 0067** before the build:
+
+- **`+ Thumbnail` in the transport** picks a JPG/PNG/WebP; it auto-fits
+  the 9:16 canvas (black bars) and holds for the first **1.0 s** ahead of
+  the clip — drag the block's right edge to set it (0.5–2.0 s hard
+  bounds, your spoken 1–2 s window with headroom below). Right-click the
+  block to replace or remove; re-clicking the button also replaces.
+- **"Everything below follows" is structural, not arithmetic**: the
+  render concat-prepends the image AROUND the finished stream, AFTER the
+  caption burn — so captions, camera cuts, and razor cuts keep their own
+  times BY CONSTRUCTION. No time was ever shifted, so nothing can drift,
+  and re-trimming the intro's length re-shifts nothing.
+- **The timeline shows the truth**: the ruler now spans intro + clip, the
+  block sits at Video 1's head (the CapCut prepend idiom — no dead
+  "Images" track; that stays #14's arc), and every caption/cut block
+  displays shifted right by the intro while its data stays put. Time
+  labels everywhere (panel timestamps, tooltips) show the same clock the
+  exported video will have.
+- **The preview is the burn**: parked inside the intro the canvas shows
+  the image exactly as it will render (same ffmpeg fit — the app still
+  ships no image decoder, deliberately); captions and the camera chip
+  show nothing there because nothing burns there. Play from inside it
+  holds the image silently, then audio + video start together at the
+  crossing. The razor/marker verbs refuse inside the intro — its right
+  edge IS its length control.
+- **Batch and headless renders are untouched** (test-pinned byte-for-byte),
+  and the picked image + duration persist on the Clip in project.json.
+
+123 tests green across app/core/render (8 new, pinned to ADR 0067's
+bars: the ASS burn count stays 1 with the intro prepended, razor + camera
++ intro compose in one graph, export args extend `-t` and map the graph's
+audio, the output-clock round-trip, the trim clamp, the razor refusal).
+Clippy clean on touched files; `face,align,ser` release build green.
+**Your eye on a real burned export is the open gate** — that's the next
+session (`nextprompt-thumbnail-verdict.md`).
+
 ## 2026-07-13 — The timeline grew its multi-track shell: header column with per-track eye/lock, zoom about the pointer, wheel scroll
 
 Plan #13's first slice, built to your two rulings ("mimic adobe or
