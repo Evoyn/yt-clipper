@@ -10,7 +10,7 @@
 //! │  add / split /  │  face overlays                │  Caption presets │
 //! │  merge / censor │  Preview: the 9:16 output +   │  + style knobs   │
 //! │  / delete)      │  captions + safe area         │  Export summary  │
-//! ├─────────────── timeline: ruler · captions · speakers · cuts ───────┤
+//! ├──── timeline: headers │ ruler · video · captions · speakers · cuts ┤
 //! ```
 //!
 //! The timeline is directly editable (feature plan #2/#3): caption blocks
@@ -19,6 +19,12 @@
 //! flow through the same truths as the panels (the transcript override, the
 //! operator-overridable camera plan), so the render burns exactly what the
 //! timeline shows.
+//!
+//! Plan #13 (ADR 0066) gave the strip its multi-track shell: a header column
+//! (painted eye/lock toggles — eye gates the burn AND the preview together,
+//! lock gates timeline gestures) and a zoom/scroll `Viewport` every t↔x
+//! conversion routes through. AI artifacts and operator artifacts never
+//! share a track (operator ruling 2026-07-13).
 //!
 //! All framing geometry stays the pure `yc_frame` layer; the speaker analysis
 //! and camera plan come from the worker (`Progress::Speakers`); the caption
@@ -53,6 +59,10 @@ const MIN_SHOT_S: f64 = 0.15;
 const MIN_SEG_S: f64 = 0.1;
 /// Pointer radius (points) within which a dragged time snaps to an anchor.
 const SNAP_PX: f32 = 8.0;
+/// The track header column's width (plan #13's Premiere/CapCut shape).
+const HDR_W: f32 = 118.0;
+/// The scrollbar row's height at the strip's bottom (ADR 0066).
+const SCROLL_H: f32 = 8.0;
 
 /// Which caption lane a timeline gesture edits: the pipeline's transcript
 /// (auto) or the operator's own added captions — the dedicated track the
@@ -89,6 +99,108 @@ enum TimelineDrag {
     Razor { idx: usize, orig_t: f64, grab_t: f64 },
     /// Move the razor's ▼ cut marker (the ✂←/→✂ reference point).
     Marker { orig_t: f64, grab_t: f64 },
+}
+
+/// The timeline viewport (plan #13, ADR 0066): horizontal zoom + scroll.
+/// `zoom` is a factor over "the whole clip fits" (1 = fit; the max keeps at
+/// least [`Self::MIN_SPAN_S`] visible); `left_t` is the clip time at the
+/// lanes' left edge. Every strip t↔x conversion goes through it, so the
+/// filmstrip, blocks, markers, and gestures all see one window. Pure and
+/// unit-tested. Mid-gesture scroll/zoom is safe by construction: gestures
+/// are pointer-tracked in TIME (`TimelineDrag`), re-derived from the
+/// pointer's x each frame.
+#[derive(Clone, Copy)]
+struct Viewport {
+    zoom: f64,
+    left_t: f64,
+}
+
+impl Viewport {
+    /// The floor a full zoom-in still shows — razor precision wants frames
+    /// on screen, not a single one.
+    const MIN_SPAN_S: f64 = 1.0;
+
+    fn max_zoom(dur: f64) -> f64 {
+        (dur / Self::MIN_SPAN_S).max(1.0)
+    }
+
+    /// Seconds visible across the lanes.
+    fn span(&self, dur: f64) -> f64 {
+        dur.max(0.001) / self.zoom
+    }
+
+    fn clamp(&mut self, dur: f64) {
+        self.zoom = self.zoom.clamp(1.0, Self::max_zoom(dur));
+        self.left_t = self.left_t.clamp(0.0, (dur - self.span(dur)).max(0.0));
+    }
+
+    fn t_to_x(&self, t: f64, left: f32, width: f32, dur: f64) -> f32 {
+        left + ((t - self.left_t) / self.span(dur)) as f32 * width
+    }
+
+    /// Inverse of `t_to_x`, clamped to the visible window (⊆ the clip).
+    fn x_to_t(&self, x: f32, left: f32, width: f32, dur: f64) -> f64 {
+        let frac = ((x - left) / width.max(1.0)).clamp(0.0, 1.0) as f64;
+        self.left_t + frac * self.span(dur)
+    }
+
+    /// Zoom by `factor` keeping the time under the pointer stationary:
+    /// `anchor_t` stays at `frac` (0..1) of the lanes width.
+    fn zoom_about(&mut self, anchor_t: f64, frac: f64, factor: f64, dur: f64) {
+        self.zoom = (self.zoom * factor).clamp(1.0, Self::max_zoom(dur));
+        self.left_t = anchor_t - frac * self.span(dur);
+        self.clamp(dur);
+    }
+
+    /// Scroll by a pixel delta (positive = later content).
+    fn scroll_px(&mut self, px: f32, width: f32, dur: f64) {
+        self.left_t += px as f64 * self.span(dur) / width.max(1.0) as f64;
+        self.clamp(dur);
+    }
+
+    /// Bring `t` into view after a seek-jump: park it at 30% when outside.
+    fn ensure_visible(&mut self, t: f64, dur: f64) {
+        let s = self.span(dur);
+        if t < self.left_t || t > self.left_t + s {
+            self.left_t = t - 0.3 * s;
+            self.clamp(dur);
+        }
+    }
+
+    /// Playback follow: page when the playhead runs off the window — a
+    /// page-turn that parks it near the left edge, not a per-frame chase.
+    fn follow(&mut self, t: f64, dur: f64) {
+        let s = self.span(dur);
+        if t < self.left_t || t > self.left_t + s * 0.98 {
+            self.left_t = t - 0.05 * s;
+            self.clamp(dur);
+        }
+    }
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self { zoom: 1.0, left_t: 0.0 }
+    }
+}
+
+/// Per-track view/edit flags (plan #13's shell, ADR 0066). A static named
+/// set today, deliberately — the track LIST becomes data (`Vec<Track>`,
+/// project.json) when track CONTENTS become data (music files, images).
+#[derive(Clone, Copy)]
+struct TrackFlags {
+    /// Output visibility: the preview overlay AND the burn together
+    /// (ADR 0036: the preview cannot drift from the burn).
+    eye: bool,
+    /// This track's timeline gestures are ignored (the panel stays live —
+    /// it is the deliberate precision surface, ADR 0066).
+    lock: bool,
+}
+
+impl Default for TrackFlags {
+    fn default() -> Self {
+        Self { eye: true, lock: false }
+    }
 }
 
 /// The timeline razor's state (feature plan #3, operator ask 2026-07-12
@@ -531,6 +643,18 @@ pub struct EditorState {
     drag: Option<TimelineDrag>,
     /// The timeline razor: segment cuts + removed spans (feature plan #3).
     razor: RazorState,
+    /// The strip's zoom + horizontal scroll window (plan #13, ADR 0066).
+    /// Session-only view state, deliberately never persisted.
+    viewport: Viewport,
+    /// Captions · auto — the pipeline's track (ADR 0066: eye gates the burn
+    /// AND the preview overlay together; lock gates timeline gestures).
+    trk_auto: TrackFlags,
+    /// Captions · yours — the operator's track (same flag semantics). The
+    /// two caption tracks never merge: AI artifacts and operator artifacts
+    /// never share a track (operator ruling 2026-07-13, ADR 0066).
+    trk_manual: TrackFlags,
+    /// The Speakers analysis zone's eye (view-only: analysis never burns).
+    speakers_eye: bool,
     /// Where the strip's right-click menu opened, so its actions (cut here,
     /// remove segment) land at the click, not wherever the pointer went next.
     strip_menu_t: Option<f64>,
@@ -621,6 +745,10 @@ impl EditorState {
             panel_sort_pending: false,
             drag: None,
             razor: RazorState::default(),
+            viewport: Viewport::default(),
+            trk_auto: TrackFlags::default(),
+            trk_manual: TrackFlags::default(),
+            speakers_eye: true,
             strip_menu_t: None,
             motion: None,
             preset_name: String::new(),
@@ -832,16 +960,32 @@ impl EditorState {
             style: self.style.clone(),
             placement: self.placement,
             camera,
-            transcript_override: if self.transcript_dirty { self.transcript.clone() } else { None },
+            // The track eye gates the burn (ADR 0066): eye-off burns NO auto
+            // captions. The override is the spec's word for "burn exactly
+            // this", so an empty one is the honest "none" — no new plumbing.
+            transcript_override: if !self.trk_auto.eye {
+                self.transcript.clone().map(|mut t| {
+                    t.units.clear();
+                    t
+                })
+            } else if self.transcript_dirty {
+                self.transcript.clone()
+            } else {
+                None
+            },
             keep: self.razor.kept_spans(self.range.duration_s()),
             // The operator's own stream travels beside the transcript, never
             // inside it (and never into any store) — placements included.
-            manual_captions: self
-                .manual_units
-                .iter()
-                .zip(&self.manual_places)
-                .map(|(u, p)| yc_core::ManualCaption { unit: u.clone(), placement: *p })
-                .collect(),
+            // Their track's eye gates it the same way (empty = burn none).
+            manual_captions: if self.trk_manual.eye {
+                self.manual_units
+                    .iter()
+                    .zip(&self.manual_places)
+                    .map(|(u, p)| yc_core::ManualCaption { unit: u.clone(), placement: *p })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -973,7 +1117,11 @@ impl EditorState {
                     let cap = self.show_captions;
                     if ui
                         .add(theme::chip(cap, "Captions"))
-                        .on_hover_text("Show/hide the caption overlay")
+                        .on_hover_text(
+                            "Show/hide the caption overlay in the preview ONLY — the export \
+                             is untouched. To keep a caption track out of the export, use \
+                             that track's eye in the timeline headers.",
+                        )
                         .clicked()
                     {
                         self.show_captions = !cap;
@@ -1113,6 +1261,7 @@ impl EditorState {
             if left || right {
                 self.playhead_s =
                     (self.playhead_s + if right { step_s } else { -step_s }).clamp(0.0, dur);
+                self.viewport.ensure_visible(self.playhead_s, dur);
                 if self.playing.is_some() {
                     self.playing = Some((Instant::now(), self.playhead_s));
                     self.start_video();
@@ -1238,9 +1387,8 @@ impl EditorState {
     /// Frame MIDPOINTS make the boundary comparison robust to sub-frame phase
     /// (a cut boundary is an exact frame pts).
     fn display_time(&self) -> f64 {
-        if self.playing.is_some() {
+        if let Some((_, offset)) = self.playing {
             if let Some(mid) = self.live.as_ref().and_then(|l| l.shown_frame_mid_s()) {
-                let (_, offset) = self.playing.expect("playing");
                 return offset + mid;
             }
         }
@@ -1916,13 +2064,20 @@ impl EditorState {
             // Timeline edit verbs (feature plan #2/#3).
             ui.add_space(6.0);
             if ui
-                .add_enabled(self.transcript.is_some(), egui::Button::new("+ Caption"))
+                .add_enabled(
+                    self.transcript.is_some() && !self.trk_manual.lock,
+                    egui::Button::new("+ Caption"),
+                )
                 .on_hover_text(
                     "Insert a caption at the playhead onto YOUR caption track (the second \
                      timeline row) — drag it on the preview to place it anywhere, double-click \
                      it there to edit the text",
                 )
-                .on_disabled_hover_text("Captions are still transcribing")
+                .on_disabled_hover_text(if self.trk_manual.lock {
+                    "Your caption track is locked — unlock it in its header"
+                } else {
+                    "Captions are still transcribing"
+                })
                 .clicked()
             {
                 self.add_caption_at_playhead();
@@ -2043,22 +2198,64 @@ impl EditorState {
             .map(|a| a.voice.is_some() || a.reaction.is_some())
             .unwrap_or(false);
         let n_lanes = n_tracks + usize::from(has_voice);
-        let (rect, resp) = ui.allocate_exact_size(
+        let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), ui.available_height().max(60.0)),
-            Sense::click_and_drag(),
+            Sense::hover(),
         );
-        // 103 = the chrome the painting below actually uses: ruler 18 + the
-        // filmstrip track 29 + the two caption lanes (auto 15 + yours 15) +
-        // the burn-line rail 6 above the speaker lanes, cut markers 20 below.
+        // The Premiere/CapCut shape (plan #13, ADR 0066): a header column on
+        // the left (track names + painted eye/lock toggles), the lanes to the
+        // right. Scrubbing, gestures, and the strip menu live on the LANES
+        // surface only; lane content clips at the header boundary.
+        let lanes = Rect::from_min_max(
+            egui::pos2((rect.left() + HDR_W).min(rect.right() - 1.0), rect.top()),
+            rect.max,
+        );
+        let resp = ui.interact(lanes, ui.id().with("strip-lanes"), Sense::click_and_drag());
+        // 117 = the fixed chrome: ruler 18 + the filmstrip track 29 + the two
+        // caption lanes (18 each) + the burn-line rail 6 above the speaker
+        // lanes, the camera badge gutter 20 and the scrollbar row 8 below.
+        let content_bottom = rect.bottom() - SCROLL_H;
         let lane_h = if n_lanes == 0 {
             13.0
         } else {
-            ((rect.height() - 103.0) / n_lanes as f32).max(13.0)
+            ((rect.height() - 117.0) / n_lanes as f32).max(13.0)
         };
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, CornerRadius::same(4), theme::WELL);
-        let t_to_x = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
-        let x_to_t = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * dur;
+        // Two painters: `ph` (unclipped) owns the background + header column;
+        // `p` clips lane content at the header boundary so a scrolled-out
+        // block can neither paint nor be read under the headers.
+        let ph = ui.painter().clone();
+        let p = ui.painter_at(lanes);
+        ph.rect_filled(rect, CornerRadius::same(4), theme::WELL);
+
+        // Viewport input (ADR 0066): ctrl+wheel / pinch zooms about the
+        // pointer, plain wheel / shift+wheel / trackpad-x scrolls — only
+        // while the pointer is over the lanes. Mid-gesture moves are safe:
+        // gestures are pointer-tracked in TIME and re-read x each frame.
+        if ui.rect_contains_pointer(lanes) {
+            let (zoomf, scroll, mods, pos) = ui.input(|i| {
+                (i.zoom_delta(), i.smooth_scroll_delta, i.modifiers, i.pointer.latest_pos())
+            });
+            if let Some(pos) = pos {
+                if (zoomf - 1.0).abs() > 1e-4 {
+                    let frac = ((pos.x - lanes.left()) / lanes.width().max(1.0)).clamp(0.0, 1.0);
+                    let anchor = self.viewport.x_to_t(pos.x, lanes.left(), lanes.width(), dur);
+                    self.viewport.zoom_about(anchor, frac as f64, zoomf as f64, dur);
+                } else if !mods.ctrl
+                    && !mods.command
+                    && (scroll.x != 0.0 || scroll.y != 0.0)
+                {
+                    // Wheel-up = earlier (scroll left), matching ScrollArea.
+                    self.viewport.scroll_px(-(scroll.x + scroll.y), lanes.width(), dur);
+                }
+            }
+        }
+        // Playback follow: page the window when the playhead runs off it.
+        if self.playing.is_some() {
+            self.viewport.follow(self.playhead_s, dur);
+        }
+        let vp = self.viewport;
+        let t_to_x = |t: f64| vp.t_to_x(t, lanes.left(), lanes.width(), dur);
+        let x_to_t = |x: f32| vp.x_to_t(x, lanes.left(), lanes.width(), dur);
 
         // Apply any in-flight direct-manipulation gesture BEFORE drawing, so
         // this frame already shows the result (responsive by construction);
@@ -2072,7 +2269,9 @@ impl EditorState {
                 _ => egui::CursorIcon::ResizeHorizontal,
             });
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
-                let tol_t = (SNAP_PX / rect.width().max(1.0)) as f64 * dur;
+                // Snap tolerance stays in POINTS: convert through the
+                // VISIBLE span, so zooming in tightens the time tolerance.
+                let tol_t = SNAP_PX as f64 * vp.span(dur) / lanes.width().max(1.0) as f64;
                 let (snapped, shown) = self.apply_timeline_drag(x_to_t(pos.x), tol_t);
                 snap_x = snapped.map(t_to_x);
                 drag_chip_t = Some(shown);
@@ -2083,10 +2282,12 @@ impl EditorState {
             }
         }
 
-        // Ruler ticks: a major every ~1/8 of the clip, rounded to a nice step.
-        let step = nice_step(dur / 8.0);
-        let mut t = 0.0;
-        while t <= dur + 1e-9 {
+        // Ruler ticks: a major every ~1/8 of the VISIBLE span, rounded to a
+        // nice step (sub-second rungs appear zoomed in — labels grow cs).
+        let span = vp.span(dur);
+        let step = nice_step(span / 8.0);
+        let mut t = (vp.left_t / step).ceil() * step;
+        while t <= (vp.left_t + span).min(dur) + 1e-9 {
             let x = t_to_x(t);
             p.line_segment(
                 [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.top() + 12.0)],
@@ -2095,7 +2296,7 @@ impl EditorState {
             p.text(
                 egui::pos2(x + 3.0, rect.top() + 1.0),
                 Align2::LEFT_TOP,
-                fmt_mmss(t),
+                if step < 1.0 { fmt_mmss_cc(t) } else { fmt_mmss(t) },
                 FontId::monospace(9.5),
                 Color32::from_gray(175),
             );
@@ -2107,8 +2308,8 @@ impl EditorState {
         // already extracted. Clicks/drags on it scrub (it is strip surface);
         // razor veils cover it, so a removed span visibly dims its video.
         let film = Rect::from_min_max(
-            egui::pos2(rect.left(), rect.top() + 18.0),
-            egui::pos2(rect.right(), rect.top() + 44.0),
+            egui::pos2(lanes.left(), rect.top() + 18.0),
+            egui::pos2(lanes.right(), rect.top() + 44.0),
         );
         if !self.frames.is_empty() {
             let aspect = (self.src_w / self.src_h.max(1.0)).max(0.1);
@@ -2151,8 +2352,8 @@ impl EditorState {
         // red instead of silently swallowed.
         self.sync_lines();
         let cap_y0 = rect.top() + 47.0; // below the ruler + video track
-        let man_y0 = cap_y0 + 15.0;
-        let rail_y = man_y0 + 15.0;
+        let man_y0 = cap_y0 + 18.0;
+        let rail_y = man_y0 + 18.0;
         let mut clicked_unit: Option<(CapLane, usize)> = None;
         let mut delete_unit: Option<(CapLane, usize)> = None;
         let mut begin_drag: Option<TimelineDrag> = None;
@@ -2167,9 +2368,11 @@ impl EditorState {
         // lane: two of the operator's captions sharing time overprint at the
         // same anchor — flag both. Cross-lane overlap is FINE: the operator's
         // stream burns at its own anchor above the auto captions (ADR 0065).
+        // Warnings describe the BURN, so a stream whose eye is off (it burns
+        // nothing, ADR 0066) contributes none.
         let hidden: std::collections::HashSet<(u8, usize)> = {
             let mut set = std::collections::HashSet::new();
-            if self.style.genre == CaptionGenre::HugeWord {
+            if self.style.genre == CaptionGenre::HugeWord && self.trk_auto.eye {
                 if let Some(t) = &self.transcript {
                     let mut order: Vec<(f64, usize)> =
                         t.units.iter().enumerate().map(|(i, u)| (u.start_s, i)).collect();
@@ -2181,31 +2384,27 @@ impl EditorState {
                     }
                 }
             }
-            for (i, a) in self.manual_units.iter().enumerate() {
-                for (j, b) in self.manual_units.iter().enumerate() {
-                    // Overprint needs shared time AND shared space: two of
-                    // the operator's captions both at the DEFAULT anchor.
-                    // Dragged-apart captions may overlap freely.
-                    let both_default = self.manual_places.get(i).copied().flatten().is_none()
-                        && self.manual_places.get(j).copied().flatten().is_none();
-                    if i != j && both_default && a.start_s < b.end_s && b.start_s < a.end_s {
-                        set.insert((CapLane::Manual as u8, i));
+            if self.trk_manual.eye {
+                for (i, a) in self.manual_units.iter().enumerate() {
+                    for (j, b) in self.manual_units.iter().enumerate() {
+                        // Overprint needs shared time AND shared space: two of
+                        // the operator's captions both at the DEFAULT anchor.
+                        // Dragged-apart captions may overlap freely.
+                        let both_default = self.manual_places.get(i).copied().flatten().is_none()
+                            && self.manual_places.get(j).copied().flatten().is_none();
+                        if i != j && both_default && a.start_s < b.end_s && b.start_s < a.end_s {
+                            set.insert((CapLane::Manual as u8, i));
+                        }
                     }
                 }
             }
             set
         };
-        for (lane, y0, tag) in
-            [(CapLane::Auto, cap_y0, "auto"), (CapLane::Manual, man_y0, "yours")]
-        {
-            // Faint lane tag so the manual track is discoverable while empty.
-            p.text(
-                egui::pos2(rect.left() + 3.0, y0 + 2.0),
-                Align2::LEFT_TOP,
-                tag,
-                FontId::proportional(8.0),
-                Color32::from_gray(110),
-            );
+        // The header column names the lanes now; flags ride into the loop.
+        for (lane, y0, flags) in [
+            (CapLane::Auto, cap_y0, self.trk_auto),
+            (CapLane::Manual, man_y0, self.trk_manual),
+        ] {
             let units: &[CaptionUnit] = match lane {
                 CapLane::Auto => {
                     self.transcript.as_ref().map(|t| t.units.as_slice()).unwrap_or(&[])
@@ -2217,22 +2416,32 @@ impl EditorState {
             for (i, u) in units.iter().enumerate() {
                 let r = Rect::from_min_max(
                     egui::pos2(t_to_x(u.start_s), y0),
-                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 14.0),
+                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 16.0),
                 );
+                if r.min.x > lanes.right() || r.max.x < lanes.left() {
+                    continue; // scrolled out of the viewport window
+                }
                 let dragging_this =
                     drag_targets.as_ref().is_some_and(|t| t.contains(&(lane, i)));
                 let selected = selected_idx == Some(i);
                 let is_hidden = hidden.contains(&(lane as u8, i));
                 // Edge trim zones only when the block is wide enough for
                 // three distinct targets; tiny blocks stay move-only (the
-                // panel's timestamps cover fine trims).
-                let edges = r.width() >= 24.0;
-                let body = if edges { r.shrink2(egui::vec2(5.0, 0.0)) } else { r };
+                // panel's timestamps cover fine trims). A locked track has
+                // no trim zones at all (ADR 0066).
+                let edges = r.width() >= 24.0 && !flags.lock;
+                let body =
+                    (if edges { r.shrink2(egui::vec2(5.0, 0.0)) } else { r }).intersect(lanes);
                 let mut tip = format!(
-                    "{} – {}  ·  {}\nDrag to move · edges trim · click to edit · right-click to delete",
+                    "{} – {}  ·  {}\n{}",
                     fmt_mmss_cc(u.start_s),
                     fmt_mmss_cc(u.end_s),
-                    u.text
+                    u.text,
+                    if flags.lock {
+                        "Track locked — unlock in its header to edit (click still selects)"
+                    } else {
+                        "Drag to move · edges trim · click to edit · right-click to delete"
+                    }
                 );
                 if is_hidden {
                     tip.push_str(match lane {
@@ -2255,18 +2464,28 @@ impl EditorState {
                     )
                     .on_hover_text(tip);
                 if resp.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    ui.ctx().set_cursor_icon(if flags.lock {
+                        egui::CursorIcon::NotAllowed
+                    } else {
+                        egui::CursorIcon::Grab
+                    });
                 }
                 if resp.clicked() {
                     clicked_unit = Some((lane, i));
                 }
                 resp.context_menu(|ui| {
-                    if ui.button("🗑 Delete caption").clicked() {
+                    if ui
+                        .add_enabled(!flags.lock, egui::Button::new("🗑 Delete caption"))
+                        .clicked()
+                    {
                         delete_unit = Some((lane, i));
                         ui.close();
                     }
                 });
-                if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && self.drag.is_none()
+                    && !flags.lock
+                {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         begin_drag = Some(TimelineDrag::CapMove {
                             targets: vec![(lane, i)],
@@ -2321,23 +2540,32 @@ impl EditorState {
                     }
                 }
                 let hot = resp.hovered() || dragging_this || selected;
+                // Eye-off tracks stay visible and editable, dimmed (output
+                // visibility is not timeline visibility — ADR 0066).
+                let dim = if flags.eye { 1.0 } else { 0.45 };
                 p.rect_filled(
                     r,
                     CornerRadius::same(3),
-                    Color32::from_rgba_unmultiplied(255, 255, 255, if hot { 48 } else { 26 }),
+                    Color32::from_rgba_unmultiplied(
+                        255,
+                        255,
+                        255,
+                        ((if hot { 48 } else { 26 }) as f32 * dim) as u8,
+                    ),
                 );
                 p.rect_stroke(
                     r,
                     CornerRadius::same(3),
                     Stroke::new(
                         if dragging_this || selected || is_hidden { 1.5 } else { 1.0 },
-                        if is_hidden {
+                        (if is_hidden {
                             theme::ERR
                         } else if hot {
                             theme::GOLD
                         } else {
                             Color32::from_gray(80)
-                        },
+                        })
+                        .gamma_multiply(dim),
                     ),
                     StrokeKind::Inside,
                 );
@@ -2356,7 +2584,7 @@ impl EditorState {
                         Align2::LEFT_CENTER,
                         ellipsize(&u.text, (r.width() / 7.0) as usize),
                         FontId::proportional(10.0),
-                        Color32::from_gray(200),
+                        Color32::from_gray(200).gamma_multiply(dim),
                     );
                 }
             }
@@ -2366,8 +2594,9 @@ impl EditorState {
         // operator's stream doesn't group, it shows each caption verbatim).
         // Dragging a rail moves the whole line's units together. Cumulative
         // word counts ARE the unit ranges (`preview_lines` builds each line
-        // from consecutive units, one word per unit).
-        if self.style.genre != CaptionGenre::HugeWord {
+        // from consecutive units, one word per unit). An eye-off auto track
+        // burns no lines, so the rail vanishes with it (ADR 0066).
+        if self.style.genre != CaptionGenre::HugeWord && self.trk_auto.eye {
             let n_units = self.transcript.as_ref().map(|t| t.units.len()).unwrap_or(0);
             let mut base = 0usize;
             for (li, l) in self.lines.iter().enumerate() {
@@ -2382,15 +2611,29 @@ impl EditorState {
                     egui::pos2(t_to_x(l.start_s), rail_y),
                     egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), rail_y + 4.0),
                 );
+                if rr.min.x > lanes.right() || rr.max.x < lanes.left() {
+                    continue; // scrolled out of the viewport window
+                }
                 let rresp = ui
-                    .interact(rr.expand2(egui::vec2(0.0, 1.5)), ui.id().with(("cap-rail", li)), Sense::drag())
-                    .on_hover_text("One on-screen line — drag to move all its captions together");
+                    .interact(
+                        rr.expand2(egui::vec2(0.0, 1.5)).intersect(lanes),
+                        ui.id().with(("cap-rail", li)),
+                        Sense::drag(),
+                    )
+                    .on_hover_text(if self.trk_auto.lock {
+                        "One on-screen line — track locked (unlock in its header)"
+                    } else {
+                        "One on-screen line — drag to move all its captions together"
+                    });
                 let hot = rresp.hovered()
                     || drag_targets.as_ref().is_some_and(|t| *t == targets);
-                if rresp.hovered() {
+                if rresp.hovered() && !self.trk_auto.lock {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                 }
-                if rresp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                if rresp.drag_started_by(egui::PointerButton::Primary)
+                    && self.drag.is_none()
+                    && !self.trk_auto.lock
+                {
                     if let (Some(pos), Some(t)) =
                         (rresp.interact_pointer_pos(), &self.transcript)
                     {
@@ -2442,6 +2685,7 @@ impl EditorState {
             };
             if let Some(start) = start {
                 self.playhead_s = start.clamp(0.0, dur);
+                self.viewport.ensure_visible(self.playhead_s, dur);
                 match lane {
                     CapLane::Auto => {
                         self.sel_unit = Some(i);
@@ -2459,9 +2703,10 @@ impl EditorState {
             }
         }
 
-        // Speaker lanes.
+        // Speaker lanes — analysis visualization; the zone's eye hides it
+        // (view-only: nothing here ever burns).
         let mut lane_y = rail_y + 6.0;
-        if let Some(a) = &self.speakers {
+        if let Some(a) = self.speakers.as_ref().filter(|_| self.speakers_eye) {
             for tr in &a.tracks {
                 let color = theme::track_color(tr.id);
                 let mut i = 0usize;
@@ -2544,9 +2789,12 @@ impl EditorState {
             if let Some(plan) = &self.plan {
                 for (i, s) in plan.shots.iter().enumerate().skip(1) {
                     let x = t_to_x(s.start_s);
+                    if x < lanes.left() - 6.0 || x > lanes.right() + 6.0 {
+                        continue; // scrolled out of the viewport window
+                    }
                     let handle = Rect::from_min_max(
                         egui::pos2(x - 5.0, rect.top() + 14.0),
-                        egui::pos2(x + 5.0, rect.bottom() - 2.0),
+                        egui::pos2(x + 5.0, content_bottom - 2.0),
                     );
                     let resp = ui.interact(handle, ui.id().with(("cut", i)), Sense::click_and_drag());
                     let hot = resp.hovered()
@@ -2575,14 +2823,14 @@ impl EditorState {
                         }
                     });
                     p.line_segment(
-                        [egui::pos2(x, rect.top() + 14.0), egui::pos2(x, rect.bottom() - 2.0)],
+                        [egui::pos2(x, rect.top() + 14.0), egui::pos2(x, content_bottom - 2.0)],
                         Stroke::new(
                             if hot { 2.0 } else { 1.0 },
                             theme::GOLD.gamma_multiply(if hot { 1.0 } else { 0.6 }),
                         ),
                     );
                     // The ◆ badge, painted (no font in the stack carries ◆).
-                    let dc = egui::pos2(x, rect.bottom() - 8.0);
+                    let dc = egui::pos2(x, content_bottom - 8.0);
                     p.add(egui::Shape::convex_polygon(
                         vec![
                             egui::pos2(dc.x, dc.y - 4.0),
@@ -2615,12 +2863,16 @@ impl EditorState {
                 }
                 let r = Rect::from_min_max(
                     egui::pos2(t_to_x(*a), rect.top() + 14.0),
-                    egui::pos2(t_to_x(*b), rect.bottom() - 2.0),
+                    egui::pos2(t_to_x(*b), content_bottom - 2.0),
                 );
+                let vis = r.intersect(lanes);
+                if vis.width() <= 0.0 {
+                    continue; // scrolled out of the viewport window
+                }
                 p.rect_filled(r, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
-                if r.width() > 46.0 {
+                if vis.width() > 46.0 {
                     p.text(
-                        r.center(),
+                        vis.center(),
                         Align2::CENTER_CENTER,
                         "cut out",
                         FontId::proportional(10.0),
@@ -2632,9 +2884,12 @@ impl EditorState {
             let mut delete_razor: Option<usize> = None;
             for (k, c) in self.razor.cuts.iter().enumerate() {
                 let x = t_to_x(*c);
+                if x < lanes.left() - 6.0 || x > lanes.right() + 6.0 {
+                    continue; // scrolled out of the viewport window
+                }
                 let handle = Rect::from_min_max(
                     egui::pos2(x - 5.0, rect.top() + 2.0),
-                    egui::pos2(x + 5.0, rect.bottom() - 2.0),
+                    egui::pos2(x + 5.0, content_bottom - 2.0),
                 );
                 let resp = ui.interact(handle, ui.id().with(("razor", k)), Sense::click_and_drag());
                 let hot = resp.hovered()
@@ -2660,7 +2915,7 @@ impl EditorState {
                 });
                 let col = if hot { Color32::WHITE } else { Color32::from_gray(200) };
                 p.line_segment(
-                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
+                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, content_bottom - 2.0)],
                     Stroke::new(if hot { 2.0 } else { 1.2 }, col),
                 );
                 p.text(
@@ -2680,12 +2935,15 @@ impl EditorState {
         }
 
         // The ▼ cut marker: the ✂←/→✂ reference point. Draggable; right-click
-        // clears it.
-        if let Some(m) = self.cut_marker {
-            let x = t_to_x(m);
+        // clears it. Culled (not cleared) when scrolled out of the window.
+        if let Some((m, x)) = self
+            .cut_marker
+            .map(|m| (m, t_to_x(m)))
+            .filter(|(_, x)| *x >= lanes.left() - 7.0 && *x <= lanes.right() + 7.0)
+        {
             let handle = Rect::from_min_max(
                 egui::pos2(x - 6.0, rect.top() + 2.0),
-                egui::pos2(x + 6.0, rect.bottom() - 2.0),
+                egui::pos2(x + 6.0, content_bottom - 2.0),
             );
             let resp = ui.interact(handle, ui.id().with("cut-marker"), Sense::click_and_drag());
             let hot = resp.hovered() || matches!(self.drag, Some(TimelineDrag::Marker { .. }));
@@ -2714,7 +2972,7 @@ impl EditorState {
             } else {
                 let col = theme::INFO.gamma_multiply(if hot { 1.0 } else { 0.8 });
                 p.line_segment(
-                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
+                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, content_bottom - 2.0)],
                     Stroke::new(if hot { 2.0 } else { 1.4 }, col),
                 );
                 // The ▼ head, painted (no font in the stack carries ▼).
@@ -2778,41 +3036,47 @@ impl EditorState {
         // every cut/marker handle so scrubbing by the head can never grab a
         // marker underneath (operator ask 2026-07-13: the playhead parked on
         // a razor cut dragged the cut instead). Markers stay grabbable on
-        // their lines below the head's zone.
+        // their lines below the head's zone. The handle exists only while
+        // the playhead sits inside the viewport window.
         let px = t_to_x(self.playhead_s);
-        let phandle = Rect::from_min_max(
-            egui::pos2(px - 8.0, rect.top()),
-            egui::pos2(px + 8.0, rect.top() + 16.0),
-        );
-        let presp = ui.interact(phandle, ui.id().with("playhead-grab"), Sense::click_and_drag());
-        if presp.hovered() || presp.dragged() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
-        if presp.dragged() {
-            if let Some(pos) = presp.interact_pointer_pos() {
-                // Same contract as the strip scrub: visuals track the pointer;
-                // the audio commits on release (a per-frame sink restart is a
-                // re-seek storm).
-                self.playhead_s = x_to_t(pos.x);
-                if self.playing.is_some() {
-                    self.playing = Some((Instant::now(), self.playhead_s));
-                    self.stop_video();
+        let mut ph_hot = false;
+        if px >= lanes.left() - 8.0 && px <= lanes.right() + 8.0 {
+            let phandle = Rect::from_min_max(
+                egui::pos2(px - 8.0, rect.top()),
+                egui::pos2(px + 8.0, rect.top() + 16.0),
+            );
+            let presp =
+                ui.interact(phandle, ui.id().with("playhead-grab"), Sense::click_and_drag());
+            if presp.hovered() || presp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if presp.dragged() {
+                if let Some(pos) = presp.interact_pointer_pos() {
+                    // Same contract as the strip scrub: visuals track the
+                    // pointer; the audio commits on release (a per-frame
+                    // sink restart is a re-seek storm).
+                    self.playhead_s = x_to_t(pos.x);
+                    if self.playing.is_some() {
+                        self.playing = Some((Instant::now(), self.playhead_s));
+                        self.stop_video();
+                    }
                 }
             }
-        }
-        if presp.drag_stopped() && self.playing.is_some() {
-            self.playing = Some((Instant::now(), self.playhead_s));
-            self.start_video();
-            action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+            if presp.drag_stopped() && self.playing.is_some() {
+                self.playing = Some((Instant::now(), self.playhead_s));
+                self.start_video();
+                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+            }
+            ph_hot = presp.hovered() || presp.dragged();
         }
         let px = t_to_x(self.playhead_s);
         p.line_segment(
-            [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+            [egui::pos2(px, rect.top()), egui::pos2(px, content_bottom)],
             Stroke::new(2.0, theme::GOLD),
         );
         p.circle_filled(
             egui::pos2(px, rect.top() + 4.0),
-            if presp.hovered() || presp.dragged() { 5.5 } else { 4.0 },
+            if ph_hot { 5.5 } else { 4.0 },
             theme::GOLD,
         );
 
@@ -2820,14 +3084,17 @@ impl EditorState {
         // drag snapped onto) and the m:ss.cc chip at the manipulated time.
         if let Some(x) = snap_x {
             p.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                [egui::pos2(x, rect.top()), egui::pos2(x, content_bottom)],
                 Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.7)),
             );
         }
         if let Some(t) = drag_chip_t.filter(|_| self.drag.is_some()) {
             chip(
                 &p,
-                egui::pos2((t_to_x(t) + 8.0).min(rect.right() - 64.0), rect.top() + 16.0),
+                egui::pos2(
+                    (t_to_x(t) + 8.0).clamp(lanes.left() + 2.0, rect.right() - 64.0),
+                    rect.top() + 16.0,
+                ),
                 &fmt_mmss_cc(t),
                 theme::GOLD,
             );
@@ -2861,6 +3128,174 @@ impl EditorState {
             self.playing = Some((Instant::now(), self.playhead_s));
             self.start_video();
             action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+        }
+
+        // ---- Header column (plan #13, ADR 0066): names + painted toggles,
+        // painted LAST so lane content can never cover it. Only toggles whose
+        // OFF state is real today appear (per-kind honesty): Video 1 has no
+        // eye (hiding the only video would export nothing) and no mute (that
+        // arrives with the audio-mixer arc); the caption tracks carry
+        // eye + lock; Speakers is an eye-only analysis zone.
+        let hdr = Rect::from_min_max(rect.min, egui::pos2(lanes.left(), rect.bottom()));
+        ph.rect_filled(
+            hdr,
+            CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+            Color32::from_rgb(0x16, 0x19, 0x1F),
+        );
+        ph.line_segment(
+            [hdr.right_top(), hdr.right_bottom()],
+            Stroke::new(1.0, Color32::from_gray(50)),
+        );
+        let name_font = FontId::proportional(9.5);
+        let name_col = Color32::from_gray(200);
+        // Corner: zoom verbs — the discoverable fallback for ctrl+wheel.
+        let center_t = vp.left_t + vp.span(dur) * 0.5;
+        let btn_r = |x0: f32, w: f32| {
+            Rect::from_min_max(
+                egui::pos2(hdr.left() + x0, hdr.top() + 2.0),
+                egui::pos2(hdr.left() + x0 + w, hdr.top() + 15.0),
+            )
+        };
+        if mini_btn(ui, &ph, btn_r(6.0, 16.0), "-", "Zoom out (or ctrl+wheel on the timeline)") {
+            self.viewport.zoom_about(center_t, 0.5, 1.0 / 1.5, dur);
+        }
+        if mini_btn(ui, &ph, btn_r(24.0, 16.0), "+", "Zoom in (ctrl+wheel zooms about the pointer)")
+        {
+            self.viewport.zoom_about(center_t, 0.5, 1.5, dur);
+        }
+        if mini_btn(ui, &ph, btn_r(42.0, 24.0), "Fit", "Show the whole clip") {
+            self.viewport = Viewport::default();
+        }
+        if vp.zoom > 1.001 {
+            ph.text(
+                egui::pos2(hdr.right() - 5.0, hdr.top() + 8.5),
+                Align2::RIGHT_CENTER,
+                format!("{:.1}×", vp.zoom),
+                FontId::proportional(8.5),
+                Color32::from_gray(140),
+            );
+        }
+        // Video 1 · Main (the filmstrip).
+        ph.text(
+            egui::pos2(hdr.left() + 8.0, rect.top() + 31.0),
+            Align2::LEFT_CENTER,
+            "Video 1 · Main",
+            name_font.clone(),
+            name_col,
+        );
+        // The two caption tracks: eye + lock. The AI/operator separation is
+        // architectural (operator ruling 2026-07-13) — these never merge.
+        for (y0, label, is_auto) in
+            [(cap_y0, "Captions · auto", true), (man_y0, "Captions · yours", false)]
+        {
+            let cy = y0 + 9.0;
+            let mut f = if is_auto { self.trk_auto } else { self.trk_manual };
+            let eye_tip = if is_auto {
+                "Show the auto captions. OFF keeps the whole stream OUT of the export \
+                 (and the preview) — the blocks stay on the timeline, dimmed, editable."
+            } else {
+                "Show your captions. OFF keeps your stream OUT of the export (and the \
+                 preview) — the blocks stay on the timeline, dimmed, editable."
+            };
+            if track_toggle(ui, &ph, egui::pos2(hdr.left() + 13.0, cy), TrackIcon::Eye, f.eye, (label, 0), eye_tip)
+            {
+                f.eye = !f.eye;
+            }
+            if track_toggle(
+                ui,
+                &ph,
+                egui::pos2(hdr.left() + 29.0, cy),
+                TrackIcon::Lock,
+                f.lock,
+                (label, 1),
+                "Lock this track — timeline drags, trims, and deletes are ignored \
+                 (the caption panel still edits)",
+            ) {
+                f.lock = !f.lock;
+            }
+            if is_auto {
+                self.trk_auto = f;
+            } else {
+                self.trk_manual = f;
+            }
+            ph.text(
+                egui::pos2(hdr.left() + 40.0, cy),
+                Align2::LEFT_CENTER,
+                label,
+                name_font.clone(),
+                if f.eye { name_col } else { Color32::from_gray(130) },
+            );
+        }
+        // Speakers analysis zone (eye only — nothing here ever burns).
+        if self.speakers.is_some() {
+            let cy = rail_y + 15.0;
+            if track_toggle(
+                ui,
+                &ph,
+                egui::pos2(hdr.left() + 13.0, cy),
+                TrackIcon::Eye,
+                self.speakers_eye,
+                ("speakers", 0),
+                "Show the speaker analysis lanes (who's on camera / voice evidence). \
+                 Analysis only — never part of the export.",
+            ) {
+                self.speakers_eye = !self.speakers_eye;
+            }
+            ph.text(
+                egui::pos2(hdr.left() + 24.0, cy),
+                Align2::LEFT_CENTER,
+                "Speakers",
+                name_font.clone(),
+                if self.speakers_eye { name_col } else { Color32::from_gray(130) },
+            );
+        }
+        // The camera badge gutter's label (Active Speaker only).
+        if self.camera_mode == CameraMode::ActiveSpeaker && self.plan.is_some() {
+            ph.text(
+                egui::pos2(hdr.left() + 8.0, content_bottom - 10.0),
+                Align2::LEFT_CENTER,
+                "Camera",
+                FontId::proportional(8.5),
+                Color32::from_gray(130),
+            );
+        }
+
+        // ---- Scrollbar row (ADR 0066): the viewport window into the clip.
+        let sb = Rect::from_min_max(
+            egui::pos2(lanes.left() + 1.0, rect.bottom() - SCROLL_H + 1.0),
+            egui::pos2(lanes.right() - 1.0, rect.bottom() - 1.0),
+        );
+        if vp.zoom > 1.001 {
+            let sresp = ui.interact(sb, ui.id().with("tl-scrollbar"), Sense::click_and_drag());
+            if sresp.clicked() || sresp.dragged() {
+                if let Some(pos) = sresp.interact_pointer_pos() {
+                    let frac_w = (vp.span(dur) / dur).clamp(0.0, 1.0) as f32;
+                    let thumb_w = (sb.width() * frac_w).clamp(24.0_f32.min(sb.width()), sb.width());
+                    let f = ((pos.x - sb.left() - thumb_w * 0.5)
+                        / (sb.width() - thumb_w).max(1.0))
+                    .clamp(0.0, 1.0);
+                    self.viewport.left_t = f as f64 * (dur - vp.span(dur)).max(0.0);
+                    self.viewport.clamp(dur);
+                }
+            }
+            let hot = sresp.hovered() || sresp.dragged();
+            p.rect_filled(sb, CornerRadius::same(3), Color32::from_gray(28));
+            // Thumb geometry from the post-drag viewport so the drag is 1:1.
+            let cur = self.viewport;
+            let frac_w = (cur.span(dur) / dur).clamp(0.0, 1.0) as f32;
+            let thumb_w = (sb.width() * frac_w).clamp(24.0_f32.min(sb.width()), sb.width());
+            let denom = (dur - cur.span(dur)).max(1e-9);
+            let tf = (cur.left_t / denom).clamp(0.0, 1.0) as f32;
+            let tx = sb.left() + tf * (sb.width() - thumb_w);
+            p.rect_filled(
+                Rect::from_min_max(egui::pos2(tx, sb.top()), egui::pos2(tx + thumb_w, sb.bottom())),
+                CornerRadius::same(3),
+                if hot { Color32::from_gray(115) } else { Color32::from_gray(78) },
+            );
+        } else {
+            // Fit: the whole clip is the window — a quiet full-width thumb.
+            p.rect_filled(sb, CornerRadius::same(3), Color32::from_gray(28));
+            p.rect_filled(sb.shrink(1.0), CornerRadius::same(3), Color32::from_gray(42));
         }
         action
     }
@@ -3232,6 +3667,7 @@ impl EditorState {
         }
         if let Some(t) = seek {
             self.playhead_s = t.clamp(0.0, self.range.duration_s());
+            self.viewport.ensure_visible(self.playhead_s, self.range.duration_s());
             // Seeking during playback restarts audio + video at the row's
             // time — same contract as the timeline scrub.
             if self.playing.is_some() {
@@ -3780,21 +4216,23 @@ impl EditorState {
         }
         self.sync_lines();
         let p = self.playhead_s;
-        let (li, ghost) = match self.lines.iter().position(|l| l.start_s <= p && p < l.end_s) {
-            Some(i) => (i, false),
-            None => {
-                let fallback = self
+        // The auto line under (or nearest) the playhead — picked only when
+        // the auto track's eye is on: the preview shows what burns
+        // (ADR 0066), and an eye-off stream burns nothing.
+        let line_pick: Option<(usize, bool)> = if self.trk_auto.eye {
+            match self.lines.iter().position(|l| l.start_s <= p && p < l.end_s) {
+                Some(i) => Some((i, false)),
+                None => self
                     .lines
                     .iter()
                     .position(|l| l.start_s >= p)
-                    .or(self.lines.len().checked_sub(1));
-                match fallback {
-                    Some(i) => (i, true),
-                    None => return,
-                }
+                    .or(self.lines.len().checked_sub(1))
+                    .map(|i| (i, true)),
             }
+        } else {
+            None
         };
-        let line = &self.lines[li];
+        let ghost = line_pick.is_some_and(|(_, g)| g);
 
         let style = &self.style;
         let place = self.placement.unwrap_or_default();
@@ -3814,82 +4252,92 @@ impl EditorState {
         let outline_c = tint(style.outline_color);
         let shadow_c = Color32::from_rgba_unmultiplied(0, 0, 0, (200.0 * mul) as u8);
 
-        let states = word_states(style.genre, line, p);
-
-        let key = OverlayKey {
-            line_start_bits: line.start_s.to_bits(),
-            n_words: line.words.len(),
-            states: states.clone(),
-            ghost,
-            font_bits: font_px.to_bits(),
-        };
         let painter = ui.painter_at(canvas_rect);
-        let (galley, shadow) = match &self.overlay_cache {
-            Some((k, g, s)) if *k == key => (g.clone(), s.clone()),
-            _ => {
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                let mut shadow_job = egui::text::LayoutJob::default();
-                shadow_job.wrap.max_width = f32::INFINITY;
-                for (i, w) in line.words.iter().enumerate() {
-                    let color = match if ghost { WordState::Base } else { states[i] } {
-                        WordState::Hidden => Color32::TRANSPARENT, // reserves its space
-                        WordState::Base => primary,
-                        WordState::Sung => accent,
-                    };
-                    let text = if i + 1 < line.words.len() {
-                        format!("{} ", w.text)
-                    } else {
-                        w.text.clone()
-                    };
-                    let fmt = |c| egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: c,
-                        ..Default::default()
-                    };
-                    job.append(&text, 0.0, fmt(color));
-                    let sc = if color == Color32::TRANSPARENT { color } else { outline_c };
-                    shadow_job.append(&text, 0.0, fmt(sc));
+
+        // The auto stream: one line at a time (the burn's grammar). Skipped
+        // entirely when its track's eye is off — the manual stream below is
+        // independent (simultaneity is the point, ADR 0065 Amendment 3).
+        let mut auto_box: Option<(egui::Pos2, egui::Vec2, usize)> = None;
+        if let Some((li, _)) = line_pick {
+            let line = &self.lines[li];
+            let states = word_states(style.genre, line, p);
+
+            let key = OverlayKey {
+                line_start_bits: line.start_s.to_bits(),
+                n_words: line.words.len(),
+                states: states.clone(),
+                ghost,
+                font_bits: font_px.to_bits(),
+            };
+            let (galley, shadow) = match &self.overlay_cache {
+                Some((k, g, s)) if *k == key => (g.clone(), s.clone()),
+                _ => {
+                    let mut job = egui::text::LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
+                    let mut shadow_job = egui::text::LayoutJob::default();
+                    shadow_job.wrap.max_width = f32::INFINITY;
+                    for (i, w) in line.words.iter().enumerate() {
+                        let color = match if ghost { WordState::Base } else { states[i] } {
+                            WordState::Hidden => Color32::TRANSPARENT, // reserves its space
+                            WordState::Base => primary,
+                            WordState::Sung => accent,
+                        };
+                        let text = if i + 1 < line.words.len() {
+                            format!("{} ", w.text)
+                        } else {
+                            w.text.clone()
+                        };
+                        let fmt = |c| egui::TextFormat {
+                            font_id: font_id.clone(),
+                            color: c,
+                            ..Default::default()
+                        };
+                        job.append(&text, 0.0, fmt(color));
+                        let sc = if color == Color32::TRANSPARENT { color } else { outline_c };
+                        shadow_job.append(&text, 0.0, fmt(sc));
+                    }
+                    let g = painter.layout_job(job);
+                    let s = painter.layout_job(shadow_job);
+                    self.overlay_cache = Some((key, g.clone(), s.clone()));
+                    (g, s)
                 }
-                let g = painter.layout_job(job);
-                let s = painter.layout_job(shadow_job);
-                self.overlay_cache = Some((key, g.clone(), s.clone()));
-                (g, s)
-            }
-        };
-        let center = egui::pos2(
-            canvas_rect.left() + ass_x as f32 * px,
-            canvas_rect.top() + ass_y as f32 * px,
-        );
-        let size = galley.size();
-        let top_left = center - size / 2.0; // \an5: centered both axes
-        // Background box (BorderStyle 3 approximation).
-        if style.back_box {
-            painter.rect_filled(
-                Rect::from_center_size(center, size + egui::vec2(18.0 * px, 12.0 * px)),
-                CornerRadius::same(3),
-                tint(style.back_color),
+            };
+            let center = egui::pos2(
+                canvas_rect.left() + ass_x as f32 * px,
+                canvas_rect.top() + ass_y as f32 * px,
             );
-        }
-        // Faux outline: four offset passes in the outline colour stand in for
-        // libass's outline (ADR 0036's fidelity boundary: look approximate,
-        // position/size/timing exact). Width follows the style's outline px.
-        if style.outline > 0.0 {
-            let o = (style.outline * px * place.scale).clamp(1.0, 6.0);
-            for d in [
-                egui::vec2(-o, 0.0),
-                egui::vec2(o, 0.0),
-                egui::vec2(0.0, -o),
-                egui::vec2(0.0, o),
-            ] {
-                painter.galley(top_left + d, shadow.clone(), outline_c);
+            let size = galley.size();
+            let top_left = center - size / 2.0; // \an5: centered both axes
+            // Background box (BorderStyle 3 approximation).
+            if style.back_box {
+                painter.rect_filled(
+                    Rect::from_center_size(center, size + egui::vec2(18.0 * px, 12.0 * px)),
+                    CornerRadius::same(3),
+                    tint(style.back_color),
+                );
             }
+            // Faux outline: four offset passes in the outline colour stand in
+            // for libass's outline (ADR 0036's fidelity boundary: look
+            // approximate, position/size/timing exact). Width follows the
+            // style's outline px.
+            if style.outline > 0.0 {
+                let o = (style.outline * px * place.scale).clamp(1.0, 6.0);
+                for d in [
+                    egui::vec2(-o, 0.0),
+                    egui::vec2(o, 0.0),
+                    egui::vec2(0.0, -o),
+                    egui::vec2(0.0, o),
+                ] {
+                    painter.galley(top_left + d, shadow.clone(), outline_c);
+                }
+            }
+            if style.shadow > 0.0 {
+                let s = (style.shadow * px).clamp(1.0, 8.0);
+                painter.galley(top_left + egui::vec2(s, s), shadow.clone(), shadow_c);
+            }
+            painter.galley(top_left, galley, primary);
+            auto_box = Some((center, size, li));
         }
-        if style.shadow > 0.0 {
-            let s = (style.shadow * px).clamp(1.0, 8.0);
-            painter.galley(top_left + egui::vec2(s, s), shadow.clone(), shadow_c);
-        }
-        painter.galley(top_left, galley, primary);
 
         // The operator's OWN caption stream (ADR 0065): every caption active
         // at the playhead draws WITH the auto line — simultaneity is the
@@ -3898,13 +4346,18 @@ impl EditorState {
         // so preview and export agree), and each is directly draggable:
         // drag moves it anywhere on the canvas, scroll resizes it,
         // right-click resets it to the default anchor.
-        let active_manual: Vec<usize> = self
-            .manual_units
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.start_s <= p && p < m.end_s.max(m.start_s + 0.1))
-            .map(|(i, _)| i)
-            .collect();
+        // An eye-off manual track draws (and burns) nothing — the empty set
+        // skips the loop without touching the operator's data (ADR 0066).
+        let active_manual: Vec<usize> = if self.trk_manual.eye {
+            self.manual_units
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.start_s <= p && p < m.end_s.max(m.start_s + 0.1))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut set_place: Option<(usize, Option<CaptionPlacement>)> = None;
         for i in active_manual {
             let m = &self.manual_units[i];
@@ -4030,6 +4483,10 @@ impl EditorState {
         if !enabled {
             return;
         }
+        let Some((center, size, li)) = auto_box else {
+            return; // auto track hidden (or no lines): no auto block to grab
+        };
+        let line = &self.lines[li];
         // Drag to move, scroll on it to resize — the Crop verbs, applied to
         // the caption block. Double-click = edit what you see: focuses this
         // caption's text field in the panel (operator ask 2026-07-13).
@@ -4666,6 +5123,124 @@ mod tests {
         assert_eq!(nice_step(7.0), 10.0);
         assert_eq!(nice_step(0.8), 1.0);
         assert_eq!(nice_step(20.0), 30.0);
+        // The zoomed-in ruler's sub-second rungs (ADR 0066).
+        assert_eq!(nice_step(0.09), 0.1);
+        assert_eq!(nice_step(0.3), 0.5);
+    }
+
+    #[test]
+    fn viewport_round_trips_and_clamps() {
+        let dur = 60.0;
+        let mut vp = Viewport::default();
+        vp.zoom_about(30.0, 0.5, 4.0, dur); // 4× about the middle
+        assert!((vp.zoom - 4.0).abs() < 1e-9);
+        assert!((vp.span(dur) - 15.0).abs() < 1e-9);
+        // x ↔ t round-trips through the window.
+        let (left, width) = (100.0_f32, 800.0_f32);
+        let t = 31.7;
+        let x = vp.t_to_x(t, left, width, dur);
+        assert!((vp.x_to_t(x, left, width, dur) - t).abs() < 1e-4);
+        // Scroll clamps at the clip edges.
+        vp.scroll_px(-1e9, width, dur);
+        assert_eq!(vp.left_t, 0.0);
+        vp.scroll_px(1e9, width, dur);
+        assert!((vp.left_t - (dur - vp.span(dur))).abs() < 1e-9);
+        // Fit can't zoom out below 1 and never scrolls.
+        let mut fit = Viewport::default();
+        fit.zoom_about(10.0, 0.3, 0.25, dur);
+        assert_eq!(fit.zoom, 1.0);
+        assert_eq!(fit.left_t, 0.0);
+        // Max zoom keeps at least MIN_SPAN_S visible.
+        let mut deep = Viewport::default();
+        deep.zoom_about(30.0, 0.5, 1e9, dur);
+        assert!(deep.span(dur) >= Viewport::MIN_SPAN_S - 1e-9);
+    }
+
+    #[test]
+    fn viewport_zoom_about_pointer_keeps_the_anchor_time() {
+        let dur = 120.0;
+        let mut vp = Viewport::default();
+        // Pointer parked at 25% of the lanes, over t = 30.
+        let (left, width) = (0.0_f32, 1000.0_f32);
+        let anchor = vp.x_to_t(250.0, left, width, dur);
+        assert!((anchor - 30.0).abs() < 1e-4);
+        vp.zoom_about(anchor, 0.25, 3.0, dur);
+        let x_after = vp.t_to_x(30.0, left, width, dur);
+        assert!((x_after - 250.0).abs() < 0.5, "anchor drifted to {x_after}");
+        // Zooming far back out re-clamps to fit.
+        vp.zoom_about(anchor, 0.25, 1.0 / 100.0, dur);
+        assert_eq!(vp.zoom, 1.0);
+        assert_eq!(vp.left_t, 0.0);
+    }
+
+    #[test]
+    fn viewport_follow_and_ensure_visible_page_the_window() {
+        let dur = 100.0;
+        let mut vp = Viewport { zoom: 10.0, left_t: 0.0 }; // span 10
+        vp.follow(5.0, dur);
+        assert_eq!(vp.left_t, 0.0, "inside the window: no move");
+        vp.follow(11.0, dur);
+        assert!((vp.left_t - 10.5).abs() < 1e-9, "pages past the right edge");
+        vp.ensure_visible(50.0, dur);
+        assert!((vp.left_t - 47.0).abs() < 1e-9, "outside jump parks at 30%");
+        let before = vp.left_t;
+        vp.ensure_visible(50.5, dur);
+        assert_eq!(vp.left_t, before, "inside jump: untouched");
+    }
+
+    fn editor_state() -> EditorState {
+        EditorState::from_seed(
+            Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 100.0, h: 200.0 } },
+            1920.0,
+            1080.0,
+            yc_core::TimeRange { start_s: 0.0, end_s: 60.0 },
+            None,
+            Vec::new(),
+            4.0,
+            yc_core::CaptionGenre::RollingPop,
+            yc_core::CaptionEngine::Whisper,
+            Vec::new(),
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            0.0,
+            30.0,
+        )
+    }
+
+    fn cap(t0: f64, t1: f64) -> CaptionUnit {
+        CaptionUnit { text: "hi".into(), start_s: t0, end_s: t1 }
+    }
+
+    #[test]
+    fn track_eyes_gate_the_render_spec() {
+        let mut ed = editor_state();
+        ed.transcript = Some(yc_core::Transcript {
+            language: yc_core::Language::En,
+            units: vec![cap(1.0, 2.0)],
+        });
+        ed.manual_units = vec![cap(3.0, 4.0)];
+        ed.manual_places = vec![None];
+        // Eyes on, transcript untouched: no override, the manual stream rides.
+        let spec = ed.render_spec();
+        assert!(spec.transcript_override.is_none());
+        assert_eq!(spec.manual_captions.len(), 1);
+        // Auto eye off: the override says "burn none" — the eye wins even
+        // over an edited (dirty) transcript.
+        ed.trk_auto.eye = false;
+        ed.transcript_dirty = true;
+        let spec = ed.render_spec();
+        assert_eq!(spec.transcript_override.as_ref().map(|t| t.units.len()), Some(0));
+        // Manual eye off: the stream leaves the spec; the editor's data stays.
+        ed.trk_manual.eye = false;
+        let spec = ed.render_spec();
+        assert!(spec.manual_captions.is_empty());
+        assert_eq!(ed.manual_units.len(), 1);
+        // Eyes back on + dirty: the edited transcript burns verbatim again.
+        ed.trk_auto.eye = true;
+        ed.trk_manual.eye = true;
+        let spec = ed.render_spec();
+        assert_eq!(spec.transcript_override.as_ref().map(|t| t.units.len()), Some(1));
+        assert_eq!(spec.manual_captions.len(), 1);
     }
 
     fn plan(bounds: &[f64]) -> yc_core::CameraPlan {
@@ -4907,9 +5482,108 @@ fn strip_frame_time_s(idx: usize, strip_fps: f64) -> f64 {
     idx as f64 / strip_fps.max(1e-6)
 }
 
-/// A round ruler step (1/2/5/10/15/30/60s ladder) at least `raw` long.
+/// Which painted track-header toggle to draw.
+#[derive(Clone, Copy, PartialEq)]
+enum TrackIcon {
+    Eye,
+    Lock,
+}
+
+/// A 15-px track-header toggle, PAINTED — no font in the stack reliably
+/// carries 👁/🔒 (the round-6 tofu lesson, ADR 0065 Amendment 5).
+fn track_toggle(
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    center: egui::Pos2,
+    icon: TrackIcon,
+    on: bool,
+    id: (&str, u8),
+    tip: &str,
+) -> bool {
+    let r = Rect::from_center_size(center, egui::vec2(15.0, 15.0));
+    let resp = ui.interact(r, ui.id().with(("trk-toggle", id.0, id.1)), Sense::click());
+    if resp.hovered() {
+        p.rect_filled(r, CornerRadius::same(3), Color32::from_gray(46));
+    }
+    match icon {
+        TrackIcon::Eye => draw_eye(p, center, on),
+        TrackIcon::Lock => draw_lock(p, center, on),
+    }
+    resp.on_hover_text(tip).clicked()
+}
+
+/// An almond-shaped eye + pupil; slashed when off. Sampled quadratics —
+/// crisp at 15 px and font-proof.
+fn draw_eye(p: &egui::Painter, c: egui::Pos2, on: bool) {
+    let col = if on { Color32::from_gray(208) } else { Color32::from_gray(105) };
+    let (a, b) = (c + egui::vec2(-4.6, 0.0), c + egui::vec2(4.6, 0.0));
+    let mut pts = Vec::with_capacity(18);
+    for k in 0..=8 {
+        pts.push(quad_point(a, c + egui::vec2(0.0, -5.8), b, k as f32 / 8.0));
+    }
+    for k in 0..=8 {
+        pts.push(quad_point(b, c + egui::vec2(0.0, 5.8), a, k as f32 / 8.0));
+    }
+    p.add(egui::Shape::line(pts, Stroke::new(1.1, col)));
+    p.circle_filled(c, 1.7, col);
+    if !on {
+        p.line_segment(
+            [c + egui::vec2(-4.6, 4.6), c + egui::vec2(4.6, -4.6)],
+            Stroke::new(1.3, Color32::from_gray(150)),
+        );
+    }
+}
+
+/// A padlock: gold-filled body when locked, quiet outline when open.
+fn draw_lock(p: &egui::Painter, c: egui::Pos2, locked: bool) {
+    let col = if locked { theme::GOLD } else { Color32::from_gray(105) };
+    let body = Rect::from_center_size(c + egui::vec2(0.0, 2.0), egui::vec2(7.6, 6.2));
+    if locked {
+        p.rect_filled(body, CornerRadius::same(1), col);
+    } else {
+        p.rect_stroke(body, CornerRadius::same(1), Stroke::new(1.1, col), StrokeKind::Inside);
+    }
+    let top = egui::pos2(body.center().x, body.top());
+    let mut pts = Vec::with_capacity(9);
+    for k in 0..=8 {
+        let ang = std::f32::consts::PI * (1.0 - k as f32 / 8.0);
+        pts.push(egui::pos2(top.x + 2.6 * ang.cos(), top.y - 2.6 * ang.sin()));
+    }
+    p.add(egui::Shape::line(pts, Stroke::new(1.1, col)));
+}
+
+/// A point on the quadratic Bézier (a, ctrl, b) at parameter `t`.
+fn quad_point(a: egui::Pos2, ctrl: egui::Pos2, b: egui::Pos2, t: f32) -> egui::Pos2 {
+    let u = 1.0 - t;
+    egui::pos2(
+        u * u * a.x + 2.0 * u * t * ctrl.x + t * t * b.x,
+        u * u * a.y + 2.0 * u * t * ctrl.y + t * t * b.y,
+    )
+}
+
+/// A tiny painted button (the zoom corner) — painted like the toggles so it
+/// lives on the strip's own painter, above the lane content.
+fn mini_btn(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, tip: &str) -> bool {
+    let resp = ui.interact(r, ui.id().with(("tl-mini", label)), Sense::click());
+    p.rect_filled(
+        r,
+        CornerRadius::same(3),
+        if resp.hovered() { Color32::from_gray(52) } else { Color32::from_gray(36) },
+    );
+    p.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(9.5),
+        Color32::from_gray(205),
+    );
+    resp.on_hover_text(tip).clicked()
+}
+
+/// A round ruler step (0.1/0.2/0.5/1/2/5/10/15/30/60s ladder) at least `raw`
+/// long — the sub-second rungs exist for the zoomed-in ruler (ADR 0066).
 fn nice_step(raw: f64) -> f64 {
-    for s in [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0] {
+    for s in [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0] {
         if raw <= s {
             return s;
         }
