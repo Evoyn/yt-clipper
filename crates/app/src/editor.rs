@@ -3199,7 +3199,7 @@ impl EditorState {
             ui,
             &ph,
             btn_r(6.0, 18.0),
-            MiniGlyph::Minus,
+            "-",
             "zoom-out",
             "Zoom out (or ctrl+wheel on the timeline)",
         ) {
@@ -3209,14 +3209,13 @@ impl EditorState {
             ui,
             &ph,
             btn_r(28.0, 18.0),
-            MiniGlyph::Plus,
+            "+",
             "zoom-in",
             "Zoom in (ctrl+wheel zooms about the pointer)",
         ) {
             self.viewport.zoom_about(center_t, 0.5, 1.5, dur);
         }
-        if mini_btn(ui, &ph, btn_r(50.0, 30.0), MiniGlyph::Text("Fit"), "fit", "Show the whole clip")
-        {
+        if mini_btn(ui, &ph, btn_r(50.0, 30.0), "Fit", "fit", "Show the whole clip") {
             self.viewport = Viewport::default();
         }
         if vp.zoom > 1.001 {
@@ -5682,25 +5681,11 @@ fn quad_point(a: egui::Pos2, ctrl: egui::Pos2, b: egui::Pos2, t: f32) -> egui::P
     )
 }
 
-/// The zoom corner buttons' glyphs. Minus/plus are PAINTED strokes, not font
-/// glyphs — the hyphen rides near x-height while `+` sits on the math axis,
-/// so as text the pair never looks centered (operator round-2 verdict).
-enum MiniGlyph<'a> {
-    Minus,
-    Plus,
-    Text(&'a str),
-}
-
-/// A tiny painted button (the zoom corner) — painted like the toggles so it
-/// lives on the strip's own painter, above the lane content.
-fn mini_btn(
-    ui: &mut egui::Ui,
-    p: &egui::Painter,
-    r: Rect,
-    glyph: MiniGlyph,
-    id: &str,
-    tip: &str,
-) -> bool {
+/// A tiny painted button (the zoom corner). The label is normal text, but
+/// centered by its INK (`mesh_bounds`), not its font line box — line-box
+/// centering leaves a lone "-" or "+" riding its own font line, which is
+/// exactly the "doesn't look centered" the operator called (round 2).
+fn mini_btn(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, id: &str, tip: &str) -> bool {
     let resp = ui.interact(r, ui.id().with(("tl-mini", id)), Sense::click());
     p.rect_filled(
         r,
@@ -5717,20 +5702,10 @@ fn mini_btn(
         Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2F, 0x38)),
         StrokeKind::Inside,
     );
-    let c = r.center();
-    let ink = Stroke::new(1.4, Color32::from_gray(210));
-    match glyph {
-        MiniGlyph::Minus => {
-            p.line_segment([c + egui::vec2(-3.5, 0.0), c + egui::vec2(3.5, 0.0)], ink);
-        }
-        MiniGlyph::Plus => {
-            p.line_segment([c + egui::vec2(-3.5, 0.0), c + egui::vec2(3.5, 0.0)], ink);
-            p.line_segment([c + egui::vec2(0.0, -3.5), c + egui::vec2(0.0, 3.5)], ink);
-        }
-        MiniGlyph::Text(s) => {
-            p.text(c, Align2::CENTER_CENTER, s, FontId::proportional(11.0), Color32::from_gray(210));
-        }
-    }
+    let col = Color32::from_gray(210);
+    let galley = p.layout_no_wrap(label.to_owned(), FontId::proportional(11.0), col);
+    let pos = r.center() - galley.mesh_bounds.center().to_vec2();
+    p.galley(pos, galley, col);
     resp.on_hover_text(tip).clicked()
 }
 
