@@ -12,6 +12,7 @@ mod pipeline;
 mod player;
 mod presets;
 mod review_queue;
+mod settings;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -116,6 +117,8 @@ fn main() -> eframe::Result<()> {
                             caption_engine: None,
                             camera: None,
                             transcript_override: None,
+                            keep: None,
+                            manual_captions: Vec::new(),
                         })
                         .expect("send render");
                 }
@@ -263,6 +266,8 @@ fn main() -> eframe::Result<()> {
                             caption_engine: None,
                             camera: None,
                             transcript_override: None,
+                            keep: None,
+                            manual_captions: Vec::new(),
                         })
                         .expect("send render");
                 }
@@ -305,6 +310,10 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // App-level operator preferences (workspace/settings.json): today the
+    // master playback volume (feature plan #7) — playback only, never renders.
+    let app_settings = settings::AppSettings::load(&paths.workspace);
+
     eframe::run_native(
         "yt-clipper",
         options,
@@ -333,7 +342,8 @@ fn main() -> eframe::Result<()> {
                 analysis_wav: None,
                 audio_out: None,
                 sink: None,
-                volume: 1.0,
+                prefs: app_settings,
+                prefs_dirty_since: None,
                 status: Status::Idle,
                 download_frac: None,
                 editor: None,
@@ -630,9 +640,14 @@ struct App {
     audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     /// The currently-playing sink; taking/replacing it stops playback.
     sink: Option<rodio::Sink>,
-    /// Review playback gain applied to the sink; 1.0 = unmodified, >1.0 boosts
-    /// a quiet streamer in the mixed track (rodio amplifies linearly).
-    volume: f32,
+    /// App-level operator preferences (workspace/settings.json): the master
+    /// playback gain (Moment review + Studio playback share it; 1.0 =
+    /// unmodified, up to 2.0 boosts a quiet streamer — playback only, never
+    /// the export) and the operator's saved caption presets.
+    prefs: settings::AppSettings,
+    /// When the operator last changed a preference not yet written to
+    /// settings.json — debounces the save off slider drags.
+    prefs_dirty_since: Option<std::time::Instant>,
     status: Status,
     /// Fraction (0..=1) of the in-flight dependency download (ADR 0041);
     /// `None` outside a download. Drives the status bar's progress bar.
@@ -913,6 +928,8 @@ impl eframe::App for App {
                             caption_engine: Some(self.caption_engine),
                             camera: None,
                             transcript_override: None,
+                            keep: None,
+                            manual_captions: Vec::new(),
                         });
                         self.rendering = true;
                         continue;
@@ -1088,10 +1105,11 @@ impl eframe::App for App {
         // Studio owns the whole area below the brand bar — a promoted Clip is
         // the operator's entire context until they Export or go Back. ---
         let mut editor_action = editor::EditorAction::None;
+        let prefs_before = self.prefs.clone();
         if self.editor.is_some() {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 if let Some(ed) = &mut self.editor {
-                    editor_action = ed.show(ui, working, self.rendering);
+                    editor_action = ed.show(ui, working, self.rendering, &mut self.prefs);
                 }
             });
         } else {
@@ -1139,6 +1157,8 @@ impl eframe::App for App {
                     caption_engine: Some(self.caption_engine),
                     camera: spec.camera,
                     transcript_override: spec.transcript_override,
+                    keep: spec.keep,
+                    manual_captions: spec.manual_captions,
                 });
                 self.rendering = true;
                 // While a pre-pass job still runs, this Render only QUEUES
@@ -1174,6 +1194,28 @@ impl eframe::App for App {
             editor::EditorAction::None => {}
         }
 
+        // The Studio changed a preference (volume slider, saved caption
+        // presets): apply volume to the live sink immediately (real-time
+        // adjustment) and schedule the settings write.
+        if self.prefs != prefs_before {
+            if let Some(sink) = &self.sink {
+                sink.set_volume(self.prefs.volume);
+            }
+            self.prefs_dirty_since = Some(std::time::Instant::now());
+        }
+        // Debounced settings write: once the prefs have rested ~0.7 s (a write
+        // per slider frame would hammer the disk for nothing). The repaint
+        // request guarantees the flush runs even if the app then idles;
+        // `save` (below) flushes on exit for the close-immediately case.
+        if let Some(t0) = self.prefs_dirty_since {
+            if t0.elapsed().as_secs_f32() > 0.7 {
+                self.prefs.save(&self.paths.workspace);
+                self.prefs_dirty_since = None;
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(750));
+            }
+        }
+
         // (Status lives in the top brand bar now — see `status_bar`.)
 
         // Repaint cadence while a job runs: a steady 60 fps tick (16 ms,
@@ -1186,6 +1228,15 @@ impl eframe::App for App {
         // [`throttled_spinner`] instead.
         if working {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    /// eframe's periodic/exit persistence hook: flush a preference change the
+    /// debounce hasn't written yet (the operator drags the slider and closes
+    /// the window inside the debounce window).
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if self.prefs_dirty_since.take().is_some() {
+            self.prefs.save(&self.paths.workspace);
         }
     }
 }
@@ -2307,12 +2358,17 @@ impl App {
             }
             ui.label("Vol");
             if ui
-                .add(egui::Slider::new(&mut self.volume, 0.0..=2.0).show_value(false))
+                .add(egui::Slider::new(&mut self.prefs.volume, 0.0..=2.0).show_value(false))
+                .on_hover_text(format!(
+                    "Playback volume {:.0}% — persists; never affects the export",
+                    self.prefs.volume * 100.0
+                ))
                 .changed()
             {
                 if let Some(sink) = &self.sink {
-                    sink.set_volume(self.volume);
+                    sink.set_volume(self.prefs.volume);
                 }
+                self.prefs_dirty_since = Some(std::time::Instant::now());
             }
             ui.add_space(10.0);
             if theme::primary_button(ui, "Open in editor")
@@ -2400,7 +2456,7 @@ impl App {
         match rodio::Sink::try_new(&handle) {
             Ok(sink) => {
                 sink.append(rodio::buffer::SamplesBuffer::new(1, yc_ingest::WHISPER_SR, samples));
-                sink.set_volume(self.volume);
+                sink.set_volume(self.prefs.volume);
                 sink.play();
                 self.sink = Some(sink);
             }

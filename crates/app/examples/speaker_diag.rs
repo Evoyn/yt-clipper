@@ -1033,7 +1033,7 @@ fn main() -> anyhow::Result<()> {
     // --- the real filtergraph (render it with export_args-style ffmpeg flags
     // to SEE this plan; clip.ass + fonts live in the data dir) ----------------
     let fg = data_dir.join("camera_diag.fg");
-    std::fs::write(&fg, yc_render::build_camera_filtergraph(&plan, "clip.ass"))?;
+    std::fs::write(&fg, yc_render::build_camera_filtergraph(&plan, "clip.ass", false))?;
     println!("\nfiltergraph: {}", fg.display());
 
     // Render THIS plan with the production export command. TWO env vars, two
@@ -1053,6 +1053,7 @@ fn main() -> anyhow::Result<()> {
             dur,
             "camera_diag.fg",
             "../camera_smoothing.mp4",
+            false,
         );
         println!("rendering ../camera_smoothing.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1065,6 +1066,7 @@ fn main() -> anyhow::Result<()> {
             dur,
             "camera_diag.fg",
             "../diar_integration.mp4",
+            false,
         );
         println!("rendering ../diar_integration.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1079,6 +1081,7 @@ fn main() -> anyhow::Result<()> {
             dur,
             "camera_diag.fg",
             "../diar_person.mp4",
+            false,
         );
         println!("rendering ../diar_person.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1093,6 +1096,7 @@ fn main() -> anyhow::Result<()> {
             dur,
             "camera_diag.fg",
             "../diar_reaction.mp4",
+            false,
         );
         println!("rendering ../diar_reaction.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1105,7 +1109,7 @@ fn main() -> anyhow::Result<()> {
         match &presence_plan {
             Some(rp) => {
                 let fg2 = data_dir.join("camera_presence.fg");
-                std::fs::write(&fg2, yc_render::build_camera_filtergraph(rp, "clip.ass"))?;
+                std::fs::write(&fg2, yc_render::build_camera_filtergraph(rp, "clip.ass", false))?;
                 let out = std::env::var("YC_PRESENCE_OUT")
                     .unwrap_or_else(|_| "../diar_presence.mp4".to_string());
                 let ffabs = std::fs::canonicalize(ffmpeg)?;
@@ -1115,6 +1119,7 @@ fn main() -> anyhow::Result<()> {
                     dur,
                     "camera_presence.fg",
                     &out,
+                    false,
                 );
                 println!("rendering {out} (solo-presence rewritten plan) ...");
                 yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;

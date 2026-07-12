@@ -579,6 +579,110 @@ impl Shot {
     }
 }
 
+impl CameraPlan {
+    /// The plan cut down to the timeline razor's kept spans (sorted,
+    /// non-overlapping, clip-relative) for a cut export: each shot is
+    /// intersected with each kept span, **keeping source-clip trim times**
+    /// (the filtergraph trims by source time; the concat compresses the
+    /// output timeline). A glide piece keeps the original motion exactly —
+    /// linear interpolation is composable, so the piece's endpoints sample
+    /// `layout_at` at the piece bounds. Pieces shorter than ~a frame are
+    /// dropped (an empty `trim` would sink the whole graph); callers derive
+    /// audio cuts and caption remaps from the RESULT's spans so A/V/text
+    /// stay aligned even when a sliver is dropped.
+    pub fn cut_to(&self, keep: &[TimeRange]) -> CameraPlan {
+        const MIN_PIECE_S: f64 = 0.05;
+        let mut shots = Vec::new();
+        for seg in keep {
+            for shot in &self.shots {
+                let a = shot.start_s.max(seg.start_s);
+                let b = shot.end_s.min(seg.end_s);
+                if b - a < MIN_PIECE_S {
+                    continue;
+                }
+                let whole = (a - shot.start_s).abs() < 1e-9 && (b - shot.end_s).abs() < 1e-9;
+                let mut piece = shot.clone();
+                piece.start_s = a;
+                piece.end_s = b;
+                if !whole && shot.pan_to.is_some() {
+                    if let (Layout::FullFrame { crop: c0 }, Layout::FullFrame { crop: c1 }) =
+                        (shot.layout_at(a), shot.layout_at(b))
+                    {
+                        piece.layout = Layout::FullFrame { crop: c0 };
+                        piece.pan_to = Some(c1);
+                    }
+                }
+                shots.push(piece);
+            }
+        }
+        CameraPlan { shots }
+    }
+
+    /// The kept source spans this plan's shots cover, adjacent/touching shots
+    /// merged — the spans a razor-cut export's audio trims and caption remap
+    /// must use (identical to the video by construction).
+    pub fn kept_spans(&self) -> Vec<TimeRange> {
+        let mut out: Vec<TimeRange> = Vec::new();
+        for s in &self.shots {
+            match out.last_mut() {
+                Some(last) if (s.start_s - last.end_s).abs() < 1e-6 => last.end_s = s.end_s,
+                _ => out.push(TimeRange { start_s: s.start_s, end_s: s.end_s }),
+            }
+        }
+        out
+    }
+}
+
+/// One caption of the operator's OWN stream (ADR 0065): their text + times,
+/// plus where it sits on the canvas. `None` placement = the default second
+/// anchor (one block above the auto captions); `Some` is the operator's own
+/// drag — per caption, so different captions can sit in different places.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManualCaption {
+    pub unit: CaptionUnit,
+    #[serde(default)]
+    pub placement: Option<CaptionPlacement>,
+}
+
+/// Remap caption units onto the compressed timeline a razor-cut export
+/// produces: each kept span shifts left by the removed time before it. A unit
+/// keeps its largest single kept-overlap piece (clamped to the span, then
+/// shifted); a unit entirely inside removed time is dropped. Text and order
+/// are preserved.
+pub fn remap_units_through_cuts(units: &[CaptionUnit], keep: &[TimeRange]) -> Vec<CaptionUnit> {
+    // (kept span, its start position on the compressed output timeline)
+    let mut spans: Vec<(TimeRange, f64)> = Vec::with_capacity(keep.len());
+    let mut out_t = 0.0;
+    for k in keep {
+        spans.push((*k, out_t));
+        out_t += (k.end_s - k.start_s).max(0.0);
+    }
+    let mut out: Vec<CaptionUnit> = units
+        .iter()
+        .filter_map(|u| {
+            let best = spans
+                .iter()
+                .map(|(k, off)| {
+                    let a = u.start_s.max(k.start_s);
+                    let b = u.end_s.min(k.end_s);
+                    (b - a, a, b, k.start_s, *off)
+                })
+                .filter(|(olap, ..)| *olap > 1e-6)
+                .max_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal))?;
+            let (_, a, b, k_start, off) = best;
+            Some(CaptionUnit {
+                text: u.text.clone(),
+                start_s: off + (a - k_start),
+                end_s: off + (b - k_start),
+            })
+        })
+        .collect();
+    // Overlapping input units can cross spans in either direction; the ASS
+    // generator expects start order.
+    out.sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Everything the app knows about one VOD: persisted as `project.json`
 /// in that VOD's workspace folder. No database, by design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,5 +1027,87 @@ mod tests {
         let stat = Shot { pan_to: None, ..shot.clone() };
         let Layout::FullFrame { crop } = stat.layout_at(4.0) else { panic!() };
         assert_eq!(crop.x, 0.0);
+    }
+
+    fn shot(start_s: f64, end_s: f64, x: f32) -> Shot {
+        Shot {
+            start_s,
+            end_s,
+            track: Some(0),
+            layout: Layout::FullFrame { crop: Crop { x, y: 0.0, w: 100.0, h: 200.0 } },
+            pan_to: None,
+        }
+    }
+
+    #[test]
+    fn cut_to_intersects_shots_with_kept_spans_in_source_time() {
+        // Shots [0,4)[4,10); remove [3,6): pieces [0,3) [6,10) in SOURCE time.
+        let plan = CameraPlan { shots: vec![shot(0.0, 4.0, 0.0), shot(4.0, 10.0, 500.0)] };
+        let keep =
+            [TimeRange { start_s: 0.0, end_s: 3.0 }, TimeRange { start_s: 6.0, end_s: 10.0 }];
+        let cut = plan.cut_to(&keep);
+        let spans: Vec<(f64, f64)> = cut.shots.iter().map(|s| (s.start_s, s.end_s)).collect();
+        assert_eq!(spans, vec![(0.0, 3.0), (6.0, 10.0)]);
+        // Each piece keeps its shot's framing (the second piece is shot 2's).
+        let Layout::FullFrame { crop } = &cut.shots[1].layout else { panic!() };
+        assert_eq!(crop.x, 500.0);
+        // kept_spans reports exactly the pieces (nothing adjacent to merge).
+        let ks = cut.kept_spans();
+        assert_eq!(ks.len(), 2);
+        assert_eq!((ks[1].start_s, ks[1].end_s), (6.0, 10.0));
+        // A camera cut INSIDE a kept span leaves two touching pieces that
+        // kept_spans merges into one contiguous audio trim.
+        let keep_all = [TimeRange { start_s: 1.0, end_s: 9.0 }];
+        let cut = plan.cut_to(&keep_all);
+        assert_eq!(cut.shots.len(), 2, "shot boundary preserved inside the span");
+        let ks = cut.kept_spans();
+        assert_eq!(ks.len(), 1, "touching pieces merge for audio/captions");
+        assert_eq!((ks[0].start_s, ks[0].end_s), (1.0, 9.0));
+    }
+
+    #[test]
+    fn cut_to_preserves_a_glide_motion_across_the_cut() {
+        // One shot gliding x 0->80 over [0,8); keep only [2,6): the piece must
+        // sample the ORIGINAL motion at its bounds (x 20 -> 60), so the pixels
+        // that render are identical to the uncut export's middle.
+        let plan = CameraPlan {
+            shots: vec![Shot {
+                pan_to: Some(Crop { x: 80.0, y: 0.0, w: 100.0, h: 200.0 }),
+                ..shot(0.0, 8.0, 0.0)
+            }],
+        };
+        let cut = plan.cut_to(&[TimeRange { start_s: 2.0, end_s: 6.0 }]);
+        assert_eq!(cut.shots.len(), 1);
+        let p = &cut.shots[0];
+        let Layout::FullFrame { crop: c0 } = &p.layout else { panic!() };
+        assert_eq!(c0.x, 20.0);
+        assert_eq!(p.pan_to.as_ref().unwrap().x, 60.0);
+        // Sliver pieces (sub-frame) are dropped, not rendered as empty trims.
+        let cut = plan.cut_to(&[TimeRange { start_s: 0.0, end_s: 0.01 }]);
+        assert!(cut.shots.is_empty());
+    }
+
+    #[test]
+    fn remap_units_shift_left_drop_removed_clamp_partials() {
+        let u = |text: &str, start_s: f64, end_s: f64| CaptionUnit {
+            text: text.into(),
+            start_s,
+            end_s,
+        };
+        // Keep [0,3) and [6,10): output timeline is [0,3)+[3,7).
+        let keep =
+            [TimeRange { start_s: 0.0, end_s: 3.0 }, TimeRange { start_s: 6.0, end_s: 10.0 }];
+        let units = [
+            u("early", 1.0, 2.0),    // inside span 1: unchanged
+            u("cutout", 3.5, 5.5),   // fully removed: dropped
+            u("straddle", 2.5, 4.0), // clamped to span 1's tail
+            u("late", 7.0, 8.0),     // inside span 2: shifts left by 3
+        ];
+        let out = remap_units_through_cuts(&units, &keep);
+        let texts: Vec<&str> = out.iter().map(|u| u.text.as_str()).collect();
+        assert_eq!(texts, vec!["early", "straddle", "late"]);
+        assert_eq!((out[0].start_s, out[0].end_s), (1.0, 2.0));
+        assert_eq!((out[1].start_s, out[1].end_s), (2.5, 3.0), "clamped at the cut");
+        assert_eq!((out[2].start_s, out[2].end_s), (4.0, 5.0), "6..10 lands at 3..7");
     }
 }

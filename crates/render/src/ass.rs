@@ -21,7 +21,8 @@
 //!   deferred JA-chunking work.
 
 use yc_core::{
-    CaptionGenre, CaptionPlacement, CaptionStyle, CaptionUnit, Transcript, CANVAS_H, CANVAS_W,
+    CaptionGenre, CaptionPlacement, CaptionStyle, CaptionUnit, ManualCaption, Transcript,
+    CANVAS_H, CANVAS_W,
 };
 
 /// Keep a completed line on screen this long after its last unit ends.
@@ -266,6 +267,21 @@ pub fn resolve_placement(
     (pos_x, pos_y, size)
 }
 
+/// The anchor of the operator's OWN caption stream — the second,
+/// SIMULTANEOUS stream (ADR 0065): one block above the auto captions'
+/// resolved anchor (they may share time, so they must not share space),
+/// clamped on-canvas. Shared by the ASS generator and the editor overlay so
+/// both draw the same geometry (ADR 0036).
+pub fn resolve_manual_placement(
+    placement: Option<CaptionPlacement>,
+    font_size: u32,
+) -> (u32, u32, u32) {
+    let (x, y, size) = resolve_placement(placement, font_size);
+    let lift = (size as f64 * 1.9).round() as u32;
+    let floor = (size as f64 * 0.8).round() as u32;
+    (x, y.saturating_sub(lift).max(floor), size)
+}
+
 /// How one word of a [`PreviewLine`] presents at playhead `t` — the preview
 /// overlay's per-word state, defined HERE so the genre semantics live beside
 /// the ASS emitters that encode the same rules as tags (ADR 0036: the preview
@@ -316,11 +332,15 @@ pub fn word_states(genre: CaptionGenre, line: &PreviewLine, t: f64) -> Vec<WordS
 /// `genre` selects the animation builder; everything else about the style is data
 /// (ADR 0004), so colours/font/size flow into the shared Style line. `placement`
 /// is the Clip's Caption placement (ADR 0036): `None` keeps the built-in anchor
-/// and size, byte-identical to pre-placement output.
+/// and size, byte-identical to pre-placement output. `manual` is the operator's
+/// own caption stream (ADR 0065): burned as separate, explicitly-positioned
+/// events — each at its own placement (default: one block above the auto
+/// captions) — so both streams may share time on screen.
 pub fn generate_ass(
     transcript: &Transcript,
     style: &CaptionStyle,
     placement: Option<CaptionPlacement>,
+    manual: &[ManualCaption],
 ) -> String {
     let mut s = String::new();
 
@@ -364,6 +384,39 @@ pub fn generate_ass(
         CaptionGenre::KaraokeFill => karaoke_fill_events(&lines, style, pos_x, pos_y),
     };
     s.push_str(&events);
+
+    // The operator's OWN captions: a second, simultaneous stream — captions
+    // may share TIME because they do not share SPACE (ADR 0065). Layer 1
+    // (over the auto events), explicit \pos (which turns libass collision-
+    // shifting off — the anchor is the contract), text uppercased like every
+    // burned caption, same reveal pop. Each caption sits at ITS OWN anchor:
+    // the operator's drag when placed (`\fs` carries their per-caption
+    // scale), else the default block above the auto captions. Timed exactly
+    // as placed: no clamps against the auto stream, only the zero-duration
+    // guard.
+    if !manual.is_empty() {
+        for c in manual {
+            let (mx, my, tag) = match c.placement {
+                Some(p) => {
+                    let (x, y, size) = resolve_placement(Some(p), style.font_size);
+                    (x, y, format!("\\fs{size}"))
+                }
+                None => {
+                    let (x, y, _) = resolve_manual_placement(placement, style.font_size);
+                    (x, y, String::new())
+                }
+            };
+            let u = &c.unit;
+            let end = u.end_s.max(u.start_s + WORD_MIN_S);
+            s.push_str(&format!(
+                "Dialogue: 1,{},{},Caption,,0,0,0,,{{\\an5\\pos({mx},{my}){tag}}}{}{}\n",
+                ass_time(u.start_s),
+                ass_time(end),
+                rolling_pop_tags(0),
+                u.text.to_uppercase(),
+            ));
+        }
+    }
 
     s
 }
@@ -794,7 +847,7 @@ mod tests {
     #[test]
     fn one_dialogue_per_line_with_header() {
         let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
-        let ass = generate_ass(&t, &style(), None);
+        let ass = generate_ass(&t, &style(), None, &[]);
         assert!(ass.contains("PlayResX: 1080"));
         assert!(ass.contains("PlayResY: 1920"));
         assert!(ass.contains("Anton"));
@@ -806,15 +859,72 @@ mod tests {
     #[test]
     fn first_unit_onset_is_zero() {
         // The first unit of each line pops at relative t=0.
-        let ass = generate_ass(&units(&["hello", "world"]), &style(), None);
+        let ass = generate_ass(&units(&["hello", "world"]), &style(), None, &[]);
         assert!(ass.contains("\\t(0,40,\\alpha&H00&)"));
+    }
+
+    #[test]
+    fn manual_stream_burns_simultaneously_above_the_auto_captions() {
+        // The operator's own captions are a SECOND stream (ADR 0065): their
+        // events overlap the auto captions in time, sit on layer 1 at their
+        // own \pos above the auto anchor, and never clamp the auto stream.
+        let man = |text: &str, start_s: f64, end_s: f64| ManualCaption {
+            unit: CaptionUnit { text: text.into(), start_s, end_s },
+            placement: None,
+        };
+        let t = units(&["hello", "world"]);
+        let manual = vec![man("my note", 0.1, 1.4)];
+        let ass = generate_ass(&t, &style(), None, &manual);
+        let (ax, ay, _) = resolve_placement(None, style().font_size);
+        let (mx, my, _) = resolve_manual_placement(None, style().font_size);
+        assert_eq!(ax, mx, "same horizontal anchor");
+        assert!(my < ay, "the manual stream sits ABOVE the auto captions");
+        assert!(
+            ass.contains(&format!(
+                "Dialogue: 1,0:00:00.10,0:00:01.40,Caption,,0,0,0,,{{\\an5\\pos({mx},{my})}}"
+            )),
+            "layer-1 event at the manual anchor, timed as placed: {ass}"
+        );
+        assert!(ass.contains("MY NOTE"), "burned uppercase like every caption");
+        // The auto stream is untouched by the overlap (its events unchanged
+        // vs a manual-free document).
+        let bare = generate_ass(&t, &style(), None, &[]);
+        for line in bare.lines().filter(|l| l.starts_with("Dialogue: 0,")) {
+            assert!(ass.contains(line), "auto event missing/changed: {line}");
+        }
+        // Zero-duration guard: a degenerate manual unit still shows.
+        let manual = vec![man("x", 1.0, 1.0)];
+        let ass = generate_ass(&t, &style(), None, &manual);
+        assert!(ass.contains("Dialogue: 1,0:00:01.00,0:00:01.10"), "floored: {ass}");
+    }
+
+    #[test]
+    fn manual_caption_with_its_own_placement_burns_there() {
+        // Dragged on the canvas (ADR 0065 amendment 4): the caption's own
+        // placement wins over the default raised anchor, and its per-caption
+        // scale rides an explicit \fs tag.
+        let t = units(&["hello"]);
+        let manual = vec![ManualCaption {
+            unit: CaptionUnit { text: "top left".into(), start_s: 0.0, end_s: 1.0 },
+            placement: Some(CaptionPlacement { x_frac: 0.25, y_frac: 0.10, scale: 1.5 }),
+        }];
+        let st = style();
+        let ass = generate_ass(&t, &st, None, &manual);
+        let (x, y, size) = resolve_placement(
+            Some(CaptionPlacement { x_frac: 0.25, y_frac: 0.10, scale: 1.5 }),
+            st.font_size,
+        );
+        assert!(
+            ass.contains(&format!("{{\\an5\\pos({x},{y})\\fs{size}}}")),
+            "own anchor + scaled font: {ass}"
+        );
     }
 
     #[test]
     fn huge_word_emits_one_nonzero_event_per_word() {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
-        let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st, None);
+        let ass = generate_ass(&units(&["satu", "dua", "tiga"]), &st, None, &[]);
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 3); // one caption per word
         // Each event carries exactly its own word (uppercased), never the next.
@@ -831,7 +941,7 @@ mod tests {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
         // Words at 0.0 and 0.5; the first must end no later than 0.5.
-        let ass = generate_ass(&units(&["a", "b"]), &st, None);
+        let ass = generate_ass(&units(&["a", "b"]), &st, None, &[]);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
         assert_eq!(end, "0:00:00.40"); // shows for the word's own end, clearing before next
@@ -851,7 +961,7 @@ mod tests {
                 CaptionUnit { text: "b".into(), start_s: 0.50, end_s: 0.90 },
             ],
         };
-        let ass = generate_ass(&t, &st, None);
+        let ass = generate_ass(&t, &st, None, &[]);
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
         assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.56
@@ -1249,7 +1359,7 @@ mod tests {
     fn captions_are_uppercased() {
         let mut st = style();
         st.genre = CaptionGenre::HugeWord;
-        let ass = generate_ass(&units(&["bocil", "gila"]), &st, None);
+        let ass = generate_ass(&units(&["bocil", "gila"]), &st, None, &[]);
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
     }
@@ -1272,7 +1382,7 @@ mod tests {
     #[test]
     fn karaoke_snap_emits_k_per_word_with_inline_colours() {
         // "a b c" = 5 chars -> one line, one Dialogue, three \k snap chunks.
-        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None);
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None, &[]);
         let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
         assert_eq!(dialogues.len(), 1);
         let d = dialogues[0];
@@ -1289,7 +1399,7 @@ mod tests {
         // Onsets 0.0 / 0.5 / 1.0 -> each non-last word dwells the 0.5 s gap before
         // the next snaps (\k50); the last over its own gap-filled span (1.0->1.4 =
         // \k40). Same cursor maths as the old \kf sweep — only the visual changed.
-        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None);
+        let ass = generate_ass(&units(&["a", "b", "c"]), &karaoke_style(), None, &[]);
         let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         assert_eq!(d.matches("\\k50").count(), 2); // a and b: onset-to-onset gaps
         assert!(d.contains("\\k40")); // c: its own duration 0.4 s
@@ -1314,7 +1424,7 @@ mod tests {
                 CaptionUnit { text: "c".into(), start_s: 1.3, end_s: 1.3 },
             ],
         };
-        let ass = generate_ass(&t, &karaoke_style(), None);
+        let ass = generate_ass(&t, &karaoke_style(), None, &[]);
         let d = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         assert_eq!(d.matches("{\\k").count(), 3);
         assert!(d.contains("\\k100"), "a dwells across the gap to b's onset: {d}");
@@ -1327,7 +1437,7 @@ mod tests {
         // Same character budget as rolling-pop: a long run splits into >1 line,
         // each its own Dialogue, and the count matches group_lines.
         let t = units(&["word0", "word1", "word2", "word3", "word4", "word5"]);
-        let ass = generate_ass(&t, &karaoke_style(), None);
+        let ass = generate_ass(&t, &karaoke_style(), None, &[]);
         let dialogues = ass.lines().filter(|l| l.starts_with("Dialogue:")).count();
         assert_eq!(dialogues, group_lines(&t, MAX_LINE_CHARS).len());
         assert!(dialogues >= 2);
@@ -1335,7 +1445,7 @@ mod tests {
 
     #[test]
     fn karaoke_fill_is_uppercased() {
-        let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style(), None);
+        let ass = generate_ass(&units(&["bocil", "gila"]), &karaoke_style(), None, &[]);
         assert!(ass.contains("BOCIL") && ass.contains("GILA"));
         assert!(!ass.contains("bocil"));
     }
@@ -1346,7 +1456,7 @@ mod tests {
         // the values that were hardcoded before it existed: a default style's
         // Style line must stay byte-identical (`1,6,2` borders, black outline,
         // the &H96000000 back colour).
-        let ass = generate_ass(&units(&["a"]), &style(), None);
+        let ass = generate_ass(&units(&["a"]), &style(), None, &[]);
         let line = ass.lines().find(|l| l.starts_with("Style:")).unwrap();
         assert!(
             line.contains(",&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,6,2,5,40,40,40,1"),
@@ -1363,7 +1473,7 @@ mod tests {
         st.shadow = 0.0;
         st.outline_color = [255, 0, 0, 255]; // red
         st.bold = true;
-        let ass = generate_ass(&units(&["a"]), &st, None);
+        let ass = generate_ass(&units(&["a"]), &st, None, &[]);
         let line = ass.lines().find(|l| l.starts_with("Style:")).unwrap();
         assert!(line.contains(",3,3.5,0,5,"), "BorderStyle 3 + widths: {line}");
         assert!(line.contains("&H001E140A"), "back colour BGR: {line}");
@@ -1381,8 +1491,8 @@ mod tests {
         for genre in [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill] {
             let mut st = style();
             st.genre = genre;
-            let bare = generate_ass(&t, &st, None);
-            let defaulted = generate_ass(&t, &st, Some(CaptionPlacement::default()));
+            let bare = generate_ass(&t, &st, None, &[]);
+            let defaulted = generate_ass(&t, &st, Some(CaptionPlacement::default()), &[]);
             assert_eq!(bare, defaulted, "genre {genre:?} drifted");
             // And the built-in anchor is what it always was: centered, 46%.
             assert!(bare.contains("\\pos(540,883)"), "anchor moved: {bare}");
@@ -1393,7 +1503,7 @@ mod tests {
     fn placement_moves_the_anchor_and_scales_the_font() {
         use yc_core::CaptionPlacement;
         let p = CaptionPlacement { x_frac: 0.5, y_frac: 0.72, scale: 1.5 };
-        let ass = generate_ass(&units(&["halo"]), &style(), Some(p));
+        let ass = generate_ass(&units(&["halo"]), &style(), Some(p), &[]);
         // 1920 * 0.72 = 1382.4 -> 1382; font 96 * 1.5 = 144 in the Style line.
         assert!(ass.contains("\\pos(540,1382)"), "anchor: {ass}");
         assert!(ass.contains("Style: Caption,Anton,144,"), "font size: {ass}");
@@ -1459,7 +1569,7 @@ mod tests {
             let mut st = style();
             st.genre = genre;
             let lines = preview_lines(&t, genre);
-            let ass = generate_ass(&t, &st, None);
+            let ass = generate_ass(&t, &st, None, &[]);
             let dialogues: Vec<&str> = ass.lines().filter(|l| l.starts_with("Dialogue:")).collect();
             assert_eq!(dialogues.len(), lines.len(), "genre {genre:?}");
             for (line, d) in lines.iter().zip(&dialogues) {

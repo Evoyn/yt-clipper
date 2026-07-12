@@ -97,9 +97,17 @@ fn layout_chain(layout: &Layout, in_label: &str, out_label: &str) -> String {
 /// runs once over the concatenated stream, so caption timing is untouched
 /// (shots are contiguous and start at 0, exactly the whole-clip timeline).
 ///
+/// `cut_audio` is the timeline-razor mode (ADR 0065): the shots are NOT
+/// contiguous (removed spans between them), so the graph also `atrim`s the
+/// matching audio span per shot and concats video+audio pairs into `[out]` +
+/// `[aout]` — the caller maps `[aout]` instead of the raw source audio, and
+/// burns an ASS whose times were remapped onto the compressed timeline
+/// (`yc_core::remap_units_through_cuts`). With `cut_audio` false the audio is
+/// untouched (contiguous shots ARE the source timeline).
+///
 /// The caller writes this to a script file and passes `-filter_complex_script`
 /// (a many-shot graph outgrows a comfortable command line).
-pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str) -> String {
+pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str, cut_audio: bool) -> String {
     // Defensive: an empty plan degrades to a centered full-frame — callers
     // shouldn't send one, but a graph that fails to parse sinks the render.
     if plan.shots.is_empty() {
@@ -130,13 +138,31 @@ pub fn build_camera_filtergraph(plan: &CameraPlan, ass_name: &str) -> String {
             shot.start_s, shot.end_s
         ));
         parts.push(shot_chain(shot, &format!("t{i}"), &format!("s{i}")));
-        labels.push(format!("[s{i}]"));
+        if cut_audio {
+            // The SAME span off the audio, so every video piece travels with
+            // exactly its own sound — A/V can't drift no matter what was cut.
+            parts.push(format!(
+                "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS[a{i}]",
+                shot.start_s, shot.end_s
+            ));
+            labels.push(format!("[s{i}][a{i}]"));
+        } else {
+            labels.push(format!("[s{i}]"));
+        }
     }
-    parts.push(format!(
-        "{}concat=n={}:v=1:a=0[cat];[cat]subtitles={ass_name}:fontsdir=fonts[out]",
-        labels.join(""),
-        plan.shots.len(),
-    ));
+    if cut_audio {
+        parts.push(format!(
+            "{}concat=n={}:v=1:a=1[cat][aout];[cat]subtitles={ass_name}:fontsdir=fonts[out]",
+            labels.join(""),
+            plan.shots.len(),
+        ));
+    } else {
+        parts.push(format!(
+            "{}concat=n={}:v=1:a=0[cat];[cat]subtitles={ass_name}:fontsdir=fonts[out]",
+            labels.join(""),
+            plan.shots.len(),
+        ));
+    }
     parts.join(";")
 }
 
@@ -182,21 +208,31 @@ pub fn export_args(
     filtergraph: &str,
     out_name: &str,
 ) -> Vec<String> {
-    export_args_inner(source, seek_s, duration_s, "-filter_complex", filtergraph, out_name)
+    export_args_inner(source, seek_s, duration_s, "-filter_complex", filtergraph, out_name, false)
 }
 
 /// [`export_args`] with the graph in a **script file** (`-filter_complex_script`,
 /// relative to ffmpeg's working dir) instead of inline — the dynamic-camera
 /// graph ([`build_camera_filtergraph`]) grows with its shot count and would
-/// outgrow a comfortable command line.
+/// outgrow a comfortable command line. `filtered_audio` maps the graph's
+/// `[aout]` (the razor-cut audio concat) instead of the raw source audio.
 pub fn export_args_script(
     source: &Path,
     seek_s: f64,
     duration_s: f64,
     script_name: &str,
     out_name: &str,
+    filtered_audio: bool,
 ) -> Vec<String> {
-    export_args_inner(source, seek_s, duration_s, "-filter_complex_script", script_name, out_name)
+    export_args_inner(
+        source,
+        seek_s,
+        duration_s,
+        "-filter_complex_script",
+        script_name,
+        out_name,
+        filtered_audio,
+    )
 }
 
 fn export_args_inner(
@@ -206,6 +242,7 @@ fn export_args_inner(
     graph_flag: &str,
     graph: &str,
     out_name: &str,
+    filtered_audio: bool,
 ) -> Vec<String> {
     vec![
         "-ss".into(),
@@ -219,7 +256,7 @@ fn export_args_inner(
         "-map".into(),
         "[out]".into(),
         "-map".into(),
-        "0:a:0".into(),
+        if filtered_audio { "[aout]".into() } else { "0:a:0".into() },
         "-c:v".into(),
         "h264_nvenc".into(),
         "-preset".into(),
@@ -305,7 +342,7 @@ mod tests {
                 Shot { start_s: 14.0, end_s: 30.0, track: Some(1), layout: solo(1200.0), pan_to: None },
             ],
         };
-        let g = build_camera_filtergraph(&plan, "clip.ass");
+        let g = build_camera_filtergraph(&plan, "clip.ass", false);
         // One trim per shot, contiguous and rebased, boundaries printed
         // shortest-round-trip (never rounded — rounding across a source frame's
         // pts strands that frame in the wrong shot: a 1-frame flash).
@@ -348,7 +385,7 @@ mod tests {
                 Shot { start_s: CUT, end_s: 25.0, track: Some(1), layout: solo(1200.0), pan_to: None },
             ],
         };
-        let g = build_camera_filtergraph(&plan, "clip.ass");
+        let g = build_camera_filtergraph(&plan, "clip.ass", false);
         // Each incoming shot's trim start must be <= its cut frame's pts (so
         // `pts >= start` keeps the frame) yet not reach back to the previous
         // frame (~41.7 ms earlier at 23.976 fps).
@@ -371,7 +408,7 @@ mod tests {
 
     #[test]
     fn empty_camera_plan_degrades_to_a_static_full_frame() {
-        let g = build_camera_filtergraph(&CameraPlan::default(), "clip.ass");
+        let g = build_camera_filtergraph(&CameraPlan::default(), "clip.ass", false);
         assert!(g.contains("subtitles=clip.ass"));
         assert!(!g.contains("concat"));
     }
@@ -389,7 +426,7 @@ mod tests {
                 pan_to: Some(Crop { x: 220.0, y: 40.0, w: 452.0, h: 802.0 }),
             }],
         };
-        let g = build_camera_filtergraph(&plan, "clip.ass");
+        let g = build_camera_filtergraph(&plan, "clip.ass", false);
         // Same-size crop, origin gliding over the 8 s shot; commas escaped so
         // the expression survives the filtergraph parser.
         assert!(g.contains("crop=452:802:x='100.0+(120.0)*min(t/8.000\\,1)'"), "graph: {g}");
@@ -412,14 +449,43 @@ mod tests {
                 pan_to: None,
             }],
         };
-        let g = build_camera_filtergraph(&plan, "clip.ass");
+        let g = build_camera_filtergraph(&plan, "clip.ass", false);
         assert!(g.contains("crop=452:802:380:0"), "graph: {g}");
         assert!(!g.contains("min(t/"), "no expression on a static shot: {g}");
     }
 
     #[test]
+    fn razor_graph_cuts_audio_with_video_and_maps_aout() {
+        // Timeline razor (ADR 0065): non-contiguous shots — every video piece
+        // must travel with exactly its own audio span, pairs interleaved into
+        // one v+a concat, and the args must map the graph's [aout].
+        use yc_core::Shot;
+        let solo = |x: f32| Layout::FullFrame { crop: Crop { x, y: 0.0, w: 608.0, h: 1080.0 } };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 3.0, track: None, layout: solo(100.0), pan_to: None },
+                Shot { start_s: 6.0, end_s: 10.0, track: None, layout: solo(100.0), pan_to: None },
+            ],
+        };
+        let g = build_camera_filtergraph(&plan, "clip.ass", true);
+        assert_eq!(g.matches("atrim=start=").count(), 2, "one audio trim per piece: {g}");
+        assert!(g.contains("atrim=start=6:end=10"), "audio spans match video: {g}");
+        assert!(g.contains("asetpts=PTS-STARTPTS"));
+        assert!(g.contains("[s0][a0][s1][a1]concat=n=2:v=1:a=1[cat][aout]"), "graph: {g}");
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once, post-concat");
+        let args =
+            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", true);
+        assert!(args.contains(&"[aout]".to_string()), "maps the cut audio");
+        assert!(!args.contains(&"0:a:0".to_string()), "raw source audio must not be mapped");
+        // The contiguous camera path keeps the raw audio map.
+        let plain =
+            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false);
+        assert!(plain.contains(&"0:a:0".to_string()));
+    }
+
+    #[test]
     fn export_args_script_uses_the_script_flag() {
-        let args = export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4");
+        let args = export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false);
         let f = args.iter().position(|a| a == "-filter_complex_script").unwrap();
         assert_eq!(args[f + 1], "camera.fg");
         assert!(!args.contains(&"-filter_complex".to_string()));

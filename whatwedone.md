@@ -4,6 +4,107 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 — The Studio timeline became a real editor, in two rounds: cut the CLIP (razor), cut the CAMERA, frame shots yourself, motion presets, saved caption looks, master volume
+
+Your `feature-implementation-plan.md` opened its arc ("do this session
+automatically, egui first"). Round 1 shipped draggable caption blocks,
+draggable camera-cut markers, and the volume slider; you drove it and
+ruled: "split" read wrong (it's a camera transition), you couldn't cut
+TIME at all, you couldn't frame a shot yourself, dragging a caption made
+neighbours vanish from the timeline, and caption duration had no control.
+Round 2 (ADR 0065) answered every finding plus the rest of the plan's
+egui-reachable items:
+
+- **Two cut verbs, named honestly**: `◆ Camera cut` changes framing at a
+  point (drag the gold markers, right-click to delete, merge keeps the
+  framing you were watching); the RAZOR segments the timeline and removes
+  spans from the export outright. Round 6 gave it your **marker-scissors**
+  shape: `▼ Mark` drops the reference point (drag it; right-click clears),
+  then `✂←` cuts from the playhead back to the marker (or the clip start)
+  and `→✂` forward to the marker (or the clip end) — your middle-cut flow
+  is exactly "mark the start, play past it, ✂←". The **Delete** key still
+  drops the segment under the playhead; right-click a dimmed segment to
+  restore. A removed span is gone from video, AUDIO, and captions
+  together: the render cuts audio with each kept piece (`atrim` pairs in
+  the concat), remaps caption times onto the compressed timeline, and
+  preview playback skips the span exactly like the export will. The last
+  kept segment is unremovable — you can't export nothing.
+- **A video track** (round 4): the whole clip as filmstrip thumbnails
+  right under the ruler, so you can SEE what you're cutting; removed
+  segments dim their thumbnails too.
+- **Polish round (your 2026-07-13 verdict)**: the scissors trio is now ONE
+  merged control (`✂⏴ | ⏷ Mark | ⏵✂`, no gaps) with glyphs that actually
+  render (the boxes you screenshotted were characters missing from the
+  font; the timeline's marker head and camera badges are painted shapes
+  now, immune to fonts). **Double-click any caption on the preview** —
+  the AI's or yours — and its text field opens in the panel ready to
+  type. The Camera-cut button is parked until the keyframe arc makes
+  per-cut framing real (still reachable via the timeline's right-click
+  menu on podcast clips). The **playhead got its own grab handle** at its
+  head — it always wins the pointer there, so scrubbing while parked on a
+  razor cut no longer drags the cut instead (markers stay grabbable on
+  their lines below the head).
+- **Your own camera frame, per shot** (Active Speaker): drag the crop box
+  in Original view — or just drag the picture in Preview — and you reframe
+  THE SHOT you're looking at (it goes static, like a click-retarget; the
+  audit re-runs). Add a `◆ Camera cut`, then frame each side yourself —
+  the "my own cut screen" you asked for.
+- **Caption blocks = your panel rows now, one block per caption — on TWO
+  lanes.** Round 3 (your same-day verdict) added the dedicated track you
+  asked for: `＋ Caption` drops onto **your own "yours" lane** under the
+  auto captions, with its own "Your captions" section in the panel — your
+  additions never fight the AI lane again. Blocks also **drag freely past
+  each other** now (no more getting stuck between captions; lanes sort on
+  release). Round 5 answered your "can't I have 2 captions at the same
+  time?" properly: **your lane is a real second caption stream** — yours
+  and the AI's can be on screen together (the earlier overwrite rule is
+  gone), preview matching export. Round 6 made each of your captions
+  **draggable anywhere on the screen**: grab it on the preview to place
+  it, scroll on it to resize, right-click to reset to the default spot
+  above the auto captions — each caption remembers its own position, so
+  two of yours can sit in different corners at the same moment. Warnings
+  only fire when captions truly collide: an auto caption its successor
+  would zero out, or two of YOUR captions sharing both time and the same
+  default spot. The thin rail under the lanes shows what burns together
+  as one auto line; drag the rail to move the whole line.
+- **Caption duration is yours**: drag a block's right edge, or type/drag
+  the new end-time field beside each row's start (start still MOVES the
+  caption; end sets how long it stays). The burn still clears a line at
+  the next line's onset — one line on screen at a time, by design.
+- **Panel editing un-broke** (round 3): rows are two-line now — times +
+  actions up top, the text field FULL-WIDTH below (a narrow panel had
+  squeezed it into uneditability) — and the list no longer re-sorts while
+  you're typing/dragging a time, which was swapping the row under your
+  cursor mid-edit (your "it replaced the other caption").
+- **Motion presets** (#9): Zoom in/out, Pan left/right, Ken Burns, Punch
+  in — one click in the Framing card (full-frame kinds), rendered as a
+  glide/cut of your framing through the same camera machinery as Active
+  Speaker, so preview and export are the same motion. Your crop tools set
+  the start frame.
+- **Saved caption looks** (#12): name the current style and "Save preset"
+  in the Caption panel; your presets persist in `workspace/settings.json`
+  beside the master volume (#7, round 1) and apply with one click
+  (right-click deletes).
+- Recorded in **ADR 0064 + 0065**; CONTEXT.md's Studio entry rewritten
+  (say Camera cut / Clip cut, never "split"). 108 tests green across
+  core/render/app (razor ops, cut-plan intersection incl. glide
+  continuity, caption remap, the audio-pairing filtergraph, motion plans,
+  settings round-trip). Clippy clean on the release feature set.
+- **Still in the plan, NOT in this slice** (they need the render arc, not
+  egui): transitions (#4/#10), thumbnail intro (#5), music track (#6),
+  true keyframes (#1) + auto-zoom (#8), inspector extras (#11: speed,
+  opacity, per-clip volume), multi-track/B-roll (#13/#14), speed ramp
+  (#16). The crop tool (#15) exists as the panel crops (the canvas is
+  fixed 9:16 by design). Queued next after your eye: title generation
+  (`nextprompt-title-gen.md`).
+- **For your eye on the release build**: razor a middle segment out and
+  render — watch the join (video, audio, captions all skip together);
+  reframe a couple of shots by dragging the picture; try a motion preset
+  end-to-end; confirm nothing about captions vanishes while dragging
+  anymore.
+
+---
+
 ## 2026-07-12 — The arousal Signal now ships in your release builds (A/B verified; your saved Moments untouched)
 
 You picked this thread and said "do this automatically, finish all things

@@ -1,0 +1,22 @@
+# The Studio timeline becomes directly editable (captions, cut points) + a persisted master playback volume
+
+First slice of the operator's editor-suite plan (`feature-implementation-plan.md`, queued 2026-07-12 — items #2's timeline half, #3, and #7), scoped deliberately to the **egui surface**: every edit flows through data the render already consumes (the Transcript override burned verbatim per ADR 0039; the operator-overridable `CameraPlan` per ADR 0038), so the export path changes by zero words. The operator skipped the arc's opening grill ("do this session automatically, focus on egui first") — this ADR records the grammar decisions the grill would have pinned, so later slices (keyframes, multi-track, transitions) inherit them.
+
+## Decision
+
+1. **Caption blocks are timeline objects.** Body-drag moves a line's units together in time; 6-px edge zones trim the first unit's onset / last unit's on-screen end (blocks ≥ 26 px only — tiny huge-word blocks stay move-only, the panel's `m:ss.cc` fields cover fine trims). Click still jumps + selects the transcript row: the timeline locates, the panel fixes words. A `＋ Caption` transport button (and the panel's existing add) inserts at the playhead. All of it sets the transcript override — **manual captions are first-class editor artifacts; the Dialect store stays untouched** (the no-JSON-corrections rule).
+2. **Cut points are draggable.** A marker drag moves the boundary between its two shots (min shot 0.15 s); `✂ Split` adds a cut at the playhead; right-click deletes one. **Delete merges INTO THE EARLIER shot** — the framing the viewer was already watching carries across the span; a split preserves a glide exactly (first half lands where the pan had reached, the second continues to the original target), so splitting never twitches the picture. Every plan edit re-runs the camera audit (defects surface before the export, ADR 0048).
+3. **Snapping.** Gestures magnet (8 px) to the playhead and cut boundaries — the workflow is "park the playhead on the moment by ear, drag the thing to it". A dragged cut otherwise quantizes to the **source frame grid** (the render trims at full pts precision; a frame-exact boundary cuts clean — ADR 0038's trim lesson); caption times quantize to **centiseconds**, the panel's own display granularity, never precision the operator can't see.
+4. **Gestures are pointer-tracked, not widget-tracked** (`TimelineDrag`: original times + grab point, applied absolutely each frame). Caption lines regroup live while their units move (`preview_lines` re-runs mid-drag), so the block a gesture started on can merge away without breaking the gesture. Order-stability clamps keep a drag from reordering units; a release sorts as a safety net.
+5. **Master playback volume** (plan #7): one slider in the Studio transport (and the review pane's existing one — same value), 0–200 % linear rodio gain, applied to the live sink immediately, persisted in **`workspace/settings.json`** (a new app-level store beside `creators.json`; per-Creator and per-VOD stores are the wrong scope for an app preference). Debounced write (~0.7 s rest, flushed by eframe's save hook on exit). Playback only, structurally: the render never reads it.
+
+## Considered and rejected
+
+- **Timeline zoom/scroll** — real need for sub-second precision on long clips, but it is plan #13's multi-track architecture work, not #3; the panel's timestamp fields cover precision today.
+- **Deleting a cut into the LATER shot** (or asking) — the earlier shot is what the eye is on when the cut feels wrong; one deterministic rule beats a modal.
+- **eframe's own storage for the volume** — persists in the OS profile dir; this tool is exe-plus-folders (ADR 0005), settings belong beside the workspace they describe.
+- **Trim-end compensating the rolling-line hold** (pointer = Dialogue edge) — rejected: the raw unit end is what the panel shows and the burn times; the +0.5 s hold is presentation. Delta-application keeps the pointer and the edge moving 1:1 regardless.
+
+## Validation
+
+`cargo check`/`clippy` clean on default and `face,align,ser` (the release set); pure helpers unit-tested (glide-preserving split, earlier-shot merge, magnet tolerance, cs quantization, settings round-trip — 35 green). The gate for the feel — smooth drags, honest snapping, no cut flash — is the operator's eye on the release build (gate on the burn, not the label).

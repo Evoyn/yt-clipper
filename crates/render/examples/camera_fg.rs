@@ -22,5 +22,5 @@ fn main() {
             Shot { start_s: 8.0, end_s: 12.0, track: Some(1), layout: solo(800.0), pan_to: None },
         ],
     };
-    print!("{}", yc_render::build_camera_filtergraph(&plan, "clip.ass"));
+    print!("{}", yc_render::build_camera_filtergraph(&plan, "clip.ass", false));
 }

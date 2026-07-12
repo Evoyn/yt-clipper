@@ -13,6 +13,13 @@
 //! ├─────────────── timeline: ruler · captions · speakers · cuts ───────┤
 //! ```
 //!
+//! The timeline is directly editable (feature plan #2/#3): caption blocks
+//! drag in time and trim at their edges, camera cut markers drag / split at
+//! the playhead / delete via right-click — all with magnetic snapping. Edits
+//! flow through the same truths as the panels (the transcript override, the
+//! operator-overridable camera plan), so the render burns exactly what the
+//! timeline shows.
+//!
 //! All framing geometry stays the pure `yc_frame` layer; the speaker analysis
 //! and camera plan come from the worker (`Progress::Speakers`); the caption
 //! line model stays `yc_render`'s (the preview cannot drift from the burn-in,
@@ -22,16 +29,319 @@ use std::time::Instant;
 
 use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind};
 use yc_core::{
-    CameraMode, CameraPlan, CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle, Crop,
-    Layout, TimeRange, Transcript, CANVAS_H, CANVAS_W,
+    CameraMode, CameraPlan, CaptionEngine, CaptionGenre, CaptionPlacement, CaptionStyle,
+    CaptionUnit, Crop, Layout, Shot, TimeRange, Transcript, CANVAS_H, CANVAS_W,
 };
 use yc_frame::speaker::{track_label, SpeakerAnalysis};
 use yc_frame::FaceCluster;
-use yc_render::{preview_lines, resolve_placement, word_states, PreviewLine, WordState};
+use yc_render::{
+    preview_lines, resolve_manual_placement, resolve_placement, word_states, PreviewLine,
+    WordState,
+};
 
 use crate::player::PreviewPlayer;
 use crate::presets::caption_presets;
 use crate::theme;
+
+/// Direct-manipulation floor: a caption unit never trims below this.
+const CAP_MIN_S: f64 = 0.05;
+/// A manually-edited camera shot never shrinks below this (a sub-perceptual
+/// shot reads as a glitch frame, and the planner never emits one either).
+const MIN_SHOT_S: f64 = 0.15;
+/// A razor segment never shrinks below this — a shorter keep/remove span is
+/// operator error, not intent.
+const MIN_SEG_S: f64 = 0.1;
+/// Pointer radius (points) within which a dragged time snaps to an anchor.
+const SNAP_PX: f32 = 8.0;
+
+/// Which caption lane a timeline gesture edits: the pipeline's transcript
+/// (auto) or the operator's own added captions — the dedicated track the
+/// operator asked for (2026-07-12; plan #2's "manual alongside AI").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapLane {
+    Auto,
+    Manual,
+}
+
+/// One in-flight direct-manipulation gesture on the timeline strip. Tracked
+/// by pointer position plus the ORIGINAL times (applied absolutely every
+/// frame — no incremental drift), never by egui widget-id continuity: caption
+/// blocks and razor segments reshape live while a gesture runs, so the widget
+/// a gesture started on can vanish mid-drag without breaking the gesture.
+#[derive(Clone)]
+enum TimelineDrag {
+    /// Move caption units together in time: one block, or a whole burn line
+    /// via its rail (which can span BOTH lanes — targets are explicit).
+    CapMove {
+        targets: Vec<(CapLane, usize)>,
+        /// Each target's (start_s, end_s) at drag start (same order).
+        orig: Vec<(f64, f64)>,
+        /// Timeline time under the pointer at drag start.
+        grab_t: f64,
+    },
+    /// Trim a caption's onset (end stays).
+    CapTrimStart { lane: CapLane, unit: usize, orig_start: f64, grab_t: f64 },
+    /// Trim a caption's on-screen end.
+    CapTrimEnd { lane: CapLane, unit: usize, orig_end: f64, grab_t: f64 },
+    /// Move the camera cut between plan shots `boundary-1` and `boundary`.
+    Cut { boundary: usize, orig_t: f64, grab_t: f64 },
+    /// Move timeline razor cut `idx` (the boundary between two segments).
+    Razor { idx: usize, orig_t: f64, grab_t: f64 },
+    /// Move the razor's ▼ cut marker (the ✂←/→✂ reference point).
+    Marker { orig_t: f64, grab_t: f64 },
+}
+
+/// The timeline razor's state (feature plan #3, operator ask 2026-07-12
+/// "make another to cut the timeline"): interior cut times segmenting the
+/// clip, plus a removed flag per segment. Removed spans are dropped from the
+/// export — video, audio, and captions together (ADR 0065); preview playback
+/// skips them. Pure and unit-tested; the strip draws/edits it.
+#[derive(Default)]
+struct RazorState {
+    /// Sorted interior cut times (clip-relative, exclusive of 0 and dur).
+    cuts: Vec<f64>,
+    /// One flag per segment (`cuts.len() + 1`): true = cut out of the export.
+    removed: Vec<bool>,
+}
+
+impl RazorState {
+    /// Segment bounds, `cuts.len() + 1` of them covering `0..dur`.
+    fn segments(&self, dur: f64) -> Vec<(f64, f64)> {
+        let mut edges = Vec::with_capacity(self.cuts.len() + 2);
+        edges.push(0.0);
+        edges.extend_from_slice(&self.cuts);
+        edges.push(dur);
+        edges.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
+    fn seg_index_at(&self, t: f64) -> usize {
+        self.cuts.iter().take_while(|c| **c <= t).count()
+    }
+
+    /// Split the segment containing `t`. Both halves inherit its removed
+    /// flag. Refused within [`MIN_SEG_S`] of an existing edge.
+    fn add_cut(&mut self, t: f64, dur: f64) -> bool {
+        if self.removed.is_empty() {
+            self.removed.push(false);
+        }
+        let near_edge = t < MIN_SEG_S
+            || t > dur - MIN_SEG_S
+            || self.cuts.iter().any(|c| (c - t).abs() < MIN_SEG_S);
+        if near_edge {
+            return false;
+        }
+        let i = self.seg_index_at(t);
+        self.cuts.insert(i, t);
+        self.removed.insert(i + 1, self.removed[i]);
+        true
+    }
+
+    /// Merge the two segments around cut `idx`. The merged segment is removed
+    /// only if BOTH halves were (keeping content is the safe default).
+    fn delete_cut(&mut self, idx: usize) -> bool {
+        if idx >= self.cuts.len() {
+            return false;
+        }
+        self.cuts.remove(idx);
+        let later = self.removed.remove(idx + 1);
+        self.removed[idx] = self.removed[idx] && later;
+        true
+    }
+
+    /// Toggle a segment's removal. Refuses to remove the LAST kept segment —
+    /// an export of nothing is never intent.
+    fn toggle_segment(&mut self, i: usize) -> bool {
+        if self.removed.is_empty() {
+            self.removed.push(false);
+        }
+        if i >= self.removed.len() {
+            return false;
+        }
+        if !self.removed[i] && self.removed.iter().filter(|r| !**r).count() <= 1 {
+            return false;
+        }
+        self.removed[i] = !self.removed[i];
+        true
+    }
+
+    /// The kept spans, adjacent kept segments merged — what the export keeps.
+    /// `None` when nothing is removed (razor cuts alone are just markers).
+    fn kept_spans(&self, dur: f64) -> Option<Vec<TimeRange>> {
+        if !self.removed.iter().any(|r| *r) {
+            return None;
+        }
+        let mut out: Vec<TimeRange> = Vec::new();
+        for (i, (a, b)) in self.segments(dur).iter().enumerate() {
+            if *self.removed.get(i).unwrap_or(&false) {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if (last.end_s - *a).abs() < 1e-9 => last.end_s = *b,
+                _ => out.push(TimeRange { start_s: *a, end_s: *b }),
+            }
+        }
+        Some(out)
+    }
+
+    /// The removed span containing `t`, if any (playback skips it).
+    fn removed_span_at(&self, t: f64, dur: f64) -> Option<(f64, f64)> {
+        let i = self.seg_index_at(t);
+        if *self.removed.get(i).unwrap_or(&false) {
+            let segs = self.segments(dur);
+            return segs.get(i).copied();
+        }
+        None
+    }
+
+    /// Remove the span `[a, b]` from the export: ensure razor cuts at both
+    /// bounds (reusing any within the min-segment radius; a bound at the
+    /// clip edge needs none) and mark every segment inside removed. Refused
+    /// when the span is sub-segment or removing it would empty the export.
+    fn remove_span(&mut self, a: f64, b: f64, dur: f64) -> bool {
+        let (a, b) = (a.max(0.0), b.min(dur));
+        if b - a < MIN_SEG_S {
+            return false;
+        }
+        for bound in [a, b] {
+            let interior = bound > MIN_SEG_S && bound < dur - MIN_SEG_S;
+            if interior
+                && !self.cuts.iter().any(|c| (c - bound).abs() < MIN_SEG_S)
+                && !self.add_cut(bound, dur)
+            {
+                return false;
+            }
+        }
+        if self.removed.is_empty() {
+            self.removed.push(false);
+        }
+        let segs = self.segments(dur);
+        let doomed: Vec<usize> = segs
+            .iter()
+            .enumerate()
+            .filter(|(i, (s, e))| {
+                !*self.removed.get(*i).unwrap_or(&false)
+                    && *s >= a - MIN_SEG_S
+                    && *e <= b + MIN_SEG_S
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let kept_after = self
+            .removed
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| !**r && !doomed.contains(i))
+            .count();
+        if doomed.is_empty() || kept_after == 0 {
+            return false;
+        }
+        for i in doomed {
+            self.removed[i] = true;
+        }
+        true
+    }
+
+    /// ✂← — cut LEFT from the playhead: removes back to the marker when one
+    /// sits left of the playhead, else to the clip start (the operator's
+    /// marker-scissors flow, 2026-07-12).
+    fn cut_left(&mut self, playhead: f64, marker: Option<f64>, dur: f64) -> bool {
+        let a = marker.filter(|m| *m < playhead - MIN_SEG_S).unwrap_or(0.0);
+        self.remove_span(a, playhead, dur)
+    }
+
+    /// →✂ — cut RIGHT from the playhead: removes up to the marker when one
+    /// sits right of the playhead, else to the clip end.
+    fn cut_right(&mut self, playhead: f64, marker: Option<f64>, dur: f64) -> bool {
+        let b = marker.filter(|m| *m > playhead + MIN_SEG_S).unwrap_or(dur);
+        self.remove_span(playhead, b, dur)
+    }
+
+    /// Remove the segment under `t` (the CapCut "cut the middle" finisher:
+    /// two cuts around it, park the playhead inside, remove). Restore stays
+    /// on the segment's right-click menu.
+    fn remove_segment_at(&mut self, t: f64) -> bool {
+        let i = self.seg_index_at(t);
+        if *self.removed.get(i).unwrap_or(&false) {
+            return false; // already removed
+        }
+        self.toggle_segment(i)
+    }
+}
+
+/// A one-click motion preset (feature plan #9): rendered as a [`CameraPlan`]
+/// glide/cut over the operator's manual full-frame crop — the same `camera.fg`
+/// machinery as the Active Speaker plan, so preview and export agree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MotionPreset {
+    ZoomIn,
+    ZoomOut,
+    PanLeft,
+    PanRight,
+    KenBurns,
+    PunchIn,
+}
+
+const MOTION_PRESETS: [(MotionPreset, &str); 6] = [
+    (MotionPreset::ZoomIn, "Zoom in"),
+    (MotionPreset::ZoomOut, "Zoom out"),
+    (MotionPreset::PanLeft, "Pan left"),
+    (MotionPreset::PanRight, "Pan right"),
+    (MotionPreset::KenBurns, "Ken Burns"),
+    (MotionPreset::PunchIn, "Punch in"),
+];
+
+fn motion_label(m: MotionPreset) -> &'static str {
+    MOTION_PRESETS.iter().find(|(p, _)| *p == m).map(|(_, l)| *l).unwrap_or("Motion")
+}
+
+/// Build the camera plan a motion preset renders as, over the operator's
+/// manual crop. Pans first tighten the crop slightly (a full-width crop has
+/// no room to travel); Punch in is a hard CUT to a tighter crop at 55% — the
+/// grammar is a punch, not a glide.
+fn motion_plan(base: Crop, sw: f32, sh: f32, dur: f64, preset: MotionPreset) -> CameraPlan {
+    let full = |crop: Crop| Layout::FullFrame { crop };
+    let zoomed = |c: Crop, f: f32| {
+        yc_frame::zoom_crop(c, sw, sh, f, c.x + c.w * 0.5, c.y + c.h * 0.5)
+    };
+    let shot = |start_s: f64, end_s: f64, layout: Layout, pan_to: Option<Crop>| Shot {
+        start_s,
+        end_s,
+        track: None,
+        layout,
+        pan_to,
+    };
+    let shots = match preset {
+        MotionPreset::ZoomIn => vec![shot(0.0, dur, full(base), Some(zoomed(base, 0.82)))],
+        MotionPreset::ZoomOut => vec![shot(0.0, dur, full(zoomed(base, 0.82)), Some(base))],
+        MotionPreset::PanLeft | MotionPreset::PanRight => {
+            let z = zoomed(base, 0.88);
+            let travel = z.w * 0.12;
+            let (from, to) = if preset == MotionPreset::PanLeft {
+                (yc_frame::pan_crop(z, sw, sh, travel, 0.0), yc_frame::pan_crop(z, sw, sh, -travel, 0.0))
+            } else {
+                (yc_frame::pan_crop(z, sw, sh, -travel, 0.0), yc_frame::pan_crop(z, sw, sh, travel, 0.0))
+            };
+            vec![shot(0.0, dur, full(from), Some(to))]
+        }
+        MotionPreset::KenBurns => {
+            let drift = base.w * 0.05;
+            let from = yc_frame::pan_crop(zoomed(base, 0.94), sw, sh, -drift, -drift);
+            let to = yc_frame::pan_crop(zoomed(base, 0.82), sw, sh, drift, drift);
+            vec![shot(0.0, dur, full(from), Some(to))]
+        }
+        MotionPreset::PunchIn => {
+            let at = (dur * 0.55).max(MIN_SHOT_S).min(dur - MIN_SHOT_S);
+            if at <= MIN_SHOT_S {
+                vec![shot(0.0, dur, full(base), None)]
+            } else {
+                vec![
+                    shot(0.0, at, full(base), None),
+                    shot(at, dur, full(zoomed(base, 0.75)), None),
+                ]
+            }
+        }
+    };
+    CameraPlan { shots }
+}
 
 /// Which of the three Layouts the operator has selected. `Layout::FullFrame`
 /// collapses the talking-cam and gameplay cases into one variant, so the
@@ -68,10 +378,19 @@ pub struct RenderSpec {
     pub layout: Layout,
     pub style: CaptionStyle,
     pub placement: Option<CaptionPlacement>,
-    /// The active-speaker cut plan — `Some` only in ActiveSpeaker mode.
+    /// The dynamic camera — the active-speaker cut plan, or a Manual-mode
+    /// motion preset synthesized as a plan (feature plan #9).
     pub camera: Option<CameraPlan>,
     /// The operator's edited transcript — `Some` only when they touched it.
     pub transcript_override: Option<Transcript>,
+    /// The timeline razor's kept spans (ADR 0065) — `Some` only when a
+    /// segment is removed; the export drops everything between them.
+    pub keep: Option<Vec<TimeRange>>,
+    /// The operator's own caption stream (ADR 0065): burned as separate
+    /// simultaneous events — each at its own placement (default: above the
+    /// auto captions) — captions may share TIME because the two streams do
+    /// not share SPACE.
+    pub manual_captions: Vec<yc_core::ManualCaption>,
 }
 
 /// What `show` reports back to the app each frame.
@@ -187,6 +506,38 @@ pub struct EditorState {
     /// One-shot: scroll the transcript panel to `sel_unit` this frame (set by
     /// clicking a caption block on the timeline).
     scroll_to_sel: bool,
+    /// The operator's OWN captions (the dedicated manual lane, plan #2):
+    /// editor artifacts burned as their own simultaneous stream — never
+    /// written into any store.
+    manual_units: Vec<CaptionUnit>,
+    /// Where each manual caption sits on the canvas, 1:1 with
+    /// `manual_units` (every structural edit maintains the pairing —
+    /// insert/remove/sort go through the shared helpers). `None` = the
+    /// default anchor above the auto captions; `Some` = the operator's drag.
+    manual_places: Vec<Option<CaptionPlacement>>,
+    /// Selected row in the manual lane / "Your captions" panel section.
+    sel_manual: Option<usize>,
+    /// One-shot: focus this caption's text field in the panel (set by
+    /// double-clicking a caption on the PREVIEW — edit what you see).
+    focus_caption: Option<(CapLane, usize)>,
+    /// The razor's cut marker (▼): the reference point the ✂← / →✂ verbs
+    /// cut to from the playhead (operator's CapCut flow, 2026-07-12).
+    cut_marker: Option<f64>,
+    /// A panel time-edit changed unit order: sort once no time widget is
+    /// active (sorting mid-edit swapped the row under the operator's cursor —
+    /// the "it replaced the other caption" bug, 2026-07-12).
+    panel_sort_pending: bool,
+    /// The timeline gesture in flight (caption move/trim, cut drag), if any.
+    drag: Option<TimelineDrag>,
+    /// The timeline razor: segment cuts + removed spans (feature plan #3).
+    razor: RazorState,
+    /// Where the strip's right-click menu opened, so its actions (cut here,
+    /// remove segment) land at the click, not wherever the pointer went next.
+    strip_menu_t: Option<f64>,
+    /// Manual-mode motion preset (feature plan #9); `None` = static framing.
+    motion: Option<MotionPreset>,
+    /// Name buffer for saving the current caption style as a preset (#12).
+    preset_name: String,
     /// Export-summary modal visibility.
     show_export: bool,
 }
@@ -262,6 +613,17 @@ impl EditorState {
             speaker_job: SpeakerJob::NotRun,
             sel_unit: None,
             scroll_to_sel: false,
+            manual_units: Vec::new(),
+            manual_places: Vec::new(),
+            sel_manual: None,
+            focus_caption: None,
+            cut_marker: None,
+            panel_sort_pending: false,
+            drag: None,
+            razor: RazorState::default(),
+            strip_menu_t: None,
+            motion: None,
+            preset_name: String::new(),
             show_export: false,
         }
     }
@@ -273,11 +635,24 @@ impl EditorState {
         if self.transcript_dirty {
             return;
         }
-        self.lines = preview_lines(&transcript, self.style.genre);
-        self.lines_genre = self.style.genre;
-        self.lines_dirty = false;
-        self.overlay_cache = None;
         self.transcript = Some(transcript);
+        // Rebuild the line model MERGED with the manual lane on the next
+        // frame (a late worker echo must not hide the operator's captions).
+        self.lines_dirty = true;
+        self.overlay_cache = None;
+        // A gesture on the OLD units would land on the wrong words.
+        self.drag = None;
+    }
+
+    /// The units vec a caption lane edits. The two lanes are two RENDER
+    /// streams (ADR 0065): the auto captions burn as today, the operator's
+    /// lane burns as its own simultaneous events one block above — captions
+    /// may share time across streams because they don't share space.
+    fn lane_units_mut(&mut self, lane: CapLane) -> Option<&mut Vec<CaptionUnit>> {
+        match lane {
+            CapLane::Auto => self.transcript.as_mut().map(|t| &mut t.units),
+            CapLane::Manual => Some(&mut self.manual_units),
+        }
     }
 
     /// Receive the speaker analysis + camera plan (`Progress::Speakers`).
@@ -288,14 +663,22 @@ impl EditorState {
         voice_note: Option<String>,
     ) {
         // Auto-arm Active Speaker when the analysis proves multi-person and
-        // the operator hasn't chosen a mode deliberately (Manual = the seed).
-        if analysis.tracks.len() >= 2 && self.camera_mode == CameraMode::Manual {
+        // the operator hasn't chosen a mode deliberately (Manual = the seed;
+        // Manual WITH a motion preset is deliberate — never override it).
+        if analysis.tracks.len() >= 2
+            && self.camera_mode == CameraMode::Manual
+            && self.motion.is_none()
+        {
             self.camera_mode = CameraMode::ActiveSpeaker;
         }
         self.speakers = Some(analysis);
         self.plan = Some(plan);
         self.voice_note = voice_note;
         self.speaker_job = SpeakerJob::Ready;
+        // A cut drag on the REPLACED plan would land on the wrong boundary.
+        if matches!(self.drag, Some(TimelineDrag::Cut { .. })) {
+            self.drag = None;
+        }
         self.refresh_camera_audit();
     }
 
@@ -312,6 +695,8 @@ impl EditorState {
     }
 
     /// Keep `lines` in step with the current genre and any operator edits.
+    /// The line model covers the AUTO stream only — the operator's captions
+    /// are their own simultaneous stream, drawn separately.
     fn sync_lines(&mut self) {
         if self.lines_genre != self.style.genre || self.lines_dirty {
             if let Some(t) = &self.transcript {
@@ -342,11 +727,30 @@ impl EditorState {
         }
     }
 
+    /// The Manual-mode motion plan, when a preset is active on a full-frame
+    /// kind (feature plan #9). Stacked framing has no single crop to glide.
+    fn motion_camera(&self) -> Option<CameraPlan> {
+        let preset = self.motion?;
+        let base = match self.kind {
+            LayoutKind::Stacked => return None,
+            LayoutKind::FullCam => self.fullcam,
+            LayoutKind::FullGameplay => self.fullgameplay,
+        };
+        Some(motion_plan(base, self.src_w, self.src_h, self.range.duration_s(), preset))
+    }
+
     /// The Layout the preview shows at clip time `t` under the current camera
     /// mode — and what a static-mode render exports.
     fn effective_layout(&self, t: f64) -> Layout {
         match self.camera_mode {
-            CameraMode::Manual => self.manual_layout(),
+            CameraMode::Manual => match self.motion_camera() {
+                // The motion preset's glide, exactly as the render bakes it.
+                Some(plan) => plan
+                    .shot_at(t)
+                    .map(|s| s.layout_at(t))
+                    .unwrap_or_else(|| self.manual_layout()),
+                None => self.manual_layout(),
+            },
             CameraMode::Center => Layout::FullFrame {
                 crop: yc_frame::centered_fullcam_crop(self.src_w, self.src_h),
             },
@@ -411,14 +815,33 @@ impl EditorState {
     fn render_spec(&self) -> RenderSpec {
         let camera = match self.camera_mode {
             CameraMode::ActiveSpeaker => self.plan.clone().filter(|p| !p.shots.is_empty()),
+            // A Manual-mode motion preset renders through the same per-shot
+            // machinery (feature plan #9).
+            CameraMode::Manual => self.motion_camera(),
             _ => None,
         };
+        // A motion plan glides; exporting the playhead's instantaneous frame
+        // as the static layout would double-apply it — send the BASE framing.
+        let layout = if camera.is_some() && self.camera_mode == CameraMode::Manual {
+            self.manual_layout()
+        } else {
+            self.effective_layout(self.playhead_s)
+        };
         RenderSpec {
-            layout: self.effective_layout(self.playhead_s),
+            layout,
             style: self.style.clone(),
             placement: self.placement,
             camera,
             transcript_override: if self.transcript_dirty { self.transcript.clone() } else { None },
+            keep: self.razor.kept_spans(self.range.duration_s()),
+            // The operator's own stream travels beside the transcript, never
+            // inside it (and never into any store) — placements included.
+            manual_captions: self
+                .manual_units
+                .iter()
+                .zip(&self.manual_places)
+                .map(|(u, p)| yc_core::ManualCaption { unit: u.clone(), placement: *p })
+                .collect(),
         }
     }
 
@@ -436,6 +859,7 @@ impl EditorState {
         ui: &mut egui::Ui,
         busy: bool,
         rendering: bool,
+        prefs: &mut crate::settings::AppSettings,
     ) -> EditorAction {
         let mut action = EditorAction::None;
 
@@ -482,6 +906,29 @@ impl EditorState {
                 self.playing = None;
                 self.stop_video();
                 action = EditorAction::StopAudio;
+            } else if let Some((_, span_end)) =
+                self.razor.removed_span_at(self.playhead_s, dur).filter(|_| {
+                    // Skip only while the live decode is actually delivering:
+                    // during a scrub drag (live stopped) the pointer owns the
+                    // playhead — a skip would yank it out from under the drag.
+                    self.live.as_ref().and_then(|l| l.video_secs()).is_some()
+                })
+            {
+                // Playback entered a razor-removed span: skip to where the
+                // export resumes, exactly like a scrub (the preview must play
+                // what the render will show). The clip END being removed
+                // stops playback outright.
+                if span_end >= dur - 1e-6 {
+                    self.playhead_s = dur;
+                    self.playing = None;
+                    self.stop_video();
+                    action = EditorAction::StopAudio;
+                } else {
+                    self.playhead_s = span_end;
+                    self.playing = Some((Instant::now(), span_end));
+                    self.start_video();
+                    action = EditorAction::Play(self.play_range_from(span_end));
+                }
             } else {
                 // 60 fps visual tick (vsync-capped).
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
@@ -557,10 +1004,10 @@ impl EditorState {
         // smaller than the pre-resize UI.
         egui::Panel::bottom("studio-timeline")
             .resizable(true)
-            .default_size(230.0)
-            .size_range(150.0..=420.0)
+            .default_size(290.0)
+            .size_range(200.0..=460.0)
             .show_inside(ui, |ui| {
-                if let Some(a) = self.ui_timeline(ui, busy, rendering) {
+                if let Some(a) = self.ui_timeline(ui, busy, rendering, &mut prefs.volume) {
                     action = a;
                 }
             });
@@ -583,7 +1030,7 @@ impl EditorState {
             .size_range(250.0..=420.0)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("props").show(ui, |ui| {
-                    if let Some(a) = self.ui_properties(ui, busy) {
+                    if let Some(a) = self.ui_properties(ui, busy, prefs) {
                         action = a;
                     }
                 });
@@ -609,7 +1056,7 @@ impl EditorState {
     /// Keyboard shortcuts. Returns an action when one needs the app (play).
     fn handle_keys(&mut self, ui: &egui::Ui) -> Option<EditorAction> {
         let dur = self.range.duration_s();
-        let (space, esc, left, right, up, down, plus, minus, zero, shift) = ui.input(|i| {
+        let (space, esc, left, right, up, down, plus, minus, zero, shift, del) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Escape),
@@ -621,6 +1068,7 @@ impl EditorState {
                 i.key_pressed(egui::Key::Minus),
                 i.key_pressed(egui::Key::Num0),
                 i.modifiers.shift,
+                i.key_pressed(egui::Key::Delete),
             )
         });
         if esc {
@@ -632,6 +1080,11 @@ impl EditorState {
         }
         if space {
             return Some(self.toggle_play());
+        }
+        if del {
+            // The razor's remove verb (CapCut Delete): drop the segment
+            // under the playhead from the export.
+            self.razor.remove_segment_at(self.playhead_s);
         }
         let crop_mode = self.view == ViewMode::Source && self.camera_mode == CameraMode::Manual;
         let step = if shift { 20.0 } else { 4.0 };
@@ -679,6 +1132,11 @@ impl EditorState {
             let dur = self.range.duration_s();
             if self.playhead_s >= dur {
                 self.playhead_s = 0.0;
+            }
+            // Never START inside a razor-removed span — begin where the
+            // export would resume.
+            if let Some((_, span_end)) = self.razor.removed_span_at(self.playhead_s, dur) {
+                self.playhead_s = span_end.min(dur);
             }
             self.playing = Some((Instant::now(), self.playhead_s));
             self.start_video();
@@ -829,6 +1287,21 @@ impl EditorState {
                         _ => &mut self.fullgameplay,
                     };
                     pan_zoom(ui, canvas, "full", target, self.src_w, self.src_h);
+                } else if self.camera_mode == CameraMode::ActiveSpeaker {
+                    // Reframe THE SHOT by dragging the output directly (the
+                    // Original view's crop box is the precision tool; this is
+                    // the quick nudge). Same contract: manual frame = static.
+                    let mut c = *crop;
+                    pan_zoom(ui, canvas, "as-shot-out", &mut c, self.src_w, self.src_h);
+                    if c != *crop {
+                        if let Some(plan) = &mut self.plan {
+                            if let Some(shot) = plan.shot_at_mut(shown_t) {
+                                shot.layout = Layout::FullFrame { crop: c };
+                                shot.pan_to = None;
+                            }
+                        }
+                        self.refresh_camera_audit();
+                    }
                 }
             }
         }
@@ -946,21 +1419,51 @@ impl EditorState {
             match self.kind {
                 LayoutKind::Stacked => {
                     let (g, f) = (self.gameplay, self.facecam);
-                    self.crop_box_interaction(ui, frame_rect, to_screen(&g), "src-gp", CropTarget::Gameplay);
-                    self.crop_box_interaction(ui, frame_rect, to_screen(&f), "src-fc", CropTarget::Facecam);
+                    crop_box_interaction(ui, frame_rect, to_screen(&g), "src-gp", &mut self.gameplay, sw, sh);
+                    crop_box_interaction(ui, frame_rect, to_screen(&f), "src-fc", &mut self.facecam, sw, sh);
                 }
                 LayoutKind::FullCam => {
                     let c = self.fullcam;
-                    self.crop_box_interaction(ui, frame_rect, to_screen(&c), "src-cam", CropTarget::FullCam);
+                    crop_box_interaction(ui, frame_rect, to_screen(&c), "src-cam", &mut self.fullcam, sw, sh);
                 }
                 LayoutKind::FullGameplay => {
                     let c = self.fullgameplay;
-                    self.crop_box_interaction(ui, frame_rect, to_screen(&c), "src-gpl", CropTarget::FullGameplay);
+                    crop_box_interaction(ui, frame_rect, to_screen(&c), "src-gpl", &mut self.fullgameplay, sw, sh);
+                }
+            }
+        } else if self.camera_mode == CameraMode::ActiveSpeaker {
+            // Per-shot manual framing (operator ask 2026-07-12): the crop box
+            // is a direct-manipulation target for THE SHOT under the frame on
+            // screen — the operator's own camera frame, not just face-click
+            // retargeting. A manual reframe drops the shot's follow (same
+            // contract as click_face). A split-screen (group) shot has no
+            // single crop; clicking a face there still retargets.
+            let t = self.display_time();
+            let shot_crop = self
+                .plan
+                .as_ref()
+                .and_then(|p| p.shot_at(t))
+                .and_then(|s| match s.layout_at(t) {
+                    Layout::FullFrame { crop } => Some(crop),
+                    _ => None,
+                });
+            if let Some(c0) = shot_crop {
+                let mut c = c0;
+                if crop_box_interaction(ui, frame_rect, to_screen(&c0), "src-shot", &mut c, sw, sh)
+                {
+                    if let Some(plan) = &mut self.plan {
+                        if let Some(shot) = plan.shot_at_mut(t) {
+                            shot.layout = Layout::FullFrame { crop: c };
+                            shot.pan_to = None; // a manual frame is static
+                        }
+                    }
+                    self.refresh_camera_audit();
                 }
             }
         } else {
-            // In an AI mode a drag on the frame flips to Manual (CapCut-style:
-            // touching the framing takes control), seeding from the AI crop.
+            // In the other AI modes a drag on the frame flips to Manual
+            // (CapCut-style: touching the framing takes control), seeding
+            // from the AI crop.
             let resp = ui.interact(frame_rect, ui.id().with("src-takeover"), Sense::click_and_drag());
             if resp.drag_started() || resp.double_clicked() {
                 if let Layout::FullFrame { crop } = layout {
@@ -976,86 +1479,9 @@ impl EditorState {
         self.face_overlays(ui, &painter, frame_rect);
     }
 
-    /// Drag body to move + corner handles to resize + scroll to zoom, for one
-    /// crop box in Source view.
-    fn crop_box_interaction(
-        &mut self,
-        ui: &mut egui::Ui,
-        frame_rect: Rect,
-        screen: Rect,
-        id: &str,
-        target: CropTarget,
-    ) {
-        let (sw, sh) = (self.src_w, self.src_h);
-        let px = sw / frame_rect.width().max(1.0);
-        // Corner handles first (they win the pointer over the body).
-        let hs = 7.0;
-        let corners = [
-            (screen.left_top(), -1.0, -1.0),
-            (screen.right_top(), 1.0, -1.0),
-            (screen.left_bottom(), -1.0, 1.0),
-            (screen.right_bottom(), 1.0, 1.0),
-        ];
-        let mut resized = false;
-        for (i, (pos, sx, sy)) in corners.iter().enumerate() {
-            let hrect = Rect::from_center_size(*pos, egui::vec2(hs * 2.0, hs * 2.0));
-            let resp = ui.interact(hrect, ui.id().with((id, "corner", i)), Sense::drag());
-            ui.painter().rect_filled(
-                Rect::from_center_size(*pos, egui::vec2(hs, hs)),
-                CornerRadius::same(2),
-                if resp.hovered() || resp.dragged() { theme::GOLD } else { Color32::WHITE },
-            );
-            if resp.dragged() {
-                resized = true;
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                let d = resp.drag_delta();
-                // Dragging a corner outward grows the box: project the delta on
-                // the outward diagonal, aspect-locked via zoom about the
-                // opposite corner.
-                let crop = self.crop_of_mut(target);
-                let grow = (d.x * sx + d.y * sy) * 0.5 * px;
-                let factor = ((crop.w + 2.0 * grow) / crop.w).clamp(0.25, 4.0);
-                let (ax, ay) = (
-                    crop.x + crop.w * (0.5 - sx * 0.5), // opposite corner stays put
-                    crop.y + crop.h * (0.5 - sy * 0.5),
-                );
-                *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
-            }
-        }
-        if resized {
-            return;
-        }
-        // Body: move.
-        let resp = ui.interact(screen, ui.id().with((id, "body")), Sense::click_and_drag());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-        }
-        if resp.dragged() {
-            let d = resp.drag_delta();
-            let crop = self.crop_of_mut(target);
-            *crop = yc_frame::pan_crop(*crop, sw, sh, d.x * px, d.y * px);
-        }
-        // Scroll on the box: zoom about its center.
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0 {
-                let factor = (-scroll * 0.0015).exp();
-                let crop = self.crop_of_mut(target);
-                let (ax, ay) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
-                *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
-                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
-            }
-        }
-    }
-
-    fn crop_of_mut(&mut self, target: CropTarget) -> &mut Crop {
-        match target {
-            CropTarget::Gameplay => &mut self.gameplay,
-            CropTarget::Facecam => &mut self.facecam,
-            CropTarget::FullCam => &mut self.fullcam,
-            CropTarget::FullGameplay => &mut self.fullgameplay,
-        }
-    }
+    // (Crop-box interaction is the free `crop_box_interaction` below — it
+    // writes any `&mut Crop`, so the Manual fields AND a camera-plan shot's
+    // crop share one direct-manipulation implementation.)
 
     /// Face boxes + labels over the Source view; click to retarget the camera.
     fn face_overlays(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, frame_rect: Rect) {
@@ -1149,9 +1575,317 @@ impl EditorState {
 
     // ------------------------------------------------------------ timeline --
 
+    /// Insert a fresh caption at the playhead onto the operator's OWN lane
+    /// (feature plan #2's New Caption; the dedicated track): burned as its
+    /// own SIMULTANEOUS stream above the auto captions (ADR 0065), so it can
+    /// share time with them without ever fighting them.
+    fn add_caption_at_playhead(&mut self) {
+        if self.transcript.is_none() {
+            return; // the pre-pass still owns captions
+        }
+        let at = self.playhead_s;
+        let idx =
+            self.manual_units.iter().position(|u| u.start_s > at).unwrap_or(self.manual_units.len());
+        self.manual_units
+            .insert(idx, CaptionUnit { text: "text".into(), start_s: at, end_s: at + 0.8 });
+        self.manual_places.insert(idx, None); // starts at the default anchor
+        self.sel_manual = Some(idx);
+        self.lines_dirty = true;
+    }
+
+    /// Remove one of the operator's captions, keeping the placement pairing.
+    fn remove_manual_caption(&mut self, i: usize) {
+        if i < self.manual_units.len() {
+            self.manual_units.remove(i);
+            self.manual_places.remove(i);
+            self.sel_manual = None;
+            self.lines_dirty = true;
+        }
+    }
+
+    /// Sort the operator's captions by start, placements riding along.
+    fn sort_manual_units(&mut self) {
+        let mut zipped: Vec<(CaptionUnit, Option<CaptionPlacement>)> =
+            self.manual_units.drain(..).zip(self.manual_places.drain(..)).collect();
+        zipped.sort_by(|a, b| {
+            a.0.start_s.partial_cmp(&b.0.start_s).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (u, p) in zipped {
+            self.manual_units.push(u);
+            self.manual_places.push(p);
+        }
+    }
+
+    /// Add a CAMERA cut at the (frame-snapped) playhead: split the shot under
+    /// it in two. The operator then reframes either half by dragging the crop
+    /// (per-shot framing) or clicking a face. Framing only — no time removed
+    /// (that is the razor's job).
+    fn split_shot_at_playhead(&mut self) {
+        let mut t = self.playhead_s;
+        if self.src_fps > 0.0 {
+            t = (t * self.src_fps).round() / self.src_fps;
+        }
+        if let Some(plan) = &mut self.plan {
+            if split_plan_at(plan, t) {
+                self.refresh_camera_audit();
+            }
+        }
+    }
+
+    /// Remove the cut between shots `boundary-1` and `boundary` (the marker's
+    /// right-click menu).
+    fn delete_cut(&mut self, boundary: usize) {
+        if let Some(plan) = &mut self.plan {
+            if delete_plan_cut(plan, boundary) {
+                self.refresh_camera_audit();
+            }
+        }
+    }
+
+
+    /// Apply the in-flight timeline gesture at pointer time `pointer_t`:
+    /// clamp, snap (anchors within `tol_t`), and write the result into the
+    /// transcript / camera plan so THIS frame draws it. Returns the anchor a
+    /// magnet snapped to (for the guide line) and the manipulated time (for
+    /// the chip beside the pointer).
+    fn apply_timeline_drag(&mut self, pointer_t: f64, tol_t: f64) -> (Option<f64>, f64) {
+        let dur = self.range.duration_s();
+        let playhead = self.playhead_s;
+        // Cut boundaries double as caption-snap anchors; a dragged cut snaps
+        // to the playhead only (it IS the boundary set).
+        let cuts: Vec<f64> = self
+            .plan
+            .as_ref()
+            .map(|p| p.shots.iter().skip(1).map(|s| s.start_s).collect())
+            .unwrap_or_default();
+        let mut snapped = None;
+        let mut shown = pointer_t;
+        match self.drag.clone() {
+            Some(TimelineDrag::CapMove { targets, orig, grab_t }) => {
+                if targets.is_empty() || targets.len() != orig.len() {
+                    return (None, shown); // stale gesture
+                }
+                let first_start = orig.iter().map(|o| o.0).fold(f64::INFINITY, f64::min);
+                let last_end = orig.iter().map(|o| o.1).fold(0.0f64, f64::max);
+                // Clip bounds only: captions move FREELY past each other
+                // (operator ruling 2026-07-12 — "stuck between captions");
+                // lanes sort on release, the burn-order warning marks any
+                // caption another one would hide.
+                let lo = -first_start;
+                let hi = dur - last_end;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let mut dt = (pointer_t - grab_t).clamp(lo, hi);
+                let anchors: Vec<f64> = std::iter::once(playhead)
+                    .chain(cuts.iter().copied())
+                    .filter(|c| (first_start + lo..=first_start + hi).contains(c))
+                    .collect();
+                match magnet(first_start + dt, &anchors, tol_t) {
+                    Some(anchor) => {
+                        dt = anchor - first_start;
+                        snapped = Some(anchor);
+                    }
+                    // The panel shows m:ss.cc — never bake in precision the
+                    // operator can't see or reproduce there.
+                    None => dt = quantize_cs(first_start + dt) - first_start,
+                }
+                let mut touched_auto = false;
+                for ((lane, idx), (os, oe)) in targets.iter().zip(orig.iter()) {
+                    let Some(units) = self.lane_units_mut(*lane) else { continue };
+                    if let Some(u) = units.get_mut(*idx) {
+                        u.start_s = os + dt;
+                        u.end_s = oe + dt;
+                        touched_auto |= *lane == CapLane::Auto;
+                    }
+                }
+                shown = first_start + dt;
+                if touched_auto {
+                    self.transcript_dirty = true;
+                }
+                self.lines_dirty = true;
+            }
+            Some(TimelineDrag::CapTrimStart { lane, unit, orig_start, grab_t }) => {
+                let Some(units) = self.lane_units_mut(lane) else { return (None, shown) };
+                if unit >= units.len() {
+                    return (None, shown);
+                }
+                let lo = 0.0;
+                let hi = units[unit].end_s - CAP_MIN_S;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let v = (orig_start + (pointer_t - grab_t)).clamp(lo, hi);
+                let anchors: Vec<f64> = std::iter::once(playhead)
+                    .chain(cuts.iter().copied())
+                    .filter(|c| (lo..=hi).contains(c))
+                    .collect();
+                let v = match magnet(v, &anchors, tol_t) {
+                    Some(anchor) => {
+                        snapped = Some(anchor);
+                        anchor
+                    }
+                    None => quantize_cs(v).clamp(lo, hi),
+                };
+                let Some(units) = self.lane_units_mut(lane) else { return (None, shown) };
+                units[unit].start_s = v;
+                shown = v;
+                if lane == CapLane::Auto {
+                    self.transcript_dirty = true;
+                }
+                self.lines_dirty = true;
+            }
+            Some(TimelineDrag::CapTrimEnd { lane, unit, orig_end, grab_t }) => {
+                let Some(units) = self.lane_units_mut(lane) else { return (None, shown) };
+                if unit >= units.len() {
+                    return (None, shown);
+                }
+                let lo = units[unit].start_s + CAP_MIN_S;
+                let hi = dur;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let v = (orig_end + (pointer_t - grab_t)).clamp(lo, hi);
+                // The workflow is "park the playhead where the word should
+                // end, drag the edge to it" — so the playhead is the anchor.
+                let anchors: Vec<f64> =
+                    std::iter::once(playhead).filter(|c| (lo..=hi).contains(c)).collect();
+                let v = match magnet(v, &anchors, tol_t) {
+                    Some(anchor) => {
+                        snapped = Some(anchor);
+                        anchor
+                    }
+                    None => quantize_cs(v).clamp(lo, hi),
+                };
+                let Some(units) = self.lane_units_mut(lane) else { return (None, shown) };
+                units[unit].end_s = v;
+                shown = v;
+                if lane == CapLane::Auto {
+                    self.transcript_dirty = true;
+                }
+                self.lines_dirty = true;
+            }
+            Some(TimelineDrag::Cut { boundary, orig_t, grab_t }) => {
+                let src_fps = self.src_fps;
+                let Some(plan) = self.plan.as_mut() else { return (None, shown) };
+                if boundary == 0 || boundary >= plan.shots.len() {
+                    return (None, shown);
+                }
+                let lo = plan.shots[boundary - 1].start_s + MIN_SHOT_S;
+                let hi = plan.shots[boundary].end_s - MIN_SHOT_S;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let mut v = (orig_t + (pointer_t - grab_t)).clamp(lo, hi);
+                let anchors: Vec<f64> =
+                    std::iter::once(playhead).filter(|c| (lo..=hi).contains(c)).collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(anchor) => {
+                        v = anchor;
+                        snapped = Some(anchor);
+                    }
+                    // Feature plan #3's frame snap: the render trims at full
+                    // pts precision, so a frame-exact boundary cuts clean.
+                    None if src_fps > 0.0 => {
+                        v = ((v * src_fps).round() / src_fps).clamp(lo, hi);
+                    }
+                    None => {}
+                }
+                plan.shots[boundary - 1].end_s = v;
+                plan.shots[boundary].start_s = v;
+                shown = v;
+            }
+            Some(TimelineDrag::Razor { idx, orig_t, grab_t }) => {
+                if idx >= self.razor.cuts.len() {
+                    return (None, shown);
+                }
+                let lo = if idx > 0 { self.razor.cuts[idx - 1] } else { 0.0 } + MIN_SEG_S;
+                let hi = self.razor.cuts.get(idx + 1).copied().unwrap_or(dur) - MIN_SEG_S;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let mut v = (orig_t + (pointer_t - grab_t)).clamp(lo, hi);
+                let anchors: Vec<f64> =
+                    std::iter::once(playhead).filter(|c| (lo..=hi).contains(c)).collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(anchor) => {
+                        v = anchor;
+                        snapped = Some(anchor);
+                    }
+                    // Frame-exact razor edges cut clean (feature plan #3).
+                    None if self.src_fps > 0.0 => {
+                        v = ((v * self.src_fps).round() / self.src_fps).clamp(lo, hi);
+                    }
+                    None => {}
+                }
+                self.razor.cuts[idx] = v;
+                shown = v;
+            }
+            Some(TimelineDrag::Marker { orig_t, grab_t }) => {
+                let mut v = (orig_t + (pointer_t - grab_t)).clamp(0.0, dur);
+                let anchors: Vec<f64> = std::iter::once(playhead)
+                    .chain(cuts.iter().copied())
+                    .filter(|c| (0.0..=dur).contains(c))
+                    .collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(anchor) => {
+                        v = anchor;
+                        snapped = Some(anchor);
+                    }
+                    None if self.src_fps > 0.0 => {
+                        v = ((v * self.src_fps).round() / self.src_fps).clamp(0.0, dur);
+                    }
+                    None => {}
+                }
+                self.cut_marker = Some(v);
+                shown = v;
+            }
+            None => {}
+        }
+        (snapped, shown)
+    }
+
+    /// Land the in-flight gesture: restore each caption lane's ordering
+    /// (captions drag freely past each other now — the sort happens HERE, on
+    /// release, never mid-gesture) and re-audit an edited camera plan
+    /// (jitter-class defects surface BEFORE the export).
+    fn finish_timeline_drag(&mut self) {
+        match self.drag.take() {
+            Some(TimelineDrag::Cut { .. }) => self.refresh_camera_audit(),
+            Some(TimelineDrag::Razor { .. }) | Some(TimelineDrag::Marker { .. }) => {}
+            Some(_) => {
+                if let Some(t) = &mut self.transcript {
+                    let sorted = t.units.windows(2).all(|w| w[0].start_s <= w[1].start_s);
+                    if !sorted {
+                        t.units.sort_by(|x, y| {
+                            x.start_s
+                                .partial_cmp(&y.start_s)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        self.sel_unit = None; // row indices shifted under the sort
+                    }
+                }
+                let sorted =
+                    self.manual_units.windows(2).all(|w| w[0].start_s <= w[1].start_s);
+                if !sorted {
+                    self.sort_manual_units(); // placements ride along
+                    self.sel_manual = None;
+                }
+                self.lines_dirty = true;
+            }
+            None => {}
+        }
+    }
+
     /// The bottom strip: transport, ruler + scrub, caption blocks, speaker
     /// lanes, cut markers.
-    fn ui_timeline(&mut self, ui: &mut egui::Ui, busy: bool, rendering: bool) -> Option<EditorAction> {
+    fn ui_timeline(
+        &mut self,
+        ui: &mut egui::Ui,
+        busy: bool,
+        rendering: bool,
+        volume: &mut f32,
+    ) -> Option<EditorAction> {
         let mut action = None;
         let dur = self.range.duration_s().max(0.001);
         ui.add_space(6.0);
@@ -1165,6 +1899,92 @@ impl EditorState {
                 action = Some(self.toggle_play());
             }
             ui.monospace(format!("{} / {}", fmt_mmss_cc(self.playhead_s), fmt_mmss_cc(dur)));
+            // Master playback volume (feature plan #7): every preview sink,
+            // never the export. The app owns the sink; it applies + persists
+            // any change after this frame.
+            ui.add_space(6.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_width = 74.0;
+                ui.label("🔊");
+                ui.add(egui::Slider::new(volume, 0.0..=2.0).show_value(false)).on_hover_text(
+                    format!(
+                        "Playback volume {:.0}% — persists; never affects the export",
+                        *volume * 100.0
+                    ),
+                );
+            });
+            // Timeline edit verbs (feature plan #2/#3).
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(self.transcript.is_some(), egui::Button::new("+ Caption"))
+                .on_hover_text(
+                    "Insert a caption at the playhead onto YOUR caption track (the second \
+                     timeline row) — drag it on the preview to place it anywhere, double-click \
+                     it there to edit the text",
+                )
+                .on_disabled_hover_text("Captions are still transcribing")
+                .clicked()
+            {
+                self.add_caption_at_playhead();
+            }
+            // The timeline razor, marker-scissors style (operator ask
+            // 2026-07-12): one merged three-part control — cut-left | place
+            // marker | cut-right (zero gap, shared corners, their round-6
+            // sketch). Delete drops the segment under the playhead; restore
+            // via the segment's right-click menu. All of it drops video +
+            // audio + captions from the export together.
+            // (The camera-cut button is parked until the keyframe arc gives
+            // per-cut framing real function — operator call 2026-07-13; the
+            // strip's right-click menu still carries it for AS clips.)
+            let dur_full = self.range.duration_s();
+            ui.add_space(6.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if ui
+                    .add(egui::Button::new("✂⏴").corner_radius(CornerRadius {
+                        nw: 4,
+                        sw: 4,
+                        ne: 0,
+                        se: 0,
+                    }))
+                    .on_hover_text(
+                        "Cut LEFT of the playhead: removes back to the marker (or the clip \
+                         start when no marker is on the left)",
+                    )
+                    .clicked()
+                {
+                    self.razor.cut_left(self.playhead_s, self.cut_marker, dur_full);
+                }
+                if ui
+                    .add(egui::Button::new("⏷ Mark").corner_radius(CornerRadius::ZERO))
+                    .on_hover_text(
+                        "Place the cut marker at the playhead — the point both scissors cut \
+                         to. Drag it on the timeline to adjust; right-click it to clear.",
+                    )
+                    .clicked()
+                {
+                    self.cut_marker = Some(if self.src_fps > 0.0 {
+                        (self.playhead_s * self.src_fps).round() / self.src_fps
+                    } else {
+                        self.playhead_s
+                    });
+                }
+                if ui
+                    .add(egui::Button::new("⏵✂").corner_radius(CornerRadius {
+                        nw: 0,
+                        sw: 0,
+                        ne: 4,
+                        se: 4,
+                    }))
+                    .on_hover_text(
+                        "Cut RIGHT of the playhead: removes up to the marker (or the clip \
+                         end when no marker is on the right)",
+                    )
+                    .clicked()
+                {
+                    self.razor.cut_right(self.playhead_s, self.cut_marker, dur_full);
+                }
+            });
             // Say WHAT the worker is doing — a mystery-disabled UI reads as a
             // hang (operator feedback). Everything here stays usable meanwhile.
             if busy {
@@ -1227,17 +2047,41 @@ impl EditorState {
             egui::vec2(ui.available_width(), ui.available_height().max(60.0)),
             Sense::click_and_drag(),
         );
-        // 64 = the chrome the painting below actually uses: ruler 18 +
-        // caption row 26 above the lanes, cut markers 20 below them.
+        // 103 = the chrome the painting below actually uses: ruler 18 + the
+        // filmstrip track 29 + the two caption lanes (auto 15 + yours 15) +
+        // the burn-line rail 6 above the speaker lanes, cut markers 20 below.
         let lane_h = if n_lanes == 0 {
             13.0
         } else {
-            ((rect.height() - 64.0) / n_lanes as f32).max(13.0)
+            ((rect.height() - 103.0) / n_lanes as f32).max(13.0)
         };
         let p = ui.painter_at(rect);
         p.rect_filled(rect, CornerRadius::same(4), theme::WELL);
         let t_to_x = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
         let x_to_t = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * dur;
+
+        // Apply any in-flight direct-manipulation gesture BEFORE drawing, so
+        // this frame already shows the result (responsive by construction);
+        // land it on release. Pointer-tracked, not widget-id-tracked — see
+        // `TimelineDrag`.
+        let mut snap_x: Option<f32> = None;
+        let mut drag_chip_t: Option<f64> = None;
+        if self.drag.is_some() {
+            ui.ctx().set_cursor_icon(match self.drag {
+                Some(TimelineDrag::CapMove { .. }) => egui::CursorIcon::Grabbing,
+                _ => egui::CursorIcon::ResizeHorizontal,
+            });
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                let tol_t = (SNAP_PX / rect.width().max(1.0)) as f64 * dur;
+                let (snapped, shown) = self.apply_timeline_drag(x_to_t(pos.x), tol_t);
+                snap_x = snapped.map(t_to_x);
+                drag_chip_t = Some(shown);
+            }
+            if ui.input(|i| !i.pointer.primary_down()) {
+                self.finish_timeline_drag();
+                drag_chip_t = None;
+            }
+        }
 
         // Ruler ticks: a major every ~1/8 of the clip, rounded to a nice step.
         let step = nice_step(dur / 8.0);
@@ -1258,72 +2102,365 @@ impl EditorState {
             t += step;
         }
 
-        // Caption blocks — clickable: jump the playhead to the line AND
-        // select + scroll to its row in the transcript panel (the timeline is
-        // the fastest way to LOCATE a caption; the panel is where you fix it).
-        self.sync_lines();
-        let cap_y0 = rect.top() + 18.0;
-        let mut clicked_line: Option<usize> = None;
-        for (li, l) in self.lines.iter().enumerate() {
-            let r = Rect::from_min_max(
-                egui::pos2(t_to_x(l.start_s), cap_y0),
-                egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), cap_y0 + 20.0),
-            );
-            let text = l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
-            // Registered after the strip's scrub response, so blocks win the
-            // pointer for clicks; drags still fall through to the scrub.
-            let resp = ui.interact(r, ui.id().with(("cap-block", li)), Sense::click());
-            let hovered = resp.hovered();
-            if hovered {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        // The video track (operator ask 2026-07-12 "so we know where to
+        // cut"): the whole clip as filmstrip thumbnails — the frames Prepare
+        // already extracted. Clicks/drags on it scrub (it is strip surface);
+        // razor veils cover it, so a removed span visibly dims its video.
+        let film = Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 18.0),
+            egui::pos2(rect.right(), rect.top() + 44.0),
+        );
+        if !self.frames.is_empty() {
+            let aspect = (self.src_w / self.src_h.max(1.0)).max(0.1);
+            let thumb_w = film.height() * aspect;
+            let n_thumbs = (film.width() / thumb_w).ceil().max(1.0) as usize;
+            for k in 0..n_thumbs {
+                let x0 = film.left() + k as f32 * thumb_w;
+                let slot = Rect::from_min_max(
+                    egui::pos2(x0, film.top()),
+                    egui::pos2((x0 + thumb_w).min(film.right()), film.bottom()),
+                );
+                let t_mid = x_to_t(x0 + thumb_w * 0.5);
+                let idx = ((t_mid * self.frame_fps).round() as usize)
+                    .min(self.frames.len().saturating_sub(1));
+                // A partial rightmost slot crops the thumb instead of
+                // squeezing it (uv trimmed to the visible fraction).
+                let frac = (slot.width() / thumb_w).clamp(0.0, 1.0);
+                p.image(
+                    self.frames[idx].id(),
+                    slot,
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(frac, 1.0)),
+                    Color32::WHITE,
+                );
             }
-            if resp.on_hover_text(format!("{}  ·  {text}", fmt_mmss_cc(l.start_s))).clicked() {
-                clicked_line = Some(li);
-            }
-            p.rect_filled(
-                r,
-                CornerRadius::same(3),
-                Color32::from_rgba_unmultiplied(255, 255, 255, if hovered { 48 } else { 26 }),
-            );
             p.rect_stroke(
-                r,
-                CornerRadius::same(3),
-                Stroke::new(1.0, if hovered { theme::GOLD } else { Color32::from_gray(80) }),
+                film,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, Color32::from_gray(60)),
                 StrokeKind::Inside,
             );
-            if r.width() > 26.0 {
-                p.text(
-                    r.left_center() + egui::vec2(4.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    ellipsize(&text, (r.width() / 7.0) as usize),
-                    FontId::proportional(10.5),
-                    Color32::from_gray(200),
+        }
+
+        // Caption blocks — ONE BLOCK PER UNIT (= per panel row) on TWO lanes:
+        // the pipeline's captions (top row) and the operator's own dedicated
+        // track below it (plan #2's "manual alongside AI" — the 2026-07-12
+        // ask). Blocks are stable objects: the body drags FREELY in time
+        // (past other captions too — lanes sort on release), edges trim,
+        // click selects, right-click deletes. A caption the burn would hide
+        // (huge-word: the next merged caption starts at/before it) is flagged
+        // red instead of silently swallowed.
+        self.sync_lines();
+        let cap_y0 = rect.top() + 47.0; // below the ruler + video track
+        let man_y0 = cap_y0 + 15.0;
+        let rail_y = man_y0 + 15.0;
+        let mut clicked_unit: Option<(CapLane, usize)> = None;
+        let mut delete_unit: Option<(CapLane, usize)> = None;
+        let mut begin_drag: Option<TimelineDrag> = None;
+        let drag_targets: Option<Vec<(CapLane, usize)>> = match &self.drag {
+            Some(TimelineDrag::CapMove { targets, .. }) => Some(targets.clone()),
+            Some(TimelineDrag::CapTrimStart { lane, unit, .. })
+            | Some(TimelineDrag::CapTrimEnd { lane, unit, .. }) => Some(vec![(*lane, *unit)]),
+            _ => None,
+        };
+        // Per-lane collision warnings. Auto lane (huge-word): a caption whose
+        // successor starts at/before it gets zero display — flag it. Manual
+        // lane: two of the operator's captions sharing time overprint at the
+        // same anchor — flag both. Cross-lane overlap is FINE: the operator's
+        // stream burns at its own anchor above the auto captions (ADR 0065).
+        let hidden: std::collections::HashSet<(u8, usize)> = {
+            let mut set = std::collections::HashSet::new();
+            if self.style.genre == CaptionGenre::HugeWord {
+                if let Some(t) = &self.transcript {
+                    let mut order: Vec<(f64, usize)> =
+                        t.units.iter().enumerate().map(|(i, u)| (u.start_s, i)).collect();
+                    order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    for w in order.windows(2) {
+                        if w[1].0 <= w[0].0 + 1e-9 {
+                            set.insert((CapLane::Auto as u8, w[0].1));
+                        }
+                    }
+                }
+            }
+            for (i, a) in self.manual_units.iter().enumerate() {
+                for (j, b) in self.manual_units.iter().enumerate() {
+                    // Overprint needs shared time AND shared space: two of
+                    // the operator's captions both at the DEFAULT anchor.
+                    // Dragged-apart captions may overlap freely.
+                    let both_default = self.manual_places.get(i).copied().flatten().is_none()
+                        && self.manual_places.get(j).copied().flatten().is_none();
+                    if i != j && both_default && a.start_s < b.end_s && b.start_s < a.end_s {
+                        set.insert((CapLane::Manual as u8, i));
+                    }
+                }
+            }
+            set
+        };
+        for (lane, y0, tag) in
+            [(CapLane::Auto, cap_y0, "auto"), (CapLane::Manual, man_y0, "yours")]
+        {
+            // Faint lane tag so the manual track is discoverable while empty.
+            p.text(
+                egui::pos2(rect.left() + 3.0, y0 + 2.0),
+                Align2::LEFT_TOP,
+                tag,
+                FontId::proportional(8.0),
+                Color32::from_gray(110),
+            );
+            let units: &[CaptionUnit] = match lane {
+                CapLane::Auto => {
+                    self.transcript.as_ref().map(|t| t.units.as_slice()).unwrap_or(&[])
+                }
+                CapLane::Manual => &self.manual_units,
+            };
+            let selected_idx =
+                match lane { CapLane::Auto => self.sel_unit, CapLane::Manual => self.sel_manual };
+            for (i, u) in units.iter().enumerate() {
+                let r = Rect::from_min_max(
+                    egui::pos2(t_to_x(u.start_s), y0),
+                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 14.0),
+                );
+                let dragging_this =
+                    drag_targets.as_ref().is_some_and(|t| t.contains(&(lane, i)));
+                let selected = selected_idx == Some(i);
+                let is_hidden = hidden.contains(&(lane as u8, i));
+                // Edge trim zones only when the block is wide enough for
+                // three distinct targets; tiny blocks stay move-only (the
+                // panel's timestamps cover fine trims).
+                let edges = r.width() >= 24.0;
+                let body = if edges { r.shrink2(egui::vec2(5.0, 0.0)) } else { r };
+                let mut tip = format!(
+                    "{} – {}  ·  {}\nDrag to move · edges trim · click to edit · right-click to delete",
+                    fmt_mmss_cc(u.start_s),
+                    fmt_mmss_cc(u.end_s),
+                    u.text
+                );
+                if is_hidden {
+                    tip.push_str(match lane {
+                        CapLane::Auto => {
+                            "\n⚠ WON'T SHOW at burn: the next caption starts at/before this one — move one of them"
+                        }
+                        CapLane::Manual => {
+                            "\n⚠ OVERPRINTS: two of your captions share time and space — stagger their times"
+                        }
+                    });
+                }
+                // Registered after the strip's scrub response, so blocks win
+                // the pointer; a drag on a block moves the CAPTION, not the
+                // playhead (scrub anywhere else on the strip).
+                let resp = ui
+                    .interact(
+                        body,
+                        ui.id().with(("cap-unit", lane as u8, i)),
+                        Sense::click_and_drag(),
+                    )
+                    .on_hover_text(tip);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                if resp.clicked() {
+                    clicked_unit = Some((lane, i));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("🗑 Delete caption").clicked() {
+                        delete_unit = Some((lane, i));
+                        ui.close();
+                    }
+                });
+                if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        begin_drag = Some(TimelineDrag::CapMove {
+                            targets: vec![(lane, i)],
+                            orig: vec![(u.start_s, u.end_s)],
+                            grab_t: x_to_t(pos.x),
+                        });
+                    }
+                }
+                let mut edge_hot = (false, false);
+                if edges {
+                    for side in 0..2 {
+                        let er = if side == 0 {
+                            Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 5.0, r.bottom()))
+                        } else {
+                            Rect::from_min_max(egui::pos2(r.right() - 5.0, r.top()), r.right_bottom())
+                        };
+                        let eresp = ui.interact(
+                            er,
+                            ui.id().with(("cap-edge", lane as u8, i, side)),
+                            Sense::drag(),
+                        );
+                        let hot = eresp.hovered() || eresp.dragged();
+                        if side == 0 {
+                            edge_hot.0 = hot;
+                        } else {
+                            edge_hot.1 = hot;
+                        }
+                        if hot {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if eresp.drag_started_by(egui::PointerButton::Primary)
+                            && self.drag.is_none()
+                        {
+                            if let Some(pos) = eresp.interact_pointer_pos() {
+                                begin_drag = Some(if side == 0 {
+                                    TimelineDrag::CapTrimStart {
+                                        lane,
+                                        unit: i,
+                                        orig_start: u.start_s,
+                                        grab_t: x_to_t(pos.x),
+                                    }
+                                } else {
+                                    TimelineDrag::CapTrimEnd {
+                                        lane,
+                                        unit: i,
+                                        orig_end: u.end_s,
+                                        grab_t: x_to_t(pos.x),
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                let hot = resp.hovered() || dragging_this || selected;
+                p.rect_filled(
+                    r,
+                    CornerRadius::same(3),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, if hot { 48 } else { 26 }),
+                );
+                p.rect_stroke(
+                    r,
+                    CornerRadius::same(3),
+                    Stroke::new(
+                        if dragging_this || selected || is_hidden { 1.5 } else { 1.0 },
+                        if is_hidden {
+                            theme::ERR
+                        } else if hot {
+                            theme::GOLD
+                        } else {
+                            Color32::from_gray(80)
+                        },
+                    ),
+                    StrokeKind::Inside,
+                );
+                // Trim affordance: an accent tick on the hovered edge.
+                for (on, x) in [(edge_hot.0, r.left() + 1.5), (edge_hot.1, r.right() - 1.5)] {
+                    if on {
+                        p.line_segment(
+                            [egui::pos2(x, r.top() + 2.0), egui::pos2(x, r.bottom() - 2.0)],
+                            Stroke::new(3.0, theme::GOLD),
+                        );
+                    }
+                }
+                if r.width() > 24.0 {
+                    p.text(
+                        r.left_center() + egui::vec2(4.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        ellipsize(&u.text, (r.width() / 7.0) as usize),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(200),
+                    );
+                }
+            }
+        }
+        // The burn-line rail: how the AUTO captions group into on-screen
+        // lines (grouping genres only — a huge-word line IS its unit; the
+        // operator's stream doesn't group, it shows each caption verbatim).
+        // Dragging a rail moves the whole line's units together. Cumulative
+        // word counts ARE the unit ranges (`preview_lines` builds each line
+        // from consecutive units, one word per unit).
+        if self.style.genre != CaptionGenre::HugeWord {
+            let n_units = self.transcript.as_ref().map(|t| t.units.len()).unwrap_or(0);
+            let mut base = 0usize;
+            for (li, l) in self.lines.iter().enumerate() {
+                let range = (base, base + l.words.len());
+                base = range.1;
+                if range.1 > n_units {
+                    continue; // stale lines mid-frame; sync_lines heals next frame
+                }
+                let targets: Vec<(CapLane, usize)> =
+                    (range.0..range.1).map(|i| (CapLane::Auto, i)).collect();
+                let rr = Rect::from_min_max(
+                    egui::pos2(t_to_x(l.start_s), rail_y),
+                    egui::pos2(t_to_x(l.end_s).max(t_to_x(l.start_s) + 2.0), rail_y + 4.0),
+                );
+                let rresp = ui
+                    .interact(rr.expand2(egui::vec2(0.0, 1.5)), ui.id().with(("cap-rail", li)), Sense::drag())
+                    .on_hover_text("One on-screen line — drag to move all its captions together");
+                let hot = rresp.hovered()
+                    || drag_targets.as_ref().is_some_and(|t| *t == targets);
+                if rresp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                if rresp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                    if let (Some(pos), Some(t)) =
+                        (rresp.interact_pointer_pos(), &self.transcript)
+                    {
+                        begin_drag = Some(TimelineDrag::CapMove {
+                            targets: targets.clone(),
+                            orig: t.units[range.0..range.1]
+                                .iter()
+                                .map(|u| (u.start_s, u.end_s))
+                                .collect(),
+                            grab_t: x_to_t(pos.x),
+                        });
+                    }
+                }
+                p.rect_filled(
+                    rr,
+                    CornerRadius::same(2),
+                    if hot {
+                        theme::GOLD.gamma_multiply(0.8)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 60)
+                    },
                 );
             }
         }
-        if let Some(li) = clicked_line {
-            let start = self.lines[li].start_s;
-            self.playhead_s = start.clamp(0.0, dur);
-            // Locate the line's first word in the transcript rows and scroll
-            // the panel to it.
-            if let Some(t) = &self.transcript {
-                self.sel_unit = t
-                    .units
-                    .iter()
-                    .position(|u| u.start_s >= start - 1e-6)
-                    .or(Some(t.units.len().saturating_sub(1)));
-                self.scroll_to_sel = true;
+        if let Some(d) = begin_drag {
+            self.drag = Some(d);
+        }
+        if let Some((lane, i)) = delete_unit {
+            match lane {
+                CapLane::Auto => {
+                    if let Some(t) = &mut self.transcript {
+                        if i < t.units.len() {
+                            t.units.remove(i);
+                            self.sel_unit = None;
+                            self.transcript_dirty = true;
+                            self.lines_dirty = true;
+                        }
+                    }
+                }
+                CapLane::Manual => self.remove_manual_caption(i),
             }
-            // Same contract as the scrub: playing audio + video restart at the jump.
-            if self.playing.is_some() {
-                self.playing = Some((Instant::now(), self.playhead_s));
-                self.start_video();
-                action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+        }
+        if let Some((lane, i)) = clicked_unit {
+            let start = match lane {
+                CapLane::Auto => {
+                    self.transcript.as_ref().and_then(|t| t.units.get(i)).map(|u| u.start_s)
+                }
+                CapLane::Manual => self.manual_units.get(i).map(|u| u.start_s),
+            };
+            if let Some(start) = start {
+                self.playhead_s = start.clamp(0.0, dur);
+                match lane {
+                    CapLane::Auto => {
+                        self.sel_unit = Some(i);
+                        self.scroll_to_sel = true;
+                    }
+                    CapLane::Manual => self.sel_manual = Some(i),
+                }
+                // Same contract as the scrub: playing audio + video restart
+                // at the jump.
+                if self.playing.is_some() {
+                    self.playing = Some((Instant::now(), self.playhead_s));
+                    self.start_video();
+                    action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+                }
             }
         }
 
         // Speaker lanes.
-        let mut lane_y = cap_y0 + 26.0;
+        let mut lane_y = rail_y + 6.0;
         if let Some(a) = &self.speakers {
             for tr in &a.tracks {
                 let color = theme::track_color(tr.id);
@@ -1397,33 +2534,304 @@ impl EditorState {
             }
         }
 
-        // Camera cut markers (Active Speaker).
+        // Camera cut markers (Active Speaker) — draggable cut points (feature
+        // plan #3): drag moves the boundary between the two shots (frame-
+        // snapped), right-click deletes the cut (the earlier shot's framing
+        // carries across the merged span), ✂ Split in the transport adds one.
         if self.camera_mode == CameraMode::ActiveSpeaker {
+            let mut begin_cut: Option<TimelineDrag> = None;
+            let mut delete_cut: Option<usize> = None;
             if let Some(plan) = &self.plan {
-                for s in plan.shots.iter().skip(1) {
+                for (i, s) in plan.shots.iter().enumerate().skip(1) {
                     let x = t_to_x(s.start_s);
+                    let handle = Rect::from_min_max(
+                        egui::pos2(x - 5.0, rect.top() + 14.0),
+                        egui::pos2(x + 5.0, rect.bottom() - 2.0),
+                    );
+                    let resp = ui.interact(handle, ui.id().with(("cut", i)), Sense::click_and_drag());
+                    let hot = resp.hovered()
+                        || matches!(&self.drag, Some(TimelineDrag::Cut { boundary, .. }) if *boundary == i);
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            begin_cut = Some(TimelineDrag::Cut {
+                                boundary: i,
+                                orig_t: s.start_s,
+                                grab_t: x_to_t(pos.x),
+                            });
+                        }
+                    }
+                    resp.on_hover_text(format!(
+                        "Camera cut at {} — the framing changes here (no time removed)\n\
+                         Drag to move · right-click to delete",
+                        fmt_mmss_cc(s.start_s)
+                    ))
+                    .context_menu(|ui| {
+                        if ui.button("🗑 Delete camera cut").clicked() {
+                            delete_cut = Some(i);
+                            ui.close();
+                        }
+                    });
                     p.line_segment(
                         [egui::pos2(x, rect.top() + 14.0), egui::pos2(x, rect.bottom() - 2.0)],
-                        Stroke::new(1.0, theme::GOLD.gamma_multiply(0.6)),
+                        Stroke::new(
+                            if hot { 2.0 } else { 1.0 },
+                            theme::GOLD.gamma_multiply(if hot { 1.0 } else { 0.6 }),
+                        ),
                     );
-                    p.text(
-                        egui::pos2(x + 2.0, rect.bottom() - 12.0),
-                        Align2::LEFT_TOP,
-                        "✂",
-                        FontId::proportional(9.0),
-                        theme::GOLD.gamma_multiply(0.8),
-                    );
+                    // The ◆ badge, painted (no font in the stack carries ◆).
+                    let dc = egui::pos2(x, rect.bottom() - 8.0);
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(dc.x, dc.y - 4.0),
+                            egui::pos2(dc.x + 3.5, dc.y),
+                            egui::pos2(dc.x, dc.y + 4.0),
+                            egui::pos2(dc.x - 3.5, dc.y),
+                        ],
+                        theme::GOLD.gamma_multiply(if hot { 1.0 } else { 0.8 }),
+                        Stroke::NONE,
+                    ));
                 }
+            }
+            if let Some(d) = begin_cut {
+                self.drag = Some(d);
+            }
+            if let Some(i) = delete_cut {
+                self.delete_cut(i);
             }
         }
 
-        // Playhead.
+        // Timeline razor (feature plan #3, ADR 0065): removed segments veiled
+        // (they are cut from the export — video, audio, captions), white ✂
+        // markers on the cut boundaries, draggable; segment removal toggles
+        // live in the strip's right-click menu.
+        {
+            let segs = self.razor.segments(dur);
+            for (i, (a, b)) in segs.iter().enumerate() {
+                if !*self.razor.removed.get(i).unwrap_or(&false) {
+                    continue;
+                }
+                let r = Rect::from_min_max(
+                    egui::pos2(t_to_x(*a), rect.top() + 14.0),
+                    egui::pos2(t_to_x(*b), rect.bottom() - 2.0),
+                );
+                p.rect_filled(r, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+                if r.width() > 46.0 {
+                    p.text(
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        "cut out",
+                        FontId::proportional(10.0),
+                        Color32::from_gray(160),
+                    );
+                }
+            }
+            let mut begin_razor: Option<TimelineDrag> = None;
+            let mut delete_razor: Option<usize> = None;
+            for (k, c) in self.razor.cuts.iter().enumerate() {
+                let x = t_to_x(*c);
+                let handle = Rect::from_min_max(
+                    egui::pos2(x - 5.0, rect.top() + 2.0),
+                    egui::pos2(x + 5.0, rect.bottom() - 2.0),
+                );
+                let resp = ui.interact(handle, ui.id().with(("razor", k)), Sense::click_and_drag());
+                let hot = resp.hovered()
+                    || matches!(&self.drag, Some(TimelineDrag::Razor { idx, .. }) if *idx == k);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        begin_razor =
+                            Some(TimelineDrag::Razor { idx: k, orig_t: *c, grab_t: x_to_t(pos.x) });
+                    }
+                }
+                resp.on_hover_text(format!(
+                    "Clip cut at {}\nDrag to move · right-click to delete (merges the segments)",
+                    fmt_mmss_cc(*c)
+                ))
+                .context_menu(|ui| {
+                    if ui.button("🗑 Delete clip cut").clicked() {
+                        delete_razor = Some(k);
+                        ui.close();
+                    }
+                });
+                let col = if hot { Color32::WHITE } else { Color32::from_gray(200) };
+                p.line_segment(
+                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
+                    Stroke::new(if hot { 2.0 } else { 1.2 }, col),
+                );
+                p.text(
+                    egui::pos2(x + 2.0, rect.top() + 2.0),
+                    Align2::LEFT_TOP,
+                    "✂",
+                    FontId::proportional(9.0),
+                    col,
+                );
+            }
+            if let Some(d) = begin_razor {
+                self.drag = Some(d);
+            }
+            if let Some(k) = delete_razor {
+                self.razor.delete_cut(k);
+            }
+        }
+
+        // The ▼ cut marker: the ✂←/→✂ reference point. Draggable; right-click
+        // clears it.
+        if let Some(m) = self.cut_marker {
+            let x = t_to_x(m);
+            let handle = Rect::from_min_max(
+                egui::pos2(x - 6.0, rect.top() + 2.0),
+                egui::pos2(x + 6.0, rect.bottom() - 2.0),
+            );
+            let resp = ui.interact(handle, ui.id().with("cut-marker"), Sense::click_and_drag());
+            let hot = resp.hovered() || matches!(self.drag, Some(TimelineDrag::Marker { .. }));
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    self.drag = Some(TimelineDrag::Marker { orig_t: m, grab_t: x_to_t(pos.x) });
+                }
+            }
+            let mut clear_marker = false;
+            resp.on_hover_text(format!(
+                "Cut marker at {} — ✂← / →✂ cut from the playhead to here\n\
+                 Drag to move · right-click to clear",
+                fmt_mmss_cc(m)
+            ))
+            .context_menu(|ui| {
+                if ui.button("🗑 Clear marker").clicked() {
+                    clear_marker = true;
+                    ui.close();
+                }
+            });
+            if clear_marker {
+                self.cut_marker = None;
+            } else {
+                let col = theme::INFO.gamma_multiply(if hot { 1.0 } else { 0.8 });
+                p.line_segment(
+                    [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
+                    Stroke::new(if hot { 2.0 } else { 1.4 }, col),
+                );
+                // The ▼ head, painted (no font in the stack carries ▼).
+                p.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(x - 5.0, rect.top() + 2.0),
+                        egui::pos2(x + 5.0, rect.top() + 2.0),
+                        egui::pos2(x, rect.top() + 10.0),
+                    ],
+                    col,
+                    Stroke::NONE,
+                ));
+            }
+        }
+
+        // The strip's right-click menu: razor verbs at the click position
+        // (recorded when the menu opened — the pointer moves once it's open).
+        if resp.secondary_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                self.strip_menu_t = Some(x_to_t(pos.x));
+            }
+        }
+        resp.context_menu(|ui| {
+            let at = self.strip_menu_t.unwrap_or(self.playhead_s);
+            if ui.button(format!("✂ Cut clip here ({})", fmt_mmss(at))).clicked() {
+                let t = if self.src_fps > 0.0 {
+                    (at * self.src_fps).round() / self.src_fps
+                } else {
+                    at
+                };
+                self.razor.add_cut(t, dur);
+                ui.close();
+            }
+            if ui.button("⏷ Place cut marker here").clicked() {
+                self.cut_marker = Some(at);
+                ui.close();
+            }
+            let seg = self.razor.seg_index_at(at);
+            let removed = *self.razor.removed.get(seg).unwrap_or(&false);
+            let label = if removed { "Restore this segment" } else { "Remove this segment from the export" };
+            if ui.button(label).clicked() {
+                if !self.razor.toggle_segment(seg) && !removed {
+                    // The refusal case: this is the last kept segment.
+                    tracing::info!("razor: refused to remove the last kept segment");
+                }
+                ui.close();
+            }
+            if self.camera_mode == CameraMode::ActiveSpeaker
+                && self.plan.is_some()
+                && ui.button("Camera cut here (framing change)").clicked()
+            {
+                let keep_playhead = self.playhead_s;
+                self.playhead_s = at;
+                self.split_shot_at_playhead();
+                self.playhead_s = keep_playhead;
+                ui.close();
+            }
+        });
+
+        // Playhead — with its own grab handle at the head, registered AFTER
+        // every cut/marker handle so scrubbing by the head can never grab a
+        // marker underneath (operator ask 2026-07-13: the playhead parked on
+        // a razor cut dragged the cut instead). Markers stay grabbable on
+        // their lines below the head's zone.
+        let px = t_to_x(self.playhead_s);
+        let phandle = Rect::from_min_max(
+            egui::pos2(px - 8.0, rect.top()),
+            egui::pos2(px + 8.0, rect.top() + 16.0),
+        );
+        let presp = ui.interact(phandle, ui.id().with("playhead-grab"), Sense::click_and_drag());
+        if presp.hovered() || presp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if presp.dragged() {
+            if let Some(pos) = presp.interact_pointer_pos() {
+                // Same contract as the strip scrub: visuals track the pointer;
+                // the audio commits on release (a per-frame sink restart is a
+                // re-seek storm).
+                self.playhead_s = x_to_t(pos.x);
+                if self.playing.is_some() {
+                    self.playing = Some((Instant::now(), self.playhead_s));
+                    self.stop_video();
+                }
+            }
+        }
+        if presp.drag_stopped() && self.playing.is_some() {
+            self.playing = Some((Instant::now(), self.playhead_s));
+            self.start_video();
+            action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
+        }
         let px = t_to_x(self.playhead_s);
         p.line_segment(
             [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
             Stroke::new(2.0, theme::GOLD),
         );
-        p.circle_filled(egui::pos2(px, rect.top() + 3.0), 4.0, theme::GOLD);
+        p.circle_filled(
+            egui::pos2(px, rect.top() + 4.0),
+            if presp.hovered() || presp.dragged() { 5.5 } else { 4.0 },
+            theme::GOLD,
+        );
+
+        // Gesture feedback, above everything: the magnet guide (the anchor a
+        // drag snapped onto) and the m:ss.cc chip at the manipulated time.
+        if let Some(x) = snap_x {
+            p.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.7)),
+            );
+        }
+        if let Some(t) = drag_chip_t.filter(|_| self.drag.is_some()) {
+            chip(
+                &p,
+                egui::pos2((t_to_x(t) + 8.0).min(rect.right() - 64.0), rect.top() + 16.0),
+                &fmt_mmss_cc(t),
+                theme::GOLD,
+            );
+        }
 
         // Scrub: click or drag anywhere on the strip. While dragging, only the
         // visuals track the pointer (restarting the sink every frame is a
@@ -1432,7 +2840,8 @@ impl EditorState {
         // `dragged()` is already false, so a release branch nested under it
         // can never run — the bug where dragging mid-playback moved the
         // playhead while the audio kept playing from the old position.
-        if resp.clicked() || resp.dragged() {
+        // A caption/cut gesture owns the pointer instead — no scrub then.
+        if self.drag.is_none() && (resp.clicked() || resp.dragged()) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.playhead_s = x_to_t(pos.x);
                 if self.playing.is_some() {
@@ -1448,7 +2857,7 @@ impl EditorState {
                 }
             }
         }
-        if resp.drag_stopped() && self.playing.is_some() {
+        if self.drag.is_none() && resp.drag_stopped() && self.playing.is_some() {
             self.playing = Some((Instant::now(), self.playhead_s));
             self.start_video();
             action = Some(EditorAction::Play(self.play_range_from(self.playhead_s)));
@@ -1496,16 +2905,29 @@ impl EditorState {
                     .size(11.5),
             );
         }
+        if !self.manual_units.is_empty() {
+            ui.weak(
+                "Your captions burn as their own line ABOVE the auto captions — they can \
+                 share time with them.",
+            );
+        }
         ui.add_space(4.0);
 
         let mut dirty = false;
+        let mut manual_dirty = false;
+        // A time widget being edited RIGHT NOW: sorting must wait for it (a
+        // mid-edit resort swaps the row under the operator's cursor — the
+        // "editing replaced the other caption" bug, 2026-07-12).
+        let mut time_edit_active = false;
         let mut seek: Option<f64> = None;
         let mut delete: Option<usize> = None;
         let mut split: Option<usize> = None;
         let mut merge: Option<usize> = None;
         let mut censor: Option<usize> = None;
+        let mut delete_manual: Option<usize> = None;
         let playhead = self.playhead_s;
         let n = transcript.units.len();
+        let dur = self.range.duration_s();
 
         egui::ScrollArea::vertical().id_salt("caption-rows").auto_shrink([false, true]).show(ui, |ui| {
             for i in 0..n {
@@ -1525,15 +2947,22 @@ impl EditorState {
                     .corner_radius(CornerRadius::same(4))
                     .inner_margin(egui::Margin::symmetric(4, 3))
                     .show(ui, |ui| {
+                        // Two-line rows: times + actions up top, the text on
+                        // its own FULL-WIDTH line below — a narrow panel must
+                        // never squeeze the text field into uneditability
+                        // (operator report 2026-07-12).
                         ui.horizontal(|ui| {
-                            // Timestamp: editable mm:ss.cc (drag or type).
+                            // Timestamps: editable mm:ss.cc (drag or type).
+                            // Start MOVES the caption (duration kept); end
+                            // sets how long it stays. The burn still clears a
+                            // line at the next line's onset.
                             let u = &mut transcript.units[i];
                             let mut start = u.start_s;
                             let resp = ui.add_enabled(
                                 enabled,
                                 egui::DragValue::new(&mut start)
                                     .speed(0.02)
-                                    .range(0.0..=self.range.duration_s())
+                                    .range(0.0..=dur)
                                     .custom_formatter(|v, _| fmt_mmss_cc(v))
                                     .custom_parser(parse_mmss_cc),
                             );
@@ -1546,42 +2975,75 @@ impl EditorState {
                             if resp.clicked() || resp.gained_focus() {
                                 self.sel_unit = Some(i);
                             }
-                            // Text.
-                            let text_resp = ui.add_enabled(
-                                enabled,
-                                egui::TextEdit::singleline(&mut u.text)
-                                    .desired_width(ui.available_width() - 108.0)
-                                    .font(egui::TextStyle::Body),
-                            );
-                            if text_resp.changed() {
+                            let mut end = u.end_s;
+                            let eresp = ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::DragValue::new(&mut end)
+                                        .speed(0.02)
+                                        .range(0.0..=dur)
+                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
+                                        .custom_parser(parse_mmss_cc),
+                                )
+                                .on_hover_text(
+                                    "When this caption leaves the screen (the next caption's \
+                                     start still wins at burn time)",
+                                );
+                            if eresp.changed() {
+                                u.end_s = end.max(u.start_s + CAP_MIN_S);
                                 dirty = true;
                             }
-                            if text_resp.gained_focus() {
+                            if eresp.clicked() || eresp.gained_focus() {
                                 self.sel_unit = Some(i);
-                                seek = Some(u.start_s);
                             }
+                            time_edit_active |= resp.dragged()
+                                || resp.has_focus()
+                                || eresp.dragged()
+                                || eresp.has_focus();
                             // Row actions, right-aligned and compact.
-                            ui.add_enabled_ui(enabled, |ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
-                                if ui.small_button("✂").on_hover_text("Split this caption").clicked() {
-                                    split = Some(i);
-                                }
-                                if i + 1 < n {
-                                    if ui.small_button("⇓").on_hover_text("Merge with the next caption").clicked() {
-                                        merge = Some(i);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                                    if ui.small_button("🗑").on_hover_text("Delete this caption").clicked() {
+                                        delete = Some(i);
                                     }
-                                } else {
-                                    ui.add_enabled(false, egui::Button::new("⇓").small());
-                                }
-                                if ui.small_button("＊").on_hover_text("Censor this word (d***)").clicked() {
-                                    censor = Some(i);
-                                }
-                                if ui.small_button("🗑").on_hover_text("Delete this caption").clicked() {
-                                    delete = Some(i);
-                                }
+                                    if ui.small_button("＊").on_hover_text("Censor this word (d***)").clicked() {
+                                        censor = Some(i);
+                                    }
+                                    if i + 1 < n {
+                                        if ui.small_button("⇓").on_hover_text("Merge with the next caption").clicked() {
+                                            merge = Some(i);
+                                        }
+                                    } else {
+                                        ui.add_enabled(false, egui::Button::new("⇓").small());
+                                    }
+                                    if ui.small_button("✂").on_hover_text("Split this caption").clicked() {
+                                        split = Some(i);
+                                    }
+                                });
                             });
                         });
+                        let u = &mut transcript.units[i];
+                        let text_resp = ui.add_enabled(
+                            enabled,
+                            egui::TextEdit::singleline(&mut u.text)
+                                .id(egui::Id::new(("cap-text", i)))
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Body),
+                        );
+                        if self.focus_caption == Some((CapLane::Auto, i)) {
+                            // Double-clicked on the preview: edit here.
+                            text_resp.request_focus();
+                            self.focus_caption = None;
+                        }
+                        if text_resp.changed() {
+                            dirty = true;
+                        }
+                        if text_resp.gained_focus() {
+                            self.sel_unit = Some(i);
+                            seek = Some(u.start_s);
+                        }
                     });
                 // A timeline caption-block click selects this row: bring it
                 // into view (one-shot).
@@ -1589,23 +3051,123 @@ impl EditorState {
                     row_resp.response.scroll_to_me(Some(egui::Align::Center));
                 }
             }
+
+            // The operator's OWN captions (the dedicated lane): same editing
+            // grammar, minus split/merge/censor (type what you mean).
+            if !self.manual_units.is_empty() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Your captions").strong().size(12.5));
+                for i in 0..self.manual_units.len() {
+                    let row_bg = if self.sel_manual == Some(i) {
+                        theme::GOLD.gamma_multiply(0.12)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    // The preview's double-click handed focus here: bring the
+                    // row into view (checked before the closure clears it).
+                    let focus_this = self.focus_caption == Some((CapLane::Manual, i));
+                    let row_resp = egui::Frame::new()
+                        .fill(row_bg)
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(4, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let u = &mut self.manual_units[i];
+                                let mut start = u.start_s;
+                                let resp = ui.add_enabled(
+                                    enabled,
+                                    egui::DragValue::new(&mut start)
+                                        .speed(0.02)
+                                        .range(0.0..=dur)
+                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
+                                        .custom_parser(parse_mmss_cc),
+                                );
+                                if resp.changed() {
+                                    let d = u.end_s - u.start_s;
+                                    u.start_s = start;
+                                    u.end_s = start + d.max(0.05);
+                                    manual_dirty = true;
+                                }
+                                let mut end = u.end_s;
+                                let eresp = ui.add_enabled(
+                                    enabled,
+                                    egui::DragValue::new(&mut end)
+                                        .speed(0.02)
+                                        .range(0.0..=dur)
+                                        .custom_formatter(|v, _| fmt_mmss_cc(v))
+                                        .custom_parser(parse_mmss_cc),
+                                );
+                                if eresp.changed() {
+                                    u.end_s = end.max(u.start_s + CAP_MIN_S);
+                                    manual_dirty = true;
+                                }
+                                if resp.clicked()
+                                    || resp.gained_focus()
+                                    || eresp.clicked()
+                                    || eresp.gained_focus()
+                                {
+                                    self.sel_manual = Some(i);
+                                }
+                                time_edit_active |= resp.dragged()
+                                    || resp.has_focus()
+                                    || eresp.dragged()
+                                    || eresp.has_focus();
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            ui.spacing_mut().button_padding = egui::vec2(4.0, 2.0);
+                                            if ui
+                                                .small_button("🗑")
+                                                .on_hover_text("Delete this caption")
+                                                .clicked()
+                                            {
+                                                delete_manual = Some(i);
+                                            }
+                                        });
+                                    },
+                                );
+                            });
+                            let u = &mut self.manual_units[i];
+                            let text_resp = ui.add_enabled(
+                                enabled,
+                                egui::TextEdit::singleline(&mut u.text)
+                                    .id(egui::Id::new(("man-text", i)))
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Body),
+                            );
+                            if self.focus_caption == Some((CapLane::Manual, i)) {
+                                // Double-clicked on the preview: edit here.
+                                text_resp.request_focus();
+                                self.focus_caption = None;
+                            }
+                            if text_resp.changed() {
+                                manual_dirty = true;
+                            }
+                            if text_resp.gained_focus() {
+                                self.sel_manual = Some(i);
+                                seek = Some(u.start_s);
+                            }
+                        });
+                    if focus_this {
+                        row_resp.response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                }
+            }
         });
         self.scroll_to_sel = false;
 
         ui.add_space(6.0);
+        // Deferred: `add_caption_at_playhead` needs `&mut self`, still
+        // borrowed as `transcript` here (the timeline's ＋ Caption button is
+        // the same verb).
+        let mut add_at_playhead = false;
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(enabled, egui::Button::new("＋ Add caption at playhead"))
                 .clicked()
             {
-                let at = self.playhead_s;
-                let idx = transcript.units.iter().position(|u| u.start_s > at).unwrap_or(n);
-                transcript.units.insert(
-                    idx,
-                    yc_core::CaptionUnit { text: "text".into(), start_s: at, end_s: at + 0.8 },
-                );
-                self.sel_unit = Some(idx);
-                dirty = true;
+                add_at_playhead = true;
             }
         });
 
@@ -1637,14 +3199,36 @@ impl EditorState {
             self.sel_unit = None;
             dirty = true;
         }
+        if let Some(i) = delete_manual {
+            if i < self.manual_units.len() {
+                // Inline while `transcript` is still borrowed (disjoint
+                // fields): same pairing contract as remove_manual_caption.
+                self.manual_units.remove(i);
+                self.manual_places.remove(i);
+                self.sel_manual = None;
+                self.lines_dirty = true;
+                manual_dirty = true;
+            }
+        }
         if dirty {
-            // Keep units start-ordered so grouping/preview stay sane even if a
-            // timestamp edit reordered them.
-            transcript
-                .units
-                .sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal));
             self.transcript_dirty = true;
+        }
+        if dirty || manual_dirty {
             self.lines_dirty = true;
+            self.panel_sort_pending = true;
+        }
+        // Keep units start-ordered so grouping/preview stay sane — but only
+        // once no time widget is active: sorting mid-edit swaps the row under
+        // the operator's cursor and the edit lands on the WRONG caption.
+        if self.panel_sort_pending && !time_edit_active {
+            transcript.units.sort_by(|a, b| {
+                a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            self.sort_manual_units(); // placements ride along
+            self.panel_sort_pending = false;
+        }
+        if add_at_playhead {
+            self.add_caption_at_playhead();
         }
         if let Some(t) = seek {
             self.playhead_s = t.clamp(0.0, self.range.duration_s());
@@ -1661,7 +3245,12 @@ impl EditorState {
 
     // ---------------------------------------------------------- properties --
 
-    fn ui_properties(&mut self, ui: &mut egui::Ui, busy: bool) -> Option<EditorAction> {
+    fn ui_properties(
+        &mut self,
+        ui: &mut egui::Ui,
+        busy: bool,
+        prefs: &mut crate::settings::AppSettings,
+    ) -> Option<EditorAction> {
         let mut action = None;
 
         // --- Camera ---
@@ -1801,6 +3390,27 @@ impl EditorState {
                         }
                     });
                 }
+                // Motion presets (feature plan #9): one-click camera moves
+                // rendered as a glide/cut of the manual crop through the same
+                // per-shot machinery as the Active Speaker plan.
+                if self.kind != LayoutKind::Stacked {
+                    ui.label("Motion");
+                    let opts: Vec<(bool, &str)> = std::iter::once((self.motion.is_none(), "None"))
+                        .chain(MOTION_PRESETS.iter().map(|(m, l)| (self.motion == Some(*m), *l)))
+                        .collect();
+                    let mut pick: Option<usize> = None;
+                    for (ri, row) in opts.chunks(3).enumerate() {
+                        if let Some(j) = theme::chip_row(ui, row) {
+                            pick = Some(ri * 3 + j);
+                        }
+                    }
+                    if let Some(i) = pick {
+                        self.motion = if i == 0 { None } else { Some(MOTION_PRESETS[i - 1].0) };
+                    }
+                    if self.motion.is_some() {
+                        ui.weak("Renders as a glide/cut of your framing — the crop tools edit the start frame.");
+                    }
+                }
                 if theme::wide_button(ui, egui::Button::new("Reset to auto framing")).clicked() {
                     self.reset_to_auto();
                 }
@@ -1832,6 +3442,43 @@ impl EditorState {
                     self.preset = Some(i);
                     self.lines_dirty = true;
                     self.overlay_cache = None;
+                }
+            }
+            // The operator's own saved looks (feature plan #12), persisted in
+            // settings.json. Right-click deletes.
+            if !prefs.caption_presets.is_empty() {
+                ui.add_space(2.0);
+                ui.weak("Your presets:");
+                let mut apply: Option<usize> = None;
+                let mut delete: Option<usize> = None;
+                for (ri, row) in prefs.caption_presets.chunks(3).enumerate() {
+                    ui.horizontal(|ui| {
+                        for (j, up) in row.iter().enumerate() {
+                            let i = ri * 3 + j;
+                            let selected = self.style == up.style;
+                            let resp = ui
+                                .add(theme::chip(selected, &up.name))
+                                .on_hover_text("Apply this saved look · right-click to delete");
+                            if resp.clicked() {
+                                apply = Some(i);
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("🗑 Delete preset").clicked() {
+                                    delete = Some(i);
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+                }
+                if let Some(i) = apply {
+                    self.style = prefs.caption_presets[i].style.clone();
+                    self.preset = None;
+                    self.lines_dirty = true;
+                    self.overlay_cache = None;
+                }
+                if let Some(i) = delete {
+                    prefs.caption_presets.remove(i);
                 }
             }
             ui.weak("Pick a starting look - everything below stays editable.");
@@ -1910,6 +3557,37 @@ impl EditorState {
                         ui.weak("Drag the caption on the preview to place it; scroll on it to resize.");
                     }
                 }
+                // Save the current look as a named preset (feature plan #12);
+                // same name = update in place. Persists across sessions.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.preset_name)
+                            .hint_text("Preset name")
+                            .desired_width(130.0),
+                    );
+                    if ui
+                        .button("Save preset")
+                        .on_hover_text("Save this exact caption look for every future clip")
+                        .clicked()
+                    {
+                        let name = self.preset_name.trim().to_string();
+                        let name = if name.is_empty() {
+                            format!("Preset {}", prefs.caption_presets.len() + 1)
+                        } else {
+                            name
+                        };
+                        let entry = crate::settings::UserCaptionPreset {
+                            name: name.clone(),
+                            style: self.style.clone(),
+                        };
+                        match prefs.caption_presets.iter_mut().find(|p| p.name == name) {
+                            Some(p) => *p = entry,
+                            None => prefs.caption_presets.push(entry),
+                        }
+                        self.preset_name.clear();
+                    }
+                });
             }
         });
 
@@ -1963,10 +3641,19 @@ impl EditorState {
                 row(
                     ui,
                     "Captions",
-                    match (&self.transcript, self.transcript_dirty) {
-                        (None, _) => "on - transcribed during render".into(),
-                        (Some(t), true) => format!("on - {} lines (edited)", preview_lines(t, self.style.genre).len()),
-                        (Some(t), false) => format!("on - {} lines", preview_lines(t, self.style.genre).len()),
+                    match &self.transcript {
+                        None => "on - transcribed during render".into(),
+                        Some(t) => {
+                            let mut s =
+                                format!("on - {} lines", preview_lines(t, self.style.genre).len());
+                            if !self.manual_units.is_empty() {
+                                s.push_str(&format!(" + {} yours", self.manual_units.len()));
+                            }
+                            if self.transcript_dirty {
+                                s.push_str(" (edited)");
+                            }
+                            s
+                        }
                     },
                 );
                 row(ui, "Caption style", format!("{} · {}px", self.style.name, self.style.font_size));
@@ -2003,10 +3690,27 @@ impl EditorState {
                         } else {
                             format!("Active Speaker · {cuts} cuts")
                         }
+                    } else if self.camera_mode == CameraMode::Manual && self.motion_camera().is_some()
+                    {
+                        format!("Motion · {}", self.motion.map(motion_label).unwrap_or("preset"))
                     } else {
                         camera_mode_label(self.camera_mode).to_string()
                     },
                 );
+                // Timeline razor cuts (ADR 0065): the export drops these spans.
+                if let Some(keep) = self.razor.kept_spans(dur) {
+                    let kept: f64 = keep.iter().map(|k| k.duration_s()).sum();
+                    let n_removed = self.razor.removed.iter().filter(|r| **r).count();
+                    row(
+                        ui,
+                        "Timeline cuts",
+                        format!(
+                            "{n_removed} segment{} removed · final {}",
+                            if n_removed == 1 { "" } else { "s" },
+                            fmt_mmss_cc(kept)
+                        ),
+                    );
+                }
                 if spec_camera && !self.camera_audit.is_empty() {
                     for w in &self.camera_audit {
                         ui.label(
@@ -2076,13 +3780,21 @@ impl EditorState {
         }
         self.sync_lines();
         let p = self.playhead_s;
-        let (line, ghost) = match self.lines.iter().find(|l| l.start_s <= p && p < l.end_s) {
-            Some(l) => (l, false),
-            None => match self.lines.iter().find(|l| l.start_s >= p).or(self.lines.last()) {
-                Some(l) => (l, true),
-                None => return,
-            },
+        let (li, ghost) = match self.lines.iter().position(|l| l.start_s <= p && p < l.end_s) {
+            Some(i) => (i, false),
+            None => {
+                let fallback = self
+                    .lines
+                    .iter()
+                    .position(|l| l.start_s >= p)
+                    .or(self.lines.len().checked_sub(1));
+                match fallback {
+                    Some(i) => (i, true),
+                    None => return,
+                }
+            }
         };
+        let line = &self.lines[li];
 
         let style = &self.style;
         let place = self.placement.unwrap_or_default();
@@ -2179,13 +3891,151 @@ impl EditorState {
         }
         painter.galley(top_left, galley, primary);
 
+        // The operator's OWN caption stream (ADR 0065): every caption active
+        // at the playhead draws WITH the auto line — simultaneity is the
+        // point. Each sits at ITS OWN anchor (their drag, else the default
+        // block above the auto captions — the same geometry the ASS emits,
+        // so preview and export agree), and each is directly draggable:
+        // drag moves it anywhere on the canvas, scroll resizes it,
+        // right-click resets it to the default anchor.
+        let active_manual: Vec<usize> = self
+            .manual_units
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.start_s <= p && p < m.end_s.max(m.start_s + 0.1))
+            .map(|(i, _)| i)
+            .collect();
+        let mut set_place: Option<(usize, Option<CaptionPlacement>)> = None;
+        for i in active_manual {
+            let m = &self.manual_units[i];
+            let own = self.manual_places.get(i).copied().flatten();
+            let (mx, my, msize) = match own {
+                Some(pl) => resolve_placement(Some(pl), style.font_size),
+                None => resolve_manual_placement(self.placement, style.font_size),
+            };
+            let center = egui::pos2(
+                canvas_rect.left() + mx as f32 * px,
+                canvas_rect.top() + my as f32 * px,
+            );
+            let mfont = FontId::new(
+                (msize as f32 * px * Self::ASS_TO_EGUI_FONT).max(4.0),
+                theme::display_family(),
+            );
+            let galley = painter.layout_no_wrap(m.text.to_uppercase(), mfont.clone(), primary);
+            let sgalley = painter.layout_no_wrap(m.text.to_uppercase(), mfont, outline_c);
+            let gsize = galley.size();
+            let tl = center - gsize / 2.0;
+            if style.back_box {
+                painter.rect_filled(
+                    Rect::from_center_size(center, gsize + egui::vec2(18.0 * px, 12.0 * px)),
+                    CornerRadius::same(3),
+                    tint(style.back_color),
+                );
+            }
+            if style.outline > 0.0 {
+                let o = (style.outline * px).clamp(1.0, 6.0);
+                for d in [
+                    egui::vec2(-o, 0.0),
+                    egui::vec2(o, 0.0),
+                    egui::vec2(0.0, -o),
+                    egui::vec2(0.0, o),
+                ] {
+                    painter.galley(tl + d, sgalley.clone(), outline_c);
+                }
+            }
+            painter.galley(tl, galley, primary);
+
+            if !enabled {
+                continue;
+            }
+            let box_rect = Rect::from_center_size(center, gsize.max(egui::vec2(24.0, 16.0)));
+            let resp = ui
+                .interact(
+                    box_rect.expand(6.0),
+                    ui.id().with(("man-cap", i)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_text(
+                    "Your caption — drag to place it anywhere, scroll to resize, \
+                     double-click to edit the text, right-click to reset position",
+                );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                painter.rect_stroke(
+                    box_rect.expand(4.0),
+                    CornerRadius::same(3),
+                    Stroke::new(1.0, theme::INFO),
+                    StrokeKind::Outside,
+                );
+            }
+            if resp.double_clicked() {
+                self.sel_manual = Some(i);
+                self.focus_caption = Some((CapLane::Manual, i));
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Reset position").clicked() {
+                    set_place = Some((i, None));
+                    ui.close();
+                }
+            });
+            if resp.dragged() {
+                // Anchor fracs from the CURRENT resolved spot, so the first
+                // drag starts from where the caption already is.
+                let cur = own.unwrap_or(CaptionPlacement {
+                    x_frac: mx as f32 / CANVAS_W as f32,
+                    y_frac: my as f32 / CANVAS_H as f32,
+                    scale: 1.0,
+                });
+                let d = resp.drag_delta();
+                let mut x = cur.x_frac + d.x / canvas_rect.width();
+                let y = cur.y_frac + d.y / canvas_rect.height();
+                if (x - 0.5).abs() < 0.02 {
+                    x = 0.5; // snap to the canvas centre, like the main block
+                }
+                set_place = Some((
+                    i,
+                    Some(CaptionPlacement {
+                        x_frac: x.clamp(0.05, 0.95),
+                        y_frac: y.clamp(0.03, 0.97),
+                        scale: cur.scale,
+                    }),
+                ));
+            } else if resp.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll.abs() > 0.0 {
+                    let cur = own.unwrap_or(CaptionPlacement {
+                        x_frac: mx as f32 / CANVAS_W as f32,
+                        y_frac: my as f32 / CANVAS_H as f32,
+                        scale: 1.0,
+                    });
+                    let factor = (scroll * 0.0015).exp();
+                    set_place = Some((
+                        i,
+                        Some(CaptionPlacement {
+                            scale: (cur.scale * factor)
+                                .clamp(CaptionPlacement::SCALE_MIN, CaptionPlacement::SCALE_MAX),
+                            ..cur
+                        }),
+                    ));
+                    ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                }
+            }
+        }
+        if let Some((i, pl)) = set_place {
+            if let Some(slot) = self.manual_places.get_mut(i) {
+                *slot = pl;
+            }
+        }
+
         if !enabled {
             return;
         }
-        // Drag to move, scroll on it to resize — the Crop verbs, applied to the
-        // caption block.
+        // Drag to move, scroll on it to resize — the Crop verbs, applied to
+        // the caption block. Double-click = edit what you see: focuses this
+        // caption's text field in the panel (operator ask 2026-07-13).
         let box_rect = Rect::from_center_size(center, size.max(egui::vec2(24.0, 16.0)));
-        let resp = ui.interact(box_rect.expand(6.0), ui.id().with("caption-box"), Sense::drag());
+        let resp =
+            ui.interact(box_rect.expand(6.0), ui.id().with("caption-box"), Sense::click_and_drag());
         if resp.hovered() || resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             painter.rect_stroke(
@@ -2194,6 +4044,19 @@ impl EditorState {
                 Stroke::new(1.0, theme::GOLD),
                 StrokeKind::Outside,
             );
+        }
+        if resp.double_clicked() {
+            // The unit under the playhead within this line (the word being
+            // spoken), else the line's first unit. Cumulative word counts map
+            // lines onto transcript units (one word per unit).
+            let base: usize = self.lines[..li].iter().map(|l| l.words.len()).sum();
+            let off = line.words.iter().rposition(|w| w.start_s <= p).unwrap_or(0);
+            let unit = base + off;
+            if self.transcript.as_ref().is_some_and(|t| unit < t.units.len()) {
+                self.sel_unit = Some(unit);
+                self.scroll_to_sel = true;
+                self.focus_caption = Some((CapLane::Auto, unit));
+            }
         }
         if resp.dragged() {
             let d = resp.drag_delta();
@@ -2255,13 +4118,82 @@ impl EditorState {
     }
 }
 
-/// Which crop a Source-view interaction targets.
-#[derive(Clone, Copy)]
-enum CropTarget {
-    Gameplay,
-    Facecam,
-    FullCam,
-    FullGameplay,
+/// Drag body to move + corner handles to resize + scroll to zoom, for one
+/// crop box in Source view — over ANY crop (a Manual field, or a camera-plan
+/// shot's crop for the operator's own per-shot framing). Returns true when
+/// the crop changed.
+fn crop_box_interaction(
+    ui: &mut egui::Ui,
+    frame_rect: Rect,
+    screen: Rect,
+    id: &str,
+    crop: &mut Crop,
+    sw: f32,
+    sh: f32,
+) -> bool {
+    let px = sw / frame_rect.width().max(1.0);
+    let mut changed = false;
+    // Corner handles first (they win the pointer over the body).
+    let hs = 7.0;
+    let corners = [
+        (screen.left_top(), -1.0, -1.0),
+        (screen.right_top(), 1.0, -1.0),
+        (screen.left_bottom(), -1.0, 1.0),
+        (screen.right_bottom(), 1.0, 1.0),
+    ];
+    let mut resized = false;
+    for (i, (pos, sx, sy)) in corners.iter().enumerate() {
+        let hrect = Rect::from_center_size(*pos, egui::vec2(hs * 2.0, hs * 2.0));
+        let resp = ui.interact(hrect, ui.id().with((id, "corner", i)), Sense::drag());
+        ui.painter().rect_filled(
+            Rect::from_center_size(*pos, egui::vec2(hs, hs)),
+            CornerRadius::same(2),
+            if resp.hovered() || resp.dragged() { theme::GOLD } else { Color32::WHITE },
+        );
+        if resp.dragged() {
+            resized = true;
+            changed = true;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+            let d = resp.drag_delta();
+            // Dragging a corner outward grows the box: project the delta on
+            // the outward diagonal, aspect-locked via zoom about the
+            // opposite corner.
+            let grow = (d.x * sx + d.y * sy) * 0.5 * px;
+            let factor = ((crop.w + 2.0 * grow) / crop.w).clamp(0.25, 4.0);
+            let (ax, ay) = (
+                crop.x + crop.w * (0.5 - sx * 0.5), // opposite corner stays put
+                crop.y + crop.h * (0.5 - sy * 0.5),
+            );
+            *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
+        }
+    }
+    if resized {
+        return changed;
+    }
+    // Body: move.
+    let resp = ui.interact(screen, ui.id().with((id, "body")), Sense::click_and_drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        if d != egui::Vec2::ZERO {
+            changed = true;
+        }
+        *crop = yc_frame::pan_crop(*crop, sw, sh, d.x * px, d.y * px);
+    }
+    // Scroll on the box: zoom about its center.
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.0 {
+            changed = true;
+            let factor = (-scroll * 0.0015).exp();
+            let (ax, ay) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
+            *crop = yc_frame::zoom_crop(*crop, sw, sh, factor, ax, ay);
+            ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+        }
+    }
+    changed
 }
 
 /// Everything the overlay's shaped galleys depend on (ADR 0036).
@@ -2569,6 +4501,66 @@ fn split_unit(u: &yc_core::CaptionUnit) -> Option<(yc_core::CaptionUnit, yc_core
     ))
 }
 
+/// Split the plan's shot covering `t` in two at `t` (feature plan #3's manual
+/// cut point). Both halves keep the shot's subject and framing — the operator
+/// retargets either by clicking a face. A glide is split so the motion stays
+/// identical: the first half lands where the pan had reached at `t`, the
+/// second continues from there to the original target. Refuses a split that
+/// would leave a sliver shot (< [`MIN_SHOT_S`]).
+fn split_plan_at(plan: &mut CameraPlan, t: f64) -> bool {
+    let Some(idx) = plan.shots.iter().position(|s| s.start_s <= t && t < s.end_s) else {
+        return false;
+    };
+    let shot = plan.shots[idx].clone();
+    if t - shot.start_s < MIN_SHOT_S || shot.end_s - t < MIN_SHOT_S {
+        return false;
+    }
+    let mid = shot.layout_at(t);
+    let mut first = shot.clone();
+    let mut second = shot;
+    first.end_s = t;
+    second.start_s = t;
+    if first.pan_to.is_some() {
+        if let Layout::FullFrame { crop } = mid {
+            first.pan_to = Some(crop);
+            second.layout = Layout::FullFrame { crop };
+        }
+    }
+    plan.shots[idx] = first;
+    plan.shots.insert(idx + 1, second);
+    true
+}
+
+/// Remove the cut between shots `boundary-1` and `boundary`: the earlier
+/// shot's framing carries across the merged span (the framing the viewer was
+/// already watching leading into the cut; a kept glide just spans longer).
+fn delete_plan_cut(plan: &mut CameraPlan, boundary: usize) -> bool {
+    if boundary == 0 || boundary >= plan.shots.len() {
+        return false;
+    }
+    let removed = plan.shots.remove(boundary);
+    plan.shots[boundary - 1].end_s = removed.end_s;
+    true
+}
+
+/// The nearest anchor within `tol` of `t`, if any — the timeline's magnetic
+/// snap (feature plan #3: dragged times snap to nearby anchors).
+fn magnet(t: f64, anchors: &[f64], tol: f64) -> Option<f64> {
+    anchors
+        .iter()
+        .copied()
+        .filter(|a| (a - t).abs() <= tol)
+        .min_by(|a, b| {
+            (a - t).abs().partial_cmp(&(b - t).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Quantize to centiseconds — the transcript panel's own granularity
+/// (`m:ss.cc`), so a drag never bakes in precision the panel can't show.
+fn quantize_cs(t: f64) -> f64 {
+    (t * 100.0).round() / 100.0
+}
+
 /// A rough wall-clock estimate for the export (the summary row): NVENC runs
 /// ~2.5x realtime on the 1080x1920 encode, whisper ~0.9x when the transcript
 /// is not already cached, plus fixed process overhead.
@@ -2674,6 +4666,203 @@ mod tests {
         assert_eq!(nice_step(7.0), 10.0);
         assert_eq!(nice_step(0.8), 1.0);
         assert_eq!(nice_step(20.0), 30.0);
+    }
+
+    fn plan(bounds: &[f64]) -> yc_core::CameraPlan {
+        let shots = bounds
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| yc_core::Shot {
+                start_s: w[0],
+                end_s: w[1],
+                track: Some(i),
+                layout: Layout::FullFrame {
+                    crop: Crop { x: i as f32 * 10.0, y: 0.0, w: 100.0, h: 200.0 },
+                },
+                pan_to: None,
+            })
+            .collect();
+        yc_core::CameraPlan { shots }
+    }
+
+    #[test]
+    fn split_plan_at_keeps_coverage_and_splits_a_glide_without_a_jump() {
+        // Static shot: both halves inherit the framing; spans stay contiguous.
+        let mut p = plan(&[0.0, 4.0, 8.0]);
+        assert!(split_plan_at(&mut p, 2.0));
+        assert_eq!(p.shots.len(), 3);
+        assert_eq!((p.shots[0].start_s, p.shots[0].end_s), (0.0, 2.0));
+        assert_eq!((p.shots[1].start_s, p.shots[1].end_s), (2.0, 4.0));
+        assert_eq!(p.shots[0].layout, p.shots[1].layout);
+        assert_eq!(p.shots[0].track, p.shots[1].track);
+        // A sliver split is refused outright.
+        assert!(!split_plan_at(&mut p, 2.0 + MIN_SHOT_S / 2.0));
+        assert!(!split_plan_at(&mut p, 99.0), "outside every shot");
+        // A glide splits into two glides that meet exactly at the cut: the
+        // motion on screen is unchanged.
+        let mut p = plan(&[0.0, 4.0]);
+        p.shots[0].pan_to = Some(Crop { x: 40.0, y: 0.0, w: 100.0, h: 200.0 });
+        let before = p.shots[0].layout_at(2.0);
+        assert!(split_plan_at(&mut p, 2.0));
+        assert_eq!(p.shots[0].layout_at(2.0 - 1e-9), p.shots[1].layout_at(2.0));
+        assert_eq!(p.shots[1].layout_at(2.0), before);
+        assert_eq!(
+            p.shots[1].pan_to,
+            Some(Crop { x: 40.0, y: 0.0, w: 100.0, h: 200.0 }),
+            "the second half still glides to the original target"
+        );
+    }
+
+    #[test]
+    fn delete_plan_cut_merges_into_the_earlier_shot() {
+        let mut p = plan(&[0.0, 4.0, 8.0, 10.0]);
+        let earlier = p.shots[0].layout.clone();
+        assert!(delete_plan_cut(&mut p, 1));
+        assert_eq!(p.shots.len(), 2);
+        assert_eq!((p.shots[0].start_s, p.shots[0].end_s), (0.0, 8.0));
+        assert_eq!(p.shots[0].layout, earlier, "the framing the viewer was already watching");
+        assert_eq!(p.shots[1].start_s, 8.0, "later shots untouched");
+        // Boundary 0 is the clip start, not a cut; out-of-range is a no-op.
+        assert!(!delete_plan_cut(&mut p, 0));
+        assert!(!delete_plan_cut(&mut p, 5));
+    }
+
+    #[test]
+    fn razor_add_toggle_delete_and_kept_spans() {
+        let mut r = RazorState::default();
+        assert!(r.kept_spans(10.0).is_none(), "no cuts, no removals");
+        assert!(r.add_cut(4.0, 10.0));
+        assert!(!r.add_cut(4.05, 10.0), "too near an existing cut");
+        assert!(!r.add_cut(0.05, 10.0), "too near the clip start");
+        assert!(r.add_cut(7.0, 10.0));
+        assert_eq!(r.segments(10.0), vec![(0.0, 4.0), (4.0, 7.0), (7.0, 10.0)]);
+        // Cuts alone are markers: the export is unchanged.
+        assert!(r.kept_spans(10.0).is_none());
+        // Remove the middle segment.
+        assert!(r.toggle_segment(1));
+        let keep = r.kept_spans(10.0).unwrap();
+        assert_eq!(keep.len(), 2);
+        assert_eq!((keep[0].start_s, keep[0].end_s), (0.0, 4.0));
+        assert_eq!((keep[1].start_s, keep[1].end_s), (7.0, 10.0));
+        // Removing every segment is refused: one kept segment survives.
+        assert!(r.toggle_segment(0));
+        assert!(!r.toggle_segment(2), "the last kept segment is protected");
+        // Deleting the cut between two REMOVED segments keeps them removed...
+        assert!(r.delete_cut(0));
+        assert_eq!(r.segments(10.0).len(), 2);
+        assert!(r.removed[0], "both halves removed -> merged removed");
+        // ...but merging removed+kept lands KEPT (the safe default).
+        assert!(r.delete_cut(0));
+        assert!(!r.removed[0]);
+        assert!(r.kept_spans(10.0).is_none());
+    }
+
+    #[test]
+    fn razor_marker_scissors_cut_left_right_and_remove_span() {
+        // ✂← with no marker: removes from the clip start to the playhead.
+        let mut r = RazorState::default();
+        assert!(r.cut_left(4.0, None, 10.0));
+        let keep = r.kept_spans(10.0).unwrap();
+        assert_eq!((keep[0].start_s, keep[0].end_s), (4.0, 10.0));
+        // →✂ with a marker right of the playhead stops AT the marker.
+        let mut r = RazorState::default();
+        assert!(r.cut_right(2.0, Some(6.0), 10.0));
+        let keep = r.kept_spans(10.0).unwrap();
+        assert_eq!(keep.len(), 2);
+        assert_eq!((keep[0].start_s, keep[0].end_s), (0.0, 2.0));
+        assert_eq!((keep[1].start_s, keep[1].end_s), (6.0, 10.0));
+        // The operator's middle-cut flow: marker at 3, playhead moved PAST it
+        // to 6, ✂← removes exactly [3, 6] — "cut left until it touches the
+        // marker, then stop".
+        let mut r = RazorState::default();
+        assert!(r.cut_left(6.0, Some(3.0), 10.0));
+        let keep = r.kept_spans(10.0).unwrap();
+        assert_eq!(keep.len(), 2);
+        assert_eq!((keep[0].start_s, keep[0].end_s), (0.0, 3.0));
+        assert_eq!((keep[1].start_s, keep[1].end_s), (6.0, 10.0));
+        // A marker on the WRONG side falls back to the clip edge.
+        let mut r = RazorState::default();
+        assert!(r.cut_left(4.0, Some(7.0), 10.0), "marker right of playhead: cut to start");
+        assert_eq!(r.kept_spans(10.0).unwrap()[0].start_s, 4.0);
+        // Refusals: a sub-segment span; removing the last kept segment.
+        let mut r = RazorState::default();
+        assert!(!r.cut_left(0.05, None, 10.0));
+        assert!(r.cut_left(9.0, None, 10.0));
+        assert!(!r.cut_right(9.0, None, 10.0), "would remove the last kept segment");
+        // remove_span reuses a razor cut within the min-segment radius
+        // instead of stacking a second cut beside it.
+        let mut r = RazorState::default();
+        r.add_cut(5.0, 20.0);
+        assert!(r.remove_span(5.04, 12.0, 20.0));
+        assert_eq!(r.cuts.len(), 2, "reused the existing cut at 5.0");
+        // Delete key: the segment under the playhead.
+        let mut r = RazorState::default();
+        r.add_cut(3.0, 10.0);
+        r.add_cut(6.0, 10.0);
+        assert!(r.remove_segment_at(4.5));
+        assert!(!r.remove_segment_at(4.5), "already removed");
+    }
+
+    #[test]
+    fn razor_playback_skip_and_adjacent_kept_merge() {
+        let mut r = RazorState::default();
+        r.add_cut(2.0, 10.0);
+        r.add_cut(5.0, 10.0);
+        r.toggle_segment(1);
+        assert_eq!(r.removed_span_at(3.0, 10.0), Some((2.0, 5.0)));
+        assert_eq!(r.removed_span_at(1.0, 10.0), None);
+        // A cut between two KEPT segments is just a marker: the kept spans
+        // merge across it, so the export sees one contiguous trim.
+        r.add_cut(7.0, 10.0);
+        let keep = r.kept_spans(10.0).unwrap();
+        assert_eq!(keep.len(), 2, "adjacent kept segments merge");
+        assert_eq!((keep[1].start_s, keep[1].end_s), (5.0, 10.0));
+    }
+
+    #[test]
+    fn motion_plans_cover_the_clip_and_move_as_named() {
+        let base = Crop { x: 200.0, y: 100.0, w: 450.0, h: 800.0 };
+        let (sw, sh) = (1920.0, 1080.0);
+        for (m, _) in MOTION_PRESETS {
+            let plan = motion_plan(base, sw, sh, 20.0, m);
+            assert!(!plan.shots.is_empty());
+            assert_eq!(plan.shots.first().unwrap().start_s, 0.0);
+            assert_eq!(plan.shots.last().unwrap().end_s, 20.0);
+            for w in plan.shots.windows(2) {
+                assert_eq!(w[0].end_s, w[1].start_s, "contiguous shots");
+            }
+        }
+        // Zoom in: ends tighter than it starts.
+        let plan = motion_plan(base, sw, sh, 20.0, MotionPreset::ZoomIn);
+        let Layout::FullFrame { crop } = plan.shots[0].layout.clone() else { panic!() };
+        assert!(plan.shots[0].pan_to.unwrap().w < crop.w);
+        // Pan left: same size, traveling left.
+        let plan = motion_plan(base, sw, sh, 20.0, MotionPreset::PanLeft);
+        let Layout::FullFrame { crop } = plan.shots[0].layout.clone() else { panic!() };
+        let to = plan.shots[0].pan_to.unwrap();
+        assert!(to.x < crop.x, "pan-left travels left: {} -> {}", crop.x, to.x);
+        assert_eq!(to.w, crop.w, "a pan never zooms");
+        // Punch in: two static shots, the second tighter — a hard cut.
+        let plan = motion_plan(base, sw, sh, 20.0, MotionPreset::PunchIn);
+        assert_eq!(plan.shots.len(), 2);
+        assert!(plan.shots.iter().all(|s| s.pan_to.is_none()));
+        let Layout::FullFrame { crop: c0 } = plan.shots[0].layout.clone() else { panic!() };
+        let Layout::FullFrame { crop: c1 } = plan.shots[1].layout.clone() else { panic!() };
+        assert!(c1.w < c0.w);
+    }
+
+    #[test]
+    fn magnet_snaps_to_the_nearest_anchor_within_tolerance_only() {
+        assert_eq!(magnet(5.1, &[5.0, 6.0], 0.2), Some(5.0));
+        assert_eq!(magnet(5.6, &[5.0, 6.0], 0.5), Some(6.0));
+        assert_eq!(magnet(5.5, &[5.0, 7.0], 0.2), None);
+        assert_eq!(magnet(5.0, &[], 1.0), None);
+    }
+
+    #[test]
+    fn quantize_cs_rounds_to_centiseconds() {
+        assert!((quantize_cs(1.23456) - 1.23).abs() < 1e-9);
+        assert!((quantize_cs(1.235) - 1.24).abs() < 1e-9);
     }
 
     #[test]

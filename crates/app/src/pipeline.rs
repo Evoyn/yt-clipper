@@ -190,7 +190,12 @@ pub enum Job {
     /// the static `layout`. `transcript_override` is the operator's edited
     /// transcript from the editor's caption panel: it becomes the render's
     /// truth verbatim (no whisper, no harvest, no re-timing — the operator's
-    /// words are not guesses to second-guess).
+    /// words are not guesses to second-guess). `keep` is the timeline razor's
+    /// kept spans (ADR 0065, clip-relative, sorted): `Some` drops everything
+    /// between them from the export — video, audio, and captions together —
+    /// `None` renders the whole clip. `manual_captions` is the operator's own
+    /// caption stream (ADR 0065): burned as separate simultaneous events
+    /// above the auto captions, razor-remapped like them.
     Render {
         layout: Layout,
         style: CaptionStyle,
@@ -199,6 +204,8 @@ pub enum Job {
         caption_engine: Option<CaptionEngine>,
         camera: Option<CameraPlan>,
         transcript_override: Option<Transcript>,
+        keep: Option<Vec<TimeRange>>,
+        manual_captions: Vec<yc_core::ManualCaption>,
     },
     /// Fetch missing dependencies from their pinned official sources (ADR
     /// 0041): stream to a `.part` beside the destination, verify the pinned
@@ -570,9 +577,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         ));
                     }
                 },
-                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override } => match (&session, &mut prepared) {
+                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -2179,10 +2186,20 @@ fn do_render(
     caption_engine: Option<CaptionEngine>,
     camera: Option<CameraPlan>,
     transcript_override: Option<Transcript>,
+    keep: Option<Vec<TimeRange>>,
+    manual_captions: Vec<yc_core::ManualCaption>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
     let range = prepared.range;
+    // Timeline razor (ADR 0065): a keep list that covers the whole clip is no
+    // cut at all — normalize it away so the untouched paths stay untouched.
+    let keep = keep.filter(|k| {
+        !k.is_empty()
+            && (k.len() > 1
+                || k[0].start_s > 1e-6
+                || k[0].end_s < range.duration_s() - 1e-6)
+    });
     // The operator's edited transcript is the render's truth: cache it as
     // operator-owned (no whisper, no harvest, no re-timing — these are not
     // guesses to second-guess) and skip transcription entirely.
@@ -2198,13 +2215,65 @@ fn do_render(
     // included) — the editor may have opened after the first one.
     let _ = tx.send(Progress::Captions { transcript: transcript.clone() });
 
+    // Timeline razor (ADR 0065): the export drops the removed spans. The
+    // camera plan (or the static layout, promoted to one shot per kept span)
+    // is intersected with the kept spans IN SOURCE TIME — the filtergraph
+    // trims by source time and its concat compresses the output — and the
+    // captions remap onto that compressed timeline through the spans the plan
+    // ACTUALLY kept (a sub-frame sliver piece is dropped), so burned text can
+    // never drift from the cut audio. The editor keeps the full-clip
+    // transcript (sent above); only the burn compresses.
+    let export_camera: Option<CameraPlan> = match (&camera, &keep) {
+        (Some(plan), Some(k)) => Some(plan.cut_to(k)),
+        (Some(plan), None) => Some(plan.clone()),
+        (None, Some(k)) => Some(CameraPlan {
+            shots: k
+                .iter()
+                .map(|seg| yc_core::Shot {
+                    start_s: seg.start_s,
+                    end_s: seg.end_s,
+                    track: None,
+                    layout: layout.clone(),
+                    pan_to: None,
+                })
+                .collect(),
+        }),
+        (None, None) => None,
+    };
+    let (ass_transcript, ass_manual) = match (&keep, &export_camera) {
+        (Some(_), Some(plan)) => {
+            let spans = plan.kept_spans();
+            (
+                Transcript {
+                    language: transcript.language,
+                    units: yc_core::remap_units_through_cuts(&transcript.units, &spans),
+                },
+                // Each manual caption remaps like the transcript (a caption
+                // fully inside removed time drops); its placement rides along.
+                manual_captions
+                    .iter()
+                    .filter_map(|c| {
+                        yc_core::remap_units_through_cuts(
+                            std::slice::from_ref(&c.unit),
+                            &spans,
+                        )
+                        .into_iter()
+                        .next()
+                        .map(|unit| yc_core::ManualCaption { unit, placement: c.placement })
+                    })
+                    .collect(),
+            )
+        }
+        _ => (transcript.clone(), manual_captions.clone()),
+    };
+
     // Captions: write the ASS into the data folder and the font into a fonts-only
     // `data/fonts/` subdir. ffmpeg runs in the data folder, so the relative
     // `subtitles=clip.ass:fontsdir=fonts` resolves both (dodging Windows
     // filtergraph path escaping) while libass scans only fonts — not the sibling
     // analysis.wav / project.json a flat fontsdir tried (and failed) to open.
     let _ = tx.send(Progress::Stage("Generating captions"));
-    let ass = yc_render::generate_ass(transcript, &style, placement);
+    let ass = yc_render::generate_ass(&ass_transcript, &style, placement, &ass_manual);
     fs::write(session.data_dir.join("clip.ass"), ass).context("writing clip.ass")?;
     let fonts_dir = session.data_dir.join("fonts");
     fs::create_dir_all(&fonts_dir)
@@ -2228,11 +2297,13 @@ fn do_render(
     // stay relative for libass); ffmpeg runs in data/ so the relative ASS + font
     // resolve, and writes the Short up at the stream-folder root.
     let out_name = out_path.to_string_lossy();
-    let args = match &camera {
-        // Active-speaker camera (focus 2026-07): the per-shot cut concat. The
+    let args = match &export_camera {
+        // Active-speaker camera / timeline razor: the per-shot cut concat. The
         // graph grows with the shot count, so it travels as a script file.
+        // With razor cuts the graph also cuts the audio per kept piece.
         Some(plan) if !plan.shots.is_empty() => {
-            let graph = yc_render::build_camera_filtergraph(plan, "clip.ass");
+            let cut_audio = keep.is_some();
+            let graph = yc_render::build_camera_filtergraph(plan, "clip.ass", cut_audio);
             fs::write(session.data_dir.join("camera.fg"), graph)
                 .context("writing camera filtergraph")?;
             yc_render::export_args_script(
@@ -2241,6 +2312,7 @@ fn do_render(
                 range.duration_s(),
                 "camera.fg",
                 &out_name,
+                cut_audio,
             )
         }
         _ => {

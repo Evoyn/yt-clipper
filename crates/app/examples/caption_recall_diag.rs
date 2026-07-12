@@ -400,7 +400,7 @@ fn main() -> anyhow::Result<()> {
         let style = CaptionStyle::for_genre(CaptionGenre::HugeWord);
         let dir = wav.parent().unwrap_or_else(|| Path::new("."));
         let out = dir.join("clip_recall.ass");
-        std::fs::write(&out, yc_render::generate_ass(&refined, &style, None))?;
+        std::fs::write(&out, yc_render::generate_ass(&refined, &style, None, &[]))?;
         println!("\n--- emitted {} ({} cues); the four drops in the REAL apply output ---", out.display(), refined.units.len());
         for d in DROPS {
             let lead = d.anchor[0];

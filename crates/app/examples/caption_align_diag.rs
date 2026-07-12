@@ -72,7 +72,7 @@ fn dwell_stats(units: &[yc_core::CaptionUnit]) -> (usize, f64, f64) {
 
 fn write_ass(t: &Transcript, out: &Path) -> anyhow::Result<()> {
     let style = CaptionStyle::for_genre(CaptionGenre::HugeWord);
-    std::fs::write(out, yc_render::generate_ass(t, &style, None))?;
+    std::fs::write(out, yc_render::generate_ass(t, &style, None, &[]))?;
     Ok(())
 }
 

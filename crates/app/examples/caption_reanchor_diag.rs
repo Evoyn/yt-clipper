@@ -233,8 +233,8 @@ fn main() -> anyhow::Result<()> {
     let dir = wav.parent().unwrap_or_else(|| std::path::Path::new("."));
     let before_p = dir.join("clip_before.ass");
     let after_p = dir.join("clip_after.ass");
-    std::fs::write(&before_p, yc_render::generate_ass(&before, &style, None))?;
-    std::fs::write(&after_p, yc_render::generate_ass(&after, &style, None))?;
+    std::fs::write(&before_p, yc_render::generate_ass(&before, &style, None, &[]))?;
+    std::fs::write(&after_p, yc_render::generate_ass(&after, &style, None, &[]))?;
     println!("\nwrote {}\n      {}", before_p.display(), after_p.display());
     Ok(())
 }
