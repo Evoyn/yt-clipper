@@ -3220,9 +3220,13 @@ impl EditorState {
         // the track's eye is off. Blue = video, gold = the pipeline's
         // captions, green = the operator's own, gray = analysis.
         // Video 1 · Main (the filmstrip).
+        // Every name sits in ONE column (x = LABEL_X, clear of the icon
+        // slots) so the labels align down the whole header — the operator's
+        // round-2 symmetry ask. Icon-less cards keep the empty icon gutter.
+        const LABEL_X: f32 = 44.0;
         let card = track_card(&ph, hdr, film_y0, film_y1, theme::INFO, true);
         ph.text(
-            egui::pos2(card.left() + 12.0, card.center().y),
+            egui::pos2(card.left() + LABEL_X, card.center().y),
             Align2::LEFT_CENTER,
             "Video 1 · Main",
             name_font.clone(),
@@ -3231,7 +3235,7 @@ impl EditorState {
         // The two caption tracks: eye + lock. The AI/operator separation is
         // architectural (operator ruling 2026-07-13) — these never merge.
         for (y0, label, is_auto) in
-            [(cap_y0, "Captions · auto", true), (man_y0, "Captions · yours", false)]
+            [(cap_y0, "Captions · Auto", true), (man_y0, "Captions · Yours", false)]
         {
             let mut f = if is_auto { self.trk_auto } else { self.trk_manual };
             let accent = if is_auto { theme::GOLD } else { theme::OK };
@@ -3273,7 +3277,7 @@ impl EditorState {
                 self.trk_manual = f;
             }
             ph.text(
-                egui::pos2(card.left() + 44.0, cy),
+                egui::pos2(card.left() + LABEL_X, cy),
                 Align2::LEFT_CENTER,
                 label,
                 name_font.clone(),
@@ -3306,7 +3310,7 @@ impl EditorState {
                 self.speakers_eye = !self.speakers_eye;
             }
             ph.text(
-                egui::pos2(card.left() + 28.0, cy),
+                egui::pos2(card.left() + LABEL_X, cy),
                 Align2::LEFT_CENTER,
                 "Speakers",
                 name_font.clone(),
@@ -3324,11 +3328,11 @@ impl EditorState {
                 true,
             );
             ph.text(
-                egui::pos2(card.left() + 12.0, card.center().y),
+                egui::pos2(card.left() + LABEL_X, card.center().y),
                 Align2::LEFT_CENTER,
                 "Camera",
-                FontId::proportional(10.5),
-                Color32::from_gray(165),
+                name_font.clone(),
+                Color32::from_gray(175),
             );
         }
 
