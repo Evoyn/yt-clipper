@@ -1,5 +1,13 @@
 # Session prompt — native DASH section fetcher (the ADR 0059 quality fix)
 
+> **RESOLVED — SHIPPED 2026-07-12 (ADR 0060).** The spike passed all four
+> pre-registered bars on both fixture VODs (ranged reads at MB/s, sidx dur
+> dev ≤0.01%, A/V delta ≤1 ms via the copyts+output_ts_offset recipe) and
+> the native fetcher is live as tier 2 of `fetch_segment` (HLS auto-heal →
+> native DASH 1080p → progressive 360p floor). Operator-eye gate on a real
+> Promote: see ADR 0060's gate section. Queue returns to
+> nextprompt-caption-general.md (lane-2 / engine-default fork).
+
 > **Why this is the queue head (2026-07-12):** YouTube killed the
 > `web_safari` HLS client (ADR 0059) and every Promote now runs on the
 > 360p progressive stopgap — test-grade, not publish-grade. Restoring

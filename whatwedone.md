@@ -4,6 +4,36 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (native DASH) — 1080p Segments are BACK: the fetch YouTube can't take away without breaking its own player
+
+You said "do the native dash fix" and it shipped the same sitting,
+spike-first (ADR 0060 — all four pre-registered bars passed on both fixture
+VODs before a line of production wiring):
+
+- **The mechanism**: YouTube's DASH files carry a `sidx` index that maps
+  time → byte ranges. We fetch the tiny head (~12 KB of index), compute
+  exactly which bytes cover the padded Segment, and read just those with
+  plain ranged HTTP — no tokens, no ffmpeg-seeking-over-HTTP (the M1 hang),
+  no whole-file pull. Video (1080p avc1) and audio (m4a) sections are muxed
+  locally with a spike-pinned recipe that preserves their sync to ≤1 ms and
+  lands the same file shape the old HLS path produced, so every downstream
+  consumer (probe, anchor measurement, editor, export) needed ZERO changes.
+- **Measured**: ranged reads at 7-8 MB/s (no throttle class), sidx duration
+  deviation ≤0.01%, A/V delta error 0.000-0.001 s, a 60-70 s section in
+  ~19-35 s. Clip 3's own range on the old VIOR VOD was one of the fixtures.
+- **The tiers now**: HLS if YouTube ever revives it (auto-heal) → native
+  DASH 1080p (today's path) → progressive 360p (the morning's stopgap,
+  demoted to emergency floor). A tier-2 failure warns and falls through —
+  a Promote never breaks because the fast path did.
+- 369 workspace tests green (+5 new: sidx parse, window planning, format
+  pickers, hierarchical/multi-sidx refusal, truncation tolerance).
+  `dash_spike` stays in-tree as the re-runnable gate instrument.
+- **Your eye is the last gate**: release is rebuilt — promote a Moment on
+  the ECA podcast; the segment should land 1920×1080 in ~20-40 s, Studio
+  opens, export plays in sync. Say the word if anything reads off.
+
+---
+
 ## 2026-07-12 (hotfix) — YouTube killed the Segment fetch under you mid-test; Promote works again (360p stopgap, you picked it), 1080p fix queued
 
 You promoted a Moment on the new ECA podcast and the editor wouldn't open.

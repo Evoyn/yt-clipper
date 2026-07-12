@@ -12,6 +12,7 @@ use std::path::Path;
 use yc_core::{NoConsole, TimeRange};
 
 pub mod align;
+pub mod dash;
 pub mod youtube;
 pub use align::{measure_segment_anchor, tail_shortfall_s, SegmentAnchor};
 pub use youtube::{

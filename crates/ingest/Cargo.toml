@@ -11,3 +11,6 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hound = "3"
+# Native DASH section fetch (ADR 0060): ranged reads of the sidx-indexed
+# representations — rustls like the app's downloads (ADR 0041), no OS TLS.
+ureq = "3"

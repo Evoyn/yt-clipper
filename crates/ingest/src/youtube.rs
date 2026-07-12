@@ -371,11 +371,13 @@ fn chat_args(url: &str, workdir: &Path) -> Vec<String> {
 ///   2. muxed progressive (`acodec!=none`, moov-at-front, ffmpeg range-seeks
 ///      cleanly) — today that is itag 18, 360p: the ADR 0059 quality
 ///      STOPGAP until the native DASH section fetcher lands.
-/// Deliberately NEVER `bv*+ba` DASH merges or bare `best`: YouTube's DASH
-/// https files cannot be range-seeked (moov at the end), so a "section"
-/// degenerates into pulling the whole multi-GB VOD — the M1 hang, re-measured
-/// 2026-07-12 (150 s, zero bytes). No client pin: the default client mix is
-/// yt-dlp's maintained pick and survives per-client cutoffs.
+/// Deliberately NEVER `bv*+ba` DASH merges or bare `best`: yt-dlp hands DASH
+/// sections to an ffmpeg HTTP seek that degenerates into pulling the whole
+/// multi-GB VOD — the M1 hang, re-measured 2026-07-12 (150 s, zero bytes).
+/// DASH is instead tier 2 via OUR sidx-planned ranged reads
+/// ([`crate::dash`], ADR 0060) — [`fetch_segment`] runs it between these
+/// selector tiers. No client pin: the default client mix is yt-dlp's
+/// maintained pick and survives per-client cutoffs.
 fn segment_args(url: &str, padded: TimeRange, ffmpeg: &Path, workdir: &Path) -> Vec<String> {
     vec![
         "--download-sections".into(),
@@ -518,11 +520,31 @@ pub fn pad_range(range: TimeRange, duration_s: Option<f64>) -> TimeRange {
     TimeRange { start_s, end_s }
 }
 
-/// Fetch the padded Segment (HLS section download). Returns the file path.
+/// Resolve the VOD's format list (`yt-dlp -j`) for the tier decision — one
+/// webpage/API round-trip, per attempt (the DASH URLs it yields are signed
+/// and expire in hours, so they are never persisted).
+fn resolve_formats(sc: &Sidecars, url: &str, cancel: &CancelToken) -> Result<serde_json::Value> {
+    let args: Vec<String> =
+        vec!["-j".into(), "--no-playlist".into(), "--no-warnings".into(), url.into()];
+    let out = run_capture(&sc.ytdlp, &args, sc.deno_dir.as_deref(), cancel)?;
+    let v: serde_json::Value = serde_json::from_str(&out).context("parsing yt-dlp -j")?;
+    Ok(v["formats"].clone())
+}
+
+/// Fetch the padded Segment. Returns the file path.
 ///
-/// Retries transient yt-dlp format-resolution failures up to
-/// [`SEGMENT_FETCH_ATTEMPTS`] times (one bad webpage response would otherwise
-/// abort a whole batch render); a user cancel is terminal and never retried.
+/// Tiered by SECTION-SEEKABILITY (ADR 0059 named the order, ADR 0060 realized
+/// tier 2): **tier 1** — muxed HLS still exists (auto-heal): the yt-dlp
+/// section download exactly as ADR 0006 shipped it; **tier 2** — the native
+/// DASH section fetch (`dash::fetch_dash_section`): 1080p avc1 + m4a via
+/// sidx-planned ranged reads, no token, no ffmpeg-over-HTTP seek; **tier 3**
+/// — the yt-dlp progressive floor (itag 18, 360p — ADR 0059's stopgap, now
+/// the last resort). Tier-2 errors warn and fall through: a Promote never
+/// fails because the fast path did.
+///
+/// Retries transient failures up to [`SEGMENT_FETCH_ATTEMPTS`] times (one bad
+/// webpage response would otherwise abort a whole batch render); a user
+/// cancel is terminal and never retried.
 pub fn fetch_segment(
     sc: &Sidecars,
     url: &str,
@@ -536,8 +558,37 @@ pub fn fetch_segment(
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
         }
-        // Start each attempt from a clean slate (a failed try may leave a .part).
+        // Start each attempt from a clean slate (a failed try may leave a
+        // .part; a failed tier-2 leaves dashpart_* stream sections).
         clear_prefix(workdir, "segment.");
+        clear_prefix(workdir, "dashpart_");
+        match resolve_formats(sc, url, cancel) {
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            // Resolution hiccup: the yt-dlp tier below re-resolves itself.
+            Err(e) => tracing::warn!("format resolve failed (yt-dlp tier retries it): {e:#}"),
+            Ok(formats) => {
+                if !crate::dash::has_muxed_hls(&formats) {
+                    if let Some((v, a)) = crate::dash::pick_dash_pair(&formats) {
+                        match crate::dash::fetch_dash_section(
+                            &v,
+                            &a,
+                            padded.start_s,
+                            padded.end_s,
+                            &sc.ffmpeg,
+                            workdir,
+                            cancel,
+                        ) {
+                            Ok(p) => return Ok(p),
+                            Err(e) if cancel.is_cancelled() => return Err(e),
+                            Err(e) => tracing::warn!(
+                                "native DASH section failed; falling to the yt-dlp tier \
+                                 (progressive floor): {e:#}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
         match run(&sc.ytdlp, &args, sc.deno_dir.as_deref(), cancel) {
             Ok(()) => {
                 return single_with_prefix(workdir, "segment.")
