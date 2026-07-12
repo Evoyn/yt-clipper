@@ -20,6 +20,12 @@ REM the same ort runtime `face` already ships. Since the ADR 0055 flip it is
 REM the ensemble path's DEFAULT timing skeleton (YC_FORCED_ALIGN=0 is the
 REM off-switch back to the whisper DTW fusion); whisper-engine renders are
 REM untouched either way.
+REM `ser` compiles the arousal Signal's refine pass (ADR 0008, wired to release
+REM by ADR 0063) into the same ort runtime again: the CPU speech-emotion model
+REM that demotes loud-but-flat moments and feeds arousal_z to the LLM judge.
+REM Without it the 0.15 arousal weight renormalizes away and Moments rank
+REM loud-vs-flat blind. Fail-soft at runtime: a missing/unloadable model just
+REM omits the Signal (Diagnostics > Downloads heals the install).
 
-call "%~dp0cargo-cuda.bat" build --release -p yt-clipper -p yc-llm-judge --features face,align
+call "%~dp0cargo-cuda.bat" build --release -p yt-clipper -p yc-llm-judge --features face,align,ser
 exit /b %ERRORLEVEL%

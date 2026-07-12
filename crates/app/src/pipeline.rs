@@ -1032,23 +1032,18 @@ fn do_detect(
     // (game explosions, music, cutscenes). Runs after the whisper drop (CPU, no
     // VRAM). Only when built `--features ser` and the model is present;
     // combined_score renormalizes when arousal is absent, so detection still
-    // ranks fine without it.
+    // ranks fine without it. A present-but-unloadable model must not fail the
+    // detect either (ADR 0063): the whisper refine above is already paid for,
+    // so it degrades to the missing-model ranking, exactly like the llm arm
+    // below. Only a cancel stops the job.
     #[cfg(feature = "ser")]
     if paths.ser_model.is_file() {
         let _ = tx.send(Progress::Stage("Refining moments (arousal, CPU)"));
-        let sr = yc_ingest::WHISPER_SR as f64;
-        let win = (yc_detect::arousal::WINDOW_S * sr) as usize;
-        let hop = (yc_detect::arousal::HOP_S * sr) as usize;
-        let mut ser = yc_detect::arousal::Ser::load(&paths.ser_model)?;
-        let mut arousals = Vec::with_capacity(moments.len());
-        for m in &moments {
-            if cancel.is_cancelled() {
-                anyhow::bail!("cancelled");
-            }
-            let samples = yc_ingest::read_range_samples(&session.analysis_wav, m.range)?;
-            arousals.push(ser.arousal_max(&samples, win, hop)?);
+        match arousal_refine(&paths.ser_model, &session.analysis_wav, &moments, cancel) {
+            Ok(arousals) => yc_detect::arousal::apply(&mut moments, &arousals, &params.weights),
+            Err(e) if cancel.is_cancelled() => return Err(e),
+            Err(e) => tracing::warn!("arousal refine failed: {e:#}; omitting arousal signal"),
         }
-        yc_detect::arousal::apply(&mut moments, &arousals, &params.weights);
     }
 
     // LLM judgment (ADR 0010): a local GGUF model reads each candidate's
@@ -1134,6 +1129,35 @@ fn do_detect(
     // Persist the review notes alongside (M8) so a re-import restores the panel.
     save_review(&transcripts, &llm_reasons, &session.data_dir);
     Ok((ranked, transcripts, llm_reasons, timeline))
+}
+
+/// Max-pooled arousal per candidate (ADR 0008): slide the SER window across each
+/// Moment's `analysis.wav` range and keep the peak. Fallible as one unit so the
+/// caller can treat ANY failure (unloadable model, unreadable wav) as "Signal
+/// absent for the whole candidate set" rather than a failed detect (ADR 0063) —
+/// a partial set must never reach `arousal::apply`, whose z-score is across all
+/// candidates. Cancellation also surfaces as an error; the caller tells the two
+/// apart with `cancel.is_cancelled()`, like the llm arm.
+#[cfg(feature = "ser")]
+fn arousal_refine(
+    model: &Path,
+    analysis_wav: &Path,
+    moments: &[Moment],
+    cancel: &CancelToken,
+) -> Result<Vec<f32>> {
+    let sr = yc_ingest::WHISPER_SR as f64;
+    let win = (yc_detect::arousal::WINDOW_S * sr) as usize;
+    let hop = (yc_detect::arousal::HOP_S * sr) as usize;
+    let mut ser = yc_detect::arousal::Ser::load(model)?;
+    let mut arousals = Vec::with_capacity(moments.len());
+    for m in moments {
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        let samples = yc_ingest::read_range_samples(analysis_wav, m.range)?;
+        arousals.push(ser.arousal_max(&samples, win, hop)?);
+    }
+    Ok(arousals)
 }
 
 /// Run the out-of-process LLM judge over the whole candidate batch (ADR 0010):
@@ -3330,6 +3354,25 @@ mod tests {
         // ...but an explicit operator pick always wins.
         assert_eq!(resolve_language(&ws, "Somebody", Some(Language::En)), Language::En);
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// ADR 0063: a PRESENT-but-corrupt SER model must degrade to "Signal
+    /// absent" (the call site warns and omits), never fail the detect that
+    /// already paid for the whisper refine. The helper is the fallible unit:
+    /// garbage bytes -> a contexted Err for the warn+omit arm, not a panic.
+    #[cfg(feature = "ser")]
+    #[test]
+    fn arousal_refine_errs_on_a_corrupt_model_instead_of_failing_detect() {
+        let dir = std::env::temp_dir().join("yc_arousal_corrupt_model_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.onnx");
+        fs::write(&model, b"not an onnx protobuf").unwrap();
+        let err = arousal_refine(&model, Path::new("missing.wav"), &[], &CancelToken::new())
+            .expect_err("garbage model bytes must fail the load");
+        // The load's context names the model, so the warn+omit log says what broke.
+        assert!(format!("{err:#}").contains("SER model"), "unexpected error: {err:#}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -4,6 +4,49 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 — The arousal Signal now ships in your release builds (A/B verified; your saved Moments untouched)
+
+You picked this thread and said "do this automatically, finish all things
+on the md" — the whole slice ran in one session while you were away:
+
+- **What was broken**: `build-release.bat` never compiled the `ser`
+  feature, so every production detect ranked Moments with the Arousal
+  Signal missing (its 0.15 weight silently renormalized away) AND the LLM
+  judge corroborated against an `arousal_z` that was always None. Your
+  saved ECA table shows the fingerprint: all 25 Moments carry
+  `arousal: null`.
+- **Proven before wiring** (ADR 0063 — bars pre-registered and committed
+  BEFORE the first run): A/B detect on the ECA podcast, ser-less exe vs
+  the wired build, same audio, greedy judge. All 25 Moments now carry
+  arousal; every rank move is the arousal column's doing — the loud-but-
+  flat cold-open fell #7→#21 (loud 2.64, arousal −1.85), the music-led
+  "Botak Botak Mania" fell #2→#6, while high-activation talk rose (#12→#1
+  at arousal 2.47). The judge, now actually seeing arousal, flipped one
+  verdict up out of the −2 band (#23→#3). **The full before/after table is
+  in ADR 0063 for your eye** — a one-line build-script revert reverses the
+  wire if you refuse it.
+- **Cost, re-measured today**: 0.213 s per 4-s window (was ~0.35–0.46 s at
+  the ADR 0008 gate), 164.7 s for the 25-candidate refine batch (was
+  ~163 s) — CPU, after the whisper drop, no VRAM.
+- **Sturdier than before**: a present-but-corrupt model no longer kills
+  the whole detect — it degrades to today's ranking with a warning,
+  matching the llm judge's convention (unit-covered; suites 388+52+31 all
+  green). A missing model was already soft; Diagnostics ▸ Downloads heals.
+- **Your data**: project.json + review.json were byte-backed-up, the A/B
+  ran, then both restored SHA-verified identical. The backup pair stays at
+  `data/_backup_arousal_ab/` (delete at will). Boot check passed: GUI
+  opens, SER row green, the "Refining moments (arousal, CPU)" stage fires
+  on the shipped binary.
+- Still yours, one click each: flipping Helmy Yahya Bicara + "local" to
+  the ensemble engine (ADR 0035/0061).
+
+**The new queue head: `nextprompt-editor-suite.md`** — your
+`feature-implementation-plan.md` (16 editor features + title-gen). That
+arc opens with a grill session with you present; it re-architects the
+editor, so slicing comes before code.
+
+---
+
 ## 2026-07-12 (arc closed) — Caption-general is DONE; the next feature is the arousal Signal release builds have been silently missing
 
 You said "finish this md all the way, i want to move to next feature" and

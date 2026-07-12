@@ -1,5 +1,17 @@
 # Session prompt — ship the arousal Signal in release builds (operator pick 2026-07-12)
 
+> **ARC CLOSED (2026-07-12, same day — shipped).** The slice ran start to
+> finish in one session, operator away ("do this automatically"): every
+> pre-registered bar passed (ADR 0063 Outcome has the A/B table + costs),
+> `ser` is wired into `build-release.bat`, the corrupt-model fail-soft
+> landed unit-covered, and the operator's saved Moments were restored
+> byte-identical. Do NOT queue sessions from this file (focus-md pattern:
+> historical once the arc closes). The staged eye-gate lives in ADR 0063's
+> table — a one-line `build-release.bat` revert reverses the wire if the
+> eye refuses. **The queue head is now `nextprompt-editor-suite.md`** (the
+> operator's own `feature-implementation-plan.md`, 16 editor features +
+> title-gen — grill first, slice second).
+
 The operator closed the caption-general arc and picked this thread
 ("i want you to make based on your recommended"), then had this prompt
 verified-and-sharpened against the actual code the same day — the facts
