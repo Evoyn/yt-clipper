@@ -11,8 +11,8 @@ pub mod ass;
 pub mod export;
 pub use ass::{
     generate_ass, preview_lines, refine_caption_timing, refine_caption_timing_keep_verified,
-    refine_caption_timing_traced, resolve_placement, word_states, PreviewLine, PreviewWord,
-    RefineTrace, UnitOutcome, WordState,
+    refine_caption_timing_traced, resolve_placement, trim_reaction_holds, word_states,
+    PreviewLine, PreviewWord, ReactionHoldTrim, RefineTrace, UnitOutcome, WordState,
 };
 pub use export::{
     build_camera_filtergraph, build_filtergraph, export_args, export_args_script, run_export,

@@ -302,8 +302,48 @@ fn main() -> anyhow::Result<()> {
             Some(v) => std::env::set_var("YC_FORCED_ALIGN", v),
             None => std::env::remove_var("YC_FORCED_ALIGN"),
         }
-        let refined =
+        #[allow(unused_mut)]
+        let mut refined =
             yc_render::refine_caption_timing_keep_verified(fused?, &samples, WHISPER_SR);
+        // ADR 0062, OPT-IN (unlike production's default-on once wired): with
+        // YC_LAUGH_TRIM=1 the emit applies the laughter-aware hold trim after
+        // the refine, exactly where the pipeline would — so the burn artifact
+        // can be production-shaped for the trim's own gate. Default OFF so
+        // this diag cannot silently diverge from a production that hasn't
+        // wired the trim (or has it reverted). Needs the `face` feature (the
+        // tagger's ort session) and the downloaded tagger files.
+        #[cfg(feature = "face")]
+        if std::env::var("YC_LAUGH_TRIM").ok().as_deref() == Some("1") {
+            let tag_model =
+                models.join("sherpa-onnx-zipformer-audio-tagging-2024-04-09.onnx");
+            let tag_labels = models.join("audioset_class_labels_indices.csv");
+            anyhow::ensure!(
+                tag_model.is_file() && tag_labels.is_file(),
+                "YC_LAUGH_TRIM=1 but tagger files missing under {}",
+                models.display()
+            );
+            let steps = yc_frame::reaction::laugh_steps(
+                &tag_model,
+                &tag_labels,
+                &samples,
+                range.duration_s(),
+            )?;
+            let runs =
+                yc_frame::reaction::mask_runs(&steps, yc_frame::speaker::REACTION_TAU);
+            let trims = yc_render::trim_reaction_holds(&mut refined.units, &runs);
+            println!(
+                "laugh-hold trim (ADR 0062): {} run(s), {} cue(s) trimmed",
+                runs.len(),
+                trims.len()
+            );
+            for t in &trims {
+                println!(
+                    "  trim {:<14} {:>6.2}: end {:.2} -> {:.2} (run @{:.2})",
+                    refined.units[t.index].text, refined.units[t.index].start_s,
+                    t.old_end_s, t.new_end_s, t.run_start_s
+                );
+            }
+        }
         write_ass(&refined, &dir.join("clip_alignburn.ass"))?;
         println!("wrote {}\\clip_alignburn.ass ({} cues) — the burn artifact", dir.display(), refined.units.len());
     }

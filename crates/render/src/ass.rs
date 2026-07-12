@@ -589,6 +589,67 @@ pub fn refine_caption_timing_keep_verified(
     transcript
 }
 
+/// One hold cut by [`trim_reaction_holds`]: which unit, the end it had, the
+/// end it got, and the mask-run onset that cut it — the pipeline logs these
+/// and the ADR 0062 instrument names every one (bar R5: a trim off the mask
+/// is structurally impossible; the report lets the instrument prove it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReactionHoldTrim {
+    /// Index into the units slice as passed (post-refine order).
+    pub index: usize,
+    pub old_end_s: f64,
+    pub new_end_s: f64,
+    /// The shared-reaction run onset the hold was trimmed at.
+    pub run_start_s: f64,
+}
+
+/// Laughter-aware hold trim (ADR 0062): cut a cue's gap-fill hold (ADR 0013)
+/// at the first shared-reaction onset inside it, so a held word never rides
+/// over a group laugh (the CORP-hold class). Runs over REFINED units, both
+/// engines; `laugh_runs` are the mask spans at the production tau
+/// (`yc_frame::speaker::REACTION_TAU` — the caller thresholds; this crate
+/// stays ort-free).
+///
+/// The rule, exactly as pre-registered:
+/// - onset masked (pop-on-laugh) ⇒ UNTOUCHED — that class is the mis-onset
+///   lane's (ADR 0051 measured auto-moving onsets unsafe; ADR 0050's reversal
+///   forbids deleting): this function must never look like a fix for it;
+/// - first run onset `L` strictly inside `(start, end)` ⇒
+///   `end' = max(L, start + MIN_READ_S)` — the readability floor always wins
+///   over the mask (a trim may never mint a sub-readable flash, ADR 0013/0049),
+///   and an already-sub-floor cue is never touched at all;
+/// - ends only shrink; texts, onsets, and the unit count are untouched by
+///   construction (zero words added/removed — the standing bar).
+pub fn trim_reaction_holds(
+    units: &mut [CaptionUnit],
+    laugh_runs: &[(f64, f64)],
+) -> Vec<ReactionHoldTrim> {
+    let masked_at = |t: f64| laugh_runs.iter().any(|&(l, m)| l <= t && t < m);
+    let mut trims = Vec::new();
+    for (index, u) in units.iter_mut().enumerate() {
+        if masked_at(u.start_s) {
+            continue;
+        }
+        // Runs are ascending (mask construction order): `find` = the FIRST
+        // onset inside the cue; trimming at it kills any later run's overlap.
+        let Some(&(l, _)) = laugh_runs.iter().find(|&&(l, _)| l > u.start_s && l < u.end_s)
+        else {
+            continue;
+        };
+        let new_end = (u.start_s + MIN_READ_S).max(l).min(u.end_s);
+        if new_end + 1e-9 < u.end_s {
+            trims.push(ReactionHoldTrim {
+                index,
+                old_end_s: u.end_s,
+                new_end_s: new_end,
+                run_start_s: l,
+            });
+            u.end_s = new_end;
+        }
+    }
+    trims
+}
+
 /// Multi-word rolling-pop lines (M1): each [`PreviewLine`] is one Dialogue
 /// event in which every word pops in at its onset (grouping + line bounds come
 /// from [`preview_lines`]).
@@ -794,6 +855,109 @@ mod tests {
         let first = ass.lines().find(|l| l.starts_with("Dialogue:")).unwrap();
         let end = first.split(',').nth(2).unwrap();
         assert_eq!(end, "0:00:00.50"); // clamped to "b"'s onset, not floored to 0.56
+    }
+
+    // --- laughter-aware hold trim (ADR 0062) ---
+
+    fn u(text: &str, start_s: f64, end_s: f64) -> CaptionUnit {
+        CaptionUnit { text: text.into(), start_s, end_s }
+    }
+
+    #[test]
+    fn trim_cuts_a_hold_at_the_laugh_onset() {
+        // The CORP class: a word gap-filled to 26.90 while the laugh starts at
+        // 26.00, past the readability floor - the hold must end AT the laugh
+        // onset, onset and text untouched.
+        let mut units = vec![u("corp", 25.50, 26.90)];
+        let trims = trim_reaction_holds(&mut units, &[(26.00, 29.00)]);
+        assert_eq!(trims.len(), 1);
+        assert_eq!(trims[0], ReactionHoldTrim {
+            index: 0,
+            old_end_s: 26.90,
+            new_end_s: 26.00,
+            run_start_s: 26.00,
+        });
+        assert_eq!(units[0], u("corp", 25.50, 26.00));
+    }
+
+    #[test]
+    fn trim_never_cuts_below_the_readability_floor() {
+        // Laugh starts 0.1 s after the onset: the floor (MIN_READ_S) wins, the
+        // residue over the mask is the floor-protected class the bars allow.
+        let mut units = vec![u("a", 10.0, 11.2)];
+        let trims = trim_reaction_holds(&mut units, &[(10.1, 12.0)]);
+        assert_eq!(trims.len(), 1);
+        assert!((units[0].end_s - (10.0 + MIN_READ_S)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pop_on_laugh_is_never_touched() {
+        // Onset inside the mask = the mis-onset lane's class: the trim must
+        // leave it byte-identical (ADR 0050's reversal lesson).
+        let mut units = vec![u("gue", 26.1, 27.3)];
+        let trims = trim_reaction_holds(&mut units, &[(26.0, 29.0)]);
+        assert!(trims.is_empty());
+        assert_eq!(units[0], u("gue", 26.1, 27.3));
+    }
+
+    #[test]
+    fn cues_off_the_mask_are_untouched() {
+        // Runs entirely before and entirely after the cue: no trim.
+        let mut units = vec![u("kata", 10.0, 11.0)];
+        let trims = trim_reaction_holds(&mut units, &[(8.0, 9.5), (11.0, 12.0)]);
+        assert!(trims.is_empty());
+        assert_eq!(units[0], u("kata", 10.0, 11.0));
+        // A run starting exactly at the end is outside (l < end is strict).
+        let trims = trim_reaction_holds(&mut units, &[(11.0, 12.0)]);
+        assert!(trims.is_empty());
+    }
+
+    #[test]
+    fn an_already_sub_floor_cue_is_never_trimmed() {
+        // Dense-speech flash (0.3 s) crossing a run onset: nothing to give
+        // without minting a shorter flash, so it stays byte-identical.
+        let mut units = vec![u("ya", 5.0, 5.3)];
+        let trims = trim_reaction_holds(&mut units, &[(5.2, 6.0)]);
+        assert!(trims.is_empty());
+        assert_eq!(units[0], u("ya", 5.0, 5.3));
+    }
+
+    #[test]
+    fn first_run_wins_and_kills_later_overlap() {
+        let mut units = vec![u("word", 10.0, 11.2)];
+        let trims = trim_reaction_holds(&mut units, &[(10.6, 10.8), (11.0, 11.5)]);
+        assert_eq!(trims.len(), 1);
+        assert!((units[0].end_s - 10.6).abs() < 1e-9, "trimmed at the FIRST onset");
+    }
+
+    #[test]
+    fn trim_only_shrinks_and_only_ends() {
+        // A spread of cues around one laugh: onsets, texts, and count are
+        // byte-identical after; every end <= before (the R4 invariants).
+        let before =
+            vec![u("a", 0.0, 1.0), u("b", 1.0, 2.2), u("c", 2.5, 3.0), u("d", 5.0, 6.2)];
+        let mut after = before.clone();
+        let trims = trim_reaction_holds(&mut after, &[(1.8, 4.0), (5.5, 7.0)]);
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(b.text, a.text);
+            assert!((b.start_s - a.start_s).abs() < 1e-12, "onset moved");
+            assert!(a.end_s <= b.end_s + 1e-12, "an end grew");
+        }
+        // b trimmed at 1.8, c pops masked (2.5 in [1.8,4.0)) untouched, d at 5.5.
+        assert_eq!(trims.len(), 2);
+        assert!((after[1].end_s - 1.8).abs() < 1e-9);
+        assert_eq!(after[2], before[2]);
+        assert!((after[3].end_s - 5.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_mask_is_a_no_op() {
+        let before = vec![u("a", 0.0, 1.2), u("b", 1.5, 2.0)];
+        let mut after = before.clone();
+        let trims = trim_reaction_holds(&mut after, &[]);
+        assert!(trims.is_empty());
+        assert_eq!(before, after);
     }
 
     #[test]

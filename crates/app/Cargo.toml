@@ -89,3 +89,9 @@ required-features = ["align"]
 [[example]]
 name = "whisper_align_diag"
 required-features = ["align"]
+
+# The laughter-aware hold-trim instrument (ADR 0062) drives the reaction
+# tagger's ort session (yc-frame/voice, via `face`).
+[[example]]
+name = "caption_laugh_diag"
+required-features = ["face"]

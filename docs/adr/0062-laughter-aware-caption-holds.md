@@ -127,6 +127,66 @@ STAGED for the operator's eye — the actual gate. Reversal pre-committed:
 `YC_LAUGH_TRIM=0` per render; full revert = one pipeline call site + one
 pure function + this instrument (captions byte-identical to pre-0062).
 
-## Measured (filled in AFTER the bars above were committed)
+## Measured (2026-07-12, fresh raw-store production emits, idle GPU)
 
-_(pending — this section is written by the measurement run)_
+Emits: `caption_align_diag` `YC_ALIGN_EMIT=1` per ensemble fixture (fresh 5
+sidecar decodes each; clip-3 vote reproduced 117 words / 119 cues — decode
+determinism holding); Helmy = the same-day ADR 0058 `clip_wdtw.ass`
+(whisper production downstream, code untouched since). Instrument:
+`caption_laugh_diag` (tau 0.1 verbatim, mixed analysis audio).
+
+```
+clip           cues  mask-runs/s   pop-on-laugh  HOL pre  trims  HOL post  residual  regroup-flips
+VIOR 4p        119   15 / 21.00s   27            3.64s    7      1.48s     41%       1 (on a trimmed unit)
+Deddy 3p       214    2 /  4.75s    9            0.02s    0      0.02s     (no defect: < R2 floor)
+guru solo      164    ~ /  low      1            0.14s    0      0.14s     (no defect)
+ANTITESA       184    real laugh   12            0.76s    3      0.56s     74% (floor-protected)
+Helmy whisper   83    none          0            0.00s    0      0.00s     n/a
+```
+
+- **R1 PASS (3/3)** — the mask covers every operator-named laughter moment
+  on clip 3, including the "faint" 12 s row; the Deddy-3p mask lands on the
+  ADR 0045 ear-confirmed 25.5–30.25 span (25.25–26.25 + 26.75–30.50), an
+  independent reproduction of the annotation of record.
+- **R2 PASS** — clip 3 pre-trim HOL 3.64 s (headline riders: the raw
+  emit's floating GEMOY@51.20 rides 1.15 s into the 51.25–56 laugh; TUH
+  0.80 s; NGELEDEKIN 0.50 s; MAU 0.42 s). The defect is real and visible.
+- **R3 clause 2 PASS everywhere**: after the trim, zero trimmable seconds
+  remain on any clip — every residual masked second sits inside its cue's
+  `[onset, onset+0.40)` floor window. **R3 clause 1 FAIL at its letter**:
+  clip 3 residual 41% (> 30%). The 30% number was mis-calibrated against
+  the floor's physics: in dense overlap the room erupts within 0.40 s of a
+  word's pop, so 1.48 s of the 3.64 s ride is the READABILITY FLOOR's
+  protectorate (ISI/KERATIN/MASALAH/KAN/TUH-class 0.10–0.25 s residues),
+  which the pre-declared rule itself refuses to trim — by design
+  (ADR 0013/0049: a trim may never mint a flash). Deddy 3p's ratio is a
+  degenerate denominator (0.02 s pre — below R2's own 1.0 s defect floor).
+- **R4 PASS (all five)** — counts, texts, onsets byte-identical; ends only
+  shrink; every trimmed cue ≥ 0.40 s; pop-on-laugh counts identical.
+- **R5 PASS (all five)** — every trim named and on a mask run (guru 0,
+  Helmy 0, ANTITESA 3: KALI −0.02 s, NANTI −0.40 s, YA −0.18 s at its real
+  ~62 s laugh); the ONE karaoke regroup flip (clip 3: JALANANNYA starts a
+  fresh line after the laugh gap) sits on the trimmed GEMOY — the
+  after-silence rule treating the laugh as the pause it is.
+- **R6 PASS (all five)** — zero words added/removed.
+
+## Verdict: NOT WIRED (the pre-registration rules), mechanism unrefuted — the re-pin is the operator's
+
+R3 clause 1 failed as written, so per the pre-registration **nothing ships
+this session**: production renders are byte-identical; the pure function,
+its tests, and both instruments stay in-tree; the emit trim stays behind the
+explicit `YC_LAUGH_TRIM=1` opt-in so no diag artifact can silently diverge
+from unwired production.
+
+What the measurement actually says: the mechanism did exactly what it
+pre-declared, with zero measured harm (no onset moved, no word touched, no
+off-mask change, floor never violated, controls clean) — the failed clause
+measured the FLOOR, not the trim. The honest fix is a re-pin of clause 1 to
+its clause-2 form ("zero trimmable seconds left"), and after the ADR 0050
+lesson a bar re-pin plus a caption look-change is the operator's eye's call,
+not a session's: the A/B burn is staged (raw production vs trimmed holds,
+same 5-decode emit path, only 7 cue ends differ) and the one-sentence ruling
+this ADR waits on is **"trim reads better — re-pin and wire"** or **"leave
+holds alone"**. The wiring diff (ensure_transcript, post-refine, the ADR
+0050 fail-soft shape + `YC_LAUGH_TRIM=0` off-switch) is recorded in the
+session handoff, one paste away.

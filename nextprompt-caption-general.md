@@ -1,5 +1,20 @@
 # Session prompt — GENERAL caption accuracy (operator directive 2026-07-12)
 
+> **LANE 3 IS MEASURED AND STAGED ON THE OPERATOR'S EYE (2026-07-12, ADR
+> 0062).** The laughter-aware HOLD TRIM (cue holds cut at a shared-reaction
+> onset, floored at 0.40 s, nothing deleted/moved) was pre-registered,
+> built, and measured on the 5-clip corpus: every safety bar PASSED
+> everywhere (R1 mask⇄ear 3/3; zero onset/text changes; controls clean;
+> the one karaoke regroup flip sits on a trimmed unit), the defect is real
+> (clip 3 HOL 3.64 s), and the trim removes every second the readability
+> floor allows — but **R3's letter (≤30% residual) FAILED (41%)** because
+> the floor's protectorate IS the residual, so per the pre-registration
+> **nothing wired**. The A/B burn is staged
+> (`nextprompt-laugh-verdict.md`, ~2 min): "B is better" re-pins the bar
+> and wires it for ALL future videos on BOTH engines; "A is better"
+> banners the lane REFUSED. Until that verdict, do NOT re-attempt lane 3;
+> the autonomous default falls to **lane 2's measure-first phase** (below).
+
 > **LANE 1 IS RESOLVED — MEASURED AND REFUSED (2026-07-12, ADR 0058).** The
 > whisper-engine forced-align wiring was built, measured on the 5-clip
 > corpus against pre-registered bars, and FAILED the defect-clip bar:
@@ -119,12 +134,14 @@ first question is which lane, the second is the new-Creator engine default.
 ## Ritual
 
 /grill-with-docs first (the operator may be present — if they said "do this
-automatically", apply the recorded pick rubric; with lane 1 resolved-refused
-the autonomous default is **lane 2's measure-first phase** — design +
+automatically", apply the recorded pick rubric; with lane 1
+resolved-refused (ADR 0058) and lane 3 measured-and-staged (ADR 0062) the
+autonomous default is **lane 2's measure-first phase** — design +
 instrument + pre-registered bars for the whisper-engine witness/recall
-question, production untouched until its own gate. The engine-default
-policy question needs ONE operator sentence and unblocks both lanes — put
-it at the top of every handoff until answered);
+question, production untouched until its own gate; note lane 2 now serves
+only explicitly-whisper Creators (Helmy, "local") since ADR 0061. The two
+staged verdicts (laugh-hold A/B, dedikornya) go at the top of every
+handoff until the operator answers — ~2 min each, no urgency);
 finish with /handoff + whatwedone.md entry; commit as Evoyn with the model
 trailer; `git push origin main` has standing permission; ALWAYS end with the
 next `read nextprompt-<slug>.md and follow it.` line.

@@ -302,6 +302,33 @@ pub fn tag_steps(
     Ok(steps)
 }
 
+/// Per-step laughter-family scores end-to-end from the model files: labels →
+/// family → one [`TagSession`] → [`tag_steps`], with the selftest-pinned
+/// conventions (`SampleScale::Unit`, `TagOutput::Probs`) applied HERE so no
+/// caller can drift one (the double-sigmoid class ADR 0045's selftest
+/// caught). One glue shared by the caption hold-trim (ADR 0062), its
+/// instrument, and any future consumer; the speaker lane keeps its own call
+/// because it projects onto its bin grid mid-stream. `samples` are the same
+/// 16 kHz mixed analysis samples the voice lane embeds.
+#[cfg(feature = "voice")]
+pub fn laugh_steps(
+    tag_model: &std::path::Path,
+    tag_labels: &std::path::Path,
+    samples: &[f32],
+    duration_s: f64,
+) -> Result<Vec<f32>> {
+    let labels = parse_class_labels(&std::fs::read_to_string(tag_labels)?);
+    let family = laughter_family(&labels);
+    anyhow::ensure!(
+        !family.is_empty(),
+        "no laughter-family classes in {}",
+        tag_labels.display()
+    );
+    let mut sess =
+        TagSession::load(tag_model, crate::voice::SampleScale::Unit, TagOutput::Probs)?;
+    tag_steps(&mut sess, samples, duration_s, &family)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

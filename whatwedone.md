@@ -4,6 +4,45 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (lane 3) — Captions no longer linger over group laughs: the hold trim measured floor-exact, and your A/B is staged
+
+You said "do this automatically" and went to shower, so this session ran the
+re-ranked queue head (lane 3 — laughter-aware holds, the one caption lane
+that applies to EVERY engine): trim a held word at the moment the room
+erupts, using the same shared-reaction mask the camera already trusts
+(ADR 0045/0046). Measure-first, bars committed before the first run
+(ADR 0062).
+
+- **The defect, measured on the fresh raw emit of your clip 3** (first burn
+  of the true code path since your no-JSON ruling): held words ride group
+  laughs for 3.64 s total — GEMOY floats 1.15 s into the big 51–56 s laugh,
+  TUH rides 0.80 s, NGELEDEKIN 0.50 s over the mocking laugh. The mask sees
+  every laugh your ear named (3/3, even the faint 12 s one), and on the
+  Deddy 3p control it lands exactly on the 25.5–30.25 span your ear
+  confirmed in ADR 0045 — independent reproduction.
+- **The trim (pure, tiny)**: a cue's gap-fill hold ends at the first laugh
+  onset inside it, never below the 0.40 s readability floor, nothing
+  deleted, no onset moved (your ADR 0050 rule is structural: pop-on-laugh
+  cues are untouchable). It removed EVERY trimmable second on all five
+  corpus clips; controls are clean (guru/Helmy zero trims; ANTITESA trims
+  exactly its real ~62 s laugh).
+- **Why it did NOT ship: the pre-registered bar split.** R3's letter said
+  "residual ≤ 30%" and the floor physically protects 41% (in dense overlap
+  a word pops < 0.40 s before the laugh — untouchable without minting
+  flashes). Bars are bars: production is byte-identical, the wiring spot
+  carries a NOT-wired comment, and the emit-side trim sits behind an
+  explicit YC_LAUGH_TRIM=1 so no artifact can silently diverge.
+- **Your call is staged (~2 min)**: watch A (raw) vs B (trimmed holds) —
+  only seven cue ends differ, timestamps listed in
+  `nextprompt-laugh-verdict.md`. "B is better" re-pins the bar to its
+  honest form and wires the trim for all future videos on both engines;
+  "A is better" banners the lane refused.
+- Suites green everywhere (388 workspace + face,align/align flavors); the
+  production-order emit reproduced the instrument's trims value-for-value,
+  twice decode-deterministic.
+
+---
+
 ## 2026-07-12 (ruling landed) — Your eye passed the 1080p gate, and new Creators now start on the ensemble
 
 Two rulings in one sentence ("its 1080p now, use ensemble for new

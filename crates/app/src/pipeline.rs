@@ -2100,6 +2100,19 @@ fn ensure_transcript(
                     range.duration_s(),
                 );
             }
+            // NOT wired: the laughter-aware hold trim
+            // (`yc_render::trim_reaction_holds`, ADR 0062, 2026-07-12) belongs
+            // HERE — immediately after the refine below, over the refined
+            // units, mask from `yc_frame::reaction::laugh_steps` over the
+            // clip's MIXED analysis range at `speaker::REACTION_TAU`, the ADR
+            // 0050 fail-soft shape (tagger absent/broken or non-`face` build
+            // ⇒ untouched) plus a `YC_LAUGH_TRIM=0` off-switch. It measured
+            // harmless and floor-exact on the 5-clip corpus but FAILED its
+            // pre-registered R3 clause-1 letter (41% residual > 30% — the
+            // residual is the readability floor's protectorate), so per the
+            // pre-registration nothing shipped; the A/B burn is staged for
+            // the operator's re-pin ruling. Instrument: `caption_laugh_diag`;
+            // emit-side preview: `caption_align_diag` with `YC_LAUGH_TRIM=1`.
             // Refine caption end-times to the streamer's actual vocalization: a
             // screamed / drawn-out word holds for its full sound and a normal word
             // clears when the sound drops, instead of huge-word's fixed hold.
