@@ -1802,13 +1802,15 @@ fn ensure_transcript(
 
     // The Caption engine for this render (ADR 0035): the GUI rail's explicit
     // pick when one was sent, else the Creator's saved engine (headless/CLI),
-    // Whisper for an unknown Creator. `YC_QWEN_ENS` then overrides the resolved
-    // selection in either direction (tri-state, per-invocation — the gate
-    // fixtures pin an engine with it regardless of how a Creator is flipped);
-    // only the SELECTION is saved back below, never the override.
+    // the ensemble for an unknown Creator (the operator's new-Creator ruling,
+    // ADR 0061 — existing key-less records still read Whisper; only the seed
+    // changed). `YC_QWEN_ENS` then overrides the resolved selection in either
+    // direction (tri-state, per-invocation — the gate fixtures pin an engine
+    // with it regardless of how a Creator is flipped); only the SELECTION is
+    // saved back below, never the override.
     let engine = caption_engine
         .or_else(|| remembered_caption_engine(&paths.workspace, &session.vod))
-        .unwrap_or_default();
+        .unwrap_or(CaptionEngine::FOR_NEW_CREATORS);
     let use_ensemble = yc_transcribe::ensemble::engine_override()
         .unwrap_or(engine == CaptionEngine::QwenEnsemble);
 

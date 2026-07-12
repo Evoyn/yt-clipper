@@ -319,7 +319,7 @@ fn main() -> eframe::Result<()> {
                 end_s: 30.0,
                 language: None, // Auto: the Creator's saved language (ADR 0016)
                 caption_genre: CaptionGenre::HugeWord,
-                caption_engine: CaptionEngine::Whisper,
+                caption_engine: CaptionEngine::FOR_NEW_CREATORS,
                 saved_engine: None,
                 correct_captions: false, // opt-in (ADR 0031); off until the operator ticks it
                 layout_pref: LayoutPref::default(),
@@ -860,10 +860,11 @@ impl eframe::App for App {
                         self.caption_genre = genre;
                     }
                     // Seed the engine picker likewise (ADR 0035) — but unlike
-                    // genre, an UNKNOWN Creator resets it to Whisper: engine
-                    // flips are deliberate per-Creator acts, so a previous
-                    // session's ensemble pick must not leak onto a new Creator.
-                    self.caption_engine = caption_engine.unwrap_or_default();
+                    // genre, an UNKNOWN Creator always RESETS the picker (a
+                    // previous session's pick must not leak onto a new
+                    // Creator): to the ensemble, the new-Creator default the
+                    // operator ruled (ADR 0061). A saved engine still wins.
+                    self.caption_engine = caption_engine.unwrap_or(CaptionEngine::FOR_NEW_CREATORS);
                     self.saved_engine = caption_engine;
                     // Restore a prior session's detected Moments + their review text
                     // from project.json / review.json (M8) so a re-import shows the

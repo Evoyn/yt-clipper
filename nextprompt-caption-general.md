@@ -10,6 +10,15 @@
 > to re-measure. **Lane 1's prerequisite IS lane 2** (a whisper-side word
 > cleaner), OR the operator's engine-default policy call (below). Do NOT
 > re-attempt the wiring without one of those.
+>
+> **THE POLICY CALL LANDED (2026-07-12, ADR 0061): "use ensemble for new
+> creators."** New Creators now seed to qwen_ensemble (existing key-less
+> records — Helmy, "local" — stay whisper; flipping them stays deliberate).
+> This re-ranks the arc: lanes 1/2 now serve only explicitly-whisper
+> Creators and drop in priority; the next grill should weigh lane 3
+> (laughter-aware holds — applies to EVERY engine's captions) and the
+> ADR 0058 re-measure as the live candidates, and confirm the ranking with
+> the operator if present.
 
 > **Operator ruling (2026-07-12, verbatim intent): stop polishing clip 3 /
 > single videos. Fix captions so the fix applies to ALL FUTURE VIDEOS —

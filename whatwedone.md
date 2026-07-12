@@ -4,6 +4,31 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (ruling landed) — Your eye passed the 1080p gate, and new Creators now start on the ensemble
+
+Two rulings in one sentence ("its 1080p now, use ensemble for new
+creators"), both executed:
+
+- **ADR 0060's gate: PASSED on your eye** — the native DASH Promote is the
+  production Segment path; the 360p floor is officially the emergency
+  fallback only.
+- **ADR 0061: new Creators default to the qwen ensemble.** The seed for a
+  never-seen Creator (GUI picker, import reset, headless resolution) is now
+  `qwen_ensemble` — vote-cleaned words + the eye-approved aligned timing on
+  every first import, 5 sidecar decodes per clip accepted. **Existing
+  Creators are untouched**: Helmy Yahya Bicara and "local" keep whisper
+  (their records carry no engine key, and reinterpreting old files would be
+  a silent flip — the serde default deliberately stays Whisper, pinned by a
+  new unit test). Want local files on the ensemble too? One click in the
+  rail picker persists it (ADR 0035).
+- This re-ranks the caption arc: the whisper-only lanes (the ADR 0058
+  refusal, recall parity) now serve only explicitly-whisper Creators; the
+  queue banner points the next grill at lane 3 (laughter-aware holds,
+  every-engine fuel) vs an ADR 0058 re-measure.
+- Suites green across the workspace; release rebuilt.
+
+---
+
 ## 2026-07-12 (native DASH) — 1080p Segments are BACK: the fetch YouTube can't take away without breaking its own player
 
 You said "do the native dash fix" and it shipped the same sitting,

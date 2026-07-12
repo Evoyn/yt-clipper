@@ -82,12 +82,11 @@ section fetch (60-70s)   ~19 s                         ~35 s
 - The ADR 0059 selector unit test stays as the tier-1/3 guard; new pure
   tests pin the sidx parse and the window planning.
 
-## Gate
+## Gate — PASSED (operator's eye, 2026-07-12)
 
-Suites green; a real Promote on the ECA VOD produces a **1920×1080 h264 +
-aac** `segment.mp4` in seconds, the Studio opens, the export plays with
-A/V in sync — the operator's eye on the burned Short before the 360p floor
-is considered replaced. PENDING until their eye rules.
+The operator promoted on the ECA VOD the same sitting and ruled: **"its
+1080p now."** The native tier is the production Segment path; the 360p
+floor stands demoted to the emergency fallback it was designed to be.
 
 ## Consequences (written at decision time; confirmed at the gate)
 

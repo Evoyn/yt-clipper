@@ -40,6 +40,17 @@ impl CaptionEngine {
     pub fn is_default(&self) -> bool {
         *self == Self::Whisper
     }
+
+    /// The engine a NEW (never-seen) Creator starts on — the ensemble, per
+    /// the operator's ruling (2026-07-12, ADR 0061): vote-cleaned words +
+    /// the eye-approved forced-alignment timing on every first import, at
+    /// the cost of five sidecar decodes per clip (quality over runtime).
+    /// Deliberately NOT the serde/`Default` default: an existing
+    /// never-flipped record carries no `caption_engine` key and MUST keep
+    /// reading as Whisper — reinterpreting old files would silently flip
+    /// existing Creators, which stays a deliberate per-Creator act
+    /// (ADR 0033/0035). This constant is the seed for unknown Creators only.
+    pub const FOR_NEW_CREATORS: CaptionEngine = CaptionEngine::QwenEnsemble;
 }
 
 /// A streamer whose VODs the operator clips with their permission. Carries
@@ -828,6 +839,18 @@ mod tests {
         assert!(json.contains("\"caption_engine\":\"qwen_ensemble\""), "json: {json}");
         let back: CreatorStore = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get("guntur").unwrap().caption_engine, CaptionEngine::QwenEnsemble);
+    }
+
+    #[test]
+    fn new_creator_seed_is_the_ensemble_while_old_records_still_read_whisper() {
+        // ADR 0061 (operator ruling 2026-07-12): the SEED for a never-seen
+        // Creator is the ensemble...
+        assert_eq!(CaptionEngine::FOR_NEW_CREATORS, CaptionEngine::QwenEnsemble);
+        // ...while the serde/`Default` default stays Whisper, so an existing
+        // never-flipped record (no caption_engine key — e.g. Helmy, "local")
+        // is NOT silently reinterpreted; flipping THEM stays a deliberate act
+        // (ADR 0033/0035). The two defaults differing is the design.
+        assert_eq!(CaptionEngine::default(), CaptionEngine::Whisper);
     }
 
     #[test]
