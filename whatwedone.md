@@ -39,6 +39,14 @@ inherits them:
   playhead > markers > blocks > scrub. You can scroll/zoom MID-DRAG and
   the gesture keeps tracking — drags live in time, not pixels.
 
+**Round 2, same day — your "plain → box style" verdict**: every header
+became a card spanning exactly its track's band (title and track the
+same size, your symmetry ask), with a colored accent edge — blue video,
+gold auto captions, green yours, gray analysis — that dims when the eye
+is off; the lanes mirror the cards with row bands + hairlines, caption
+blocks tint by their track's color (CapCut-style), lanes grew to 22 px,
+and the zoom buttons match the card look. Behavior untouched.
+
 115 tests green across app/core/render (new: viewport round-trip +
 zoom-anchor + paging math, the eye→RenderSpec gates, sub-second ruler
 steps); clippy clean on the touched file; the `face,align,ser` release

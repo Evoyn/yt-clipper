@@ -22,8 +22,8 @@ operator drives → findings become the next slice).
    - drag-under-zoom: caption block moves/trims and razor drags at 10×+,
      including scroll/zoom MID-DRAG (should keep tracking — drags live in
      time);
-   - header legibility at 15 px rows; eye/lock icon read (painted shapes,
-     not emoji);
+   - header cards (round-2 boxed style: card = exactly the track's band,
+     accent edge dims with the eye) — legibility, icon read, block tints;
    - the eye's honesty ON THE BURN: eye-off the auto track, export, play
      the mp4 — the auto stream must be absent, the manual stream intact
      (and vice versa). Gate on the burn, not the preview;
@@ -42,9 +42,9 @@ operator drives → findings become the next slice).
   `scroll_px` call (editor.rs, viewport-input block).
 - The zoom corner buttons zoom about the view CENTER (only ctrl+wheel
   zooms about the pointer) — deliberate; verify it doesn't feel wrong.
-- Caption lanes grew 15→18 px and blocks 14→16 px; the strip's minimum
-  panel height still degrades to the old layout (chrome 117 incl. the
-  8 px scrollbar row). Check nothing feels cramped or fat.
+- Caption lanes grew 15→22 px and blocks to 18 px (round-2 boxed style);
+  chrome is 125 incl. the 8 px scrollbar row. Check nothing feels
+  cramped or fat at the minimum panel height.
 - Eye-off blocks dim to 0.45 — enough contrast against the veils?
 - `MIN_SPAN_S = 1.0` (max zoom = 1 s across the strip). If the operator
   wants frame-level zoom, that constant is the lever; keep points-based

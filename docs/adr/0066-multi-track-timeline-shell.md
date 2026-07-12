@@ -25,6 +25,10 @@ Plan #13 (`feature-implementation-plan.md`), the operator-picked arc after edito
 - **Persisting zoom/scroll in `workspace/settings.json`** — view state, not project state; a stale zoom on open reads as a broken timeline.
 - **Emoji glyphs (👁 🔒) for the header toggles** — the round-6 tofu lesson (ADR 0065 Amendment 5): only egui's emoji fonts back the UI font, so the toggles are PAINTED shapes, font-proof.
 
+## Amendment — boxed headers (operator round-2 verdict, same day)
+
+The operator drove the shell and ruled it "plain — maybe have a box style so it will symetrical with the track timeline (same size between title and actual track)". The headers became **cards**: each a rounded box spanning EXACTLY its track's lane band, with a kind-colored accent edge — blue (INFO) = video, gold = the pipeline's captions, green (`theme::OK`) = the operator's own, gray = analysis — that dims when the track's eye is off. The lanes mirror the cards with row bands + hairline separators so header and lane read as one continuous bar, and the caption blocks now tint by their track's accent (the CapCut colored-track idiom; radius 4). Caption lanes grew 18 → 22 px (blocks 18 px tall, 2 px inset) so the cards breathe; chrome is 125. The zoom corner buttons restyled to match the cards. Pure look — every toggle, gate, and gesture from the shell round is byte-identical in behavior.
+
 ## Validation
 
 Viewport math unit-tested (t↔x round-trip under zoom+scroll, zoom-about-pointer keeps the anchor time, clamps at the clip edges, min-span floor, follow/ensure-visible paging); `render_spec` eye tests (auto off → empty override even when dirty, yours off → empty manual stream, eyes on → byte-identical to today); `nice_step` gains sub-second ruler steps, pinned. `cargo test` green on yt-clipper/yc-core/yc-render; clippy + `--features face,align,ser` check clean. The feel gates — zoom about the pointer, wheel scroll, drag-under-zoom, header toggles, and an eye-off export honestly missing that stream — are the operator's eye on the release build (gate on the burn, not the label).

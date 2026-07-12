@@ -2211,15 +2211,22 @@ impl EditorState {
             rect.max,
         );
         let resp = ui.interact(lanes, ui.id().with("strip-lanes"), Sense::click_and_drag());
-        // 117 = the fixed chrome: ruler 18 + the filmstrip track 29 + the two
-        // caption lanes (18 each) + the burn-line rail 6 above the speaker
+        // 125 = the fixed chrome: ruler 18 + the filmstrip track 29 + the two
+        // caption tracks (22 each) + the burn-line rail 6 above the speaker
         // lanes, the camera badge gutter 20 and the scrollbar row 8 below.
         let content_bottom = rect.bottom() - SCROLL_H;
         let lane_h = if n_lanes == 0 {
             13.0
         } else {
-            ((rect.height() - 117.0) / n_lanes as f32).max(13.0)
+            ((rect.height() - 125.0) / n_lanes as f32).max(13.0)
         };
+        // Row geometry, top → bottom. Header cards span EXACTLY these bands
+        // (the operator's symmetry verdict, ADR 0066 round 2).
+        let film_y0 = rect.top() + 18.0;
+        let film_y1 = rect.top() + 44.0;
+        let cap_y0 = rect.top() + 47.0;
+        let man_y0 = cap_y0 + 22.0;
+        let rail_y = man_y0 + 22.0;
         // Two painters: `ph` (unclipped) owns the background + header column;
         // `p` clips lane content at the header boundary so a scrolled-out
         // block can neither paint nor be read under the headers.
@@ -2256,6 +2263,32 @@ impl EditorState {
         let vp = self.viewport;
         let t_to_x = |t: f64| vp.t_to_x(t, lanes.left(), lanes.width(), dur);
         let x_to_t = |x: f32| vp.x_to_t(x, lanes.left(), lanes.width(), dur);
+
+        // Row bands mirror the header cards across the lanes (the operator's
+        // symmetry verdict, ADR 0066 round 2): a whisper of fill + a hairline
+        // under each track so header card and lane read as one bar.
+        let mut bands: Vec<(f32, f32)> = vec![
+            (film_y0, film_y1),
+            (cap_y0, cap_y0 + 22.0),
+            (man_y0, man_y0 + 22.0),
+        ];
+        if self.speakers.is_some() {
+            bands.push((rail_y + 6.0, content_bottom - 20.0));
+        }
+        if self.camera_mode == CameraMode::ActiveSpeaker && self.plan.is_some() {
+            bands.push((content_bottom - 20.0, content_bottom - 2.0));
+        }
+        for (y0, y1) in &bands {
+            p.rect_filled(
+                Rect::from_min_max(egui::pos2(lanes.left(), *y0), egui::pos2(lanes.right(), *y1)),
+                CornerRadius::ZERO,
+                Color32::from_rgb(0x14, 0x17, 0x1D),
+            );
+            p.line_segment(
+                [egui::pos2(lanes.left(), *y1 + 0.5), egui::pos2(lanes.right(), *y1 + 0.5)],
+                Stroke::new(1.0, Color32::from_gray(36)),
+            );
+        }
 
         // Apply any in-flight direct-manipulation gesture BEFORE drawing, so
         // this frame already shows the result (responsive by construction);
@@ -2308,8 +2341,8 @@ impl EditorState {
         // already extracted. Clicks/drags on it scrub (it is strip surface);
         // razor veils cover it, so a removed span visibly dims its video.
         let film = Rect::from_min_max(
-            egui::pos2(lanes.left(), rect.top() + 18.0),
-            egui::pos2(lanes.right(), rect.top() + 44.0),
+            egui::pos2(lanes.left(), film_y0),
+            egui::pos2(lanes.right(), film_y1),
         );
         if !self.frames.is_empty() {
             let aspect = (self.src_w / self.src_h.max(1.0)).max(0.1);
@@ -2351,9 +2384,6 @@ impl EditorState {
         // (huge-word: the next merged caption starts at/before it) is flagged
         // red instead of silently swallowed.
         self.sync_lines();
-        let cap_y0 = rect.top() + 47.0; // below the ruler + video track
-        let man_y0 = cap_y0 + 18.0;
-        let rail_y = man_y0 + 18.0;
         let mut clicked_unit: Option<(CapLane, usize)> = None;
         let mut delete_unit: Option<(CapLane, usize)> = None;
         let mut begin_drag: Option<TimelineDrag> = None;
@@ -2401,10 +2431,16 @@ impl EditorState {
             set
         };
         // The header column names the lanes now; flags ride into the loop.
+        // Blocks tint by their track's accent (gold = the pipeline's, green
+        // = the operator's — matching the header cards, ADR 0066 round 2).
         for (lane, y0, flags) in [
             (CapLane::Auto, cap_y0, self.trk_auto),
             (CapLane::Manual, man_y0, self.trk_manual),
         ] {
+            let accent = match lane {
+                CapLane::Auto => theme::GOLD,
+                CapLane::Manual => theme::OK,
+            };
             let units: &[CaptionUnit] = match lane {
                 CapLane::Auto => {
                     self.transcript.as_ref().map(|t| t.units.as_slice()).unwrap_or(&[])
@@ -2415,8 +2451,8 @@ impl EditorState {
                 match lane { CapLane::Auto => self.sel_unit, CapLane::Manual => self.sel_manual };
             for (i, u) in units.iter().enumerate() {
                 let r = Rect::from_min_max(
-                    egui::pos2(t_to_x(u.start_s), y0),
-                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 16.0),
+                    egui::pos2(t_to_x(u.start_s), y0 + 2.0),
+                    egui::pos2(t_to_x(u.end_s).max(t_to_x(u.start_s) + 3.0), y0 + 20.0),
                 );
                 if r.min.x > lanes.right() || r.max.x < lanes.left() {
                     continue; // scrolled out of the viewport window
@@ -2545,17 +2581,17 @@ impl EditorState {
                 let dim = if flags.eye { 1.0 } else { 0.45 };
                 p.rect_filled(
                     r,
-                    CornerRadius::same(3),
+                    CornerRadius::same(4),
                     Color32::from_rgba_unmultiplied(
-                        255,
-                        255,
-                        255,
-                        ((if hot { 48 } else { 26 }) as f32 * dim) as u8,
+                        accent.r(),
+                        accent.g(),
+                        accent.b(),
+                        ((if hot { 54 } else { 30 }) as f32 * dim) as u8,
                     ),
                 );
                 p.rect_stroke(
                     r,
-                    CornerRadius::same(3),
+                    CornerRadius::same(4),
                     Stroke::new(
                         if dragging_this || selected || is_hidden { 1.5 } else { 1.0 },
                         (if is_hidden {
@@ -2563,7 +2599,7 @@ impl EditorState {
                         } else if hot {
                             theme::GOLD
                         } else {
-                            Color32::from_gray(80)
+                            accent.gamma_multiply(0.5)
                         })
                         .gamma_multiply(dim),
                     ),
@@ -3175,9 +3211,15 @@ impl EditorState {
                 Color32::from_gray(140),
             );
         }
+        // Every header is a CARD spanning exactly its track's lane band
+        // ("same size between title and actual track" — the operator's
+        // round-2 verdict), with a kind-colored accent bar that dims when
+        // the track's eye is off. Blue = video, gold = the pipeline's
+        // captions, green = the operator's own, gray = analysis.
         // Video 1 · Main (the filmstrip).
+        let card = track_card(&ph, hdr, film_y0, film_y1, theme::INFO, true);
         ph.text(
-            egui::pos2(hdr.left() + 8.0, rect.top() + 31.0),
+            egui::pos2(card.left() + 10.0, card.center().y),
             Align2::LEFT_CENTER,
             "Video 1 · Main",
             name_font.clone(),
@@ -3188,8 +3230,10 @@ impl EditorState {
         for (y0, label, is_auto) in
             [(cap_y0, "Captions · auto", true), (man_y0, "Captions · yours", false)]
         {
-            let cy = y0 + 9.0;
             let mut f = if is_auto { self.trk_auto } else { self.trk_manual };
+            let accent = if is_auto { theme::GOLD } else { theme::OK };
+            let card = track_card(&ph, hdr, y0, y0 + 22.0, accent, f.eye);
+            let cy = card.center().y;
             let eye_tip = if is_auto {
                 "Show the auto captions. OFF keeps the whole stream OUT of the export \
                  (and the preview) — the blocks stay on the timeline, dimmed, editable."
@@ -3197,14 +3241,21 @@ impl EditorState {
                 "Show your captions. OFF keeps your stream OUT of the export (and the \
                  preview) — the blocks stay on the timeline, dimmed, editable."
             };
-            if track_toggle(ui, &ph, egui::pos2(hdr.left() + 13.0, cy), TrackIcon::Eye, f.eye, (label, 0), eye_tip)
-            {
+            if track_toggle(
+                ui,
+                &ph,
+                egui::pos2(card.left() + 13.0, cy),
+                TrackIcon::Eye,
+                f.eye,
+                (label, 0),
+                eye_tip,
+            ) {
                 f.eye = !f.eye;
             }
             if track_toggle(
                 ui,
                 &ph,
-                egui::pos2(hdr.left() + 29.0, cy),
+                egui::pos2(card.left() + 29.0, cy),
                 TrackIcon::Lock,
                 f.lock,
                 (label, 1),
@@ -3219,20 +3270,30 @@ impl EditorState {
                 self.trk_manual = f;
             }
             ph.text(
-                egui::pos2(hdr.left() + 40.0, cy),
+                egui::pos2(card.left() + 40.0, cy),
                 Align2::LEFT_CENTER,
                 label,
                 name_font.clone(),
                 if f.eye { name_col } else { Color32::from_gray(130) },
             );
         }
-        // Speakers analysis zone (eye only — nothing here ever burns).
+        // Speakers analysis zone (eye only — nothing here ever burns). Its
+        // card spans the whole flex zone; content sits at the top like any
+        // tall NLE track header.
         if self.speakers.is_some() {
-            let cy = rail_y + 15.0;
+            let card = track_card(
+                &ph,
+                hdr,
+                rail_y + 6.0,
+                content_bottom - 20.0,
+                Color32::from_gray(120),
+                self.speakers_eye,
+            );
+            let cy = if card.height() < 20.0 { card.center().y } else { card.top() + 10.0 };
             if track_toggle(
                 ui,
                 &ph,
-                egui::pos2(hdr.left() + 13.0, cy),
+                egui::pos2(card.left() + 13.0, cy),
                 TrackIcon::Eye,
                 self.speakers_eye,
                 ("speakers", 0),
@@ -3242,21 +3303,29 @@ impl EditorState {
                 self.speakers_eye = !self.speakers_eye;
             }
             ph.text(
-                egui::pos2(hdr.left() + 24.0, cy),
+                egui::pos2(card.left() + 25.0, cy),
                 Align2::LEFT_CENTER,
                 "Speakers",
                 name_font.clone(),
                 if self.speakers_eye { name_col } else { Color32::from_gray(130) },
             );
         }
-        // The camera badge gutter's label (Active Speaker only).
+        // The camera badge gutter's card (Active Speaker only).
         if self.camera_mode == CameraMode::ActiveSpeaker && self.plan.is_some() {
+            let card = track_card(
+                &ph,
+                hdr,
+                content_bottom - 20.0,
+                content_bottom - 2.0,
+                theme::GOLD.gamma_multiply(0.7),
+                true,
+            );
             ph.text(
-                egui::pos2(hdr.left() + 8.0, content_bottom - 10.0),
+                egui::pos2(card.left() + 10.0, card.center().y),
                 Align2::LEFT_CENTER,
                 "Camera",
                 FontId::proportional(8.5),
-                Color32::from_gray(130),
+                Color32::from_gray(160),
             );
         }
 
@@ -5482,6 +5551,37 @@ fn strip_frame_time_s(idx: usize, strip_fps: f64) -> f64 {
     idx as f64 / strip_fps.max(1e-6)
 }
 
+/// One track-header CARD (the operator's round-2 verdict, ADR 0066): a
+/// rounded box spanning EXACTLY the track's lane band — header and lane
+/// read as one bar — with a kind-colored accent edge that dims when the
+/// track's eye is off. Returns the card rect so callers place content in it.
+fn track_card(
+    p: &egui::Painter,
+    hdr: Rect,
+    y0: f32,
+    y1: f32,
+    accent: Color32,
+    live: bool,
+) -> Rect {
+    let card = Rect::from_min_max(
+        egui::pos2(hdr.left() + 4.0, y0 + 1.5),
+        egui::pos2(hdr.right() - 6.0, y1 - 1.5),
+    );
+    p.rect_filled(card, CornerRadius::same(4), Color32::from_rgb(0x1E, 0x22, 0x2B));
+    p.rect_stroke(
+        card,
+        CornerRadius::same(4),
+        Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2F, 0x38)),
+        StrokeKind::Inside,
+    );
+    p.rect_filled(
+        Rect::from_min_max(card.left_top(), egui::pos2(card.left() + 3.0, card.bottom())),
+        CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 },
+        if live { accent.gamma_multiply(0.9) } else { Color32::from_gray(70) },
+    );
+    card
+}
+
 /// Which painted track-header toggle to draw.
 #[derive(Clone, Copy, PartialEq)]
 enum TrackIcon {
@@ -5567,15 +5667,25 @@ fn mini_btn(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, tip: &st
     let resp = ui.interact(r, ui.id().with(("tl-mini", label)), Sense::click());
     p.rect_filled(
         r,
-        CornerRadius::same(3),
-        if resp.hovered() { Color32::from_gray(52) } else { Color32::from_gray(36) },
+        CornerRadius::same(4),
+        if resp.hovered() {
+            Color32::from_rgb(0x2A, 0x2F, 0x3A)
+        } else {
+            Color32::from_rgb(0x1E, 0x22, 0x2B)
+        },
+    );
+    p.rect_stroke(
+        r,
+        CornerRadius::same(4),
+        Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2F, 0x38)),
+        StrokeKind::Inside,
     );
     p.text(
         r.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(9.5),
-        Color32::from_gray(205),
+        Color32::from_gray(210),
     );
     resp.on_hover_text(tip).clicked()
 }
