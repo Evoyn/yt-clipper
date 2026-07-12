@@ -4,6 +4,36 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (arc closed) — Caption-general is DONE; the next feature is the arousal Signal release builds have been silently missing
+
+You said "finish this md all the way, i want to move to next feature" and
+picked the recommended thread. The close-out, per lane:
+
+- **Lane 1** (whisper alignment): refused at its bar (ADR 0058) — terminal.
+- **Lane 2** (whisper witness/recall): **parked by ranking, not built** —
+  it would rebuild, for a single-decoder engine, the vote machinery the
+  ensemble already IS, and since your ADR 0061 ruling it serves only two
+  legacy records (Helmy, "local"). The one-click rail flip to the ensemble
+  (your act, ADR 0035) covers them better than a multi-session witness
+  arc; the design question + fuel are recorded if you ever name a Creator
+  you won't flip.
+- **Lane 3** (laugh holds): refused at your eye (ADR 0062) — terminal.
+- **Lane 4** (garble): the machinery already exists — wakes only when you
+  name a class.
+- No staged verdicts remain anywhere (dedikornya was withdrawn by your
+  no-JSON rule; the laugh A/B you ruled same day).
+
+**The new queue head: `nextprompt-arousal-release.md`.** The 2026-07-07
+shakedown found release builds compile WITHOUT the `ser` feature — your
+production detect has ranked Moments missing the Arousal Signal (the one
+that tells an emotional reaction from merely-loud audio) the whole time,
+with the gate-passed model installed and idle. The slice: prove it
+contributes sanely on a real VOD (A/B, no clobbering your saved Moments),
+then ship it in build-release.bat, cost measured, your eye on the
+before/after ranking.
+
+---
+
 ## 2026-07-12 (verdict) — You ruled: raw production wins; the hold trim is REFUSED for the right reason
 
 First pass you saw no difference between A and B; pointed at the one

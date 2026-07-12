@@ -1,5 +1,31 @@
 # Session prompt — GENERAL caption accuracy (operator directive 2026-07-12)
 
+> **ARC CLOSED (2026-07-12, operator: "i want to move to next feature").**
+> Every lane is terminal — do NOT queue caption sessions from this file
+> (the focus-md pattern: historical once the arc closes):
+>
+> - **Lane 1 REFUSED** (ADR 0058) — reopens only behind a whisper-side
+>   word cleaner.
+> - **Lane 2 PARKED BY RANKING** (this close-out): it would rebuild, for a
+>   single-decoder engine, the witness/vote machinery the ensemble already
+>   IS — and since ADR 0061 it serves only the two legacy key-less records
+>   (Helmy Yahya Bicara, "local"). The recorded path to that quality for
+>   them is the operator's own ONE-CLICK rail flip to the ensemble
+>   (ADR 0035/0061 — deliberate act, theirs alone; still on the table).
+>   Reopen lane 2 only if the operator names a Creator they will NOT flip.
+>   Fuel if reopened: `caption_recall_diag`, `decode_variants`, ADR 0052's
+>   zero-added controls, ADR 0058's ready-made re-measure bars.
+> - **Lane 3 REFUSED at the eye** (ADR 0062) — drawn-out words ("gemesss…")
+>   ride INTO laughs; any successor needs an end-of-vocalization signal.
+> - **Lane 4 = the existing machinery** — wakes only when the operator
+>   names a garble class.
+>
+> **No staged verdicts remain anywhere**: the dedikornya verdict was
+> WITHDRAWN by the same-day no-JSON rule (its file says so), and the
+> laugh-hold A/B was ruled "A — raw production" the same day. The ritual
+> line below about a staged dedikornya verdict is superseded by this
+> banner. **Queue head: `nextprompt-arousal-release.md`.**
+
 > **LANE 3 IS CLOSED — REFUSED AT THE OPERATOR'S EYE (2026-07-12, ADR
 > 0062).** The hold trim measured floor-exact (every safety bar passed on
 > the 5-clip corpus; R3's ≤30% letter failed on the readability floor's
@@ -95,10 +121,11 @@ first question is which lane, the second is the new-Creator engine default.
    is an operator policy call. Costs: 5 sidecar decodes + models per clip.
    One sentence from the operator decides it; a session can then wire the
    default + re-measure lane 1 behind it.)
-2. **Whisper-engine recall parity** (carried from the recall menu): no vote
-   on a single decoder — the grill must design the witness (a second decode
-   config? the ensemble's machinery on demand?) with ADR 0052's zero-added
-   controls. Genuinely open design; do not improvise without pre-registration.
+2. **~~Whisper-engine recall parity~~ — PARKED BY RANKING (2026-07-12
+   close-out; see the top banner).** The design question stays recorded (a
+   second decode config? the ensemble's machinery on demand? ADR 0052's
+   zero-added controls) but is not session work while the one-click
+   ensemble flip covers the only two Creators it would serve.
 3. **Laughter-aware caption timing/holds (NEW lane).** Fuel exists: the
    production shared-reaction tagger (ADR 0045/0046) already masks laughter
    for the camera. Candidate uses, measure-first: cue HOLDS truncate at a
