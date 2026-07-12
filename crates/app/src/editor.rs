@@ -59,8 +59,9 @@ const MIN_SHOT_S: f64 = 0.15;
 const MIN_SEG_S: f64 = 0.1;
 /// Pointer radius (points) within which a dragged time snaps to an anchor.
 const SNAP_PX: f32 = 8.0;
-/// The track header column's width (plan #13's Premiere/CapCut shape).
-const HDR_W: f32 = 118.0;
+/// The track header column's width (plan #13's Premiere/CapCut shape;
+/// sized for 12 pt track names — the round-2 "text feels odd" verdict).
+const HDR_W: f32 = 158.0;
 /// The scrollbar row's height at the strip's bottom (ADR 0066).
 const SCROLL_H: f32 = 8.0;
 
@@ -3182,33 +3183,35 @@ impl EditorState {
             [hdr.right_top(), hdr.right_bottom()],
             Stroke::new(1.0, Color32::from_gray(50)),
         );
-        let name_font = FontId::proportional(9.5);
-        let name_col = Color32::from_gray(200);
+        // 12 pt = the theme's Small — close enough to the 15 pt transport
+        // buttons that the column no longer reads miniature (round-2 verdict).
+        let name_font = FontId::proportional(12.0);
+        let name_col = Color32::from_gray(208);
         // Corner: zoom verbs — the discoverable fallback for ctrl+wheel.
         let center_t = vp.left_t + vp.span(dur) * 0.5;
         let btn_r = |x0: f32, w: f32| {
             Rect::from_min_max(
                 egui::pos2(hdr.left() + x0, hdr.top() + 2.0),
-                egui::pos2(hdr.left() + x0 + w, hdr.top() + 15.0),
+                egui::pos2(hdr.left() + x0 + w, hdr.top() + 16.0),
             )
         };
-        if mini_btn(ui, &ph, btn_r(6.0, 16.0), "-", "Zoom out (or ctrl+wheel on the timeline)") {
+        if mini_btn(ui, &ph, btn_r(6.0, 18.0), "-", "Zoom out (or ctrl+wheel on the timeline)") {
             self.viewport.zoom_about(center_t, 0.5, 1.0 / 1.5, dur);
         }
-        if mini_btn(ui, &ph, btn_r(24.0, 16.0), "+", "Zoom in (ctrl+wheel zooms about the pointer)")
+        if mini_btn(ui, &ph, btn_r(28.0, 18.0), "+", "Zoom in (ctrl+wheel zooms about the pointer)")
         {
             self.viewport.zoom_about(center_t, 0.5, 1.5, dur);
         }
-        if mini_btn(ui, &ph, btn_r(42.0, 24.0), "Fit", "Show the whole clip") {
+        if mini_btn(ui, &ph, btn_r(50.0, 30.0), "Fit", "Show the whole clip") {
             self.viewport = Viewport::default();
         }
         if vp.zoom > 1.001 {
             ph.text(
-                egui::pos2(hdr.right() - 5.0, hdr.top() + 8.5),
+                egui::pos2(hdr.right() - 6.0, hdr.top() + 9.0),
                 Align2::RIGHT_CENTER,
                 format!("{:.1}×", vp.zoom),
-                FontId::proportional(8.5),
-                Color32::from_gray(140),
+                FontId::proportional(10.0),
+                Color32::from_gray(150),
             );
         }
         // Every header is a CARD spanning exactly its track's lane band
@@ -3219,7 +3222,7 @@ impl EditorState {
         // Video 1 · Main (the filmstrip).
         let card = track_card(&ph, hdr, film_y0, film_y1, theme::INFO, true);
         ph.text(
-            egui::pos2(card.left() + 10.0, card.center().y),
+            egui::pos2(card.left() + 12.0, card.center().y),
             Align2::LEFT_CENTER,
             "Video 1 · Main",
             name_font.clone(),
@@ -3244,7 +3247,7 @@ impl EditorState {
             if track_toggle(
                 ui,
                 &ph,
-                egui::pos2(card.left() + 13.0, cy),
+                egui::pos2(card.left() + 14.0, cy),
                 TrackIcon::Eye,
                 f.eye,
                 (label, 0),
@@ -3255,7 +3258,7 @@ impl EditorState {
             if track_toggle(
                 ui,
                 &ph,
-                egui::pos2(card.left() + 29.0, cy),
+                egui::pos2(card.left() + 31.0, cy),
                 TrackIcon::Lock,
                 f.lock,
                 (label, 1),
@@ -3270,7 +3273,7 @@ impl EditorState {
                 self.trk_manual = f;
             }
             ph.text(
-                egui::pos2(card.left() + 40.0, cy),
+                egui::pos2(card.left() + 44.0, cy),
                 Align2::LEFT_CENTER,
                 label,
                 name_font.clone(),
@@ -3293,7 +3296,7 @@ impl EditorState {
             if track_toggle(
                 ui,
                 &ph,
-                egui::pos2(card.left() + 13.0, cy),
+                egui::pos2(card.left() + 14.0, cy),
                 TrackIcon::Eye,
                 self.speakers_eye,
                 ("speakers", 0),
@@ -3303,7 +3306,7 @@ impl EditorState {
                 self.speakers_eye = !self.speakers_eye;
             }
             ph.text(
-                egui::pos2(card.left() + 25.0, cy),
+                egui::pos2(card.left() + 28.0, cy),
                 Align2::LEFT_CENTER,
                 "Speakers",
                 name_font.clone(),
@@ -3321,11 +3324,11 @@ impl EditorState {
                 true,
             );
             ph.text(
-                egui::pos2(card.left() + 10.0, card.center().y),
+                egui::pos2(card.left() + 12.0, card.center().y),
                 Align2::LEFT_CENTER,
                 "Camera",
-                FontId::proportional(8.5),
-                Color32::from_gray(160),
+                FontId::proportional(10.5),
+                Color32::from_gray(165),
             );
         }
 
@@ -5684,7 +5687,7 @@ fn mini_btn(ui: &mut egui::Ui, p: &egui::Painter, r: Rect, label: &str, tip: &st
         r.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(9.5),
+        FontId::proportional(11.0),
         Color32::from_gray(210),
     );
     resp.on_hover_text(tip).clicked()
