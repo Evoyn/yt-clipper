@@ -1,3 +1,21 @@
+# CONSUMED 2026-07-13, same session — the operator drove the verdict rounds live
+
+The shell shipped and the operator ran four verdict rounds in the same
+session (screenshots): "plain" → boxed header cards + accent edges + row
+bands; "text feels odd" → 12 pt names, 158 px column; "make the text
+symetrical / upper case" → one label column + Title-Case; "+ - Fit not
+centered" → glyph-ink centering (painted strokes tried and rejected —
+"just normal + - and fit"). Final verdict: **"its centered now, lets
+continue to the next plan."** ADR 0066's amendment records it all.
+Still unseen by a human: an eye-off caption track verified ON A REAL
+EXPORT (the burn), drag-under-zoom at high zoom — check during normal
+use; the remaining #13 requirements stay pre-registered in ADR 0066
+behind their arcs. The queue moves to `nextprompt-title-gen.md`.
+
+---
+
+# (original prompt below, kept for the record)
+
 # Session prompt — multi-track shell: the operator's verdict round (plan #13 slice 2, queued 2026-07-13)
 
 Slice 1 of plan #13 shipped (ADR 0066, handoff

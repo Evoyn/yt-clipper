@@ -45,7 +45,14 @@ same size, your symmetry ask), with a colored accent edge — blue video,
 gold auto captions, green yours, gray analysis — that dims when the eye
 is off; the lanes mirror the cards with row bands + hairlines, caption
 blocks tint by their track's color (CapCut-style), lanes grew to 22 px,
-and the zoom buttons match the card look. Behavior untouched.
+and the zoom buttons match the card look. Behavior untouched. Then your
+three text verdicts, same session: names raised to 12 pt (they were
+9.5 pt against 15 pt transport buttons — the "odd" feel) with the column
+widened to 158 px; every name in ONE label column, Title-Cased
+(Captions · Auto / Captions · Yours); and the zoom − + Fit centered by
+their glyph ink, not the font line box (painted strokes tried, you
+rejected them — normal text, properly centered). You closed it: "its
+centered now, lets continue to the next plan."
 
 115 tests green across app/core/render (new: viewport round-trip +
 zoom-anchor + paging math, the eye→RenderSpec gates, sub-second ruler
