@@ -1,77 +1,120 @@
-# Session prompt — the AROUSAL Signal has never shipped in a release build (operator pick 2026-07-12)
+# Session prompt — ship the arousal Signal in release builds (operator pick 2026-07-12)
 
-The operator closed the caption-general arc and picked this from the
-derived open-threads list ("i want you to make based on your recommended").
+The operator closed the caption-general arc and picked this thread
+("i want you to make based on your recommended"), then had this prompt
+verified-and-sharpened against the actual code the same day — the facts
+below were READ, not guessed (re-verify only if the cited files changed).
 
-## The defect (evidenced, 2026-07-07 ship-shakedown)
+## The defect (verified in code, 2026-07-12)
 
-`scripts/build-release.bat` builds `--features face,align` — **no `ser`**.
-The Arousal Signal (ADR 0008; CONTEXT.md **Arousal**: the emotional
-*activation* of the streamer's voice — the one Signal that tells an
-emotional reaction from merely-loud audio) is therefore compiled out of
-every production binary: release detect has ranked Moments from
-chat-rate / loudness / lexicon / LLM only, through the entire camera arc,
-while the gate-passed model sits installed (`models/w2v2-emotion`) doing
-nothing. The shakedown recorded it verbatim: "detect ranks without one
-Signal."
+`scripts/build-release.bat:24` builds `--features face,align` — **no
+`ser`**. The ser-gated refine pass (pipeline.rs ~1036–1052) is therefore
+compiled out of every production binary, which degrades TWO Signals, both
+verified:
 
-## Ground truth the grill must verify BEFORE code
+1. **Ranking**: the default `Weights` reserve **0.15 for arousal**
+   (yc-detect lib.rs:109); without it `combined_score` renormalizes over
+   the rest — Moments rank loud-vs-flat blind (the exact false-positive
+   class ADR 0008 exists to kill).
+2. **The LLM judge**: its prompt corroborates against `arousal_z`
+   (yc-detect llm.rs:75,101) — a ser-less build has fed it None the whole
+   time, so even the llm Signal has been judging without the
+   voice-activation line.
 
-- ADR 0008 (what the Signal measures, the CPU-refine staging), ADR
-  0002/0007 (where Signals enter Moment scoring; Signals stay SEPARATE —
-  never blended away, CONTEXT.md **Signal**).
-- The `ser` feature wiring: workspace Cargo.toml → crates/app (`ser =
-  ["yc-detect/ser"]`) → yc-detect. What a ser build does when the model
-  file is MISSING (must fail soft to today's ranking — verify, don't
-  assume) and whether Diagnostics ▸ Downloads carries the SER model row as
-  the heal path.
-- The existing instruments before inventing any:
-  `crates/detect/examples/arousal_probe.rs`, `arousal_scan.rs`,
-  `crates/app/examples/arousal_adds.rs`, `detect_diag.rs` — read their
-  headers; `arousal_adds` sounds like exactly the ranking-contribution
-  measurement this slice needs (unverified — confirm).
-- Whether ser has ever run under the CUDA build script
-  (`scripts/cargo-cuda.bat`) — ort is already shipped via `face`, but
-  verify the combined `face,align,ser` build compiles and boots before
-  touching the release script.
+Everything else is ALREADY in place (all verified): `AppPaths::ser_model`
+= `models/w2v2-emotion/model.onnx` and the model IS installed on this
+machine; the Diagnostics ▸ Downloads heal row exists ("arousal Signal
+(ser builds, ADR 0008) (~610 MB)", installs model.onnx + model.yaml —
+main.rs ~1378/1581); the GUI already displays the arousal value per
+Moment (main.rs 177, 2291); and **the mixed-audio gate PASSED 2026-06-18**
+(ADR 0008 Outcome: reactions peak 0.94–1.10 and decay to ~0, loud-but-flat
+demoted, on a real 66-min VOD). This slice VALIDATES-and-SHIPS a
+gate-passed Signal into the release binary; it does not re-open the gate.
+
+## Verified constraints and sharp edges
+
+- **Fail-soft on a MISSING model is structural**: the pass runs only under
+  `#[cfg(feature = "ser")]` AND `paths.ser_model.is_file()`; absent ⇒
+  today's ranking exactly (renormalize). BUT a PRESENT-and-corrupt file
+  hard-fails the whole detect job (`Ser::load(&paths.ser_model)?`,
+  pipeline.rs ~1042). Decide in-session: accept (Downloads re-heals) or
+  soften to warn+skip — if softened, that's part of the ONE
+  implementation, unit-covered, not an extra.
+- **Cost of record** (ADR 0008, 2026-06-18 hardware): ~0.35–0.46 s CPU per
+  4 s window, ~163 s for a 25-candidate refine batch, after the whisper
+  drop (no VRAM). Re-measure today's wall-time and record it beside the
+  old number.
+- **License** (ADR 0008): the audeering w2v2 model is
+  research/non-commercial — already ruled acceptable for this offline
+  personal tool; release inclusion changes nothing. Do not re-litigate.
+- **Discovery-arousal stays DEFERRED** (ADR 0008's own measured deferral:
+  real reactions and game-cutscene voice-acting interleave in one score
+  band; the only recorded revisit shape is a corroboration-gated
+  augmenter, itself gated on vocal separation). This slice is
+  REFINE-ONLY. Do not resurrect discovery.
+- **Weights are not a lever this session**: the 0.15 default ships as-is;
+  retuning the mix is its own future measured slice.
+
+## Instruments (verified — do not invent new ones)
+
+- `crates/detect/examples/arousal_probe.rs` — dense local arousal trace
+  (the ADR 0008 gate's per-moment evidence; needs `--features ser`).
+- `crates/detect/examples/arousal_scan.rs` — whole-VOD distribution +
+  off-diagonal report (gate fuel; discovery context only).
+- `crates/detect/examples/detect_vod.rs` — the no-GPU discovery
+  tuner/ranked-dump the ADR used for the refine re-rank table.
+- `crates/app/examples/arousal_adds.rs` — the DISCOVERY-precision
+  transcript probe. NOT this slice's tool (discovery deferred); listed so
+  nobody re-guesses its purpose.
 
 ## The slice (ONE implementation)
 
-Make release builds carry the Signal, measured:
-
-1. **Probe** (no code): a `ser`-flavored build; `arousal_probe` (or the
-   verified equivalent) on a fixture range — the model loads, scores move.
-2. **A/B the ranking on a real VOD** (measure-first, pre-register what
-   "contributes sanely" means BEFORE looking — e.g. every refined Moment
-   carries an arousal score; rank changes bounded and explainable; no
-   Signal blending). The ECA podcast has 25 operator-saved Moments — do
-   NOT clobber operator state: A/B through a diag path or a project.json
-   copy, never a persisting re-detect over their file.
-3. **Wire**: add `ser` to build-release.bat (+ its comment block) only
-   after the A/B reads sane. Rebuild release, boot check.
-4. **Cost honesty**: measure the added detect wall-time (CPU refine) and
-   report it — quality-over-runtime is standing, but the number gets
-   recorded, not assumed.
-5. Suites green: default AND `face,align,ser` flavors.
-6. **Operator gate**: the before/after top-N Moment table for their eye
-   (they know their VODs); a re-ranked detect is a look change — the eye
-   rules (ADR 0050/0057 lesson).
+1. **Persistence semantics first**: read how `--detect` / the GUI detect
+   job writes `project.json` (main.rs) BEFORE any run. Never leave the
+   operator's saved Moments altered — the ECA podcast workdir (under
+   "Deddy Corbuzier", the "JADI, COWOK RED FLAG…" stream folder) holds
+   their 25 saved Moments. Byte-backup `project.json`, restore after,
+   verify sha.
+2. **Capture the A side BEFORE rebuilding**: the current
+   `target\release\yt-clipper.exe` is the ser-less binary — copy it aside
+   (or record its detect table first); the rebuild overwrites it.
+3. **Build B**: `scripts\cargo-cuda.bat` with QUOTED
+   "--features" "face,align,ser" (PS 5.1 trap: a bare comma makes an
+   array and silently drops features). Suites: workspace default,
+   `-p yc-detect --features ser`, app `face,align,ser` flavor.
+4. **Probe**: `arousal_probe` over a current fixture's analysis.wav range
+   — scores move, per-window CPU wall recorded.
+5. **A/B the refine ranking on the real VOD** (pre-register "sane" BEFORE
+   looking): every refined Moment carries `Some(arousal)`; rank moves are
+   explainable by the arousal column (the known classes: reactions up,
+   loud-but-flat down); zero words of code changed in scoring itself.
+   Artifact: the before/after ranked top-N table with per-Signal columns.
+6. **Wire**: add `ser` to build-release.bat + extend its comment block
+   (the file documents each feature's reason — keep that convention).
+   Rebuild release; boot check (GUI opens, Diagnostics SER row green,
+   a detect shows the "Refining moments (arousal, CPU)" stage).
+7. **Operator gate**: the before/after top-N table + the measured cost
+   line, for their eye — a re-ranked detect is a behavior change; the eye
+   rules (ADR 0050/0057 lesson). Stage it in the handoff if they're away.
 
 ## Hard rules (standing)
 
-- Measure before building; pre-register bars; fail-soft on missing model.
-- GPU: idle-gate any decode-heavy step (probe decode is the decider);
-  sweep orphans; background waits die ~25-40 min — wakeup-poll instead.
-- PS 5.1: ASCII scripts; QUOTE "--features" "face,align,ser"; commit -F
-  file; git-bash mangles workspace paths — PowerShell tool for runs.
-- Caption code is OUT OF SCOPE (that arc is closed; see
-  nextprompt-caption-general.md's banner).
+- Measure before building; pre-register what "sane" means before reading
+  the A/B; fail-soft verified, not assumed.
+- GPU: detect's whisper/llm stages want the idle gate (probe decode is
+  the decider); the arousal pass itself is CPU. Sweep orphans; background
+  waits die ~25–40 min — wakeup-poll instead.
+- PS 5.1: ASCII scripts; QUOTE the features list; commit -F file;
+  git-bash mangles workspace paths — use the PowerShell tool.
+- Caption code is OUT OF SCOPE (that arc is closed — see
+  nextprompt-caption-general.md's banner). So is weight retuning and
+  discovery-arousal (above).
 
 ## Ritual
 
 /grill-with-docs first (operator may be present; if they said "do this
-automatically", the pick is already recorded — proceed measure-first
-through the slice above). Also still on the table for the operator, one
+automatically", the pick + this verified plan are the recorded rubric —
+proceed through the slice in order). Still on the operator's table, one
 click each, their act alone: flipping Helmy Yahya Bicara + "local" to the
 ensemble engine (ADR 0035/0061). Finish with /handoff + whatwedone.md
 entry; commit as Evoyn with the model trailer; `git push origin main` has
