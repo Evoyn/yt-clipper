@@ -341,7 +341,14 @@ pub fn apply(
     // measurement). Any failure logs and falls through to the DTW fusion;
     // captions never go missing because the aligner did.
     let aligned = if forced_align_requested() {
-        forced_align_fusion(cfg, &merged, samples, onset_src, sample_rate, range.duration_s())
+        forced_align_fusion(
+            cfg.align_model.as_deref(),
+            &merged,
+            samples,
+            onset_src,
+            sample_rate,
+            range.duration_s(),
+        )
     } else {
         None
     };
@@ -1015,23 +1022,26 @@ fn edit1(a: &str, b: &str) -> bool {
     long[i + 1..] == short[i..]
 }
 
-/// The forced-alignment timing pass (ADR 0054): align the voted words to the
+/// The forced-alignment timing pass (ADR 0054): align the words to the
 /// caption audio with the wav2vec2-CTC model and build the units straight from
 /// the per-word spans. Returns `None` (with a warn) on ANY failure — model
 /// missing, session error, alignment infeasible, or under half the words
-/// aligned — and the DTW fusion stands. `samples` is the caption audio the
-/// words were decoded from (the spike validated on exactly this view);
-/// `onset_src` is the cleaned-onset audio for placing the rare unaligned run.
+/// aligned — and the caller's fallback skeleton stands. `samples` is the
+/// caption audio the words were decoded from (the spike validated on exactly
+/// this view); `onset_src` is the cleaned-onset audio for placing the rare
+/// unaligned run (the whisper path passes `samples` for both — it has no
+/// cleaned variant). Takes the model dir, not the whole config, so BOTH
+/// engines' entry points ([`apply`], [`forced_align_retime`]) share it.
 #[cfg(feature = "align")]
 fn forced_align_fusion(
-    cfg: &EnsembleConfig,
+    align_model: Option<&Path>,
     merged: &[String],
     samples: &[f32],
     onset_src: &[f32],
     sample_rate: u32,
     clip_dur_s: f64,
 ) -> Option<Vec<CaptionUnit>> {
-    let Some(dir) = cfg.align_model.as_ref() else {
+    let Some(dir) = align_model else {
         tracing::warn!("forced-align: no model dir configured - DTW timing stands");
         return None;
     };
@@ -1075,12 +1085,12 @@ fn forced_align_fusion(
     Some(fuse_onto_alignment(merged, &spans, onset_src, sample_rate, clip_dur_s))
 }
 
-/// Feature-off stub: this build has no aligner compiled in, so an ensemble
-/// render's timing is the DTW fallback, NOT what a production (`align`)
-/// build ships — say so instead of silently diverging.
+/// Feature-off stub: this build has no aligner compiled in, so the render's
+/// timing is the DTW fallback, NOT what a production (`align`) build ships —
+/// say so instead of silently diverging.
 #[cfg(not(feature = "align"))]
 fn forced_align_fusion(
-    _cfg: &EnsembleConfig,
+    _align_model: Option<&Path>,
     _merged: &[String],
     _samples: &[f32],
     _onset_src: &[f32],
@@ -1092,6 +1102,46 @@ fn forced_align_fusion(
          compile it in) - DTW timing stands"
     );
     None
+}
+
+/// Re-time an already-worded transcript by forced alignment — the WHISPER
+/// engine's use of the ensemble's timing skeleton (ADR 0058), so every
+/// engine gets the accurate onsets the operator's eye approved on the burn
+/// (ADR 0054/0055). Same texts, one unit per input unit (harvest
+/// `unit_index`es stay valid), times from the CTC aligner; the caller
+/// replaces its DTW spans with the result and runs its unchanged downstream
+/// (`at_s` pins — which still override the aligner, ADR 0051/0055 — then
+/// `refine_caption_timing` with the silence-drop ARMED: whisper words are
+/// one decoder's unverified guess, so the hallucination guard stays earned).
+///
+/// Returns `None` — the caller's own spans stand, captions never missing —
+/// when: the shared `YC_FORCED_ALIGN` knob is off (one off-switch for the
+/// mechanism, both engines; read INSIDE so a render and a diag cannot
+/// diverge, ADR 0033); `units` is empty; `language` is not Indonesian (the
+/// pinned model is `models/w2v2-align-id` — EN is unvalidated on it, JA is
+/// all-OOV; a per-language model earns entry through its own gate); or any
+/// [`forced_align_fusion`] guard trips (`align` feature, model present,
+/// session, feasibility, >= half the words aligned).
+pub fn forced_align_retime(
+    align_model: Option<&Path>,
+    language: Language,
+    units: &[CaptionUnit],
+    samples: &[f32],
+    sample_rate: u32,
+    clip_dur_s: f64,
+) -> Option<Vec<CaptionUnit>> {
+    if !forced_align_requested() || units.is_empty() {
+        return None;
+    }
+    if !matches!(language, Language::Id) {
+        tracing::info!(
+            "forced-align: the whisper-path re-time is Indonesian-only today \
+             (model w2v2-align-id); {language:?} keeps its DTW spans"
+        );
+        return None;
+    }
+    let words: Vec<String> = units.iter().map(|u| u.text.clone()).collect();
+    forced_align_fusion(align_model, &words, samples, samples, sample_rate, clip_dur_s)
 }
 
 /// Build caption units from per-word forced-alignment spans: an aligned word
@@ -1991,6 +2041,35 @@ mod tests {
         let fused = fuse_onto_alignment(&merged, &spans, &silence(5.0), 16000, 5.0);
         assert!(fused[1].start_s >= fused[0].end_s - 1e-9);
         assert!(fused[1].end_s >= fused[1].start_s);
+    }
+
+    #[test]
+    fn fuse_onto_alignment_preserves_texts_one_to_one() {
+        // The zero-words invariant (ADR 0058 bar W3) by construction: a mixed
+        // aligned/unaligned word list comes back with the SAME texts in the
+        // SAME order, one unit per word — timing is the only thing that moves.
+        let merged = words("siapa 2024 otot kreatin");
+        let spans = vec![Some((1.0, 1.3)), None, Some((2.0, 2.4)), Some((3.0, 3.6))];
+        let fused = fuse_onto_alignment(&merged, &spans, &silence(5.0), 16000, 5.0);
+        assert_eq!(fused.len(), merged.len());
+        for (u, w) in fused.iter().zip(&merged) {
+            assert_eq!(&u.text, w);
+        }
+    }
+
+    #[test]
+    fn forced_align_retime_gates_empty_and_non_indonesian() {
+        // Both gates sit BEFORE any model/feature probe, so this holds on
+        // every build flavor (and regardless of the ambient knob: a gate miss
+        // and a knob-off both mean None — the caller's DTW spans stand).
+        let en_units = vec![CaptionUnit { text: "hello".into(), start_s: 0.5, end_s: 0.9 }];
+        assert!(forced_align_retime(None, Language::En, &en_units, &silence(2.0), 16000, 2.0)
+            .is_none());
+        assert!(forced_align_retime(None, Language::Ja, &en_units, &silence(2.0), 16000, 2.0)
+            .is_none());
+        assert!(
+            forced_align_retime(None, Language::Id, &[], &silence(2.0), 16000, 2.0).is_none()
+        );
     }
 
     #[test]

@@ -2020,6 +2020,16 @@ fn ensure_transcript(
             if correct {
                 correct_captions(paths, session, prepared, &mut transcript, &lexicon, cancel, tx);
             }
+            // NOT wired: a whisper-path forced-align re-time
+            // (`ensemble::forced_align_retime`) was built and measured here
+            // (ADR 0058, 2026-07-12) and its defect-clip bar FAILED — with no
+            // vote to clean whisper's token list, the aligner amplifies
+            // whisper's double-transcriptions across multi-second stretches
+            // (clip 3's SUSU DEDDY CORP dragged ~2.7 s early). Wire it only
+            // behind a whisper-side word-cleaning mechanism (the recall/vote
+            // lane) or an engine-default policy change; the instrument is
+            // `whisper_align_diag`. Whisper renders keep whisper's own DTW
+            // spans, exactly as before.
             // Auto-harvest this clip's unsure/unknown words to the PER-CLIP store
             // (ADR 0031), so the operator curates a small per-export list (with each
             // word's title + VOD timestamp, ADR 0022) — but only words the timing

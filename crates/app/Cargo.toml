@@ -85,3 +85,7 @@ required-features = ["align"]
 [[example]]
 name = "caption_align_diag"
 required-features = ["align"]
+
+[[example]]
+name = "whisper_align_diag"
+required-features = ["align"]

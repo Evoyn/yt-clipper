@@ -4,6 +4,47 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (general arc, lane 1) — Whisper-engine alignment measured, and it REFUSED itself at its own bar: without the vote, the aligner amplifies whisper's wrong tokens
+
+You said "do this automatically" and went to watch anime, so this session ran
+the general-arc queue head (nextprompt-caption-general.md) by the recorded
+rubric: lane 1 — wire the eye-approved forced aligner into the whisper
+engine, so every future video gets the accurate timing skeleton on BOTH
+engines. It was run measure-first, and the measurement said no:
+
+- **Built (all in-tree, zero production change)**: the production entry
+  point (`forced_align_retime` — same words in, aligned times out, every
+  fail-soft gate the ensemble has plus Indonesian-only) and its instrument
+  (`whisper_align_diag` — one production whisper decode, DTW arm vs ALIGN
+  arm, every mover named). Bars were written into ADR 0058 BEFORE the first
+  run, per the house rule.
+- **Measured on the 5-clip corpus (idle GPU, after waiting out your game)**:
+  the three turn-taking controls + the densest 3-person overlap clip are
+  clean-to-better (medians 0.03–0.06 s; the movers are the known un-smears
+  your eye already passed on the ensemble; zero silence-drop changes; all
+  714 words aligned, zero words changed). **But the defect clip failed its
+  bar**: whisper double-transcribed the brand ("SDC" AND "Susu Deddy Corp"),
+  and the aligner — faithful to a wrong token list — dragged the whole
+  brand phrase ~2.7 s early onto the wrong audio. 6/8 mis-onsets stayed
+  6/8; the catastrophic class got worse, not zero.
+- **The insight worth the session**: where whisper's tokens match the
+  vote's, the aligner lands BIT-IDENTICAL onsets to your approved burns
+  (fadil 32.77, pinguin 50.60, jalanannya 52.76 — exact). The ensemble's
+  timing win was never the aligner alone — it's the vote cleaning the words
+  FIRST. Wiring the aligner under unvoted whisper words ships the amplifier
+  without the cleaner.
+- **So nothing shipped**: the pipeline is byte-identical (a NOT-wired
+  comment marks the spot), suites green (360 + 30 + 98 both flavors). The
+  A/B caption files (`clip_wdtw.ass` / `clip_walign.ass`) sit beside each
+  fixture's analysis.wav if you ever want to look.
+- **Your two unlocks, on the record (ADR 0058)**: lane 2 (give whisper a
+  witness/vote to clean its tokens — then re-run this slice's ready-made
+  bars), or the policy call you own: default NEW Creators to the ensemble
+  engine (5 sidecar decodes + models per clip). The nextprompt is updated
+  to put that choice at the head.
+
+---
+
 ## 2026-07-12 (ruling) — You banned JSON caption curation: the stores are now raw, the code is the only tuning surface
 
 You ruled it twice, sharper the second time: "dont touch any json to make

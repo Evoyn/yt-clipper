@@ -1,5 +1,16 @@
 # Session prompt — GENERAL caption accuracy (operator directive 2026-07-12)
 
+> **LANE 1 IS RESOLVED — MEASURED AND REFUSED (2026-07-12, ADR 0058).** The
+> whisper-engine forced-align wiring was built, measured on the 5-clip
+> corpus against pre-registered bars, and FAILED the defect-clip bar:
+> without a vote to clean whisper's token list, the aligner amplifies
+> whisper's double-transcriptions at phrase scale (SUSU DEDDY CORP dragged
+> ~2.7 s early). Turn-taking controls measured clean-to-better; nothing
+> shipped; `forced_align_retime` + `whisper_align_diag` are in-tree, ready
+> to re-measure. **Lane 1's prerequisite IS lane 2** (a whisper-side word
+> cleaner), OR the operator's engine-default policy call (below). Do NOT
+> re-attempt the wiring without one of those.
+
 > **Operator ruling (2026-07-12, verbatim intent): stop polishing clip 3 /
 > single videos. Fix captions so the fix applies to ALL FUTURE VIDEOS —
 > the detection (dropped words), garble, and laugh classes, with the most
@@ -50,19 +61,18 @@ first question is which lane, the second is the new-Creator engine default.
 
 ## The lanes (grill to order, then ONE implementation)
 
-1. **Whisper-engine forced-alignment timing (align parity) — RECOMMENDED
-   FIRST.** Wire the shipped aligner into the whisper-only caption path so
-   every engine gets the accurate skeleton. Grill points: interactions with
-   the whisper timing stack (karaoke snap 0018, onset clamp 0019, pre-roll
-   lead 0020, silence floor 0021 — which survive, which the aligner
-   replaces?); failure fallback (aligner error -> whisper's own spans,
-   captions never missing); controls (align feature off / model missing =
-   byte-identical today); fixtures = the ADR 0049 cross-clip set on the
-   whisper engine + suite both engines; gate = the eye on a burn.
-   **Alternative/complement the grill MUST ask: should new Creators just
-   default to the ensemble engine instead?** (Quality-over-runtime pulls
-   that way; ADR 0033/0035 made switching deliberate — a default flip is an
-   operator policy call. Costs: 5 sidecar decodes + models per clip.)
+1. **~~Whisper-engine forced-alignment timing~~ — RESOLVED: measured and
+   REFUSED at its pre-registered bar (ADR 0058, 2026-07-12).** The aligner
+   is only safe over vote-cleaned words; whisper's unvoted token list is
+   the binding constraint (double-transcribed brand → phrase-scale drag).
+   The entry point + instrument are in-tree; the bars are ready-made for a
+   re-measure once a whisper-side word cleaner exists. **The alternative
+   the grill asked is now the LIVE question for the operator: should new
+   Creators default to the ensemble engine instead?** (Quality-over-runtime
+   pulls that way; ADR 0033/0035 made switching deliberate — a default flip
+   is an operator policy call. Costs: 5 sidecar decodes + models per clip.
+   One sentence from the operator decides it; a session can then wire the
+   default + re-measure lane 1 behind it.)
 2. **Whisper-engine recall parity** (carried from the recall menu): no vote
    on a single decoder — the grill must design the witness (a second decode
    config? the ensemble's machinery on demand?) with ADR 0052's zero-added
@@ -100,7 +110,12 @@ first question is which lane, the second is the new-Creator engine default.
 ## Ritual
 
 /grill-with-docs first (the operator may be present — if they said "do this
-automatically", apply the recorded pick rubric and default to lane 1);
+automatically", apply the recorded pick rubric; with lane 1 resolved-refused
+the autonomous default is **lane 2's measure-first phase** — design +
+instrument + pre-registered bars for the whisper-engine witness/recall
+question, production untouched until its own gate. The engine-default
+policy question needs ONE operator sentence and unblocks both lanes — put
+it at the top of every handoff until answered);
 finish with /handoff + whatwedone.md entry; commit as Evoyn with the model
 trailer; `git push origin main` has standing permission; ALWAYS end with the
 next `read nextprompt-<slug>.md and follow it.` line.
