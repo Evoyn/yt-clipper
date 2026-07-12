@@ -4,6 +4,27 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-12 (verdict) — You ruled: raw production wins; the hold trim is REFUSED for the right reason
+
+First pass you saw no difference between A and B; pointed at the one
+biggest change (GEMOY at 51.2 s) you named the mechanism's real flaw, which
+the numbers never could: **gemes is a drawn-out word — the sound stretches
+INTO the laugh**, so the "hold riding the laugh" was actually the caption
+covering live speech. A laugh-mask onset is not an end-of-word marker; on
+the huge-word genre the emphatic stretched words ARE the laugh-drawers, so
+the two co-occur by nature. ADR 0062 is bannered REFUSED with your ruling,
+the pipeline map comment updated, the verdict file closed. Nothing was
+ever wired, so nothing was reverted — production captions were
+byte-identical through the whole lane. The instrument, the pure function,
+and the fresh raw corpus emits stay as the record; any successor needs an
+end-of-vocalization signal (the aligner's word ENDS are the named
+candidate) behind its own gate. Two lessons saved: instrument-seeded lanes
+get a cheap eye-check before the full ritual, and burn A stays in the VIOR
+folder as your raw-production reference (B is deletable). Next: lane 2
+(whisper witness), or say the word on dedikornya (~2 min, still staged).
+
+---
+
 ## 2026-07-12 (lane 3) — Captions no longer linger over group laughs: the hold trim measured floor-exact, and your A/B is staged
 
 You said "do this automatically" and went to shower, so this session ran the

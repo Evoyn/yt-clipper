@@ -1,5 +1,20 @@
 # Laughter-aware caption holds: trim the gap-fill at a shared-reaction onset (lane 3, measure-first)
 
+> **Status: REFUSED at the operator's eye (2026-07-12, same day).** The A/B
+> burn decided it: **"raw production is better"** — the flagged GEMOY/gemes
+> is a **drawn-out word** ("gemesss…") whose vocalization stretches INTO
+> the laugh, so the gap-fill hold was covering real speech, not lingering
+> past it ("if its shorter than it bad, because its a long word like
+> gemesssss then laugh"). The mechanism's premise — mask onset ⇒ the word
+> is over — is FALSE for the huge-word genre's signature class: emphatic
+> drawn-out words are exactly the words that draw group laughs, so the two
+> co-occur by nature. Nothing was ever wired (R3's letter had already
+> refused shipping); `trim_reaction_holds`, `caption_laugh_diag`, and the
+> corpus measurements below stay in-tree as the record; production captions
+> were byte-identical throughout. Do NOT revisit hold-trimming at laugh
+> onsets without an **end-of-vocalization signal** (the aligner's word ENDS
+> are the named candidate) behind its own pre-registered gate.
+
 The operator's standing directive (2026-07-12): fix captions so the fix
 applies to **all future videos**. With ADR 0061 defaulting new Creators to
 the ensemble, the general-arc queue re-ranked lane 3 to the head: the one
@@ -190,3 +205,6 @@ this ADR waits on is **"trim reads better — re-pin and wire"** or **"leave
 holds alone"**. The wiring diff (ensure_transcript, post-refine, the ADR
 0050 fail-soft shape + `YC_LAUGH_TRIM=0` off-switch) is recorded in the
 session handoff, one paste away.
+
+**The ruling landed the same day: A — refused** (see the status banner at
+the top for the reason and the one recorded path a successor would need).

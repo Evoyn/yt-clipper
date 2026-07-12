@@ -1,5 +1,14 @@
 # Operator verdict: laughter-aware hold trim (ADR 0062) — ~2 min of your eye
 
+> **RESOLVED (2026-07-12, same day): the operator ruled A — "raw production
+> is better."** Reason, verbatim intent: "if its shorter than it bad,
+> because its a long word like gemesssss then laugh" — the drawn-out-word
+> class: the hold covers the word's own stretched tail; a laugh-mask onset
+> is not an end-of-word marker. ADR 0062 is bannered REFUSED; nothing was
+> ever wired; the instrument + pure fn stay as the measured record. Burn B
+> can be deleted anytime (nothing references it); burn A stays useful as
+> the raw-production reference. **No action pending from this file.**
+
 Two burns sit in the VIOR stream folder, identical except **seven cue ENDS**
 (same words, same onsets, same everything else — the emit reproduced the
 instrument value-for-value, decode-deterministic):
