@@ -39,8 +39,8 @@ worst case. Pinned in **ADR 0069** before the build.
 - Background arrivals (captions finishing, the speaker analysis) never
   eat a Ctrl+Z — undo always reverts YOUR last edit, not the app's.
 
-Next: your hands on it (`nextprompt-undo-verdict.md` — the feel gate),
-then title-gen.
+Gate closed same day — your verdict: **"ok all good."** Next: the fade
+arc (your pick — fade out in music and video, plan #4), then title-gen.
 
 ## 2026-07-13 — Background music: a `+ Music` button, a real Music 1 track, and your razor question answered
 

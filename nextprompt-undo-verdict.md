@@ -1,3 +1,18 @@
+# CONSUMED 2026-07-13, same day — the operator's verdict: "ok all good"
+
+Undo shipped and the gate closed on the operator's word — no findings.
+ADR 0069's amendment records it, plus what stays deliberately unexamined
+(the ↺/↻ tofu check, the PCM-heal stall at Ctrl+Z on a long mp3, undo
+during playback, the arrival-crossing semantic, selections clearing,
+the 100-floor) — those surface during normal use, not by inference.
+The queue moves to `nextprompt-fade.md` (operator pick: "next we will
+work on the fade out effect both in the music sound and video" —
+plan #4; title-gen stays queued behind it).
+
+---
+
+# (original prompt below, kept for the record)
+
 # Session prompt — undo/redo: the operator's feel gate (ADR 0069; queued 2026-07-13)
 
 Undo/redo shipped (ADR 0069, handoff

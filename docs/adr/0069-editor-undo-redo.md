@@ -42,3 +42,18 @@ The operator closed the music burn gate (ADR 0068 amendment) and picked undo as 
 ## Validation
 
 `cargo test -p yt-clipper -p yc-core -p yc-render` green; clippy clean on touched files; `--features face,align,ser` check; release build (foreground); the feel gate stays with the operator.
+
+## Amendment — feel gate closed (operator, same day)
+
+The operator's verdict, in their own words: **"ok all good."** No findings.
+The gate closes on their word (the coalescer bug was caught and fixed in
+review BEFORE the commit — the composed call-site test now pins it); the
+queue moves to the fade arc (their pick: "next we will work on the fade
+out effect both in the music sound and video" — plan #4). Deliberately
+recorded as unexamined rather than passed (they surface during normal use
+or a later verdict round, not by inference): the ↺/↻ glyphs on their
+screen (tofu rule), the music-PCM heal stall on a long mp3 at Ctrl+Z
+time, one-session-one-step feel across a long real edit, undo during
+playback (the re-cue race), undo past a speaker-analysis arrival, the
+100-floor in a real thousand-edit session, and selections clearing on
+restore against their CapCut reflexes.
