@@ -277,6 +277,61 @@ pub fn mix_music(graph: &str, clips: &[yc_core::MusicClip], input_base: usize) -
     parts.join(";")
 }
 
+/// Wrap a finished graph with the edge fades (ADR 0070, plan #4's first
+/// slice) — the OUTERMOST wrap, applied after everything (burn, intro, and
+/// the music amix), so one envelope dims the final video and kills the
+/// export's final MIXED audio (voice + music) together at the Short's edges.
+/// Video chains `fade=t=in/out` with the spec's color; audio chains `afade`
+/// (no color exists there). The fade-out `st` anchors on `out_total_s` — the
+/// REAL output end (`intro + kept_total`), never the `-t` bound: with razor
+/// cuts `-t` only bounds and the concat output ENDS earlier (the two-clocks
+/// lesson, third verse). Times print shortest-round-trip like every other
+/// computed boundary.
+///
+/// `has_graph_audio` says the graph already terminates in `[aout]` (razor
+/// audio, the intro wrap, or the music amix): that chain renames to
+/// `[preafade]` and re-terminates in `[aout]`. Otherwise the fade grows a
+/// fresh `[0:a]afade…[aout]` chain and the returned bool tells the caller
+/// the audio now maps from the graph — the [`mix_music`] `main_a` dance one
+/// layer further out. An inactive fade (`None`, or both edges 0) returns the
+/// graph byte-identical and the bool unchanged — the standing byte-identity
+/// bar; headless/batch always pass `None`.
+pub fn fade_edges(
+    graph: &str,
+    fade: Option<&yc_core::FadeSpec>,
+    out_total_s: f64,
+    has_graph_audio: bool,
+) -> (String, bool) {
+    let Some(f) = fade.filter(|f| f.active()) else {
+        return (graph.to_string(), has_graph_audio);
+    };
+    let color = match f.color {
+        yc_core::FadeColor::Black => "black",
+        yc_core::FadeColor::White => "white",
+    };
+    let mut video: Vec<String> = Vec::new();
+    let mut audio: Vec<String> = Vec::new();
+    if f.in_s > 0.0 {
+        video.push(format!("fade=t=in:st=0:d={}:c={color}", f.in_s));
+        audio.push(format!("afade=t=in:st=0:d={}", f.in_s));
+    }
+    if f.out_s > 0.0 {
+        // A fade longer than the output starts at 0 — still a legal ramp.
+        let st = (out_total_s - f.out_s).max(0.0);
+        video.push(format!("fade=t=out:st={st}:d={}:c={color}", f.out_s));
+        audio.push(format!("afade=t=out:st={st}:d={}", f.out_s));
+    }
+    let g = graph.replace("[out]", "[prefade]");
+    let (g, main_a) =
+        if has_graph_audio { (g.replace("[aout]", "[preafade]"), "[preafade]") } else { (g, "[0:a]") };
+    let wrapped = format!(
+        "{g};[prefade]{v}[out];{main_a}{a}[aout]",
+        v = video.join(","),
+        a = audio.join(","),
+    );
+    (wrapped, true)
+}
+
 /// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks `seek_s` into
 /// the source; `-t` bounds the output to `duration_s` (frame-accurate under
 /// re-encode). The burned ASS timeline is 0-based, matching the reset output
@@ -287,20 +342,26 @@ pub fn mix_music(graph: &str, clips: &[yc_core::MusicClip], input_base: usize) -
 /// the range start; the M2 Segment is a padded slice, so `seek_s` is the
 /// in-segment offset (`range.start - segment_start`; see `yc_ingest`).
 ///
+/// `filtered_audio` maps the graph's `[aout]` instead of the raw source audio
+/// — the plain path needs it exactly when the [`fade_edges`] wrap grew the
+/// audio chain (ADR 0070); intro/music flip the mapping on their own below.
 /// `intro` is the thumbnail intro (ADR 0067): `Some((image, duration))` adds
 /// the image as input 1 (`-loop 1 -t D`), extends the output `-t` bound to
 /// `duration_s + D`, and maps the graph's `[aout]` (the wrapped graph carries
 /// the intro's silence — see [`prepend_intro`]). `music` is the Music track's
 /// files (ADR 0068), riding as plain `-i` inputs AFTER the optional intro —
 /// the [`mix_music`] wrap addresses them from `input_base`, and with music
-/// the audio always maps from the graph. `None` + empty — always in
-/// headless / batch — leaves every arg byte-identical to the pre-intro export.
+/// the audio always maps from the graph. `false` + `None` + empty — always
+/// in headless / batch — leaves every arg byte-identical to the pre-intro
+/// export.
+#[allow(clippy::too_many_arguments)]
 pub fn export_args(
     source: &Path,
     seek_s: f64,
     duration_s: f64,
     filtergraph: &str,
     out_name: &str,
+    filtered_audio: bool,
     intro: Option<(&Path, f64)>,
     music: &[std::path::PathBuf],
 ) -> Vec<String> {
@@ -311,7 +372,7 @@ pub fn export_args(
         "-filter_complex",
         filtergraph,
         out_name,
-        false,
+        filtered_audio,
         intro,
         music,
     )
@@ -640,7 +701,7 @@ mod tests {
     fn export_seeks_before_input_and_uses_nvenc() {
         // M2 promote: seek the in-segment offset (2.0s), not the VOD range start.
         let args =
-            export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4", None, &[]);
+            export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4", false, None, &[]);
         let ss = args.iter().position(|a| a == "-ss").unwrap();
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i for fast seek");
@@ -711,8 +772,9 @@ mod tests {
     #[test]
     fn intro_args_add_the_image_input_extend_t_and_map_aout() {
         let img = Path::new("F:/covers/thumb.png");
-        let args =
-            export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)), &[]);
+        let args = export_args(
+            Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", false, Some((img, 1.0)), &[],
+        );
         // The image is input 1: -loop 1 -t D ahead of ITS -i, after the source.
         let loops: Vec<usize> =
             args.iter().enumerate().filter(|(_, a)| *a == "-loop").map(|(i, _)| i).collect();
@@ -733,7 +795,8 @@ mod tests {
         assert!(!args.contains(&"0:a:0".to_string()));
         // And WITHOUT an intro the args stay byte-identical to today (the
         // headless/batch pin: None means untouched).
-        let plain = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None, &[]);
+        let plain =
+            export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", false, None, &[]);
         assert!(!plain.contains(&"-loop".to_string()));
         assert!(plain.contains(&"0:a:0".to_string()));
         let t = plain.iter().position(|a| a == "-t").unwrap();
@@ -840,7 +903,8 @@ mod tests {
         ];
         // Without an intro the music files are inputs 1.. and the audio maps
         // from the graph (the amix's [aout]), never the raw source.
-        let args = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None, &beds);
+        let args =
+            export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", false, None, &beds);
         let inputs: Vec<&String> = args
             .iter()
             .enumerate()
@@ -857,7 +921,7 @@ mod tests {
         // mix_music input_base=2 addressing.
         let img = Path::new("F:/covers/thumb.png");
         let args = export_args(
-            Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)), &beds,
+            Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", false, Some((img, 1.0)), &beds,
         );
         let inputs: Vec<&String> = args
             .iter()
@@ -869,5 +933,128 @@ mod tests {
             inputs,
             ["F:/seg.mp4", "F:/covers/thumb.png", "F:/music/a.mp3", "F:/music/b.flac"]
         );
+    }
+
+    // ---- edge fades (ADR 0070) ----------------------------------------------
+
+    fn fade(in_s: f64, out_s: f64, color: yc_core::FadeColor) -> yc_core::FadeSpec {
+        yc_core::FadeSpec { in_s, out_s, color }
+    }
+
+    #[test]
+    fn no_fade_leaves_graph_args_and_mapping_byte_identical() {
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = build_filtergraph(&layout, "clip.ass");
+        let (g, from_graph) = fade_edges(&base, None, 30.0, false);
+        assert_eq!(g, base, "fade: None must change nothing");
+        assert!(!from_graph);
+        // Some(inactive) is equally nothing (defensive: the editor sends None).
+        let off = fade(0.0, 0.0, yc_core::FadeColor::Black);
+        let (g, from_graph) = fade_edges(&base, Some(&off), 30.0, false);
+        assert_eq!(g, base);
+        assert!(!from_graph);
+        // And a razor graph's existing mapping survives an inactive fade.
+        let (_, from_graph) = fade_edges(&base, None, 30.0, true);
+        assert!(from_graph, "an existing [aout] keeps its mapping");
+    }
+
+    #[test]
+    fn fade_wraps_last_around_the_music_amix_and_fades_the_mixed_audio() {
+        // The one-envelope bar: the fade renames the amix's [aout] — the mix
+        // that already contains the music — so voice and music die together.
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let mixed =
+            mix_music(&build_filtergraph(&layout, "clip.ass"), &[music(0.0, 0.0, 30.0, 1.0)], 1);
+        let f = fade(0.5, 1.5, yc_core::FadeColor::Black);
+        let (g, from_graph) = fade_edges(&mixed, Some(&f), 30.0, true);
+        assert!(from_graph);
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once: {g}");
+        // The finished graph survives byte-for-byte modulo its terminal labels.
+        assert!(
+            g.starts_with(&mixed.replace("[out]", "[prefade]").replace("[aout]", "[preafade]")),
+            "main graph rewritten: {g}"
+        );
+        assert!(
+            g.contains("amix=inputs=2:duration=first:normalize=0[preafade]"),
+            "the fade must hear the MIX: {g}"
+        );
+        assert!(
+            g.contains("[prefade]fade=t=in:st=0:d=0.5:c=black,fade=t=out:st=28.5:d=1.5:c=black[out]"),
+            "graph: {g}"
+        );
+        assert!(
+            g.contains("[preafade]afade=t=in:st=0:d=0.5,afade=t=out:st=28.5:d=1.5[aout]"),
+            "graph: {g}"
+        );
+    }
+
+    #[test]
+    fn fade_grows_the_audio_chain_when_the_graph_has_none_and_args_map_it() {
+        // Plain path (no razor/intro/music): the graph has no [aout] — the
+        // fade creates it from the raw source audio and the caller must flip
+        // the arg mapping with the returned bool.
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = build_filtergraph(&layout, "clip.ass");
+        let f = fade(0.0, 1.0, yc_core::FadeColor::Black);
+        let (g, from_graph) = fade_edges(&base, Some(&f), 12.0, false);
+        assert!(from_graph, "the fade created the audio chain");
+        assert!(g.contains("[0:a]afade=t=out:st=11:d=1[aout]"), "graph: {g}");
+        assert!(!g.contains("afade=t=in"), "in edge off — no in filter: {g}");
+        assert!(g.contains("[prefade]fade=t=out:st=11:d=1:c=black[out]"), "graph: {g}");
+        let args = export_args(
+            Path::new("F:/seg.mp4"), 2.0, 12.0, "FG", "o.mp4", from_graph, None, &[],
+        );
+        assert!(args.contains(&"[aout]".to_string()));
+        assert!(!args.contains(&"0:a:0".to_string()), "faded audio must be mapped");
+    }
+
+    #[test]
+    fn fade_out_anchors_on_the_real_output_end_not_the_t_bound() {
+        // The two-clocks trap (pre-registered ADR 0070 bar): a razor-cut
+        // export's -t stays the FULL clip duration (10 s here) while the
+        // concat output ends at kept_total (7 s). With a 1.5 s intro the fade
+        // must start at 1.5 + 7 − 2 = 6.5 — anchored on -t it would start at
+        // 9.5, past the real end, and the export would never fade.
+        use yc_core::Shot;
+        let solo = |x: f32| Layout::FullFrame { crop: Crop { x, y: 0.0, w: 608.0, h: 1080.0 } };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 3.0, track: None, layout: solo(100.0), pan_to: None },
+                Shot { start_s: 6.0, end_s: 10.0, track: None, layout: solo(100.0), pan_to: None },
+            ],
+        };
+        let base =
+            prepend_intro(&build_camera_filtergraph(&plan, "clip.ass", true), 1.5, 30.0, true);
+        let f = fade(0.0, 2.0, yc_core::FadeColor::Black);
+        let kept_total = 3.0 + 4.0;
+        let (g, from_graph) = fade_edges(&base, Some(&f), 1.5 + kept_total, true);
+        assert!(from_graph);
+        assert!(g.contains("fade=t=out:st=6.5:d=2:c=black"), "st = intro + kept, never -t: {g}");
+        assert!(g.contains("afade=t=out:st=6.5:d=2"), "graph: {g}");
+        // Wrap order pinned: the intro concat feeds the fade, not the output.
+        assert!(
+            g.contains("[thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[prefade][preafade]"),
+            "graph: {g}"
+        );
+        assert!(!g.contains("st=9.5"), "the -t anchor is the named trap: {g}");
+    }
+
+    #[test]
+    fn fade_in_covers_the_intro_from_output_zero_and_white_reaches_video_only() {
+        // Fade-in st=0 dims the intro's first frames (the fade wraps OUTSIDE
+        // the intro concat); the white variant colors the video chain only —
+        // afade has no color.
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = prepend_intro(&build_filtergraph(&layout, "clip.ass"), 1.0, 30.0, false);
+        let f = fade(0.8, 0.0, yc_core::FadeColor::White);
+        let (g, _) = fade_edges(&base, Some(&f), 31.0, true);
+        assert!(
+            g.contains("[thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[prefade][preafade]"),
+            "the fade wraps the intro concat: {g}"
+        );
+        assert!(g.contains("[prefade]fade=t=in:st=0:d=0.8:c=white[out]"), "graph: {g}");
+        assert!(g.contains("[preafade]afade=t=in:st=0:d=0.8[aout]"), "graph: {g}");
+        assert!(!g.contains("afade=t=out"), "out edge off: {g}");
+        assert!(!g.contains("c=black"), "white means white: {g}");
     }
 }

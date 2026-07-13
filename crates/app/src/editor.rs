@@ -576,6 +576,11 @@ pub struct RenderSpec {
     /// [`export_clock`]) and a muted track sends the empty list. Empty
     /// renders byte-identically to pre-music output.
     pub music: Vec<yc_core::MusicClip>,
+    /// Edge fades (ADR 0070, plan #4's first slice): the OUTERMOST wrap —
+    /// one envelope dims the video and kills the final mixed audio (voice +
+    /// music) together at the Short's edges. `Some` only when an edge is
+    /// non-zero; `None` renders byte-identically to pre-fade output.
+    pub fade: Option<yc_core::FadeSpec>,
 }
 
 /// What `show` reports back to the app each frame.
@@ -632,6 +637,9 @@ struct Snapshot {
     /// re-decodes through the `set_intro_image` path when the path changed.
     intro: Option<(std::path::PathBuf, f64)>,
     music: Vec<yc_core::MusicClip>,
+    fade_in_s: f64,
+    fade_out_s: f64,
+    fade_color: yc_core::FadeColor,
     trk_music: MusicFlags,
     trk_auto: TrackFlags,
     trk_manual: TrackFlags,
@@ -774,6 +782,12 @@ pub struct EditorState {
     /// an accident now). `at_s` is the STRIP's output clock; a razor edit
     /// never rewrites it — `render_spec` converts to the export's clock.
     music: Vec<yc_core::MusicClip>,
+    /// Edge fades (ADR 0070, plan #4's first slice): fade-in/out durations
+    /// at the SHORT'S edges (0 = that edge off) and the one shared color.
+    /// Document state — rides `Snapshot`/`restore` and the `RenderSpec`.
+    fade_in_s: f64,
+    fade_out_s: f64,
+    fade_color: yc_core::FadeColor,
     /// Decoded PCM per picked music file (see [`MusicPcm`]).
     music_pcm: std::collections::HashMap<std::path::PathBuf, MusicPcm>,
     /// The selected music clip: while `Some`, the transport's cut verbs act
@@ -904,6 +918,9 @@ impl EditorState {
             razor: RazorState::default(),
             intro: None,
             music: Vec::new(),
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            fade_color: yc_core::FadeColor::Black,
             music_pcm: std::collections::HashMap::new(),
             sel_music: None,
             trk_music: MusicFlags::default(),
@@ -1015,6 +1032,9 @@ impl EditorState {
             motion: self.motion,
             intro: self.intro.as_ref().map(|i| (i.path.clone(), i.duration_s)),
             music: self.music.clone(),
+            fade_in_s: self.fade_in_s,
+            fade_out_s: self.fade_out_s,
+            fade_color: self.fade_color,
             trk_music: self.trk_music,
             trk_auto: self.trk_auto,
             trk_manual: self.trk_manual,
@@ -1162,6 +1182,9 @@ impl EditorState {
         self.camera_mode = s.camera_mode;
         self.motion = s.motion;
         self.music = s.music;
+        self.fade_in_s = s.fade_in_s;
+        self.fade_out_s = s.fade_out_s;
+        self.fade_color = s.fade_color;
         self.trk_music = s.trk_music;
         self.trk_auto = s.trk_auto;
         self.trk_manual = s.trk_manual;
@@ -1320,6 +1343,33 @@ impl EditorState {
             });
         }
         cues
+    }
+
+    /// The fade envelope's visibility at OUTPUT time `out_t` (ADR 0070):
+    /// [`fade_visibility`] on the EXPORT clock — elapsed via
+    /// [`export_clock`] (constant across razor-veiled spans, so the ramp
+    /// can never start over removed time), total = intro + kept. 1.0 when
+    /// both edges are off.
+    fn fade_vis_at(&self, out_t: f64) -> f64 {
+        if self.fade_in_s <= 0.0 && self.fade_out_s <= 0.0 {
+            return 1.0;
+        }
+        let keep = self.razor.kept_spans(self.range.duration_s());
+        let kept_total: f64 = keep
+            .as_ref()
+            .map(|k| k.iter().map(|s| s.duration_s()).sum())
+            .unwrap_or_else(|| self.range.duration_s());
+        let elapsed = export_clock(out_t, self.intro_d(), keep.as_deref());
+        fade_visibility(elapsed, self.intro_d() + kept_total, self.fade_in_s, self.fade_out_s)
+    }
+
+    /// The preview master gain for the edge fades (ADR 0070 decision 4):
+    /// the app multiplies EVERY sink's volume by this each frame while the
+    /// Studio is open — voice and music together, the one envelope the burn
+    /// applies. 1.0 whenever fades are off, so untouched sessions hear
+    /// exactly today's volumes.
+    pub fn preview_fade_gain(&self) -> f32 {
+        self.fade_vis_at(self.playhead_s) as f32
     }
 
     /// Insert or replace the thumbnail intro from a picked image (ADR 0067):
@@ -1665,6 +1715,14 @@ impl EditorState {
                     })
                     .collect()
             },
+            // Edge fades (ADR 0070): `Some` only when an edge is live — both
+            // zero is spelled `None`, so untouched sessions send exactly
+            // today's spec (the byte-identity bar).
+            fade: (self.fade_in_s > 0.0 || self.fade_out_s > 0.0).then_some(yc_core::FadeSpec {
+                in_s: self.fade_in_s,
+                out_s: self.fade_out_s,
+                color: self.fade_color,
+            }),
         }
     }
 
@@ -2192,10 +2250,31 @@ impl EditorState {
         true
     }
 
+    /// The edge-fade overlay (ADR 0070): a black/white veil over the WHOLE
+    /// canvas — panels, captions, guides, chips, and the intro frame alike
+    /// (the fade is the burn's outermost wrap, so it draws last here too).
+    /// Anchored on the export clock via [`Self::fade_vis_at`], so a razor-cut
+    /// clip ramps exactly where its burn will.
+    fn draw_fade_ramp(&self, ui: &egui::Ui, canvas: Rect) {
+        let vis = self.fade_vis_at(self.playhead_s);
+        if vis >= 1.0 {
+            return;
+        }
+        let a = ((1.0 - vis) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let color = match self.fade_color {
+            yc_core::FadeColor::Black => Color32::from_black_alpha(a),
+            yc_core::FadeColor::White => Color32::from_white_alpha(a),
+        };
+        ui.painter_at(canvas).rect_filled(canvas, CornerRadius::same(4), color);
+    }
+
     /// Output view: the composited 9:16 result at the playhead — panels,
     /// captions, safe area, tracking chip.
     fn draw_output(&mut self, ui: &mut egui::Ui, canvas: Rect) {
         if self.draw_intro_frame(ui, canvas) {
+            // The fade-in covers the intro in the burn (the wrap is outside
+            // the intro concat) — the preview veils it identically.
+            self.draw_fade_ramp(ui, canvas);
             return;
         }
         let tex = self.frame_tex(ui.ctx());
@@ -2335,6 +2414,8 @@ impl EditorState {
                 Color32::from_gray(185),
             );
         }
+        // The edge fade veils everything above (ADR 0070) — last on purpose.
+        self.draw_fade_ramp(ui, canvas);
     }
 
     /// Source view: the whole frame, the crop box tool, and face overlays.
@@ -5634,6 +5715,64 @@ impl EditorState {
             }
         });
 
+        // --- Fade (ADR 0070): the Short's edges — video + ALL audio together ---
+        theme::section(ui, "Fade");
+        theme::card().show(ui, |ui| {
+            let before = (self.fade_in_s, self.fade_out_s);
+            ui.horizontal(|ui| {
+                ui.label("Fade in");
+                ui.add(
+                    egui::Slider::new(&mut self.fade_in_s, 0.0..=yc_core::FadeSpec::MAX_S)
+                        .step_by(0.1)
+                        .suffix(" s"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Fade out");
+                ui.add(
+                    egui::Slider::new(&mut self.fade_out_s, 0.0..=yc_core::FadeSpec::MAX_S)
+                        .step_by(0.1)
+                        .suffix(" s"),
+                );
+            });
+            // The panel shows tenths; the spec never bakes in more (the
+            // quantize_cs rule, and clean numbers in the filtergraph).
+            self.fade_in_s = quantize_cs(self.fade_in_s);
+            self.fade_out_s = quantize_cs(self.fade_out_s);
+            if (self.fade_in_s, self.fade_out_s) != before {
+                // The knobs mutate in place during `add`, so the pushed
+                // snapshot carries the pre-knob values; a slider ride
+                // coalesces into one step (ADR 0069, the style-knob pattern).
+                if !self.burst_continues(("fade", 0), ui) {
+                    let mut s = self.snapshot();
+                    (s.fade_in_s, s.fade_out_s) = before;
+                    self.push_snapshot(s);
+                }
+                self.arm_burst(("fade", 0), ui);
+            }
+            if self.fade_in_s > 0.0 || self.fade_out_s > 0.0 {
+                let colors = [yc_core::FadeColor::Black, yc_core::FadeColor::White];
+                if let Some(i) = theme::chip_row(
+                    ui,
+                    &[
+                        (self.fade_color == yc_core::FadeColor::Black, "Black"),
+                        (self.fade_color == yc_core::FadeColor::White, "White"),
+                    ],
+                ) {
+                    if self.fade_color != colors[i] {
+                        self.push_undo();
+                        self.fade_color = colors[i];
+                    }
+                }
+                ui.weak(
+                    "Video and all audio (voice + music) fade together at the Short's edges. \
+                     Preview audio ramps per frame; the export's fade is sample-accurate.",
+                );
+            } else {
+                ui.weak("0 = off. Fades the video and the mixed audio at the Short's edges.");
+            }
+        });
+
         // --- Caption style ---
         theme::section(ui, "Caption presets");
         theme::card().show(ui, |ui| {
@@ -5896,6 +6035,22 @@ impl EditorState {
                             )
                         },
                     );
+                }
+                // Edge fades (ADR 0070): the export's edges are never a
+                // surprise — the summary names both live edges and the color.
+                if self.fade_in_s > 0.0 || self.fade_out_s > 0.0 {
+                    let mut parts = Vec::new();
+                    if self.fade_in_s > 0.0 {
+                        parts.push(format!("in {:.1}s", self.fade_in_s));
+                    }
+                    if self.fade_out_s > 0.0 {
+                        parts.push(format!("out {:.1}s", self.fade_out_s));
+                    }
+                    let color = match self.fade_color {
+                        yc_core::FadeColor::Black => "black",
+                        yc_core::FadeColor::White => "white",
+                    };
+                    row(ui, "Fade", format!("{} · to {color}", parts.join(" + ")));
                 }
                 row(ui, "Resolution", "1080 × 1920 (9:16)".into());
                 row(
@@ -6857,6 +7012,24 @@ fn export_clock(out_t: f64, d_intro: f64, keep: Option<&[TimeRange]>) -> f64 {
     d_intro + spans.iter().map(|k| (src.min(k.end_s) - k.start_s).max(0.0)).sum::<f64>()
 }
 
+/// The edge-fade envelope's visibility at `elapsed` of a `total`-second
+/// export (ADR 0070): the PRODUCT of the two edge ramps — 1.0 = untouched,
+/// 0.0 = fully the fade color — mirroring the burn's chained fade filters
+/// (a second fade scales the already-faded frame). Both times are on the
+/// EXPORT clock; the caller converts via [`export_clock`], which is what
+/// keeps the ramp constant across razor-veiled spans. Pure, shared by the
+/// canvas ramp and the preview audio gain so eye and ear can never disagree.
+fn fade_visibility(elapsed: f64, total: f64, in_s: f64, out_s: f64) -> f64 {
+    let mut vis = 1.0_f64;
+    if in_s > 0.0 {
+        vis *= (elapsed / in_s).clamp(0.0, 1.0);
+    }
+    if out_s > 0.0 {
+        vis *= ((total - elapsed) / out_s).clamp(0.0, 1.0);
+    }
+    vis
+}
+
 fn magnet(t: f64, anchors: &[f64], tol: f64) -> Option<f64> {
     anchors
         .iter()
@@ -7501,7 +7674,7 @@ mod tests {
         let ctx = egui::Context::default();
         // The full call-site shape: push, then the per-frame writeback — the
         // composition a 60-tick drag runs (never one step per tick).
-        let mut tick = |ed: &mut EditorState, t: f64, key: (&'static str, usize)| {
+        let tick = |ed: &mut EditorState, t: f64, key: (&'static str, usize)| {
             let _ = ctx.run(egui::RawInput { time: Some(t), ..Default::default() }, |c| {
                 egui::CentralPanel::default().show(c, |ui| {
                     ed.push_undo_coalesced(key, ui);
@@ -7552,6 +7725,89 @@ mod tests {
         );
         assert!(ed.undo_stack.is_empty(), "a speaker arrival is not an operator op");
         assert!(ed.redo_stack.is_empty());
+    }
+
+    // ---- edge fades (ADR 0070) ----------------------------------------------
+
+    #[test]
+    fn render_spec_carries_the_fade_only_when_an_edge_is_live() {
+        let mut ed = editor_state();
+        assert!(ed.render_spec().fade.is_none(), "no fade: the spec stays pre-fade");
+        ed.fade_out_s = 1.5;
+        ed.fade_color = yc_core::FadeColor::White;
+        let f = ed.render_spec().fade.expect("a live edge rides the spec");
+        assert_eq!((f.in_s, f.out_s, f.color), (0.0, 1.5, yc_core::FadeColor::White));
+        // Both edges back to zero: None again (the byte-identity bar).
+        ed.fade_out_s = 0.0;
+        assert!(ed.render_spec().fade.is_none());
+    }
+
+    #[test]
+    fn fade_ramp_anchors_on_the_export_clock_not_the_strip() {
+        // 60 s clip, 1 s intro, razor keeps [0,10)+[50,60): kept = 20 s,
+        // export total = 21 s. The ramp must ride the EXPORT clock — the
+        // pre-registered ADR 0070 bar: it must NOT start over the veiled
+        // middle even though the STRIP holds 40 s of veiled time there.
+        let mut ed = editor_state();
+        with_intro(&mut ed, 1.0);
+        ed.razor.cuts = vec![10.0, 50.0];
+        ed.razor.removed = vec![false, true, false];
+        ed.fade_in_s = 0.5;
+        ed.fade_out_s = 2.0;
+        // Fade-in covers the intro from output 0 (the burn wraps outside
+        // the intro concat): halfway through the ramp at 0.25 s.
+        assert!((ed.fade_vis_at(0.25) - 0.5).abs() < 1e-9, "fade-in dims the intro");
+        assert_eq!(ed.fade_vis_at(0.5), 1.0, "in edge done at 0.5 s");
+        // Parked mid-veil (strip 30 s -> export elapsed 11 of 21): no ramp.
+        assert_eq!(ed.fade_vis_at(30.0), 1.0, "the ramp must not start over veiled spans");
+        // Fade-out region: export remaining < 2 s only past strip 59 s.
+        assert_eq!(ed.fade_vis_at(58.9), 1.0, "still 2.1 s of export left");
+        assert!((ed.fade_vis_at(60.0) - 0.5).abs() < 1e-9, "fade-out at the REAL end");
+        assert_eq!(ed.fade_vis_at(61.0), 0.0, "fully faded at the export's last frame");
+        // Fades off: the envelope is identity (untouched preview volumes).
+        ed.fade_in_s = 0.0;
+        ed.fade_out_s = 0.0;
+        assert_eq!(ed.preview_fade_gain(), 1.0);
+    }
+
+    #[test]
+    fn fade_knob_burst_is_one_step_and_the_chip_is_a_verb() {
+        let mut ed = editor_state();
+        let ctx = egui::Context::default();
+        // The knob call-site shape (the style-knob composed pattern):
+        // compare, push-with-before, arm — a slider ride is ONE step.
+        let knob = |ed: &mut EditorState, t: f64, v: f64| {
+            let _ = ctx.run(egui::RawInput { time: Some(t), ..Default::default() }, |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    let before = (ed.fade_in_s, ed.fade_out_s);
+                    ed.fade_out_s = v; // what the slider just wrote
+                    if (ed.fade_in_s, ed.fade_out_s) != before {
+                        if !ed.burst_continues(("fade", 0), ui) {
+                            let mut s = ed.snapshot();
+                            (s.fade_in_s, s.fade_out_s) = before;
+                            ed.push_snapshot(s);
+                        }
+                        ed.arm_burst(("fade", 0), ui);
+                    }
+                });
+            });
+        };
+        knob(&mut ed, 0.0, 0.5);
+        knob(&mut ed, 0.3, 1.0);
+        knob(&mut ed, 0.6, 1.5);
+        assert_eq!(ed.undo_stack.len(), 1, "one slider ride = one step");
+        assert_eq!(ed.fade_out_s, 1.5);
+        // The color chip is a verb: one step of its own.
+        ed.push_undo();
+        ed.fade_color = yc_core::FadeColor::White;
+        assert_eq!(ed.undo_stack.len(), 2);
+        // Undo the chip, then the whole ride — the family contract.
+        let ctx2 = egui::Context::default();
+        ed.undo(&ctx2);
+        assert_eq!(ed.fade_color, yc_core::FadeColor::Black);
+        assert_eq!(ed.fade_out_s, 1.5, "the color undo leaves the ride alone");
+        ed.undo(&ctx2);
+        assert_eq!(ed.fade_out_s, 0.0, "the ride undoes as ONE step");
     }
 
     #[test]

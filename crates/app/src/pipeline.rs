@@ -201,9 +201,13 @@ pub enum Job {
     /// source-relative by construction; `None` (always in headless/batch)
     /// renders byte-identically to pre-intro output. `music` is the Music
     /// track (ADR 0068): the finished graph — intro included — is wrapped
-    /// LAST with one amix positioning each clip on the export's output clock
+    /// with one amix positioning each clip on the export's output clock
     /// (`at_s` arrives already razor-compressed from the editor); empty
     /// (always in headless/batch) renders byte-identically to pre-music
+    /// output. `fade` is the edge fades (ADR 0070): the OUTERMOST wrap —
+    /// after the amix, so one envelope dims the video and kills the final
+    /// mixed audio (voice + music) together at the Short's edges; `None`
+    /// (always in headless/batch) renders byte-identically to pre-fade
     /// output.
     Render {
         layout: Layout,
@@ -217,6 +221,7 @@ pub enum Job {
         manual_captions: Vec<yc_core::ManualCaption>,
         intro: Option<ThumbnailIntro>,
         music: Vec<yc_core::MusicClip>,
+        fade: Option<yc_core::FadeSpec>,
     },
     /// Fetch missing dependencies from their pinned official sources (ADR
     /// 0041): stream to a `.part` beside the destination, verify the pinned
@@ -588,9 +593,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         ));
                     }
                 },
-                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music } => match (&session, &mut prepared) {
+                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music, fade } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music, fade, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -2201,10 +2206,14 @@ fn do_render(
     manual_captions: Vec<yc_core::ManualCaption>,
     intro: Option<ThumbnailIntro>,
     music: Vec<yc_core::MusicClip>,
+    fade: Option<yc_core::FadeSpec>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
     let range = prepared.range;
+    // Edge fades (ADR 0070): an inactive spec is no fade at all — normalize
+    // it away so the untouched paths stay untouched (the razor's own rule).
+    let fade = fade.filter(|f| f.active());
     // Thumbnail intro (ADR 0067): the operator asked for it, so a vanished
     // image FAILS loudly with its path — silently shipping without it would
     // lie (the drop-with-a-note rule is for loading stale project.json).
@@ -2321,8 +2330,16 @@ fn do_render(
 
     // Record the promoted Clip with the operator's Layout + its export path, then
     // render it.
-    let clip =
-        build_clip(range, layout, &style.name, placement, intro.clone(), music.clone(), &out_path);
+    let clip = build_clip(
+        range,
+        layout,
+        &style.name,
+        placement,
+        intro.clone(),
+        music.clone(),
+        fade,
+        &out_path,
+    );
     persist_clip(&session.vod, &clip, &session.data_dir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
@@ -2332,8 +2349,10 @@ fn do_render(
     // Thumbnail intro (ADR 0067): the image rides as ffmpeg input 1 and the
     // finished graph is wrapped AFTER its ASS burn (`prepend_intro`) — the
     // ASS bytes above are identical with and without it. Music (ADR 0068)
-    // wraps LAST — one amix around everything, the intro included — with its
-    // files as the inputs after the image (`input_base`).
+    // wraps one amix around everything, the intro included, with its files
+    // as the inputs after the image (`input_base`). Edge fades (ADR 0070)
+    // wrap LAST — outside even the amix, so one envelope dims the video and
+    // kills the final MIXED audio together at the Short's edges.
     let out_name = out_path.to_string_lossy();
     let intro_arg = intro.as_ref().map(|i| (i.path.as_path(), i.duration_s));
     let music_paths: Vec<PathBuf> = music.iter().map(|m| m.path.clone()).collect();
@@ -2349,6 +2368,14 @@ fn do_render(
                 graph = yc_render::prepend_intro(&graph, i.duration_s, prepared.src_fps, cut_audio);
             }
             graph = yc_render::mix_music(&graph, &music, music_base);
+            // Edge fades (ADR 0070) wrap LAST, and the fade-out anchors on
+            // the REAL output end — the concat's kept total plus the intro —
+            // never `-t`, which only bounds (a razor-cut output ENDS earlier).
+            let kept_total: f64 = plan.shots.iter().map(|s| s.end_s - s.start_s).sum();
+            let out_total = intro.as_ref().map(|i| i.duration_s).unwrap_or(0.0) + kept_total;
+            let has_aout = graph.contains("[aout]");
+            let (graph, filtered_audio) =
+                yc_render::fade_edges(&graph, fade.as_ref(), out_total, has_aout);
             fs::write(session.data_dir.join("camera.fg"), graph)
                 .context("writing camera filtergraph")?;
             yc_render::export_args_script(
@@ -2357,7 +2384,7 @@ fn do_render(
                 range.duration_s(),
                 "camera.fg",
                 &out_name,
-                cut_audio,
+                filtered_audio,
                 intro_arg,
                 &music_paths,
             )
@@ -2369,12 +2396,21 @@ fn do_render(
                     yc_render::prepend_intro(&filtergraph, i.duration_s, prepared.src_fps, false);
             }
             filtergraph = yc_render::mix_music(&filtergraph, &music, music_base);
+            // No camera and no razor on this arm by construction (a razor
+            // promotes to the camera path), so the real output end is simply
+            // intro + clip; the fade still wraps last (ADR 0070).
+            let out_total =
+                intro.as_ref().map(|i| i.duration_s).unwrap_or(0.0) + range.duration_s();
+            let has_aout = filtergraph.contains("[aout]");
+            let (filtergraph, filtered_audio) =
+                yc_render::fade_edges(&filtergraph, fade.as_ref(), out_total, has_aout);
             yc_render::export_args(
                 &prepared.render_src,
                 prepared.seek_s,
                 range.duration_s(),
                 &filtergraph,
                 &out_name,
+                filtered_audio,
                 intro_arg,
                 &music_paths,
             )
@@ -2473,6 +2509,7 @@ fn clip_id_for(range: TimeRange) -> u64 {
 
 /// A promoted range -> a Clip record (CONTEXT.md). The id is provisional; `persist_clip`
 /// relinks it to the detected Moment covering this range.
+#[allow(clippy::too_many_arguments)]
 fn build_clip(
     range: TimeRange,
     layout: Layout,
@@ -2480,6 +2517,7 @@ fn build_clip(
     caption_placement: Option<CaptionPlacement>,
     thumbnail: Option<ThumbnailIntro>,
     music: Vec<yc_core::MusicClip>,
+    fade: Option<yc_core::FadeSpec>,
     export_path: &Path,
 ) -> Clip {
     let id = clip_id_for(range);
@@ -2492,6 +2530,7 @@ fn build_clip(
         caption_placement,
         thumbnail,
         music,
+        fade,
         segment_path: None,
         export_path: Some(export_path.to_path_buf()),
     }
@@ -3650,6 +3689,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                None,
                 &dir.join(format!("{start}.mp4")),
             );
             persist_clip(&v, &clip, &dir).unwrap();
@@ -3662,7 +3702,8 @@ mod tests {
 
         // A re-render of one Moment replaces its own record (still three, not four).
         let r2 = TimeRange { start_s: 500.0, end_s: 530.0 };
-        let clip2 = build_clip(r2, lay(), "karaoke", None, None, Vec::new(), &dir.join("500b.mp4"));
+        let clip2 =
+            build_clip(r2, lay(), "karaoke", None, None, Vec::new(), None, &dir.join("500b.mp4"));
         persist_clip(&v, &clip2, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 3, "re-render replaces its own record");
@@ -3671,8 +3712,9 @@ mod tests {
 
         // A directly-promoted range with no detected Moment records its own Moment.
         let r4 = TimeRange { start_s: 2000.0, end_s: 2030.0 };
-        let clip4 =
-            build_clip(r4, lay(), "huge-word", None, None, Vec::new(), &dir.join("direct.mp4"));
+        let clip4 = build_clip(
+            r4, lay(), "huge-word", None, None, Vec::new(), None, &dir.join("direct.mp4"),
+        );
         persist_clip(&v, &clip4, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 4, "the direct promote adds a fourth Clip");

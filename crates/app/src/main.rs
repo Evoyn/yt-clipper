@@ -121,6 +121,7 @@ fn main() -> eframe::Result<()> {
                             manual_captions: Vec::new(),
                             intro: None,
                             music: Vec::new(),
+                            fade: None,
                         })
                         .expect("send render");
                 }
@@ -272,6 +273,7 @@ fn main() -> eframe::Result<()> {
                             manual_captions: Vec::new(),
                             intro: None,
                             music: Vec::new(),
+                            fade: None,
                         })
                         .expect("send render");
                 }
@@ -941,6 +943,7 @@ impl eframe::App for App {
                             manual_captions: Vec::new(),
                             intro: None,
                             music: Vec::new(),
+                            fade: None,
                         });
                         self.rendering = true;
                         continue;
@@ -1173,6 +1176,7 @@ impl eframe::App for App {
                     manual_captions: spec.manual_captions,
                     intro: spec.intro,
                     music: spec.music,
+                    fade: spec.fade,
                 });
                 self.rendering = true;
                 // While a pre-pass job still runs, this Render only QUEUES
@@ -1230,6 +1234,20 @@ impl eframe::App for App {
                 sink.set_volume(self.prefs.volume * gain);
             }
             self.prefs_dirty_since = Some(std::time::Instant::now());
+        }
+        // Edge-fade preview gain (ADR 0070): while the Studio is open the
+        // fade envelope rides EVERY sink each frame — voice and music
+        // together, the one envelope the burn applies (the canvas ramp's
+        // audible twin). 1.0 whenever fades are off, so this re-tune is
+        // exactly the volumes above; runs after them so the envelope wins.
+        if let Some(ed) = &self.editor {
+            let g = ed.preview_fade_gain();
+            if let Some(sink) = &self.sink {
+                sink.set_volume(self.prefs.volume * g);
+            }
+            for (sink, gain) in &self.music_sinks {
+                sink.set_volume(self.prefs.volume * gain * g);
+            }
         }
         // Debounced settings write: once the prefs have rested ~0.7 s (a write
         // per slider frame would hammer the disk for nothing). The repaint

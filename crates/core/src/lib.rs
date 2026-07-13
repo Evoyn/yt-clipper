@@ -386,6 +386,11 @@ pub struct Clip {
     /// args stay byte-identical to today.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub music: Vec<MusicClip>,
+    /// Edge fades as burned (ADR 0070; plan #4's first slice). `None` — the
+    /// default, and always pre-fade / headless — renders byte-identically
+    /// to today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade: Option<FadeSpec>,
     /// Padded video segment downloaded for this Clip (ADR 0001).
     pub segment_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
@@ -440,6 +445,41 @@ impl MusicClip {
     /// The trimmed length this clip contributes to the mix.
     pub fn duration_s(&self) -> f64 {
         (self.out_s - self.in_s).max(0.0)
+    }
+}
+
+/// The edge-fade color (ADR 0070): the frame the Short fades from and to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FadeColor {
+    Black,
+    White,
+}
+
+/// Edge fades (ADR 0070, plan #4's first slice): a fade-in from `color` at
+/// output 0 and a fade-out to `color` at the output END — the video and the
+/// export's final mixed audio (voice + music) under ONE envelope, wrapped
+/// around the finished graph LAST. `0.0` = that edge off; "both off" is
+/// spelled `None` at the Clip/spec level, so untouched paths stay
+/// byte-identical. Cut-boundary dips and per-music-clip fades are the named
+/// NEXT slices, not fields here.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FadeSpec {
+    pub in_s: f64,
+    pub out_s: f64,
+    pub color: FadeColor,
+}
+
+impl FadeSpec {
+    /// The slider ceiling per edge (CapCut's feel; ADR 0070), shared by the
+    /// editor's knobs and any future consumer so the UI and the burn can
+    /// never disagree about what a legal fade is.
+    pub const MAX_S: f64 = 3.0;
+
+    /// Whether either edge actually fades — the `Some`-worthiness test
+    /// (`Some(inactive)` must never reach a graph builder).
+    pub fn active(&self) -> bool {
+        self.in_s > 0.0 || self.out_s > 0.0
     }
 }
 
@@ -854,6 +894,24 @@ mod tests {
         // an empty list never invents the key on re-save.
         assert!(clip.music.is_empty());
         assert!(!out.contains("music"), "empty is skipped, not written: {out}");
+        // And for the edge fades (ADR 0070): absent key loads as None and a
+        // None never invents the key on re-save.
+        assert_eq!(clip.fade, None);
+        assert!(!out.contains("fade"), "None is skipped, not written: {out}");
+    }
+
+    #[test]
+    fn fade_spec_round_trips_and_knows_when_it_is_active() {
+        let f = FadeSpec { in_s: 0.5, out_s: 1.2, color: FadeColor::White };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"white\""), "snake_case color: {json}");
+        let back: FadeSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+        assert!(f.active());
+        // One live edge is active; both edges off is the None-worthy state.
+        assert!(FadeSpec { in_s: 0.0, out_s: 0.1, color: FadeColor::Black }.active());
+        assert!(!FadeSpec { in_s: 0.0, out_s: 0.0, color: FadeColor::Black }.active());
+        assert_eq!(FadeSpec::MAX_S, 3.0);
     }
 
     #[test]
@@ -901,6 +959,7 @@ mod tests {
             caption_placement: Some(p),
             thumbnail: None,
             music: Vec::new(),
+            fade: None,
             segment_path: None,
             export_path: None,
         };
