@@ -55,6 +55,8 @@ Music track arrived WITH its render machinery.
   it, gain audible, speech legible, output ends with the video — is
   yours, on a real export.
 
+**Gate closed same day, your verdict after testing: "okay it work."**
+
 ## 2026-07-13 — Thumbnail intro: a `+ Thumbnail` button, and everything below follows automatically
 
 Plan #5, your queue-jump ruling: *"add new button to insert thumbnail, it

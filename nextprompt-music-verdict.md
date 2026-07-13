@@ -1,3 +1,17 @@
+# CONSUMED 2026-07-13, same day — the operator tested it live
+
+The music track shipped and the operator drove it; their verdict, in
+their own words: **"okay it work."** No findings. ADR 0068's amendment
+records it, plus what stays deliberately unexamined (a razor-cut export
+WITH music end-to-end, a multi-clip mix, mono/5.1 decode, the menu gain
+slider's feel, the decode-at-pick stall) — those surface during normal
+use, not by inference. The queue moves to `nextprompt-undo.md` (operator
+pick, jumping title-gen again).
+
+---
+
+# (original prompt below, kept for the record)
+
 # Session prompt — background music: the operator's burn verdict (plan #6 gate; queued 2026-07-13)
 
 The Music track shipped (ADR 0068, handoff

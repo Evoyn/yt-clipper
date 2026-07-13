@@ -33,3 +33,7 @@ Plan #6 (`feature-implementation-plan.md`: import music; drag, trim, split and d
 ## Validation
 
 `cargo test -p yt-clipper -p yc-core -p yc-render` green (plus the ingest parser tests); clippy clean on touched files; `--features face,align,ser` check; release build; the burn gate above stays with the operator.
+
+## Amendment — burn verdict (operator, same day)
+
+The operator drove it and ruled, in their own words: **"okay it work."** No findings. The gate closes on their ear (commit `faa8ee7`); the queue moves to the undo arc (their next pick, jumping title-gen again). Deliberately recorded as unexamined rather than passed (they surface during normal use or a later verdict round, not by inference): a razor-cut export WITH music heard end-to-end (the `export_clock` conversion), a multi-clip mix's entrances under `duration=first`, a mono/5.1 file through the native-layout decode + stereo aformat, the gain slider's feel inside an egui context menu, and the decode-at-pick stall on a long mp3.
