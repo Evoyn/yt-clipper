@@ -43,8 +43,8 @@ bars: the ASS burn count stays 1 with the intro prepended, razor + camera
 + intro compose in one graph, export args extend `-t` and map the graph's
 audio, the output-clock round-trip, the trim clamp, the razor refusal).
 Clippy clean on touched files; `face,align,ser` release build green.
-**Your eye on a real burned export is the open gate** — that's the next
-session (`nextprompt-thumbnail-verdict.md`).
+**Gate closed same day, your verdict after testing: "okay its good."**
+(ADR 0067's amendment records it; the queue moves to title-gen.)
 
 ## 2026-07-13 — The timeline grew its multi-track shell: header column with per-track eye/lock, zoom about the pointer, wheel scroll
 

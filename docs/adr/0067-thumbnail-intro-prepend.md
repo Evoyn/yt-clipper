@@ -29,3 +29,7 @@ Plan #5 (`feature-implementation-plan.md`: insert image, default 1 s editable, J
 ## Validation
 
 `cargo test -p yt-clipper -p yc-core -p yc-render` green; clippy clean on touched files; `--features face,align,ser` check; release build; the burn gate above stays with the operator.
+
+## Amendment — burn verdict (operator, same day)
+
+The operator drove it and ruled, in their own words: **"okay its good, i just test it."** No findings. The gate closes on their eye (commit `dc8dbc5`); the queue moves on to title-gen. Deliberately recorded as unexamined rather than passed (they surface during normal use or a later verdict round, not by inference): a real `.webp` pick through the `-loop 1` pipe path, the intro→clip boundary frame on a 23.976 source, audio at the boundary under the new `aformat` 48k concat path, and an eye-off caption track composed with an intro in one export.

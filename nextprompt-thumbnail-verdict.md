@@ -1,3 +1,17 @@
+# CONSUMED 2026-07-13, same session — the operator tested it live
+
+The intro shipped and the operator drove it in the same session; their
+verdict, in their own words: **"okay its good, i just test it."** No
+findings. ADR 0067's amendment records it, plus what stays deliberately
+unexamined (a real .webp pick, the boundary frame on a 23.976 source,
+boundary audio under the aformat-48k concat, eye-off track + intro in
+one export) — those surface during normal use, not by inference. The
+queue moves to `nextprompt-title-gen.md`.
+
+---
+
+# (original prompt below, kept for the record)
+
 # Session prompt — thumbnail intro: the operator's burn verdict (plan #5 gate; queued 2026-07-13)
 
 The thumbnail intro shipped (ADR 0067, handoff
