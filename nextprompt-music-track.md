@@ -84,6 +84,16 @@ timeline and the wrap-the-finished-graph pattern this arc composes with.
    right-click popup, not a new panel). **No overlap on the one track**
    (clamp drags against neighbors) — crossfades arrive WITH overlap
    semantics later, never as an accident now.
+   **The selected-clip cut grammar** (operator Q 2026-07-13, "how do i
+   cut the music if my razor cannot cut it?" — the CapCut answer):
+   clicking a music block SELECTS it, and while one is selected the
+   transport verbs act on IT — ✂⏴ trims the selected clip's left side
+   to the playhead, ⏵✂ its right side, Delete removes it, and the strip
+   menu over the music lane offers Split here — with tooltips saying so.
+   Nothing selected = the verbs act on the main timeline exactly as
+   today (and the MAIN razor NEVER cuts music — removing video time
+   must not secretly chop the music; that is WHY music is
+   output-anchored). Esc / clicking empty strip deselects.
 4. **Per-kind honest toggles**: Music gets **mute** (real THIS arc: the
    muted track leaves the amix AND the preview together — the first 🔇
    whose OFF state is true) + **lock** (gestures ignored); NO eye
@@ -111,7 +121,9 @@ timeline and the wrap-the-finished-graph pattern this arc composes with.
 - Editor: razor edits never rewrite MusicClip data (output anchoring);
   trim clamps against neighbors and the probed duration; split
   produces two source-continuous clips; mute empties the spec's music
-  (the ADR 0066 eye pattern); spec carries music only when clips exist.
+  (the ADR 0066 eye pattern); spec carries music only when clips exist;
+  the cut verbs ROUTE by selection (music block selected → they edit
+  that clip; none selected → the main razor, byte-identical to today).
 - Probe: the audio-duration parser unit-tested pure (an mp3 with no
   video stream must probe; `parse_probe` is pinned to fail there).
 - The burn gate (the operator's EAR, on a real export): music enters
