@@ -4,6 +4,42 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-13 — Fade in/out at the Short's edges: video and ALL the sound together
+
+Your pick ("next we will work on the fade out effect both in the music
+sound and video"): the Short can now open from black (or white) and
+close back into it — and the sound follows the picture exactly. One
+fade covers everything you hear: the voice AND the music die together
+at the end, rise together at the start. Pinned in **ADR 0070** before
+the build.
+
+- **A new "Fade" section in the right panel** (below Framing): two
+  sliders — *Fade in* and *Fade out*, each 0–3 s, 0 = off — and a
+  Black / White choice for the color the video fades from/to. The
+  export summary names your fade so the edges are never a surprise.
+- **The preview shows AND plays it**: the canvas dims exactly where
+  the burn will (over captions, over the thumbnail intro, everything),
+  and the preview audio quiets on the same curve — what you see and
+  hear before Export is what the file does.
+- **Razor-cut clips fade at their REAL end** — cut segments out and
+  the fade-out still lands on the final seconds of what's LEFT, never
+  on where the uncut clip would have ended.
+- **Fade over the thumbnail intro reads right**: a fade-in covers the
+  intro image's first moments, exactly like the burn.
+- **Ctrl+Z works on all of it** — a slider ride is one step, the
+  color pick is one step (the undo contract from yesterday holds).
+- Not touched on purpose (they're the pre-registered next slices):
+  dips at every razor cut (fade-out/in AROUND each cut), per-music-
+  clip fades, and the fancier transition library (crossfade/slide/
+  zoom). Say the word when you want them.
+- Everything renders byte-identically with fades off; old projects
+  load clean.
+
+**Your eye + ear still gate it**: burn a real export with a fade (try
+one with razor cuts, one with the intro, one white) and confirm the
+video dims as the preview showed and the voice + music die together —
+`nextprompt-fade-verdict.md` walks it.
+
 ## 2026-07-13 — Undo/redo: Ctrl+Z everywhere in the editor, 100 steps deep
 
 Your pick ("next we will work on undo since it doesnt have it right
