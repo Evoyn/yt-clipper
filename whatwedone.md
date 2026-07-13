@@ -4,6 +4,44 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-13 — Undo/redo: Ctrl+Z everywhere in the editor, 100 steps deep
+
+Your pick ("next we will work on undo since it doesnt have it right
+now"), and your resource question answered the way we agreed: **capped
+at 100 steps** — snapshots hold only your edits (caption text, cuts,
+framing, music positions — kilobytes), never the heavy decoded stuff,
+so 100 is far more than you'll reach back for while staying ~10 MB
+worst case. Pinned in **ADR 0069** before the build.
+
+- **Ctrl+Z undoes, Ctrl+Shift+Z or Ctrl+Y redoes** — plus ↺ / ↻ buttons
+  in the transport next to the volume slider, with the step count in
+  their tooltips. Redo clears the moment you make a new edit (the
+  CapCut model).
+- **One action = one undo step, the way your hands expect**: a whole
+  block drag is ONE step (not 60 frames of steps), a whole slider ride
+  is one step, one text-editing session in a caption field is one step,
+  every button/menu verb is one step. Grabbing something and not moving
+  it stacks nothing.
+- **Everything you edit is covered**: captions (both tracks — text,
+  times, add/delete/split/merge/censor), the razor's cuts and removed
+  segments, the ▼ marker, camera cuts and per-shot reframes, crops and
+  the seam in both views, caption position/size on the canvas, style
+  presets and every knob, motion presets, the thumbnail intro
+  (add/trim/remove), music clips (move/trim/split/volume/delete), and
+  the track eyes/locks/mute.
+- **Undo never touches your view**: the timeline zoom/scroll, the
+  playhead, selections, and Preview/Original stay where they are —
+  undo changes the CLIP, not your vantage point.
+- **Deleted music plays again after undo** — the clip's decoded audio
+  is re-loaded on the spot (a long mp3 pauses ~a second, same as when
+  you first picked it). A removed thumbnail gets its image re-decoded
+  the same way.
+- Background arrivals (captions finishing, the speaker analysis) never
+  eat a Ctrl+Z — undo always reverts YOUR last edit, not the app's.
+
+Next: your hands on it (`nextprompt-undo-verdict.md` — the feel gate),
+then title-gen.
+
 ## 2026-07-13 — Background music: a `+ Music` button, a real Music 1 track, and your razor question answered
 
 Plan #6, queue-jumped ahead of title-gen: *import music; drag, trim,
