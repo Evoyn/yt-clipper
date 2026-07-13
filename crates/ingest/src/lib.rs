@@ -16,8 +16,9 @@ pub mod dash;
 pub mod youtube;
 pub use align::{measure_segment_anchor, tail_shortfall_s, SegmentAnchor};
 pub use youtube::{
-    fetch_segment, in_segment_offset, pad_range, probe_segment, resolve_deno_dir, youtube_fetch_audio,
-    youtube_fetch_chat, youtube_metadata, CancelToken, SegmentProbe, Sidecars, SEGMENT_PAD_S,
+    fetch_segment, in_segment_offset, pad_range, probe_audio, probe_segment, resolve_deno_dir,
+    youtube_fetch_audio, youtube_fetch_chat, youtube_metadata, AudioProbe, CancelToken,
+    SegmentProbe, Sidecars, SEGMENT_PAD_S,
 };
 
 /// Sample rate (mono) whisper.cpp expects.
@@ -264,6 +265,47 @@ pub fn stream_frames_rgb(
     Ok(n_frames)
 }
 
+/// ffmpeg args to decode a music file's whole audio track to raw s16le PCM on
+/// stdout at its NATIVE sample rate and channel count (ADR 0068: the Music
+/// track's preview cache — rodio resamples per-source to the device rate, so
+/// no quality is spent here; the caller interprets the bytes with the
+/// [`youtube::AudioProbe`]'s layout). `-vn` skips any embedded cover art.
+pub fn decode_audio_pcm_args(media: &Path) -> Vec<String> {
+    vec![
+        "-i".into(),
+        media.display().to_string(),
+        "-vn".into(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-c:a".into(),
+        "pcm_s16le".into(),
+        "-f".into(),
+        "s16le".into(),
+        "-".into(),
+    ]
+}
+
+/// Decode a music file to interleaved s16 samples through the pinned ffmpeg
+/// (ADR 0068 — the ADR 0067 no-image-crate rule, audio edition: ffmpeg covers
+/// mp3/wav/flac/ogg/m4a for free; NO codec crates). Blocking: a picked music
+/// file decodes far faster than real time, once, at pick time — every later
+/// play/scrub restart slices this buffer instantly. `Err` on any failure —
+/// the caller refuses the pick BEFORE it can sink a render.
+pub fn decode_audio_pcm_s16(ffmpeg: &Path, media: &Path) -> Result<Vec<i16>> {
+    let out = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args(decode_audio_pcm_args(media))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    anyhow::ensure!(out.status.success(), "ffmpeg audio decode failed ({})", out.status);
+    let samples: Vec<i16> =
+        out.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    anyhow::ensure!(!samples.is_empty(), "ffmpeg decoded no audio from {}", media.display());
+    Ok(samples)
+}
+
 /// Half-open sample bounds for `range` in a clip of `total` samples at `sr`.
 /// Clamped so `start <= end <= total`.
 fn sample_bounds(range: TimeRange, sr: u32, total: usize) -> (usize, usize) {
@@ -375,6 +417,22 @@ mod tests {
         assert_eq!(sanitize_segment("COM0", "x", 64), "COM0");
         // Empty / all-symbol input falls back.
         assert_eq!(sanitize_segment("", "untitled", 64), "untitled");
+    }
+
+    #[test]
+    fn music_decode_args_are_native_rate_raw_s16() {
+        let args = decode_audio_pcm_args(Path::new("F:/music/bed.mp3"));
+        // First audio stream only, no video (cover art must not decode).
+        assert!(args.contains(&"-vn".to_string()));
+        let m = args.iter().position(|a| a == "-map").unwrap();
+        assert_eq!(args[m + 1], "0:a:0");
+        // Raw s16le to stdout at the file's NATIVE rate/channels: no -ar/-ac
+        // (the AudioProbe's layout interprets the bytes; rodio resamples).
+        assert!(args.contains(&"pcm_s16le".to_string()));
+        let f = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[f + 1], "s16le");
+        assert!(!args.iter().any(|a| a == "-ar" || a == "-ac"), "native layout: {args:?}");
+        assert_eq!(args.last().unwrap(), "-");
     }
 
     #[test]

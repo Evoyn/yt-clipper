@@ -105,6 +105,16 @@ enum TimelineDrag {
     /// source domain like every gesture; the delta converges even though the
     /// output span breathes with `D` (the mapping shift opposes the drag).
     IntroTrim { orig_d: f64, grab_t: f64 },
+    /// Move music clip `idx` in OUTPUT time (ADR 0068). `orig_at` is the
+    /// clip's output anchor at drag start; `grab_t` stays in the source-
+    /// equivalent domain like every gesture (the delta is domain-free), so
+    /// music may ride over the intro where source time goes negative.
+    MusMove { idx: usize, orig_at: f64, grab_t: f64 },
+    /// Trim a music clip's left edge: `at_s` and `in_s` shift together, so
+    /// the audio under the untouched right side never moves.
+    MusTrimStart { idx: usize, orig_at: f64, orig_in: f64, grab_t: f64 },
+    /// Trim a music clip's right edge (`orig_end` = its output end position).
+    MusTrimEnd { idx: usize, orig_end: f64, grab_t: f64 },
 }
 
 /// The editor's thumbnail intro (ADR 0067, plan #5): the picked image, how
@@ -115,6 +125,43 @@ struct IntroState {
     path: std::path::PathBuf,
     duration_s: f64,
     tex: Option<egui::TextureHandle>,
+}
+
+/// A picked music file decoded ONCE to native-rate s16 PCM through the pinned
+/// ffmpeg (ADR 0068 — the no-codec-crate rule, audio edition), cached per
+/// path: every play/scrub restart slices this buffer instantly, exactly like
+/// the analysis.wav slice the voice uses. `duration_s` is PCM-derived — the
+/// trim clamp's ground truth.
+struct MusicPcm {
+    sr: u32,
+    ch: u16,
+    samples: std::sync::Arc<Vec<i16>>,
+    duration_s: f64,
+}
+
+/// One preview music start the app turns into a rodio sink (ADR 0068): a
+/// slice of the cached PCM, a start delay for a clip the playhead hasn't
+/// reached yet (`Source::delay`), and the clip's gain (the sink plays at
+/// `prefs.volume × gain`). Computed by `restart_playback` on the EXPORT's
+/// output clock, so the preview and the burn hear the same entrances.
+pub struct MusicCue {
+    pub samples: std::sync::Arc<Vec<i16>>,
+    pub sr: u32,
+    pub ch: u16,
+    /// First interleaved sample (frame-aligned) and interleaved length.
+    pub first: usize,
+    pub len: usize,
+    pub delay_s: f64,
+    pub gain: f32,
+}
+
+/// The Music track's per-kind honest toggles (ADR 0068): mute is real THIS
+/// arc — it empties the spec's music AND the preview cues together — and
+/// lock ignores the track's timeline gestures. No eye: nothing visual.
+#[derive(Clone, Copy, Default)]
+struct MusicFlags {
+    mute: bool,
+    lock: bool,
 }
 
 /// The timeline viewport (plan #13, ADR 0066): horizontal zoom + scroll.
@@ -523,6 +570,12 @@ pub struct RenderSpec {
     /// image AHEAD of the finished stream, after its ASS burn — `None`
     /// renders byte-identically to pre-intro output.
     pub intro: Option<yc_core::ThumbnailIntro>,
+    /// The Music track (ADR 0068, plan #6): mixed into the export by ONE
+    /// amix wrapped around the finished graph. `at_s` is already on the
+    /// EXPORT's output clock (razor compression applied — see
+    /// [`export_clock`]) and a muted track sends the empty list. Empty
+    /// renders byte-identically to pre-music output.
+    pub music: Vec<yc_core::MusicClip>,
 }
 
 /// What `show` reports back to the app each frame.
@@ -533,9 +586,13 @@ pub enum EditorAction {
     Render(Box<RenderSpec>),
     /// The operator dismissed the editor without rendering.
     Cancel,
-    /// Start clip-audio playback over this absolute VOD range (Play pressed, or
-    /// a scrub while playing). The app owns the audio sink (ADR 0036).
-    Play(TimeRange),
+    /// (Re)start playback audio (Play pressed, or a scrub/seek while playing).
+    /// The app owns every sink (ADR 0036): it stops them ALL, then starts the
+    /// voice over the absolute VOD range (`None` parked inside the intro —
+    /// nothing burns there) and one sink per music cue (ADR 0068). One
+    /// message restarts everything together, so a scrub across a music
+    /// boundary can never double-start a clip.
+    Play { voice: Option<TimeRange>, music: Vec<MusicCue> },
     /// Stop clip audio: Pause pressed, playback reached the clip end, or a
     /// render started (playback pauses so the repaint throttle that protects
     /// whisper from the wgpu loop stays in force).
@@ -670,6 +727,22 @@ pub struct EditorState {
     /// occupying output `[0..D]`; the render concat-prepends it AFTER the ASS
     /// burn so every other artifact stays source-relative by construction.
     intro: Option<IntroState>,
+    /// The Music track's clips (ADR 0068, plan #6), sorted by `at_s`, never
+    /// overlapping (crossfades arrive WITH overlap semantics later, never as
+    /// an accident now). `at_s` is the STRIP's output clock; a razor edit
+    /// never rewrites it — `render_spec` converts to the export's clock.
+    music: Vec<yc_core::MusicClip>,
+    /// Decoded PCM per picked music file (see [`MusicPcm`]).
+    music_pcm: std::collections::HashMap<std::path::PathBuf, MusicPcm>,
+    /// The selected music clip: while `Some`, the transport's cut verbs act
+    /// on IT (the operator's "how do i cut the music" — ADR 0068 decision 5).
+    /// Esc or clicking empty strip deselects.
+    sel_music: Option<usize>,
+    /// Music 1's honest toggles: mute + lock, no eye (ADR 0068).
+    trk_music: MusicFlags,
+    /// The pinned ffprobe, for the audio-tolerant duration probe at pick
+    /// time (threaded like `ffmpeg`).
+    ffprobe: std::path::PathBuf,
     /// The strip's zoom + horizontal scroll window (plan #13, ADR 0066).
     /// Session-only view state, deliberately never persisted.
     viewport: Viewport,
@@ -710,6 +783,7 @@ impl EditorState {
         caption_engine: CaptionEngine,
         faces: Vec<FaceCluster>,
         ffmpeg: std::path::PathBuf,
+        ffprobe: std::path::PathBuf,
         render_src: std::path::PathBuf,
         seek_s: f64,
         src_fps: f64,
@@ -773,6 +847,11 @@ impl EditorState {
             drag: None,
             razor: RazorState::default(),
             intro: None,
+            music: Vec::new(),
+            music_pcm: std::collections::HashMap::new(),
+            sel_music: None,
+            trk_music: MusicFlags::default(),
+            ffprobe,
             viewport: Viewport::default(),
             trk_auto: TrackFlags::default(),
             trk_manual: TrackFlags::default(),
@@ -891,17 +970,66 @@ impl EditorState {
     }
 
     /// Restart playback from OUTPUT time `out_t` — the one seek/scrub/jump
-    /// contract: past the intro, audio and the live decode restart together;
-    /// inside it the image holds silently (nothing burns there — ADR 0067)
-    /// and the crossing in `show` starts both.
+    /// contract: past the intro, the voice and the live decode restart
+    /// together; inside it the image holds with NO voice (nothing burns
+    /// there — ADR 0067) and the crossing in `show` starts it. Music placed
+    /// over the intro PLAYS there (ADR 0068): every restart recomputes the
+    /// cues, and the app clears all sinks before spawning — a scrub across a
+    /// music boundary can never double-start a clip.
     fn restart_playback(&mut self, out_t: f64) -> EditorAction {
         self.playing = Some((Instant::now(), out_t));
         self.start_video();
-        if out_t < self.intro_d() {
+        let voice = (out_t >= self.intro_d()).then(|| self.play_range_from(out_t));
+        let music = self.music_cues(out_t);
+        if voice.is_none() && music.is_empty() {
             EditorAction::StopAudio
         } else {
-            EditorAction::Play(self.play_range_from(out_t))
+            EditorAction::Play { voice, music }
         }
+    }
+
+    /// The preview music cues from OUTPUT time `out_t` (ADR 0068): both ends
+    /// convert to the EXPORT's clock through [`export_clock`], so the preview
+    /// and the burn hear the same entrances — the playhead skips razor-
+    /// removed spans in zero wall time exactly as the export compresses them
+    /// (each skip re-fires the restart contract, which recomputes these).
+    fn music_cues(&self, out_t: f64) -> Vec<MusicCue> {
+        if self.trk_music.mute || self.music.is_empty() {
+            return Vec::new();
+        }
+        let d = self.intro_d();
+        let keep = self.razor.kept_spans(self.range.duration_s());
+        let e_now = export_clock(out_t, d, keep.as_deref());
+        let mut cues = Vec::new();
+        for m in &self.music {
+            let Some(pcm) = self.music_pcm.get(&m.path) else { continue };
+            let start_e = export_clock(m.at_s, d, keep.as_deref());
+            let len = m.duration_s();
+            if len <= 0.0 || e_now >= start_e + len {
+                continue; // already over
+            }
+            let (into_clip, delay_s) =
+                if e_now >= start_e { (e_now - start_e, 0.0) } else { (0.0, start_e - e_now) };
+            let ch = pcm.ch.max(1) as usize;
+            let n_frames = pcm.samples.len() / ch;
+            let first_frame =
+                (((m.in_s + into_clip) * pcm.sr as f64).round() as usize).min(n_frames);
+            let end_frame =
+                ((m.out_s * pcm.sr as f64).round() as usize).clamp(first_frame, n_frames);
+            if end_frame == first_frame {
+                continue;
+            }
+            cues.push(MusicCue {
+                samples: pcm.samples.clone(),
+                sr: pcm.sr,
+                ch: pcm.ch,
+                first: first_frame * ch,
+                len: (end_frame - first_frame) * ch,
+                delay_s,
+                gain: m.gain,
+            });
+        }
+        cues
     }
 
     /// Insert or replace the thumbnail intro from a picked image (ADR 0067):
@@ -924,6 +1052,142 @@ impl EditorState {
         // The playhead keeps its OUTPUT position; a changed D shifts what it
         // points at, which the next frame's clamp handles.
         self.intro = Some(IntroState { path, duration_s, tex: Some(tex) });
+    }
+
+    /// Add a music clip from a picked file (ADR 0068): probe through the
+    /// audio-tolerant ffprobe variant, decode ONCE to native s16 PCM through
+    /// the pinned ffmpeg (cached per path) — a file neither can read is
+    /// refused HERE, before it can sink a render. The clip lands at the
+    /// playhead on the one track, clamped so nothing overlaps.
+    fn add_music(&mut self, path: std::path::PathBuf) {
+        if !self.music_pcm.contains_key(&path) {
+            let cancel = yc_ingest::CancelToken::new();
+            let probe = match yc_ingest::probe_audio(&self.ffprobe, &path, &cancel) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("music rejected: {} did not probe as audio ({e:#})", path.display());
+                    return;
+                }
+            };
+            let samples = match yc_ingest::decode_audio_pcm_s16(&self.ffmpeg, &path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("music rejected: ffmpeg could not decode {} ({e:#})", path.display());
+                    return;
+                }
+            };
+            let ch = probe.channels.max(1);
+            // PCM-derived duration is the trim clamp's ground truth (the
+            // container's stated duration can lie by a frame or two).
+            let duration_s = (samples.len() / ch as usize) as f64 / probe.sample_rate.max(1) as f64;
+            self.music_pcm.insert(
+                path.clone(),
+                MusicPcm {
+                    sr: probe.sample_rate,
+                    ch,
+                    samples: std::sync::Arc::new(samples),
+                    duration_s,
+                },
+            );
+        }
+        let file_dur = self.music_pcm[&path].duration_s;
+        self.place_music_clip(path, file_dur);
+    }
+
+    /// The pure placement half of [`Self::add_music`]: the clip lands at the
+    /// playhead — a block already under it pushes the start to its end (no
+    /// overlap on the one track, ADR 0068) — trimmed to the room before the
+    /// next block / the strip end. Refused when less than the minimum fits.
+    fn place_music_clip(&mut self, path: std::path::PathBuf, file_dur: f64) {
+        let out_dur = self.out_dur();
+        // `music` is sorted by `at_s`, so one pass settles the start.
+        let mut at = self.playhead_s.clamp(0.0, (out_dur - yc_core::MusicClip::MIN_S).max(0.0));
+        for m in &self.music {
+            if at >= m.at_s - 1e-9 && at < m.at_s + m.duration_s() {
+                at = m.at_s + m.duration_s();
+            }
+        }
+        let next_start = self
+            .music
+            .iter()
+            .map(|m| m.at_s)
+            .filter(|s| *s > at + 1e-9)
+            .fold(f64::INFINITY, f64::min);
+        let room = next_start.min(out_dur) - at;
+        if room < yc_core::MusicClip::MIN_S {
+            tracing::warn!("music: no room at the playhead (the track has no overlap)");
+            return;
+        }
+        let clip = yc_core::MusicClip {
+            path,
+            at_s: at,
+            in_s: 0.0,
+            out_s: file_dur.min(room),
+            gain: 1.0,
+        };
+        let idx = self.music.iter().position(|m| m.at_s > at).unwrap_or(self.music.len());
+        self.music.insert(idx, clip);
+        self.sel_music = Some(idx);
+    }
+
+    /// Remove one music clip; the PCM cache entry goes with it when no other
+    /// clip references the same file.
+    fn remove_music(&mut self, i: usize) {
+        if i >= self.music.len() {
+            return;
+        }
+        let path = self.music.remove(i).path;
+        if !self.music.iter().any(|m| m.path == path) {
+            self.music_pcm.remove(&path);
+        }
+        self.sel_music = None;
+    }
+
+    /// ✂⏴ on a SELECTED music clip (ADR 0068 decision 5): trim its left edge
+    /// to the playhead — `at_s` and `in_s` shift together, so the audio under
+    /// the untouched right side never moves. Refused when the playhead isn't
+    /// inside the clip (with min-length headroom).
+    fn trim_music_left_to_playhead(&mut self, i: usize) {
+        let ph = self.playhead_s;
+        let Some(m) = self.music.get_mut(i) else { return };
+        if ph <= m.at_s || ph >= m.at_s + m.duration_s() - yc_core::MusicClip::MIN_S {
+            tracing::info!("music trim refused: playhead outside the selected clip");
+            return;
+        }
+        let cut = ph - m.at_s;
+        m.in_s += cut;
+        m.at_s = ph;
+    }
+
+    /// ⏵✂ on a SELECTED music clip: trim its right edge to the playhead.
+    fn trim_music_right_to_playhead(&mut self, i: usize) {
+        let ph = self.playhead_s;
+        let Some(m) = self.music.get_mut(i) else { return };
+        if ph <= m.at_s + yc_core::MusicClip::MIN_S || ph >= m.at_s + m.duration_s() {
+            tracing::info!("music trim refused: playhead outside the selected clip");
+            return;
+        }
+        m.out_s = m.in_s + (ph - m.at_s);
+    }
+
+    /// Split music clip `i` at OUTPUT time `at_out` into two SOURCE-CONTINUOUS
+    /// clips (the right half picks up exactly where the left stops). Refused
+    /// within the min length of either edge.
+    fn split_music_at(&mut self, i: usize, at_out: f64) {
+        let Some(m) = self.music.get(i) else { return };
+        let cut = at_out - m.at_s;
+        if cut < yc_core::MusicClip::MIN_S || m.duration_s() - cut < yc_core::MusicClip::MIN_S {
+            return;
+        }
+        let right = yc_core::MusicClip {
+            path: m.path.clone(),
+            at_s: at_out,
+            in_s: m.in_s + cut,
+            out_s: m.out_s,
+            gain: m.gain,
+        };
+        self.music[i].out_s = self.music[i].in_s + cut;
+        self.music.insert(i + 1, right);
     }
 
     /// The static Layout the operator's manual edits describe.
@@ -1074,6 +1338,23 @@ impl EditorState {
                 path: i.path.clone(),
                 duration_s: i.duration_s,
             }),
+            // Music (ADR 0068): mute empties the spec (the eye pattern — the
+            // spec's own vocabulary says "mix none"); otherwise each anchor
+            // converts to the EXPORT's clock, so the burn plays music against
+            // exactly the content the strip showed it over.
+            music: if self.trk_music.mute {
+                Vec::new()
+            } else {
+                let keep = self.razor.kept_spans(self.range.duration_s());
+                let d = self.intro_d();
+                self.music
+                    .iter()
+                    .map(|m| yc_core::MusicClip {
+                        at_s: export_clock(m.at_s, d, keep.as_deref()),
+                        ..m.clone()
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -1129,9 +1410,10 @@ impl EditorState {
                 self.playhead_s = offset + waited;
                 if self.playhead_s >= d_intro {
                     self.playhead_s = d_intro;
-                    self.playing = Some((Instant::now(), d_intro));
-                    self.start_video();
-                    action = EditorAction::Play(self.play_range_from(d_intro));
+                    // The one restart contract: voice + live decode start at
+                    // the crossing; music re-cues at its recomputed offsets
+                    // (a clip playing over the intro continues seamlessly).
+                    action = self.restart_playback(d_intro);
                 } else {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
                 }
@@ -1142,10 +1424,14 @@ impl EditorState {
                 if !self.video_aligned && (video_secs.is_some() || stalled) {
                     // First frame on screen (or give-up): start the audio here
                     // so it runs with the video, not the ~0.1-0.5 s-earlier
-                    // Play instant.
+                    // Play instant. Music re-cues to the same anchor (the app
+                    // clears every sink first — never two over each other).
                     self.video_aligned = true;
                     self.playing = Some((Instant::now(), offset));
-                    action = EditorAction::Play(self.play_range_from(offset));
+                    action = EditorAction::Play {
+                        voice: Some(self.play_range_from(offset)),
+                        music: self.music_cues(offset),
+                    };
                 }
                 self.playhead_s = if !self.video_aligned {
                     offset // frozen on the first frame's content until it is on screen
@@ -1183,9 +1469,10 @@ impl EditorState {
                         action = EditorAction::StopAudio;
                     } else {
                         self.playhead_s = span_end + d_intro;
-                        self.playing = Some((Instant::now(), span_end + d_intro));
-                        self.start_video();
-                        action = EditorAction::Play(self.play_range_from(span_end + d_intro));
+                        // The one restart contract again — music re-cues on
+                        // the export clock, which is CONTINUOUS across the
+                        // skip (the compression the export applies).
+                        action = self.restart_playback(self.playhead_s);
                     }
                 } else {
                     // 60 fps visual tick (vsync-capped).
@@ -1338,17 +1625,31 @@ impl EditorState {
                 self.show_export = false;
                 return None;
             }
+            if self.sel_music.is_some() {
+                // Deselect the music clip BEFORE Esc means "close the
+                // editor" (ADR 0068 decision 5).
+                self.sel_music = None;
+                return None;
+            }
             return Some(EditorAction::Cancel);
         }
         if space {
             return Some(self.toggle_play());
         }
-        if del && self.playhead_s >= self.intro_d() {
-            // The razor's remove verb (CapCut Delete): drop the segment
-            // under the playhead from the export. Refused inside the intro —
-            // it is not razor-able source (ADR 0067); its right edge is its
-            // duration control.
-            self.razor.remove_segment_at(self.src_t());
+        if del {
+            // Delete ROUTES by selection (ADR 0068 decision 5): a selected
+            // music clip is removed; otherwise the razor's remove verb
+            // (CapCut Delete) drops the segment under the playhead from the
+            // export — refused inside the intro, which is not razor-able
+            // source (ADR 0067; its right edge is its duration control).
+            match self.sel_music.filter(|i| *i < self.music.len()) {
+                Some(i) if !self.trk_music.lock => self.remove_music(i),
+                Some(_) => {}
+                None if self.playhead_s >= self.intro_d() => {
+                    self.razor.remove_segment_at(self.src_t());
+                }
+                None => {}
+            }
         }
         let crop_mode = self.view == ViewMode::Source && self.camera_mode == CameraMode::Manual;
         let step = if shift { 20.0 } else { 4.0 };
@@ -2172,6 +2473,124 @@ impl EditorState {
                     shown = d;
                 }
             }
+            // Music gestures (ADR 0068) run in OUTPUT time (music may sit
+            // over the intro). `pointer_t`/`grab_t` are source-domain twins,
+            // so the delta is domain-free; clamps and anchors live in the
+            // output domain, and `shown`/`snapped` return through the
+            // source-equivalent domain the chip and guide print from
+            // (fmt(t + D) at s_to_x(t) — so the chip reads output time).
+            Some(TimelineDrag::MusMove { idx, orig_at, grab_t }) => {
+                if idx >= self.music.len() {
+                    return (None, shown);
+                }
+                let d = self.intro_d();
+                let out_dur = self.out_dur();
+                let len = self.music[idx].duration_s();
+                // No overlap on the one track: clamp against the neighbors
+                // (crossfades arrive WITH overlap semantics, never as an
+                // accident — ADR 0068).
+                let lo = if idx > 0 {
+                    self.music[idx - 1].at_s + self.music[idx - 1].duration_s()
+                } else {
+                    0.0
+                };
+                let hi = (self.music.get(idx + 1).map(|n| n.at_s).unwrap_or(out_dur) - len)
+                    .max(lo);
+                let mut v = (orig_at + (pointer_t - grab_t)).clamp(lo, hi);
+                // Anchors: the playhead against either edge, the intro
+                // boundary, the clip head, the neighbors.
+                let anchors: Vec<f64> =
+                    [self.playhead_s, self.playhead_s - len, d, 0.0, lo, hi]
+                        .into_iter()
+                        .filter(|a| (lo..=hi).contains(a))
+                        .collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(a) => {
+                        v = a;
+                        snapped = Some(a - d);
+                    }
+                    None => v = quantize_cs(v).clamp(lo, hi),
+                }
+                self.music[idx].at_s = v;
+                shown = v - d;
+            }
+            Some(TimelineDrag::MusTrimStart { idx, orig_at, orig_in, grab_t }) => {
+                if idx >= self.music.len() {
+                    return (None, shown);
+                }
+                let d = self.intro_d();
+                let prev_end = if idx > 0 {
+                    self.music[idx - 1].at_s + self.music[idx - 1].duration_s()
+                } else {
+                    0.0
+                };
+                // Extending left is bounded by the file's own head
+                // (`in_s ≥ 0`), the previous block, and output 0; shrinking
+                // keeps the minimum clip length.
+                let out_end = orig_at + (self.music[idx].out_s - orig_in);
+                let lo = prev_end.max(orig_at - orig_in).max(0.0);
+                let hi = out_end - yc_core::MusicClip::MIN_S;
+                if lo > hi {
+                    return (None, shown);
+                }
+                let mut v = (orig_at + (pointer_t - grab_t)).clamp(lo, hi);
+                let anchors: Vec<f64> = [self.playhead_s, d, 0.0]
+                    .into_iter()
+                    .filter(|a| (lo..=hi).contains(a))
+                    .collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(a) => {
+                        v = a;
+                        snapped = Some(a - d);
+                    }
+                    None => v = quantize_cs(v).clamp(lo, hi),
+                }
+                // `at_s` and `in_s` shift together: the audio under the
+                // untouched right side never moves.
+                self.music[idx].in_s = orig_in + (v - orig_at);
+                self.music[idx].at_s = v;
+                shown = v - d;
+            }
+            Some(TimelineDrag::MusTrimEnd { idx, orig_end, grab_t }) => {
+                if idx >= self.music.len() {
+                    return (None, shown);
+                }
+                let d = self.intro_d();
+                let out_dur = self.out_dur();
+                let m = &self.music[idx];
+                // Bounded by the next block, the strip end, and the decoded
+                // file's own tail (`out_s ≤` the PCM duration).
+                let file_end = m.at_s
+                    + (self
+                        .music_pcm
+                        .get(&m.path)
+                        .map(|p| p.duration_s)
+                        .unwrap_or(f64::INFINITY)
+                        - m.in_s);
+                let next_start =
+                    self.music.get(idx + 1).map(|n| n.at_s).unwrap_or(f64::INFINITY);
+                let lo = m.at_s + yc_core::MusicClip::MIN_S;
+                let hi = next_start.min(out_dur).min(file_end);
+                if lo > hi {
+                    return (None, shown);
+                }
+                let mut v = (orig_end + (pointer_t - grab_t)).clamp(lo, hi);
+                let anchors: Vec<f64> = [self.playhead_s, d, hi]
+                    .into_iter()
+                    .filter(|a| (lo..=hi).contains(a))
+                    .collect();
+                match magnet(v, &anchors, tol_t) {
+                    Some(a) => {
+                        v = a;
+                        snapped = Some(a - d);
+                    }
+                    None => v = quantize_cs(v).clamp(lo, hi),
+                }
+                let at = self.music[idx].at_s;
+                let in_s = self.music[idx].in_s;
+                self.music[idx].out_s = in_s + (v - at);
+                shown = v - d;
+            }
             None => {}
         }
         (snapped, shown)
@@ -2184,9 +2603,14 @@ impl EditorState {
     fn finish_timeline_drag(&mut self) {
         match self.drag.take() {
             Some(TimelineDrag::Cut { .. }) => self.refresh_camera_audit(),
+            // Music gestures need no release work: the neighbor clamps make
+            // reordering impossible mid-drag, so the lane stays sorted.
             Some(TimelineDrag::Razor { .. })
             | Some(TimelineDrag::Marker { .. })
-            | Some(TimelineDrag::IntroTrim { .. }) => {}
+            | Some(TimelineDrag::IntroTrim { .. })
+            | Some(TimelineDrag::MusMove { .. })
+            | Some(TimelineDrag::MusTrimStart { .. })
+            | Some(TimelineDrag::MusTrimEnd { .. }) => {}
             Some(_) => {
                 if let Some(t) = &mut self.transcript {
                     let sorted = t.units.windows(2).all(|w| w[0].start_s <= w[1].start_s);
@@ -2285,16 +2709,23 @@ impl EditorState {
             let dur_full = self.range.duration_s();
             // The razor verbs act on SOURCE time; inside the thumbnail intro
             // they disable — it is not razor-able source (ADR 0067); its
-            // right edge is its duration control.
+            // right edge is its duration control. While a MUSIC clip is
+            // selected the verbs act on IT instead (ADR 0068 decision 5 —
+            // the operator's "how do i cut the music"), and the selection
+            // lifts the intro refusal: music may sit over the intro.
             let in_intro = self.playhead_s < d_intro;
             let intro_refusal = "The thumbnail intro can't be cut — drag its right edge \
                                  to set its length";
+            let music_lock_refusal = "The Music track is locked — unlock it in its header";
+            let msel = self.sel_music.filter(|i| *i < self.music.len());
+            let cut_enabled =
+                if msel.is_some() { !self.trk_music.lock } else { !in_intro };
             ui.add_space(6.0);
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 if ui
                     .add_enabled(
-                        !in_intro,
+                        cut_enabled,
                         egui::Button::new("✂⏴").corner_radius(CornerRadius {
                             nw: 4,
                             sw: 4,
@@ -2302,14 +2733,26 @@ impl EditorState {
                             se: 0,
                         }),
                     )
-                    .on_hover_text(
+                    .on_hover_text(if msel.is_some() {
+                        "Trim the SELECTED music clip: its LEFT edge moves to the playhead \
+                         (Esc or clicking empty timeline deselects)"
+                    } else {
                         "Cut LEFT of the playhead: removes back to the marker (or the clip \
-                         start when no marker is on the left)",
-                    )
-                    .on_disabled_hover_text(intro_refusal)
+                         start when no marker is on the left)"
+                    })
+                    .on_disabled_hover_text(if msel.is_some() {
+                        music_lock_refusal
+                    } else {
+                        intro_refusal
+                    })
                     .clicked()
                 {
-                    self.razor.cut_left(self.src_t(), self.cut_marker, dur_full);
+                    match msel {
+                        Some(i) => self.trim_music_left_to_playhead(i),
+                        None => {
+                            self.razor.cut_left(self.src_t(), self.cut_marker, dur_full);
+                        }
+                    }
                 }
                 if ui
                     .add_enabled(
@@ -2331,7 +2774,7 @@ impl EditorState {
                 }
                 if ui
                     .add_enabled(
-                        !in_intro,
+                        cut_enabled,
                         egui::Button::new("⏵✂").corner_radius(CornerRadius {
                             nw: 0,
                             sw: 0,
@@ -2339,14 +2782,26 @@ impl EditorState {
                             se: 4,
                         }),
                     )
-                    .on_hover_text(
+                    .on_hover_text(if msel.is_some() {
+                        "Trim the SELECTED music clip: its RIGHT edge moves to the playhead \
+                         (Esc or clicking empty timeline deselects)"
+                    } else {
                         "Cut RIGHT of the playhead: removes up to the marker (or the clip \
-                         end when no marker is on the right)",
-                    )
-                    .on_disabled_hover_text(intro_refusal)
+                         end when no marker is on the right)"
+                    })
+                    .on_disabled_hover_text(if msel.is_some() {
+                        music_lock_refusal
+                    } else {
+                        intro_refusal
+                    })
                     .clicked()
                 {
-                    self.razor.cut_right(self.src_t(), self.cut_marker, dur_full);
+                    match msel {
+                        Some(i) => self.trim_music_right_to_playhead(i),
+                        None => {
+                            self.razor.cut_right(self.src_t(), self.cut_marker, dur_full);
+                        }
+                    }
                 }
             });
             // The thumbnail intro (ADR 0067, plan #5): pick an image; it
@@ -2370,6 +2825,27 @@ impl EditorState {
                     .pick_file()
                 {
                     self.set_intro_image(ui.ctx(), path);
+                }
+            }
+            // The Music track (ADR 0068, plan #6): pick a file; the clip
+            // lands at the playhead on Music 1 (the lane appears with its
+            // first clip — an empty lane is dead space).
+            ui.add_space(6.0);
+            if ui
+                .add(egui::Button::new("+ Music"))
+                .on_hover_text(
+                    "Add background music at the playhead (its own Music track below the \
+                     captions). Drag to move, edges trim, click to select — then ✂⏴ / ⏵✂ \
+                     trim the selected clip to the playhead; right-click it for split, \
+                     volume, and delete. The main razor never cuts music.",
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"])
+                    .pick_file()
+                {
+                    self.add_music(path);
                 }
             }
             // Say WHAT the worker is doing — a mystery-disabled UI reads as a
@@ -2446,11 +2922,15 @@ impl EditorState {
         // 125 = the fixed chrome: ruler 18 + the filmstrip track 29 + the two
         // caption tracks (22 each) + the burn-line rail 6 above the speaker
         // lanes, the camera badge gutter 20 and the scrollbar row 8 below.
+        // Music 1 (ADR 0068) adds its 24 px band only while clips exist —
+        // an empty lane is dead space (the Speakers-zone precedent).
+        let has_music = !self.music.is_empty();
+        let music_h = if has_music { 24.0 } else { 0.0 };
         let content_bottom = rect.bottom() - SCROLL_H;
         let lane_h = if n_lanes == 0 {
             13.0
         } else {
-            ((rect.height() - 125.0) / n_lanes as f32).max(13.0)
+            ((rect.height() - 125.0 - music_h) / n_lanes as f32).max(13.0)
         };
         // Row geometry, top → bottom. Header cards span EXACTLY these bands
         // (the operator's symmetry verdict, ADR 0066 round 2).
@@ -2458,7 +2938,8 @@ impl EditorState {
         let film_y1 = rect.top() + 44.0;
         let cap_y0 = rect.top() + 47.0;
         let man_y0 = cap_y0 + 22.0;
-        let rail_y = man_y0 + 22.0;
+        let mus_y0 = man_y0 + 22.0;
+        let rail_y = mus_y0 + music_h;
         // Two painters: `ph` (unclipped) owns the background + header column;
         // `p` clips lane content at the header boundary so a scrolled-out
         // block can neither paint nor be read under the headers.
@@ -2512,6 +2993,9 @@ impl EditorState {
             (cap_y0, cap_y0 + 22.0),
             (man_y0, man_y0 + 22.0),
         ];
+        if has_music {
+            bands.push((mus_y0, mus_y0 + 22.0));
+        }
         if self.speakers.is_some() {
             bands.push((rail_y + 6.0, content_bottom - 20.0));
         }
@@ -2538,7 +3022,9 @@ impl EditorState {
         let mut drag_chip_t: Option<f64> = None;
         if self.drag.is_some() {
             ui.ctx().set_cursor_icon(match self.drag {
-                Some(TimelineDrag::CapMove { .. }) => egui::CursorIcon::Grabbing,
+                Some(TimelineDrag::CapMove { .. }) | Some(TimelineDrag::MusMove { .. }) => {
+                    egui::CursorIcon::Grabbing
+                }
                 _ => egui::CursorIcon::ResizeHorizontal,
             });
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
@@ -3073,6 +3559,240 @@ impl EditorState {
                 );
             }
         }
+        // Music 1 blocks (ADR 0068): OUTPUT-anchored (no intro offset — they
+        // may sit over it), tinted by the track's teal accent. The body drags
+        // in output time, edges trim (clamped against neighbors and the
+        // file), click SELECTS (the transport verbs then act on the
+        // selection), right-click: Split here / volume / delete. A muted
+        // track draws dimmed (the eye-off idiom); a locked one ignores
+        // gestures. Registered after the scrub response, so blocks win the
+        // pointer.
+        let mut music_click: Option<usize> = None;
+        let mut music_delete: Option<usize> = None;
+        let mut music_split: Option<(usize, f64)> = None;
+        let mut music_gain: Option<(usize, f32)> = None;
+        if has_music {
+            let mflags = self.trk_music;
+            let dim = if mflags.mute { 0.45 } else { 1.0 };
+            let accent = theme::MUSIC;
+            for i in 0..self.music.len() {
+                let m = &self.music[i];
+                let (at, len, gain) = (m.at_s, m.duration_s(), m.gain);
+                let name = m
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "music".into());
+                let r = Rect::from_min_max(
+                    egui::pos2(t_to_x(at), mus_y0 + 2.0),
+                    egui::pos2(t_to_x(at + len).max(t_to_x(at) + 3.0), mus_y0 + 20.0),
+                );
+                if r.min.x > lanes.right() || r.max.x < lanes.left() {
+                    continue; // scrolled out of the viewport window
+                }
+                let dragging_this = matches!(&self.drag,
+                    Some(TimelineDrag::MusMove { idx, .. })
+                    | Some(TimelineDrag::MusTrimStart { idx, .. })
+                    | Some(TimelineDrag::MusTrimEnd { idx, .. }) if *idx == i);
+                let selected = self.sel_music == Some(i);
+                let edges = r.width() >= 24.0 && !mflags.lock;
+                let body =
+                    (if edges { r.shrink2(egui::vec2(5.0, 0.0)) } else { r }).intersect(lanes);
+                let tip = format!(
+                    "{} – {}  ·  {}{}\n{}",
+                    fmt_mmss_cc(at),
+                    fmt_mmss_cc(at + len),
+                    name,
+                    if (gain - 1.0).abs() > 1e-3 {
+                        format!("  ·  volume {:.0}%", gain * 100.0)
+                    } else {
+                        String::new()
+                    },
+                    if mflags.lock {
+                        "Track locked — unlock in its header to edit (click still selects)"
+                    } else {
+                        "Drag to move · edges trim · click to select (then ✂⏴ / ⏵✂ trim it \
+                         to the playhead) · right-click to split / set volume / delete"
+                    }
+                );
+                let resp = ui
+                    .interact(body, ui.id().with(("mus-clip", i)), Sense::click_and_drag())
+                    .on_hover_text(tip);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(if mflags.lock {
+                        egui::CursorIcon::NotAllowed
+                    } else {
+                        egui::CursorIcon::Grab
+                    });
+                }
+                if resp.clicked() {
+                    music_click = Some(i);
+                }
+                if resp.secondary_clicked() {
+                    // The menu's Split lands where the CLICK was, not where
+                    // the pointer went next (the strip-menu pattern).
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        self.strip_menu_t = Some(x_to_s(pos.x));
+                    }
+                }
+                resp.context_menu(|ui| {
+                    let at_out = self.strip_menu_t.map(|t| t + d_intro).unwrap_or(at);
+                    if ui
+                        .add_enabled(!mflags.lock, egui::Button::new("✂ Split here"))
+                        .on_hover_text(
+                            "Split this music clip at the click into two clips — the right \
+                             half continues exactly where the left stops",
+                        )
+                        .clicked()
+                    {
+                        music_split = Some((i, at_out));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let mut g = gain;
+                    ui.horizontal(|ui| {
+                        ui.label("Volume");
+                        ui.weak(format!("{:.0}%", g * 100.0));
+                    });
+                    if ui
+                        .add_enabled(
+                            !mflags.lock,
+                            egui::Slider::new(&mut g, 0.0..=2.0).show_value(false),
+                        )
+                        .on_hover_text(
+                            "This clip's volume in the export and the preview (one constant \
+                             — volume keyframes arrive with a later arc)",
+                        )
+                        .changed()
+                    {
+                        music_gain = Some((i, g));
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!mflags.lock, egui::Button::new("🗑 Delete music clip"))
+                        .clicked()
+                    {
+                        music_delete = Some(i);
+                        ui.close();
+                    }
+                });
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && self.drag.is_none()
+                    && !mflags.lock
+                {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        begin_drag = Some(TimelineDrag::MusMove {
+                            idx: i,
+                            orig_at: at,
+                            grab_t: x_to_s(pos.x),
+                        });
+                    }
+                }
+                let mut edge_hot = (false, false);
+                if edges {
+                    for side in 0..2 {
+                        let er = if side == 0 {
+                            Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 5.0, r.bottom()))
+                        } else {
+                            Rect::from_min_max(egui::pos2(r.right() - 5.0, r.top()), r.right_bottom())
+                        };
+                        let eresp = ui.interact(
+                            er.intersect(lanes),
+                            ui.id().with(("mus-edge", i, side)),
+                            Sense::drag(),
+                        );
+                        let hot = eresp.hovered() || eresp.dragged();
+                        if side == 0 {
+                            edge_hot.0 = hot;
+                        } else {
+                            edge_hot.1 = hot;
+                        }
+                        if hot {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if eresp.drag_started_by(egui::PointerButton::Primary)
+                            && self.drag.is_none()
+                        {
+                            if let Some(pos) = eresp.interact_pointer_pos() {
+                                begin_drag = Some(if side == 0 {
+                                    TimelineDrag::MusTrimStart {
+                                        idx: i,
+                                        orig_at: at,
+                                        orig_in: self.music[i].in_s,
+                                        grab_t: x_to_s(pos.x),
+                                    }
+                                } else {
+                                    TimelineDrag::MusTrimEnd {
+                                        idx: i,
+                                        orig_end: at + len,
+                                        grab_t: x_to_s(pos.x),
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                let hot = resp.hovered() || dragging_this || selected;
+                p.rect_filled(
+                    r,
+                    CornerRadius::same(4),
+                    Color32::from_rgba_unmultiplied(
+                        accent.r(),
+                        accent.g(),
+                        accent.b(),
+                        ((if hot { 54 } else { 30 }) as f32 * dim) as u8,
+                    ),
+                );
+                p.rect_stroke(
+                    r,
+                    CornerRadius::same(4),
+                    Stroke::new(
+                        if dragging_this || selected { 1.5 } else { 1.0 },
+                        (if selected || hot { theme::GOLD } else { accent.gamma_multiply(0.5) })
+                            .gamma_multiply(dim),
+                    ),
+                    StrokeKind::Inside,
+                );
+                for (on, x) in [(edge_hot.0, r.left() + 1.5), (edge_hot.1, r.right() - 1.5)] {
+                    if on {
+                        p.line_segment(
+                            [egui::pos2(x, r.top() + 2.0), egui::pos2(x, r.bottom() - 2.0)],
+                            Stroke::new(3.0, theme::GOLD),
+                        );
+                    }
+                }
+                if r.width() > 24.0 {
+                    // No ♪ glyph — the round-6 tofu lesson (ADR 0065 Am. 5):
+                    // the track's teal tint already says "music".
+                    let label = if (gain - 1.0).abs() > 1e-3 {
+                        format!("{name} · {:.0}%", gain * 100.0)
+                    } else {
+                        name.clone()
+                    };
+                    p.text(
+                        r.left_center() + egui::vec2(4.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        ellipsize(&label, (r.width() / 7.0) as usize),
+                        FontId::proportional(10.0),
+                        Color32::from_gray(200).gamma_multiply(dim),
+                    );
+                }
+            }
+        }
+        if let Some((i, g)) = music_gain {
+            if let Some(m) = self.music.get_mut(i) {
+                m.gain = g.clamp(0.0, 2.0);
+            }
+        }
+        if let Some((i, at_out)) = music_split {
+            self.split_music_at(i, at_out);
+        }
+        if let Some(i) = music_delete {
+            self.remove_music(i);
+        }
+        if let Some(i) = music_click {
+            self.sel_music = Some(i);
+        }
         if let Some(d) = begin_drag {
             self.drag = Some(d);
         }
@@ -3092,6 +3812,9 @@ impl EditorState {
             }
         }
         if let Some((lane, i)) = clicked_unit {
+            // Clicking a caption hands the verbs back to the main timeline
+            // (Delete must never surprise-remove an off-screen music clip).
+            self.sel_music = None;
             let start = match lane {
                 CapLane::Auto => {
                     self.transcript.as_ref().and_then(|t| t.units.get(i)).map(|u| u.start_s)
@@ -3537,6 +4260,11 @@ impl EditorState {
         // playhead while the audio kept playing from the old position.
         // A caption/cut gesture owns the pointer instead — no scrub then.
         if self.drag.is_none() && (resp.clicked() || resp.dragged()) {
+            if resp.clicked() {
+                // Clicking empty strip deselects the music clip (ADR 0068
+                // decision 5) — blocks win the pointer, so this IS empty.
+                self.sel_music = None;
+            }
             if let Some(pos) = resp.interact_pointer_pos() {
                 self.playhead_s = x_to_t(pos.x);
                 if self.playing.is_some() {
@@ -3683,6 +4411,47 @@ impl EditorState {
                 label,
                 name_font.clone(),
                 if f.eye { name_col } else { Color32::from_gray(130) },
+            );
+        }
+        // Music 1 (ADR 0068): mute + lock, NO eye — nothing visual. Mute is
+        // the first 🔇 whose OFF state is real: the spec's music empties AND
+        // the preview cues silence together. The card exists only while
+        // clips do (decision 4).
+        if has_music {
+            let mut f = self.trk_music;
+            let card = track_card(&ph, hdr, mus_y0, mus_y0 + 22.0, theme::MUSIC, !f.mute);
+            let cy = card.center().y;
+            if track_toggle(
+                ui,
+                &ph,
+                egui::pos2(card.left() + 14.0, cy),
+                TrackIcon::Mute,
+                !f.mute,
+                ("music", 0),
+                "Mute the Music track. OFF keeps ALL music OUT of the export (and the \
+                 preview) — the clips stay on the timeline, dimmed, editable.",
+            ) {
+                f.mute = !f.mute;
+            }
+            if track_toggle(
+                ui,
+                &ph,
+                egui::pos2(card.left() + 31.0, cy),
+                TrackIcon::Lock,
+                f.lock,
+                ("music", 1),
+                "Lock the Music track — timeline drags, trims, splits, and deletes are \
+                 ignored (clicks still select)",
+            ) {
+                f.lock = !f.lock;
+            }
+            self.trk_music = f;
+            ph.text(
+                egui::pos2(card.left() + LABEL_X, cy),
+                Align2::LEFT_CENTER,
+                "Music 1",
+                name_font.clone(),
+                if f.mute { Color32::from_gray(130) } else { name_col },
             );
         }
         // Speakers analysis zone (eye only — nothing here ever burns). Its
@@ -4575,6 +5344,23 @@ impl EditorState {
                         ui,
                         "Thumbnail intro",
                         format!("{} · +{:.1}s ahead", ellipsize(&name, 24), i.duration_s),
+                    );
+                }
+                // Music (ADR 0068): the summary names what mixes — or that a
+                // muted track deliberately mixes nothing.
+                if !self.music.is_empty() {
+                    row(
+                        ui,
+                        "Music",
+                        if self.trk_music.mute {
+                            "muted — not in the export".into()
+                        } else {
+                            format!(
+                                "{} clip{}",
+                                self.music.len(),
+                                if self.music.len() == 1 { "" } else { "s" }
+                            )
+                        },
                     );
                 }
                 row(ui, "Resolution", "1080 × 1920 (9:16)".into());
@@ -5507,6 +6293,21 @@ fn delete_plan_cut(plan: &mut CameraPlan, boundary: usize) -> bool {
 
 /// The nearest anchor within `tol` of `t`, if any — the timeline's magnetic
 /// snap (feature plan #3: dragged times snap to nearby anchors).
+/// Map a STRIP output time onto the EXPORT's output clock (ADR 0068): the
+/// two coincide until the razor removes a segment — then the export's concat
+/// compresses source time through the kept spans while the strip keeps
+/// showing the removed spans veiled. The intro region `[0..D)` never
+/// compresses (it is not razor-able source, ADR 0067). Pure; `keep = None`
+/// (nothing removed) is the identity.
+fn export_clock(out_t: f64, d_intro: f64, keep: Option<&[TimeRange]>) -> f64 {
+    let Some(spans) = keep else { return out_t };
+    if out_t <= d_intro {
+        return out_t;
+    }
+    let src = out_t - d_intro;
+    d_intro + spans.iter().map(|k| (src.min(k.end_s) - k.start_s).max(0.0)).sum::<f64>()
+}
+
 fn magnet(t: f64, anchors: &[f64], tol: f64) -> Option<f64> {
     anchors
         .iter()
@@ -5707,6 +6508,7 @@ mod tests {
             Vec::new(),
             std::path::PathBuf::new(),
             std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
             0.0,
             30.0,
         )
@@ -5820,16 +6622,212 @@ mod tests {
         assert_eq!(r.start_s, ed.range.start_s);
         let r = ed.play_range_from(1.5);
         assert!((r.start_s - (ed.range.start_s + 0.5)).abs() < 1e-9);
-        // Restarting inside the intro is SILENT (nothing burns there); the
-        // crossing in `show` starts audio+video. Past it, audio restarts.
+        // Restarting inside the intro is SILENT (nothing burns there and no
+        // music exists); the crossing in `show` starts audio+video. Past it,
+        // the voice restarts.
         ed.playing = Some((Instant::now(), 0.0));
         assert!(matches!(ed.restart_playback(0.4), EditorAction::StopAudio));
         assert!(ed.live.is_none(), "no decode spawns inside the intro");
-        assert!(matches!(ed.restart_playback(1.5), EditorAction::Play(_)));
+        assert!(matches!(
+            ed.restart_playback(1.5),
+            EditorAction::Play { voice: Some(_), .. }
+        ));
         // The razor's verbs refuse inside the intro: the source twin clamps
         // to 0 and removing the only segment is already refused.
         ed.playhead_s = 0.5;
         assert!(!ed.razor.remove_segment_at(ed.src_t()), "refused in the intro");
+    }
+
+    // ---- music track (ADR 0068) ---------------------------------------------
+
+    /// Seed a music clip + a fake decoded PCM cache entry (10 s of stereo
+    /// 100 Hz silence — the cue math only reads lengths, never samples).
+    fn with_music(ed: &mut EditorState, at_s: f64, in_s: f64, out_s: f64) -> usize {
+        let path = std::path::PathBuf::from("F:/music/bed.mp3");
+        ed.music_pcm.entry(path.clone()).or_insert_with(|| MusicPcm {
+            sr: 100,
+            ch: 2,
+            samples: std::sync::Arc::new(vec![0i16; 100 * 2 * 10]),
+            duration_s: 10.0,
+        });
+        let clip = yc_core::MusicClip { path, at_s, in_s, out_s, gain: 1.0 };
+        let idx = ed.music.iter().position(|m| m.at_s > at_s).unwrap_or(ed.music.len());
+        ed.music.insert(idx, clip);
+        idx
+    }
+
+    #[test]
+    fn export_clock_is_identity_until_the_razor_removes_time() {
+        // No removed spans: the strip's clock IS the export's.
+        assert_eq!(export_clock(7.5, 1.0, None), 7.5);
+        // Kept spans [0,3] + [5,10] of a 10 s source (span [3,5] removed),
+        // intro D = 1: the intro region never compresses; past the removed
+        // span the export clock runs 2 s behind the strip.
+        let keep = [
+            TimeRange { start_s: 0.0, end_s: 3.0 },
+            TimeRange { start_s: 5.0, end_s: 10.0 },
+        ];
+        assert_eq!(export_clock(0.4, 1.0, Some(&keep)), 0.4, "intro region untouched");
+        assert_eq!(export_clock(3.0, 1.0, Some(&keep)), 3.0, "before the cut: identity");
+        assert_eq!(export_clock(5.0, 1.0, Some(&keep)), 4.0, "inside the cut: parks at its head");
+        assert_eq!(export_clock(8.0, 1.0, Some(&keep)), 6.0, "past the cut: 2 s compressed");
+    }
+
+    #[test]
+    fn music_trims_split_and_clamps_stay_source_continuous() {
+        let mut ed = editor_state(); // 60 s clip, no intro
+        let i = with_music(&mut ed, 20.0, 1.0, 9.0); // 8 s of the file at 20 s
+        // ✂⏴ routes to the SELECTED clip: left edge to the playhead; at_s
+        // and in_s shift together (the right side's audio never moves).
+        ed.playhead_s = 22.0;
+        ed.trim_music_left_to_playhead(i);
+        assert_eq!((ed.music[i].at_s, ed.music[i].in_s, ed.music[i].out_s), (22.0, 3.0, 9.0));
+        // ⏵✂: right edge to the playhead.
+        ed.playhead_s = 25.0;
+        ed.trim_music_right_to_playhead(i);
+        assert_eq!(ed.music[i].out_s, 6.0);
+        // Outside the clip both refuse (data untouched).
+        ed.playhead_s = 40.0;
+        ed.trim_music_left_to_playhead(i);
+        ed.trim_music_right_to_playhead(i);
+        assert_eq!((ed.music[i].at_s, ed.music[i].in_s, ed.music[i].out_s), (22.0, 3.0, 6.0));
+        // Split at 23.0: two SOURCE-CONTINUOUS clips (right picks up exactly
+        // where the left stops).
+        ed.split_music_at(i, 23.0);
+        assert_eq!(ed.music.len(), 2);
+        assert_eq!((ed.music[0].at_s, ed.music[0].in_s, ed.music[0].out_s), (22.0, 3.0, 4.0));
+        assert_eq!((ed.music[1].at_s, ed.music[1].in_s, ed.music[1].out_s), (23.0, 4.0, 6.0));
+    }
+
+    #[test]
+    fn music_drags_clamp_against_neighbors_and_the_file() {
+        let mut ed = editor_state(); // 60 s clip
+        with_music(&mut ed, 10.0, 0.0, 5.0);
+        with_music(&mut ed, 20.0, 0.0, 5.0);
+        // Move clip 0 right: it may not overlap clip 1 (hi = 20 - 5 = 15).
+        ed.drag = Some(TimelineDrag::MusMove { idx: 0, orig_at: 10.0, grab_t: 0.0 });
+        ed.apply_timeline_drag(30.0, 0.0);
+        assert_eq!(ed.music[0].at_s, 15.0, "no overlap on the one track");
+        // Move clip 1 left: clamped against clip 0's new end (15 + 5 = 20).
+        ed.drag = Some(TimelineDrag::MusMove { idx: 1, orig_at: 20.0, grab_t: 0.0 });
+        ed.apply_timeline_drag(-30.0, 0.0);
+        assert_eq!(ed.music[1].at_s, 20.0);
+        // Trim clip 1's right edge way out: the decoded file (10 s) is the
+        // ceiling — out_s ≤ the PCM duration.
+        ed.drag = Some(TimelineDrag::MusTrimEnd { idx: 1, orig_end: 25.0, grab_t: 0.0 });
+        ed.apply_timeline_drag(30.0, 0.0);
+        assert_eq!(ed.music[1].out_s, 10.0, "clamped to the file's tail");
+        // Trim clip 1's left edge way out: in_s ≥ 0 is the floor.
+        ed.drag = Some(TimelineDrag::MusTrimStart {
+            idx: 1,
+            orig_at: 20.0,
+            orig_in: 0.0,
+            grab_t: 0.0,
+        });
+        ed.apply_timeline_drag(-30.0, 0.0);
+        assert_eq!((ed.music[1].at_s, ed.music[1].in_s), (20.0, 0.0), "file head + neighbor");
+        ed.drag = None;
+    }
+
+    #[test]
+    fn delete_routes_by_selection_and_razor_never_touches_music() {
+        let mut ed = editor_state();
+        let i = with_music(&mut ed, 5.0, 0.0, 8.0);
+        let before = ed.music[i].clone();
+        // Razor edits never rewrite MusicClip data (output anchoring).
+        ed.razor.add_cut(6.0, 60.0);
+        ed.razor.remove_segment_at(3.0);
+        assert_eq!(ed.music[i], before, "the main razor never cuts music");
+        // With a music clip selected, remove_music takes it (the Delete
+        // route); the razor state is untouched by that path.
+        ed.sel_music = Some(i);
+        let cuts_before = ed.razor.cuts.len();
+        ed.remove_music(i);
+        assert!(ed.music.is_empty());
+        assert!(ed.music_pcm.is_empty(), "the PCM cache leaves with the last clip");
+        assert_eq!(ed.razor.cuts.len(), cuts_before);
+        assert_eq!(ed.sel_music, None);
+    }
+
+    #[test]
+    fn render_spec_music_respects_mute_and_the_export_clock() {
+        let mut ed = editor_state(); // 60 s clip
+        with_music(&mut ed, 20.0, 1.0, 9.0);
+        // No razor cuts: the spec carries the strip anchor verbatim.
+        assert_eq!(ed.render_spec().music.len(), 1);
+        assert_eq!(ed.render_spec().music[0].at_s, 20.0);
+        // Razor removes source [5,10]: the export clock compresses 5 s, so
+        // the burn plays the clip against the content the strip showed it
+        // over. The MusicClip DATA never rewrites.
+        ed.razor.add_cut(5.0, 60.0);
+        ed.razor.add_cut(10.0, 60.0);
+        let seg = ed.razor.seg_index_at(7.0);
+        assert!(ed.razor.toggle_segment(seg));
+        assert_eq!(ed.music[0].at_s, 20.0, "data never rewrites");
+        assert_eq!(ed.render_spec().music[0].at_s, 15.0, "spec converts to the export clock");
+        // Mute empties the spec (the eye pattern); the editor's data stays.
+        ed.trk_music.mute = true;
+        assert!(ed.render_spec().music.is_empty());
+        assert_eq!(ed.music.len(), 1);
+    }
+
+    #[test]
+    fn music_cues_compute_offsets_delays_and_silence_on_mute() {
+        let mut ed = editor_state();
+        with_intro(&mut ed, 1.0);
+        with_music(&mut ed, 0.5, 2.0, 8.0); // over the intro, 6 s of file from 2.0
+        // Restart at output 0: the clip starts 0.5 s from now, at its own
+        // in-point. Frames at sr=100, stereo: first = 2.0s*100*2 = 400.
+        let cues = ed.music_cues(0.0);
+        assert_eq!(cues.len(), 1);
+        assert!((cues[0].delay_s - 0.5).abs() < 1e-9);
+        assert_eq!((cues[0].first, cues[0].len), (400, 1200));
+        assert_eq!((cues[0].sr, cues[0].ch), (100, 2));
+        // Restart MID-clip (output 3.0 = 2.5 s into the clip): no delay, the
+        // slice starts 2.5 s further into the file (in 2.0 + 2.5 = 4.5).
+        let cues = ed.music_cues(3.0);
+        assert_eq!(cues[0].delay_s, 0.0);
+        assert_eq!(cues[0].first, 900);
+        // Restart past its end: no cue. Muted: none at all.
+        assert!(ed.music_cues(30.0).is_empty());
+        ed.trk_music.mute = true;
+        assert!(ed.music_cues(0.0).is_empty());
+        ed.trk_music.mute = false;
+        // Restarting INSIDE the intro now plays music (voice stays silent).
+        ed.playing = Some((Instant::now(), 0.0));
+        assert!(matches!(
+            ed.restart_playback(0.2),
+            EditorAction::Play { voice: None, music } if music.len() == 1
+        ));
+    }
+
+    #[test]
+    fn music_placement_lands_at_the_playhead_without_overlap() {
+        let mut ed = editor_state(); // 60 s clip
+        let bed = std::path::PathBuf::from("F:/music/bed.mp3");
+        // Empty lane: the clip lands AT the playhead, full file length
+        // (shorter than the remaining strip).
+        ed.playhead_s = 12.0;
+        ed.place_music_clip(bed.clone(), 10.0);
+        assert_eq!(ed.music.len(), 1);
+        assert_eq!((ed.music[0].at_s, ed.music[0].in_s, ed.music[0].out_s), (12.0, 0.0, 10.0));
+        assert_eq!(ed.sel_music, Some(0), "the new clip arrives selected");
+        // Playhead INSIDE the existing block: the new clip starts where it
+        // ends (no overlap on the one track).
+        ed.playhead_s = 15.0;
+        ed.place_music_clip(bed.clone(), 10.0);
+        assert_eq!(ed.music.len(), 2);
+        assert_eq!(ed.music[1].at_s, 22.0);
+        // A long file near the tail trims to the room before the strip end.
+        ed.playhead_s = 55.0;
+        ed.place_music_clip(bed.clone(), 10.0);
+        assert_eq!(ed.music.len(), 3);
+        assert_eq!((ed.music[2].at_s, ed.music[2].out_s), (55.0, 5.0));
+        // Playhead inside the tail block, which runs to the strip end:
+        // pushing past it leaves no room — refused.
+        ed.playhead_s = 56.0;
+        ed.place_music_clip(bed, 10.0);
+        assert_eq!(ed.music.len(), 3, "no room past the tail block");
     }
 
     fn plan(bounds: &[f64]) -> yc_core::CameraPlan {
@@ -6107,6 +7105,9 @@ fn track_card(
 enum TrackIcon {
     Eye,
     Lock,
+    /// A speaker: waves when audible, slashed when muted (ADR 0068 — the
+    /// Music track's honest 🔇, painted like the rest: the tofu lesson).
+    Mute,
 }
 
 /// A 15-px track-header toggle, PAINTED — no font in the stack reliably
@@ -6128,8 +7129,45 @@ fn track_toggle(
     match icon {
         TrackIcon::Eye => draw_eye(p, center, on),
         TrackIcon::Lock => draw_lock(p, center, on),
+        TrackIcon::Mute => draw_speaker(p, center, on),
     }
     resp.on_hover_text(tip).clicked()
+}
+
+/// A speaker wedge with sound waves when audible; waves dropped and a slash
+/// across when muted — the same painted-shape discipline as the eye/lock
+/// (ADR 0065 Amendment 5: no font in the stack reliably carries 🔇).
+fn draw_speaker(p: &egui::Painter, c: egui::Pos2, audible: bool) {
+    let col = if audible { Color32::from_gray(208) } else { Color32::from_gray(105) };
+    // The driver box + cone, one closed shape.
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            c + egui::vec2(-5.2, -1.8),
+            c + egui::vec2(-2.4, -1.8),
+            c + egui::vec2(0.6, -4.6),
+            c + egui::vec2(0.6, 4.6),
+            c + egui::vec2(-2.4, 1.8),
+            c + egui::vec2(-5.2, 1.8),
+        ],
+        col,
+        Stroke::NONE,
+    ));
+    if audible {
+        // Two sound-wave arcs, sampled like the lock's shackle.
+        for (rad, sweep) in [(2.6_f32, 0.55_f32), (4.4, 0.7)] {
+            let mut pts = Vec::with_capacity(9);
+            for k in 0..=8 {
+                let ang = -sweep + 2.0 * sweep * (k as f32 / 8.0);
+                pts.push(egui::pos2(c.x + 1.4 + rad * ang.cos(), c.y + rad * ang.sin()));
+            }
+            p.add(egui::Shape::line(pts, Stroke::new(1.1, col)));
+        }
+    } else {
+        p.line_segment(
+            [c + egui::vec2(-4.6, 4.6), c + egui::vec2(4.6, -4.6)],
+            Stroke::new(1.3, Color32::from_gray(150)),
+        );
+    }
 }
 
 /// An almond-shaped eye + pupil; slashed when off. Sampled quadratics —

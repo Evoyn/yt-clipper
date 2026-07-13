@@ -4,6 +4,57 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-13 — Background music: a `+ Music` button, a real Music 1 track, and your razor question answered
+
+Plan #6, queue-jumped ahead of title-gen: *import music; drag, trim,
+split and delete music; support multiple clips* — future-ready for
+volume keyframes, fades, crossfades, more audio tracks. Pinned in
+**ADR 0068** before the build. This is the arc ADR 0066 promised: the
+Music track arrived WITH its render machinery.
+
+- **`+ Music` in the transport** (beside `+ Thumbnail`) picks an
+  mp3/wav/flac/ogg/m4a; the clip lands at the playhead on a new
+  **Music 1** track (teal accent, appears with its first clip). A file
+  ffmpeg can't read is refused on the spot, before it can sink a render.
+- **It really mixes**: ONE `amix` wraps the finished export graph —
+  after the caption burn AND after the thumbnail-intro prepend — so
+  intro + razor + camera + music all compose in a single ffmpeg pass.
+  `duration=first` + the output bound mean music can never stretch a
+  Short; `normalize=0` means adding music never changes the voice
+  level. Per-clip volume (right-click → slider, 0–200%) rides as a
+  `volume=` stage — keyframes/fades/crossfades slot beside it later.
+- **Your razor question — "how do i cut the music if my razor cannot
+  cut it?"** — answered the CapCut way: **click a music block to select
+  it**, and while one is selected the transport's ✂⏴ / ⏵✂ trim THAT
+  clip's edge to the playhead and Delete removes it (tooltips say so).
+  Esc or clicking empty timeline deselects; with nothing selected the
+  verbs act on the main timeline exactly as before. Right-click a block
+  for **Split here** (two clips, the music continuing seamlessly),
+  volume, and delete. The main razor NEVER cuts music — removing video
+  time can't secretly chop your song.
+- **Music is anchored to the OUTPUT timeline** — it can sit over the
+  thumbnail intro (and plays there in preview, where the voice is
+  silent), and razor edits never rewrite it: the content shifts under
+  the music. With razor cuts the export converts each anchor through
+  the kept spans, so music enters against exactly the content the strip
+  shows it over.
+- **Honest toggles**: Music 1 gets the first real **mute** (OFF = out of
+  the export AND the preview together, clips stay editable) plus lock —
+  no eye, since nothing is visual. Video 1's mute stays deferred to the
+  mixer arc, as pre-registered.
+- **Preview restarts are instant**: each picked file probes through a
+  new audio-tolerant ffprobe parser and decodes ONCE to PCM (pinned
+  ffmpeg, no codec crates); every play/scrub/seek slices that buffer —
+  one rodio sink per clip, delayed to its entrance, at master volume ×
+  clip gain. One restart contract stops-then-starts everything, so
+  scrubbing across a music boundary can never double-start a clip.
+- **Batch and headless renders are untouched** (empty music pins the
+  graph and args byte-identical); the burned clips persist on the Clip
+  in project.json. 166 tests green across the touched crates; release
+  build verified. The burn gate — music enters where the strip shows
+  it, gain audible, speech legible, output ends with the video — is
+  yours, on a real export.
+
 ## 2026-07-13 — Thumbnail intro: a `+ Thumbnail` button, and everything below follows automatically
 
 Plan #5, your queue-jump ruling: *"add new button to insert thumbnail, it

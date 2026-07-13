@@ -120,6 +120,7 @@ fn main() -> eframe::Result<()> {
                             keep: None,
                             manual_captions: Vec::new(),
                             intro: None,
+                            music: Vec::new(),
                         })
                         .expect("send render");
                 }
@@ -270,6 +271,7 @@ fn main() -> eframe::Result<()> {
                             keep: None,
                             manual_captions: Vec::new(),
                             intro: None,
+                            music: Vec::new(),
                         })
                         .expect("send render");
                 }
@@ -344,6 +346,7 @@ fn main() -> eframe::Result<()> {
                 analysis_wav: None,
                 audio_out: None,
                 sink: None,
+                music_sinks: Vec::new(),
                 prefs: app_settings,
                 prefs_dirty_since: None,
                 status: Status::Idle,
@@ -642,6 +645,10 @@ struct App {
     audio_out: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     /// The currently-playing sink; taking/replacing it stops playback.
     sink: Option<rodio::Sink>,
+    /// The Music track's preview sinks (ADR 0068): one per cue, each with its
+    /// clip's gain (sink volume = prefs.volume × gain, kept live under the
+    /// slider). `stop_audio` clears them all with the voice.
+    music_sinks: Vec<(rodio::Sink, f32)>,
     /// App-level operator preferences (workspace/settings.json): the master
     /// playback gain (Moment review + Studio playback share it; 1.0 =
     /// unmodified, up to 2.0 boosts a quiet streamer — playback only, never
@@ -933,6 +940,7 @@ impl eframe::App for App {
                             keep: None,
                             manual_captions: Vec::new(),
                             intro: None,
+                            music: Vec::new(),
                         });
                         self.rendering = true;
                         continue;
@@ -971,6 +979,7 @@ impl eframe::App for App {
                             self.caption_engine,
                             faces,
                             self.paths.ffmpeg(),
+                            self.paths.ffprobe(),
                             render_src,
                             seek_s,
                             src_fps,
@@ -1163,6 +1172,7 @@ impl eframe::App for App {
                     keep: spec.keep,
                     manual_captions: spec.manual_captions,
                     intro: spec.intro,
+                    music: spec.music,
                 });
                 self.rendering = true;
                 // While a pre-pass job still runs, this Render only QUEUES
@@ -1191,9 +1201,18 @@ impl eframe::App for App {
                 }
                 self.editor = None;
             }
-            // Editor playback (ADR 0036): the same sink the Moment review uses,
-            // sliced from the whole-VOD analysis wav at the clip offset.
-            editor::EditorAction::Play(range) => self.play_range(range),
+            // Editor playback (ADR 0036): the voice is the same sink the
+            // Moment review uses, sliced from the whole-VOD analysis wav at
+            // the clip offset; music cues each get their own sink (ADR 0068).
+            // ONE restart message stops everything, then starts what the
+            // editor computed — never two sinks of the same clip.
+            editor::EditorAction::Play { voice, music } => {
+                self.stop_audio();
+                if let Some(range) = voice {
+                    self.play_range(range);
+                }
+                self.play_music_cues(music);
+            }
             editor::EditorAction::StopAudio => self.stop_audio(),
             editor::EditorAction::None => {}
         }
@@ -1204,6 +1223,11 @@ impl eframe::App for App {
         if self.prefs != prefs_before {
             if let Some(sink) = &self.sink {
                 sink.set_volume(self.prefs.volume);
+            }
+            // Music sinks track the same master, scaled by their clip gain
+            // (ADR 0068) — real-time, playback only, never the export.
+            for (sink, gain) in &self.music_sinks {
+                sink.set_volume(self.prefs.volume * gain);
             }
             self.prefs_dirty_since = Some(std::time::Instant::now());
         }
@@ -2471,6 +2495,43 @@ impl App {
     fn stop_audio(&mut self) {
         if let Some(sink) = self.sink.take() {
             sink.stop();
+        }
+        for (sink, _) in self.music_sinks.drain(..) {
+            sink.stop();
+        }
+    }
+
+    /// Spawn one sink per music cue (ADR 0068): a slice of the editor's
+    /// cached PCM, delayed to its entrance (`Source::delay`), at
+    /// `prefs.volume × gain`. The caller stopped every sink first — the
+    /// restart contract, so a scrub can never double-start a clip.
+    fn play_music_cues(&mut self, cues: Vec<editor::MusicCue>) {
+        if cues.is_empty() {
+            return;
+        }
+        let Some(handle) = self.ensure_audio().cloned() else { return };
+        for cue in cues {
+            let end = (cue.first + cue.len).min(cue.samples.len());
+            if cue.first >= end {
+                continue;
+            }
+            match rodio::Sink::try_new(&handle) {
+                Ok(sink) => {
+                    use rodio::Source;
+                    let buf = rodio::buffer::SamplesBuffer::new(
+                        cue.ch,
+                        cue.sr,
+                        cue.samples[cue.first..end].to_vec(),
+                    );
+                    sink.append(buf.delay(std::time::Duration::from_secs_f64(
+                        cue.delay_s.max(0.0),
+                    )));
+                    sink.set_volume(self.prefs.volume * cue.gain);
+                    sink.play();
+                    self.music_sinks.push((sink, cue.gain));
+                }
+                Err(e) => tracing::warn!("music sink: {e}"),
+            }
         }
     }
 }

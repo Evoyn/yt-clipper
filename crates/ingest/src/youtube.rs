@@ -676,6 +676,65 @@ pub fn in_segment_offset(clip_start_s: f64, padded_start_s: f64, probe: &Segment
     ((clip_start_s - padded_start_s) + probe.start_time_s).max(0.0)
 }
 
+/// What ffprobe tells us about an AUDIO file (ADR 0068, the Music track):
+/// duration plus the native sample layout — what a raw `-f s16le` decode of
+/// the file must be interpreted with. [`parse_probe`] requires video
+/// width/height, so it FAILS on a music file by design; this is the
+/// audio-tolerant variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioProbe {
+    pub duration_s: f64,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// ffprobe args for [`AudioProbe`]: the first AUDIO stream's layout + the
+/// container duration (no video entries — an mp3 has none to show).
+fn probe_audio_args(media: &Path) -> Vec<String> {
+    vec![
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        "a:0".into(),
+        "-show_entries".into(),
+        "stream=sample_rate,channels:format=duration".into(),
+        "-of".into(),
+        "default=noprint_wrappers=1".into(),
+        media.display().to_string(),
+    ]
+}
+
+/// ffprobe `media` for [`AudioProbe`] (a picked music file).
+pub fn probe_audio(ffprobe: &Path, media: &Path, cancel: &CancelToken) -> Result<AudioProbe> {
+    let out = run_capture(ffprobe, &probe_audio_args(media), None, cancel)?;
+    parse_audio_probe(&out)
+        .with_context(|| format!("parsing ffprobe audio output for {}", media.display()))
+}
+
+/// Parse ffprobe `key=value` lines into an [`AudioProbe`]. Pure, so the
+/// parser is unit-tested without ffprobe. Everything is required: a music
+/// file with no audio stream, no rate, or no playable duration is refused
+/// HERE, before it can sink a render (the ADR 0067 refusal pattern).
+fn parse_audio_probe(out: &str) -> Result<AudioProbe> {
+    let value = |key: &str| -> Option<&str> {
+        out.lines()
+            .find_map(|l| l.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v.trim()))
+    };
+    let sample_rate: u32 = value("sample_rate")
+        .and_then(|v| v.parse().ok())
+        .filter(|r| *r > 0)
+        .context("ffprobe: no audio sample rate")?;
+    let channels: u16 = value("channels")
+        .and_then(|v| v.parse().ok())
+        .filter(|c| *c > 0)
+        .context("ffprobe: no audio channels")?;
+    let duration_s: f64 = value("duration")
+        .and_then(|v| v.parse().ok())
+        .filter(|d: &f64| d.is_finite() && *d > 0.0)
+        .context("ffprobe: no audio duration")?;
+    Ok(AudioProbe { duration_s, sample_rate, channels })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +843,43 @@ mod tests {
         assert_eq!(parse_probe(bare).unwrap().fps, 30.0);
         let zero_den = "width=640\nheight=360\nr_frame_rate=0/0\n";
         assert_eq!(parse_probe(zero_den).unwrap().fps, 0.0);
+    }
+
+    // ---- audio probe (ADR 0068, the Music track) ---------------------------
+
+    #[test]
+    fn audio_probe_parses_a_video_less_music_file() {
+        // Shape of real ffprobe output for an mp3: an audio stream, a format
+        // duration, and NO width/height anywhere.
+        let out = "sample_rate=44100\nchannels=2\nduration=185.256000\n";
+        let a = parse_audio_probe(out).unwrap();
+        assert_eq!((a.sample_rate, a.channels), (44100, 2));
+        assert!((a.duration_s - 185.256).abs() < 1e-6);
+        // The video probe is PINNED to fail there — a music file must go
+        // through the audio-tolerant variant, never parse_probe.
+        assert!(parse_probe(out).is_err(), "parse_probe must require video dims");
+    }
+
+    #[test]
+    fn audio_probe_refuses_streamless_and_durationless_files() {
+        // No audio stream entries at all (a PNG, a data file).
+        assert!(parse_audio_probe("duration=10.0\n").is_err());
+        // A stream but no playable duration: refused before it can sink a
+        // render (N/A parses as absent).
+        assert!(parse_audio_probe("sample_rate=48000\nchannels=2\nduration=N/A\n").is_err());
+        // Degenerate layouts are refused too.
+        assert!(parse_audio_probe("sample_rate=0\nchannels=2\nduration=9.0\n").is_err());
+        assert!(parse_audio_probe("sample_rate=44100\nchannels=0\nduration=9.0\n").is_err());
+    }
+
+    #[test]
+    fn audio_probe_args_select_the_audio_stream_only() {
+        let a = probe_audio_args(Path::new("F:/music/bed.mp3"));
+        let ss = a.iter().position(|s| s == "-select_streams").unwrap();
+        assert_eq!(a[ss + 1], "a:0");
+        let se = a.iter().position(|s| s == "-show_entries").unwrap();
+        assert_eq!(a[se + 1], "stream=sample_rate,channels:format=duration");
+        assert!(!a.iter().any(|s| s.contains("width")), "no video entries: {a:?}");
+        assert_eq!(a.last().unwrap(), "F:/music/bed.mp3");
     }
 }

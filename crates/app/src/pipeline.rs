@@ -199,7 +199,12 @@ pub enum Job {
     /// thumbnail intro (ADR 0067): `Some` concat-prepends the image AHEAD of
     /// the finished stream, after its ASS burn — captions/camera/razor stay
     /// source-relative by construction; `None` (always in headless/batch)
-    /// renders byte-identically to pre-intro output.
+    /// renders byte-identically to pre-intro output. `music` is the Music
+    /// track (ADR 0068): the finished graph — intro included — is wrapped
+    /// LAST with one amix positioning each clip on the export's output clock
+    /// (`at_s` arrives already razor-compressed from the editor); empty
+    /// (always in headless/batch) renders byte-identically to pre-music
+    /// output.
     Render {
         layout: Layout,
         style: CaptionStyle,
@@ -211,6 +216,7 @@ pub enum Job {
         keep: Option<Vec<TimeRange>>,
         manual_captions: Vec<yc_core::ManualCaption>,
         intro: Option<ThumbnailIntro>,
+        music: Vec<yc_core::MusicClip>,
     },
     /// Fetch missing dependencies from their pinned official sources (ADR
     /// 0041): stream to a `.part` beside the destination, verify the pinned
@@ -582,9 +588,9 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
                         ));
                     }
                 },
-                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro } => match (&session, &mut prepared) {
+                Job::Render { layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music } => match (&session, &mut prepared) {
                     (Some(s), Some(pc)) => {
-                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, &worker_cancel, &tx_prog) {
+                        match do_render(&paths, s, pc, layout, style, correct, placement, caption_engine, camera, transcript_override, keep, manual_captions, intro, music, &worker_cancel, &tx_prog) {
                             Ok(out) => {
                                 let _ = tx_prog.send(Progress::Done(out));
                             }
@@ -2194,6 +2200,7 @@ fn do_render(
     keep: Option<Vec<TimeRange>>,
     manual_captions: Vec<yc_core::ManualCaption>,
     intro: Option<ThumbnailIntro>,
+    music: Vec<yc_core::MusicClip>,
     cancel: &CancelToken,
     tx: &Sender<Progress>,
 ) -> Result<PathBuf> {
@@ -2206,6 +2213,15 @@ fn do_render(
             i.path.is_file(),
             "thumbnail image missing: {} — re-pick it in the editor",
             i.path.display()
+        );
+    }
+    // Music (ADR 0068): the same rule — the operator placed it, so a
+    // vanished file fails loudly with its path.
+    for m in &music {
+        anyhow::ensure!(
+            m.path.is_file(),
+            "music file missing: {} — re-pick it in the editor",
+            m.path.display()
         );
     }
     // Timeline razor (ADR 0065): a keep list that covers the whole clip is no
@@ -2305,7 +2321,8 @@ fn do_render(
 
     // Record the promoted Clip with the operator's Layout + its export path, then
     // render it.
-    let clip = build_clip(range, layout, &style.name, placement, intro.clone(), &out_path);
+    let clip =
+        build_clip(range, layout, &style.name, placement, intro.clone(), music.clone(), &out_path);
     persist_clip(&session.vod, &clip, &session.data_dir)?;
 
     let _ = tx.send(Progress::Stage("Rendering (NVENC)"));
@@ -2314,9 +2331,13 @@ fn do_render(
     // resolve, and writes the Short up at the stream-folder root.
     // Thumbnail intro (ADR 0067): the image rides as ffmpeg input 1 and the
     // finished graph is wrapped AFTER its ASS burn (`prepend_intro`) — the
-    // ASS bytes above are identical with and without it.
+    // ASS bytes above are identical with and without it. Music (ADR 0068)
+    // wraps LAST — one amix around everything, the intro included — with its
+    // files as the inputs after the image (`input_base`).
     let out_name = out_path.to_string_lossy();
     let intro_arg = intro.as_ref().map(|i| (i.path.as_path(), i.duration_s));
+    let music_paths: Vec<PathBuf> = music.iter().map(|m| m.path.clone()).collect();
+    let music_base = 1 + usize::from(intro.is_some());
     let args = match &export_camera {
         // Active-speaker camera / timeline razor: the per-shot cut concat. The
         // graph grows with the shot count, so it travels as a script file.
@@ -2327,6 +2348,7 @@ fn do_render(
             if let Some(i) = &intro {
                 graph = yc_render::prepend_intro(&graph, i.duration_s, prepared.src_fps, cut_audio);
             }
+            graph = yc_render::mix_music(&graph, &music, music_base);
             fs::write(session.data_dir.join("camera.fg"), graph)
                 .context("writing camera filtergraph")?;
             yc_render::export_args_script(
@@ -2337,6 +2359,7 @@ fn do_render(
                 &out_name,
                 cut_audio,
                 intro_arg,
+                &music_paths,
             )
         }
         _ => {
@@ -2345,6 +2368,7 @@ fn do_render(
                 filtergraph =
                     yc_render::prepend_intro(&filtergraph, i.duration_s, prepared.src_fps, false);
             }
+            filtergraph = yc_render::mix_music(&filtergraph, &music, music_base);
             yc_render::export_args(
                 &prepared.render_src,
                 prepared.seek_s,
@@ -2352,6 +2376,7 @@ fn do_render(
                 &filtergraph,
                 &out_name,
                 intro_arg,
+                &music_paths,
             )
         }
     };
@@ -2454,6 +2479,7 @@ fn build_clip(
     caption_style: &str,
     caption_placement: Option<CaptionPlacement>,
     thumbnail: Option<ThumbnailIntro>,
+    music: Vec<yc_core::MusicClip>,
     export_path: &Path,
 ) -> Clip {
     let id = clip_id_for(range);
@@ -2465,6 +2491,7 @@ fn build_clip(
         caption_style: caption_style.to_string(),
         caption_placement,
         thumbnail,
+        music,
         segment_path: None,
         export_path: Some(export_path.to_path_buf()),
     }
@@ -3616,7 +3643,15 @@ mod tests {
         // Render all three (the batch), each at its Moment's range.
         for start in [100.0_f64, 500.0, 900.0] {
             let r = TimeRange { start_s: start, end_s: start + 30.0 };
-            let clip = build_clip(r, lay(), "huge-word", None, None, &dir.join(format!("{start}.mp4")));
+            let clip = build_clip(
+                r,
+                lay(),
+                "huge-word",
+                None,
+                None,
+                Vec::new(),
+                &dir.join(format!("{start}.mp4")),
+            );
             persist_clip(&v, &clip, &dir).unwrap();
         }
         let p = Project::load(&dir.join("project.json")).unwrap();
@@ -3627,7 +3662,7 @@ mod tests {
 
         // A re-render of one Moment replaces its own record (still three, not four).
         let r2 = TimeRange { start_s: 500.0, end_s: 530.0 };
-        let clip2 = build_clip(r2, lay(), "karaoke", None, None, &dir.join("500b.mp4"));
+        let clip2 = build_clip(r2, lay(), "karaoke", None, None, Vec::new(), &dir.join("500b.mp4"));
         persist_clip(&v, &clip2, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 3, "re-render replaces its own record");
@@ -3636,7 +3671,8 @@ mod tests {
 
         // A directly-promoted range with no detected Moment records its own Moment.
         let r4 = TimeRange { start_s: 2000.0, end_s: 2030.0 };
-        let clip4 = build_clip(r4, lay(), "huge-word", None, None, &dir.join("direct.mp4"));
+        let clip4 =
+            build_clip(r4, lay(), "huge-word", None, None, Vec::new(), &dir.join("direct.mp4"));
         persist_clip(&v, &clip4, &dir).unwrap();
         let p = Project::load(&dir.join("project.json")).unwrap();
         assert_eq!(p.clips.len(), 4, "the direct promote adds a fourth Clip");

@@ -381,6 +381,11 @@ pub struct Clip {
     /// CONTENTS becoming project.json data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<ThumbnailIntro>,
+    /// The Music track's clips as burned (ADR 0068; plan #6). Empty — the
+    /// default, and always pre-music / headless — mixes nothing: graph and
+    /// args stay byte-identical to today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub music: Vec<MusicClip>,
     /// Padded video segment downloaded for this Clip (ADR 0001).
     pub segment_path: Option<PathBuf>,
     pub export_path: Option<PathBuf>,
@@ -405,6 +410,37 @@ impl ThumbnailIntro {
     pub const MIN_S: f64 = 0.5;
     pub const MAX_S: f64 = 2.0;
     pub const DEFAULT_S: f64 = 1.0;
+}
+
+/// One clip on the Music track (ADR 0068, plan #6): `at_s` anchors it on the
+/// OUTPUT timeline (it may sit over the thumbnail intro; a razor edit never
+/// rewrites it — the content shifts under it, CapCut semantics); `in_s..out_s`
+/// is the source trim inside the music file; `gain` is one constant (volume
+/// keyframes are the pre-registered future item beside it). The file is
+/// REFERENCED, not copied; missing at render time fails loudly with the path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MusicClip {
+    pub path: PathBuf,
+    pub at_s: f64,
+    pub in_s: f64,
+    pub out_s: f64,
+    #[serde(default = "MusicClip::default_gain")]
+    pub gain: f32,
+}
+
+impl MusicClip {
+    /// A music clip never trims below this — a shorter span is operator
+    /// error, not intent (the razor's own floor).
+    pub const MIN_S: f64 = 0.1;
+
+    fn default_gain() -> f32 {
+        1.0
+    }
+
+    /// The trimmed length this clip contributes to the mix.
+    pub fn duration_s(&self) -> f64 {
+        (self.out_s - self.in_s).max(0.0)
+    }
 }
 
 /// Caption placement (ADR 0036): the per-Clip override of where the caption
@@ -814,6 +850,29 @@ mod tests {
         // as None and a None never invents the key on re-save.
         assert_eq!(clip.thumbnail, None);
         assert!(!out.contains("thumbnail"), "None is skipped, not written: {out}");
+        // And for the Music track (ADR 0068): absent key loads as empty and
+        // an empty list never invents the key on re-save.
+        assert!(clip.music.is_empty());
+        assert!(!out.contains("music"), "empty is skipped, not written: {out}");
+    }
+
+    #[test]
+    fn music_clip_round_trips_and_defaults_its_gain() {
+        let m = MusicClip {
+            path: PathBuf::from("F:/music/bed.mp3"),
+            at_s: 12.5,
+            in_s: 3.0,
+            out_s: 48.0,
+            gain: 0.8,
+        };
+        let back: MusicClip = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        assert!((back.duration_s() - 45.0).abs() < 1e-9);
+        // A clip written before gain existed (or by hand) defaults to 1.0 —
+        // the constant the keyframe arc later sits beside (ADR 0068).
+        let json = r#"{ "path": "F:/music/bed.mp3", "at_s": 0.0, "in_s": 0.0, "out_s": 10.0 }"#;
+        let m: MusicClip = serde_json::from_str(json).expect("gain-less clip loads");
+        assert_eq!(m.gain, 1.0);
     }
 
     #[test]
@@ -841,6 +900,7 @@ mod tests {
             caption_style: "Huge".into(),
             caption_placement: Some(p),
             thumbnail: None,
+            music: Vec::new(),
             segment_path: None,
             export_path: None,
         };

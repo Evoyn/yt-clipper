@@ -43,6 +43,9 @@ pub const ERR: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 /// Informational accent (links to nowhere, speaker B, chat overlays) — a calm
 /// sky blue that never competes with the gold.
 pub const INFO: Color32 = Color32::from_rgb(0x6C, 0xB2, 0xFF);
+/// The Music track's accent (ADR 0068): CapCut's audio-teal family, softened
+/// to sit beside INFO/OK without competing — the operator's eye decides.
+pub const MUSIC: Color32 = Color32::from_rgb(0x4E, 0xC9, 0xB0);
 /// Deep panel background one step *below* SURFACE — the editor's preview well
 /// and timeline bed, so the video reads as the brightest thing on screen.
 pub const WELL: Color32 = Color32::from_rgb(0x0F, 0x11, 0x15);

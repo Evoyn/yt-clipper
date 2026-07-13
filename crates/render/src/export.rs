@@ -226,6 +226,57 @@ pub fn prepend_intro(graph: &str, intro_d: f64, fps: f64, razor_audio: bool) -> 
     )
 }
 
+/// Wrap a finished graph with the Music track's ONE amix (ADR 0068, plan #6)
+/// — the [`prepend_intro`] move one layer further out, applied AFTER
+/// everything (burn and intro included), so the mix hears the export's final
+/// output clock and each clip's `at_s` positions on it via `adelay`. A graph
+/// already terminating in `[aout]` (razor audio, or the intro wrap) renames
+/// it to `[premix]`; otherwise the main audio joins raw from `[0:a]` (the
+/// `-ss` seek applies to input 0, so its clock is already the clip's). Every
+/// branch passes `aformat` (fltp / 48 kHz / stereo) so the mix negotiates
+/// nothing; `duration=first` + the output `-t` bound keep the output exactly
+/// the video's length — music never extends a Short — and `normalize=0`
+/// keeps today's voice level byte-for-byte (amix would otherwise scale every
+/// input by 1/n the moment music appears).
+///
+/// `input_base` is the ffmpeg input index of the FIRST music file: the files
+/// ride as extra `-i` inputs after the optional intro image (see
+/// [`export_args`]' `music`), so 1 without an intro, 2 with. `clips` empty
+/// returns the graph untouched — byte-identical to today, test-pinned.
+pub fn mix_music(graph: &str, clips: &[yc_core::MusicClip], input_base: usize) -> String {
+    if clips.is_empty() {
+        return graph.to_string();
+    }
+    const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
+    let (g, main_a) = if graph.contains("[aout]") {
+        (graph.replace("[aout]", "[premix]"), "[premix]")
+    } else {
+        (graph.to_string(), "[0:a]")
+    };
+    let mut parts = vec![g, format!("{main_a}{AFMT}[mbase]")];
+    let mut labels = String::from("[mbase]");
+    for (k, c) in clips.iter().enumerate() {
+        // adelay positions the clip at `at_s` of the OUTPUT clock, in whole
+        // ms (`all=1` covers every channel); trim boundaries print
+        // shortest-round-trip like the camera trims — never rounded.
+        let delay_ms = (c.at_s.max(0.0) * 1000.0).round() as i64;
+        parts.push(format!(
+            "[{i}:a]atrim=start={s}:end={e},asetpts=PTS-STARTPTS,volume={v},{AFMT},\
+             adelay={delay_ms}:all=1[m{k}]",
+            i = input_base + k,
+            s = c.in_s.max(0.0),
+            e = c.out_s.max(c.in_s),
+            v = c.gain.max(0.0),
+        ));
+        labels.push_str(&format!("[m{k}]"));
+    }
+    parts.push(format!(
+        "{labels}amix=inputs={n}:duration=first:normalize=0[aout]",
+        n = clips.len() + 1,
+    ));
+    parts.join(";")
+}
+
 /// ffmpeg args for the NVENC export. `-ss` before `-i` fast-seeks `seek_s` into
 /// the source; `-t` bounds the output to `duration_s` (frame-accurate under
 /// re-encode). The burned ASS timeline is 0-based, matching the reset output
@@ -239,8 +290,11 @@ pub fn prepend_intro(graph: &str, intro_d: f64, fps: f64, razor_audio: bool) -> 
 /// `intro` is the thumbnail intro (ADR 0067): `Some((image, duration))` adds
 /// the image as input 1 (`-loop 1 -t D`), extends the output `-t` bound to
 /// `duration_s + D`, and maps the graph's `[aout]` (the wrapped graph carries
-/// the intro's silence — see [`prepend_intro`]). `None` — always in headless /
-/// batch — leaves every arg byte-identical to the pre-intro export.
+/// the intro's silence — see [`prepend_intro`]). `music` is the Music track's
+/// files (ADR 0068), riding as plain `-i` inputs AFTER the optional intro —
+/// the [`mix_music`] wrap addresses them from `input_base`, and with music
+/// the audio always maps from the graph. `None` + empty — always in
+/// headless / batch — leaves every arg byte-identical to the pre-intro export.
 pub fn export_args(
     source: &Path,
     seek_s: f64,
@@ -248,6 +302,7 @@ pub fn export_args(
     filtergraph: &str,
     out_name: &str,
     intro: Option<(&Path, f64)>,
+    music: &[std::path::PathBuf],
 ) -> Vec<String> {
     export_args_inner(
         source,
@@ -258,6 +313,7 @@ pub fn export_args(
         out_name,
         false,
         intro,
+        music,
     )
 }
 
@@ -266,6 +322,7 @@ pub fn export_args(
 /// graph ([`build_camera_filtergraph`]) grows with its shot count and would
 /// outgrow a comfortable command line. `filtered_audio` maps the graph's
 /// `[aout]` (the razor-cut audio concat) instead of the raw source audio.
+#[allow(clippy::too_many_arguments)]
 pub fn export_args_script(
     source: &Path,
     seek_s: f64,
@@ -274,6 +331,7 @@ pub fn export_args_script(
     out_name: &str,
     filtered_audio: bool,
     intro: Option<(&Path, f64)>,
+    music: &[std::path::PathBuf],
 ) -> Vec<String> {
     export_args_inner(
         source,
@@ -284,6 +342,7 @@ pub fn export_args_script(
         out_name,
         filtered_audio,
         intro,
+        music,
     )
 }
 
@@ -297,6 +356,7 @@ fn export_args_inner(
     out_name: &str,
     filtered_audio: bool,
     intro: Option<(&Path, f64)>,
+    music: &[std::path::PathBuf],
 ) -> Vec<String> {
     let mut args = vec![
         "-ss".into(),
@@ -318,6 +378,13 @@ fn export_args_inner(
             image.display().to_string(),
         ]);
         out_t += intro_d;
+        audio_from_graph = true;
+    }
+    // Music files (ADR 0068): inputs after the optional intro, in clip order
+    // — [`mix_music`]'s `input_base` addressing depends on this position.
+    // With music the audio always comes from the graph (the amix's [aout]).
+    for m in music {
+        args.extend(["-i".into(), m.display().to_string()]);
         audio_from_graph = true;
     }
     args.extend([
@@ -546,20 +613,23 @@ mod tests {
         assert!(g.contains("asetpts=PTS-STARTPTS"));
         assert!(g.contains("[s0][a0][s1][a1]concat=n=2:v=1:a=1[cat][aout]"), "graph: {g}");
         assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once, post-concat");
-        let args =
-            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", true, None);
+        let args = export_args_script(
+            Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", true, None, &[],
+        );
         assert!(args.contains(&"[aout]".to_string()), "maps the cut audio");
         assert!(!args.contains(&"0:a:0".to_string()), "raw source audio must not be mapped");
         // The contiguous camera path keeps the raw audio map.
-        let plain =
-            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None);
+        let plain = export_args_script(
+            Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None, &[],
+        );
         assert!(plain.contains(&"0:a:0".to_string()));
     }
 
     #[test]
     fn export_args_script_uses_the_script_flag() {
-        let args =
-            export_args_script(Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None);
+        let args = export_args_script(
+            Path::new("F:/seg.mp4"), 1.0, 30.0, "camera.fg", "o.mp4", false, None, &[],
+        );
         let f = args.iter().position(|a| a == "-filter_complex_script").unwrap();
         assert_eq!(args[f + 1], "camera.fg");
         assert!(!args.contains(&"-filter_complex".to_string()));
@@ -569,7 +639,8 @@ mod tests {
     #[test]
     fn export_seeks_before_input_and_uses_nvenc() {
         // M2 promote: seek the in-segment offset (2.0s), not the VOD range start.
-        let args = export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4", None);
+        let args =
+            export_args(Path::new("F:/segment.mp4"), 2.0, 7.5, "FG", "export.mp4", None, &[]);
         let ss = args.iter().position(|a| a == "-ss").unwrap();
         let i = args.iter().position(|a| a == "-i").unwrap();
         assert!(ss < i, "-ss must precede -i for fast seek");
@@ -640,7 +711,8 @@ mod tests {
     #[test]
     fn intro_args_add_the_image_input_extend_t_and_map_aout() {
         let img = Path::new("F:/covers/thumb.png");
-        let args = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)));
+        let args =
+            export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)), &[]);
         // The image is input 1: -loop 1 -t D ahead of ITS -i, after the source.
         let loops: Vec<usize> =
             args.iter().enumerate().filter(|(_, a)| *a == "-loop").map(|(i, _)| i).collect();
@@ -661,10 +733,141 @@ mod tests {
         assert!(!args.contains(&"0:a:0".to_string()));
         // And WITHOUT an intro the args stay byte-identical to today (the
         // headless/batch pin: None means untouched).
-        let plain = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None);
+        let plain = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None, &[]);
         assert!(!plain.contains(&"-loop".to_string()));
         assert!(plain.contains(&"0:a:0".to_string()));
         let t = plain.iter().position(|a| a == "-t").unwrap();
         assert_eq!(plain[t + 1], "7.500");
+    }
+
+    // ---- music track (ADR 0068) ---------------------------------------------
+
+    fn music(at_s: f64, in_s: f64, out_s: f64, gain: f32) -> yc_core::MusicClip {
+        yc_core::MusicClip {
+            path: std::path::PathBuf::from("F:/music/bed.mp3"),
+            at_s,
+            in_s,
+            out_s,
+            gain,
+        }
+    }
+
+    #[test]
+    fn empty_music_leaves_the_graph_byte_identical() {
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = build_filtergraph(&layout, "clip.ass");
+        assert_eq!(mix_music(&base, &[], 1), base, "music: [] must change nothing");
+    }
+
+    #[test]
+    fn music_wraps_the_raw_audio_graph_with_one_amix() {
+        // The plain path (no razor, no intro): the graph has no [aout], so the
+        // main audio joins raw from the seeked source. One amix, after the one
+        // burn; adelay in whole ms; trim + gain per clip; normalize=0.
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = build_filtergraph(&layout, "clip.ass");
+        let g = mix_music(&base, &[music(12.5, 3.0, 48.0, 0.8)], 1);
+        assert!(g.starts_with(&base), "the finished graph survives byte-for-byte: {g}");
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once: {g}");
+        assert!(g.contains("[0:a]aformat="), "raw main audio joins the mix: {g}");
+        assert!(
+            g.contains("[1:a]atrim=start=3:end=48,asetpts=PTS-STARTPTS,volume=0.8,"),
+            "graph: {g}"
+        );
+        assert!(g.contains("adelay=12500:all=1[m0]"), "at_s positions in ms: {g}");
+        assert!(
+            g.contains("[mbase][m0]amix=inputs=2:duration=first:normalize=0[aout]"),
+            "graph: {g}"
+        );
+        // Every branch is format-pinned (main + one clip).
+        assert_eq!(g.matches("aformat=sample_fmts=fltp").count(), 2, "{g}");
+    }
+
+    #[test]
+    fn music_mixes_after_the_intro_wrap_with_shifted_inputs() {
+        // Intro + music in ONE graph: the amix wraps AFTER the intro concat
+        // (renaming ITS terminal [aout]), and the music inputs shift to base 2
+        // (the image is input 1).
+        let layout = Layout::FullFrame { crop: Crop { x: 0.0, y: 0.0, w: 608.0, h: 1080.0 } };
+        let base = prepend_intro(&build_filtergraph(&layout, "clip.ass"), 1.0, 30.0, false);
+        let clips = [music(0.5, 0.0, 30.0, 1.0), music(45.0, 10.0, 20.0, 1.5)];
+        let g = mix_music(&base, &clips, 2);
+        assert_eq!(g.matches("subtitles=").count(), 1, "ASS burns once: {g}");
+        // The intro concat now feeds the mix, not the output.
+        assert!(
+            g.contains("[thumbv][thumba][mainv][mainaf]concat=n=2:v=1:a=1[out][premix]"),
+            "graph: {g}"
+        );
+        assert!(g.contains("[premix]aformat="), "the wrapped audio joins the mix: {g}");
+        assert!(g.contains("[2:a]atrim=start=0:end=30,"), "input base shifts past the intro: {g}");
+        assert!(g.contains("[3:a]atrim=start=10:end=20,"), "clips ride in order: {g}");
+        assert!(g.contains("adelay=500:all=1[m0]"), "{g}");
+        assert!(g.contains("adelay=45000:all=1[m1]"), "{g}");
+        assert!(g.contains("volume=1.5,"), "{g}");
+        assert!(
+            g.contains("[mbase][m0][m1]amix=inputs=3:duration=first:normalize=0[aout]"),
+            "one amix over all clips: {g}"
+        );
+        assert_eq!(g.matches("amix").count(), 1, "ONE amix: {g}");
+    }
+
+    #[test]
+    fn music_composes_with_the_razor_camera_graph() {
+        // Razor + camera + music: the per-piece a/v pairing stays, the razor's
+        // [aout] feeds the mix, and the raw source audio never bypasses it.
+        use yc_core::Shot;
+        let solo = |x: f32| Layout::FullFrame { crop: Crop { x, y: 0.0, w: 608.0, h: 1080.0 } };
+        let plan = CameraPlan {
+            shots: vec![
+                Shot { start_s: 0.0, end_s: 3.0, track: None, layout: solo(100.0), pan_to: None },
+                Shot { start_s: 6.0, end_s: 10.0, track: None, layout: solo(100.0), pan_to: None },
+            ],
+        };
+        let base = build_camera_filtergraph(&plan, "clip.ass", true);
+        let g = mix_music(&base, &[music(0.0, 0.0, 7.0, 1.0)], 1);
+        assert_eq!(g.matches("atrim=start=").count(), 3, "2 razor pieces + 1 music trim: {g}");
+        assert!(g.contains("[s0][a0][s1][a1]concat=n=2:v=1:a=1[cat][premix]"), "graph: {g}");
+        assert!(g.contains("[premix]aformat="), "the razor audio joins the mix: {g}");
+        assert!(!g.contains("[0:a]aformat="), "raw audio must not bypass the razor: {g}");
+        assert!(g.contains("amix=inputs=2:duration=first:normalize=0[aout]"), "graph: {g}");
+    }
+
+    #[test]
+    fn music_args_add_inputs_after_the_intro_and_map_aout() {
+        let beds = [
+            std::path::PathBuf::from("F:/music/a.mp3"),
+            std::path::PathBuf::from("F:/music/b.flac"),
+        ];
+        // Without an intro the music files are inputs 1.. and the audio maps
+        // from the graph (the amix's [aout]), never the raw source.
+        let args = export_args(Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", None, &beds);
+        let inputs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i.checked_sub(1).is_some_and(|p| args[p] == "-i"))
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(inputs, ["F:/seg.mp4", "F:/music/a.mp3", "F:/music/b.flac"]);
+        assert!(args.contains(&"[aout]".to_string()));
+        assert!(!args.contains(&"0:a:0".to_string()), "music always maps the graph audio");
+        // The output -t stays the clip bound — music never extends a Short.
+        let t = args.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(args[t + 1], "7.500");
+        // With an intro the image stays input 1 and music follows it — the
+        // mix_music input_base=2 addressing.
+        let img = Path::new("F:/covers/thumb.png");
+        let args = export_args(
+            Path::new("F:/seg.mp4"), 2.0, 7.5, "FG", "o.mp4", Some((img, 1.0)), &beds,
+        );
+        let inputs: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i.checked_sub(1).is_some_and(|p| args[p] == "-i"))
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(
+            inputs,
+            ["F:/seg.mp4", "F:/covers/thumb.png", "F:/music/a.mp3", "F:/music/b.flac"]
+        );
     }
 }
