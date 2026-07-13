@@ -3406,6 +3406,40 @@ impl EditorState {
         });
         ui.add_space(4.0);
 
+        // Vertical overflow guard (operator report 2026-07-13: shrinking the
+        // panel squeezed the rows into each other — Speakers over Camera):
+        // the strip runs inside a vertical ScrollArea and never allocates
+        // below its row-minimum height. A panel taller than that minimum
+        // fills exactly as before (no scrollbar, byte-same layout); a
+        // smaller one scrolls instead of overlapping.
+        let strip_avail_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("strip-vscroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(a) = self.ui_strip(ui, dur, out_dur, d_intro, strip_avail_h) {
+                    action = Some(a);
+                }
+            });
+        action
+    }
+
+    /// The multi-track strip (ADR 0066) — everything below the transport
+    /// row: ruler, filmstrip, caption/music lanes, speaker zone, camera
+    /// gutter, scrollbar. Runs inside `ui_timeline`'s vertical ScrollArea;
+    /// `avail_h` is that scroll viewport's height, so the strip can tell a
+    /// fitted layout (fill it; the wheel pans time as always) from an
+    /// overflowed one (rows keep their minimums; the wheel scrolls
+    /// vertically to the hidden lanes, shift+wheel still pans time).
+    fn ui_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        dur: f64,
+        out_dur: f64,
+        d_intro: f64,
+        avail_h: f32,
+    ) -> Option<EditorAction> {
+        let mut action = None;
         // The strip fills the height the operator dragged the panel to. The
         // chrome rows (ruler, caption blocks, cut markers) keep their fixed
         // sizes; the seat lanes + voice row split ALL the remaining height
@@ -3421,10 +3455,19 @@ impl EditorState {
             .map(|a| a.voice.is_some() || a.reaction.is_some())
             .unwrap_or(false);
         let n_lanes = n_tracks + usize::from(has_voice);
+        // Music 1 (ADR 0068) adds its 24 px band only while clips exist —
+        // an empty lane is dead space (the Speakers-zone precedent).
+        let has_music = !self.music.is_empty();
+        let music_h = if has_music { 24.0 } else { 0.0 };
+        // The strip's honest minimum: the fixed chrome + every lane at its
+        // 13 px floor. Allocating at least this is what makes the outer
+        // ScrollArea kick in instead of rows drawing over each other.
+        let min_h = 125.0 + music_h + 13.0 * n_lanes as f32;
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), ui.available_height().max(60.0)),
+            egui::vec2(ui.available_width(), ui.available_height().max(min_h)),
             Sense::hover(),
         );
+        let v_overflow = rect.height() > avail_h + 0.5;
         // The Premiere/CapCut shape (plan #13, ADR 0066): a header column on
         // the left (track names + painted eye/lock toggles), the lanes to the
         // right. Scrubbing, gestures, and the strip menu live on the LANES
@@ -3436,11 +3479,8 @@ impl EditorState {
         let resp = ui.interact(lanes, ui.id().with("strip-lanes"), Sense::click_and_drag());
         // 125 = the fixed chrome: ruler 18 + the filmstrip track 29 + the two
         // caption tracks (22 each) + the burn-line rail 6 above the speaker
-        // lanes, the camera badge gutter 20 and the scrollbar row 8 below.
-        // Music 1 (ADR 0068) adds its 24 px band only while clips exist —
-        // an empty lane is dead space (the Speakers-zone precedent).
-        let has_music = !self.music.is_empty();
-        let music_h = if has_music { 24.0 } else { 0.0 };
+        // lanes, the camera badge gutter 20 and the scrollbar row 8 below
+        // (the same sum `min_h` floors on above).
         let content_bottom = rect.bottom() - SCROLL_H;
         let lane_h = if n_lanes == 0 {
             13.0
@@ -3477,10 +3517,14 @@ impl EditorState {
                     self.viewport.zoom_about(anchor, frac as f64, zoomf as f64, out_dur);
                 } else if !mods.ctrl
                     && !mods.command
-                    && (scroll.x != 0.0 || scroll.y != 0.0)
+                    && (scroll.x != 0.0 || (!v_overflow && scroll.y != 0.0))
                 {
                     // Wheel-up = earlier (scroll left), matching ScrollArea.
-                    self.viewport.scroll_px(-(scroll.x + scroll.y), lanes.width(), out_dur);
+                    // When the strip overflows its panel the outer ScrollArea
+                    // owns the plain wheel (vertical, to the hidden lanes) —
+                    // shift+wheel / trackpad-x still pans time.
+                    let d = scroll.x + if v_overflow { 0.0 } else { scroll.y };
+                    self.viewport.scroll_px(-d, lanes.width(), out_dur);
                 }
             }
         }
