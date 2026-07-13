@@ -1,3 +1,21 @@
+# CONSUMED 2026-07-13, same day — the operator's verdict: "fade effect is already good"
+
+The fade shipped and the gate closed on the operator's word — no fade
+findings. ADR 0070's amendment records it, plus what stays deliberately
+unexamined (which burn variants their senses covered: the razor-cut
+real-end fade, the white variant, fade-in over the intro, the music
+tail inside the envelope, the no-fade byte-identity; the scrub-into-
+fade gain lag; the veiled-tail end-state read) — those surface during
+normal use, not by inference. The round's one finding was adjacent:
+the timeline panel squeeze overlapped track rows — fixed same-day
+(`d547f4e`, vertical scroll + row minimums) and closed on their word
+("okay thats good"). The queue moves to `nextprompt-title-gen.md`
+(queued behind this arc by the operator's jumps).
+
+---
+
+# (original prompt below, kept for the record)
+
 # Session prompt — edge fades: the operator's burn gate (ADR 0070; queued 2026-07-13)
 
 Edge fades shipped (ADR 0070, handoff

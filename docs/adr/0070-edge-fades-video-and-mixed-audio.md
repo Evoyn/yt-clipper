@@ -154,3 +154,21 @@ zoom) waits for the library shape.
 `cargo test -p yt-clipper -p yc-core -p yc-render` green; clippy clean on
 touched files; `--features face,align,ser` check; release build
 (foreground); the burn gate stays with the operator.
+
+## Amendment — burn gate closed (operator, same day)
+
+The operator's verdict, in their own words: **"fade effect is already
+good."** No fade findings. The one finding of the round was adjacent,
+not fade: shrinking the timeline panel squeezed the track rows into
+each other — fixed same-day (`d547f4e`: the strip keeps its row
+minimums inside a vertical ScrollArea; plain wheel scrolls vertically
+when overflowed, shift+wheel still pans time), and their word closed
+it too ("okay thats good"). Deliberately recorded as unexamined rather
+than passed (they surface during normal use, not by inference): which
+burn variants their eye/ear actually covered — the razor-cut export
+fading at its REAL end, the white variant, fade-in over the thumbnail
+intro, a music tail dying inside the envelope, the no-fade
+byte-identity diff; plus the preview scrub-into-fade one-frame gain
+lag and the veiled-tail end-state read. The queue moves to title-gen
+(`nextprompt-title-gen.md`) unless the operator's words pick the next
+arc first.
