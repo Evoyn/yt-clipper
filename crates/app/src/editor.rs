@@ -158,7 +158,7 @@ pub struct MusicCue {
 /// The Music track's per-kind honest toggles (ADR 0068): mute is real THIS
 /// arc — it empties the spec's music AND the preview cues together — and
 /// lock ignores the track's timeline gestures. No eye: nothing visual.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct MusicFlags {
     mute: bool,
     lock: bool,
@@ -250,7 +250,7 @@ impl Default for Viewport {
 /// Per-track view/edit flags (plan #13's shell, ADR 0066). A static named
 /// set today, deliberately — the track LIST becomes data (`Vec<Track>`,
 /// project.json) when track CONTENTS become data (music files, images).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct TrackFlags {
     /// Output visibility: the preview overlay AND the burn together
     /// (ADR 0036: the preview cannot drift from the burn).
@@ -271,7 +271,7 @@ impl Default for TrackFlags {
 /// clip, plus a removed flag per segment. Removed spans are dropped from the
 /// export — video, audio, and captions together (ADR 0065); preview playback
 /// skips them. Pure and unit-tested; the strip draws/edits it.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq)]
 struct RazorState {
     /// Sorted interior cut times (clip-relative, exclusive of 0 and dur).
     cuts: Vec<f64>,
@@ -601,6 +601,48 @@ pub enum EditorAction {
     AnalyzeSpeakers,
 }
 
+/// One undo step: clones of the DOCUMENT fields only (ADR 0069) — what the
+/// operator edits and the render reads. View state, transport, selections,
+/// worker artifacts, and derived caches (textures, decoded PCM, line galleys)
+/// are deliberately outside history: they heal after [`EditorState::restore`],
+/// and undo must never "undo" a scroll, a park, or a selection. A step is a
+/// few KB to ~100 KB (caption text dominates), so the 100-step ring is ≤10 MB
+/// worst case — the cap exists so a thousand-edit session can never creep.
+#[derive(Clone, PartialEq)]
+struct Snapshot {
+    transcript: Option<Transcript>,
+    transcript_dirty: bool,
+    manual_units: Vec<CaptionUnit>,
+    manual_places: Vec<Option<CaptionPlacement>>,
+    razor: RazorState,
+    cut_marker: Option<f64>,
+    plan: Option<CameraPlan>,
+    kind: LayoutKind,
+    seam: f32,
+    gameplay: Crop,
+    facecam: Crop,
+    fullcam: Crop,
+    fullgameplay: Crop,
+    style: CaptionStyle,
+    preset: Option<usize>,
+    placement: Option<CaptionPlacement>,
+    camera_mode: CameraMode,
+    motion: Option<MotionPreset>,
+    /// The intro as `(path, duration)` — the preview texture is derived and
+    /// re-decodes through the `set_intro_image` path when the path changed.
+    intro: Option<(std::path::PathBuf, f64)>,
+    music: Vec<yc_core::MusicClip>,
+    trk_music: MusicFlags,
+    trk_auto: TrackFlags,
+    trk_manual: TrackFlags,
+    speakers_eye: bool,
+}
+
+/// How many undo steps are kept (ADR 0069): far past any real regret horizon
+/// (Premiere ships 32, Photoshop ~50), small enough that history can never
+/// creep past ~10 MB.
+const UNDO_CAP: usize = 100;
+
 /// The editable state. All four Crops stay resident so switching Layout kind
 /// never discards a nudge; the speaker analysis and camera plan arrive later
 /// and slot in without disturbing anything.
@@ -764,6 +806,20 @@ pub struct EditorState {
     preset_name: String,
     /// Export-summary modal visibility.
     show_export: bool,
+    /// Undo history (ADR 0069): document snapshots, oldest first, capped at
+    /// [`UNDO_CAP`] (drop-front). Session-only — never persisted.
+    undo_stack: std::collections::VecDeque<Snapshot>,
+    /// Redo stack: filled by undo, cleared by every landed push (a new edit
+    /// after undo diverges history — the CapCut/Premiere model).
+    redo_stack: Vec<Snapshot>,
+    /// The open coalescing burst, if any: (family key, pointer-press sequence
+    /// at last tick, `Input::time` at last tick). Per-frame writers (crop
+    /// drags, knob drags, scroll-resizes, key nudges) push ONE step per burst;
+    /// a new press, a different key, or ~1 s of idle opens the next step.
+    undo_coalesce: Option<((&'static str, usize), u64, f64)>,
+    /// Counts pointer presses (any button), bumped in [`Self::show`] — the
+    /// burst boundary that keeps two quick distinct gestures two steps.
+    press_seq: u64,
 }
 
 impl EditorState {
@@ -860,6 +916,10 @@ impl EditorState {
             motion: None,
             preset_name: String::new(),
             show_export: false,
+            undo_stack: std::collections::VecDeque::new(),
+            redo_stack: Vec::new(),
+            undo_coalesce: None,
+            press_seq: 0,
         }
     }
 
@@ -927,6 +987,236 @@ impl EditorState {
             (Some(a), Some(p)) => yc_frame::speaker::audit_camera_plan(a, p, &[]),
             _ => Vec::new(),
         };
+    }
+
+    // ------------------------------------------------------------ undo (ADR 0069) --
+
+    /// Clone the document into one undo step (the [`Snapshot`] contract:
+    /// document fields only, derived/view/worker state stays out).
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            transcript: self.transcript.clone(),
+            transcript_dirty: self.transcript_dirty,
+            manual_units: self.manual_units.clone(),
+            manual_places: self.manual_places.clone(),
+            razor: self.razor.clone(),
+            cut_marker: self.cut_marker,
+            plan: self.plan.clone(),
+            kind: self.kind,
+            seam: self.seam,
+            gameplay: self.gameplay,
+            facecam: self.facecam,
+            fullcam: self.fullcam,
+            fullgameplay: self.fullgameplay,
+            style: self.style.clone(),
+            preset: self.preset,
+            placement: self.placement,
+            camera_mode: self.camera_mode,
+            motion: self.motion,
+            intro: self.intro.as_ref().map(|i| (i.path.clone(), i.duration_s)),
+            music: self.music.clone(),
+            trk_music: self.trk_music,
+            trk_auto: self.trk_auto,
+            trk_manual: self.trk_manual,
+            speakers_eye: self.speakers_eye,
+        }
+    }
+
+    /// Record the CURRENT document as one undo step — called at the START of
+    /// every operator intent (gesture begin, edit-session begin, verb), so
+    /// the step restores the world from just before it.
+    fn push_undo(&mut self) {
+        let s = self.snapshot();
+        self.push_snapshot(s);
+    }
+
+    /// The one landing point for undo steps: equal-to-top pushes are dropped
+    /// (a refused verb or a grabbed-but-never-moved gesture stacks nothing),
+    /// a landed push clears redo (new edits diverge history), the ring drops
+    /// its oldest step past [`UNDO_CAP`], and any open coalescing burst ends
+    /// (the next per-frame writer starts a fresh step).
+    fn push_snapshot(&mut self, s: Snapshot) {
+        if self.undo_stack.back() == Some(&s) {
+            return;
+        }
+        self.undo_stack.push_back(s);
+        if self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.pop_front();
+        }
+        self.redo_stack.clear();
+        self.undo_coalesce = None;
+    }
+
+    /// Whether an open coalescing burst covers this tick: the family key AND
+    /// the pointer-press sequence match, and either the pointer is still down
+    /// (a held drag may pause) or the last tick was under a second ago
+    /// (scroll and key bursts have no press boundary).
+    fn burst_continues(&self, key: (&'static str, usize), ui: &egui::Ui) -> bool {
+        let (now, down) = ui.input(|i| (i.time, i.pointer.any_down()));
+        matches!(
+            self.undo_coalesce,
+            Some((k, seq, last)) if k == key && seq == self.press_seq && (down || now - last < 1.0)
+        )
+    }
+
+    /// (Re-)arm the burst AFTER any push: `push_snapshot` breaks bursts (a
+    /// verb between ticks must own its own step), so the burst's opener
+    /// re-arms itself once its push has landed.
+    fn arm_burst(&mut self, key: (&'static str, usize), ui: &egui::Ui) {
+        let now = ui.input(|i| i.time);
+        self.undo_coalesce = Some((key, self.press_seq, now));
+    }
+
+    /// One undo step per burst, for the per-frame writers (crop/seam/
+    /// placement drags, scroll-resizes, key nudges, knob rides): pushes on
+    /// the first tick of a burst, nothing while it continues. Call ONLY when
+    /// a real change happened, so a no-op gesture never opens a step.
+    fn push_undo_coalesced(&mut self, key: (&'static str, usize), ui: &egui::Ui) {
+        if !self.burst_continues(key, ui) {
+            self.push_undo();
+        }
+        self.arm_burst(key, ui);
+    }
+
+    /// Snapshot-then-set for every timeline gesture (the five
+    /// `self.drag = Some(..)` sites): one gesture = one undo step, recorded
+    /// at the None→Some transition — a 60-frame drag lands ONE snapshot.
+    fn begin_drag(&mut self, d: TimelineDrag) {
+        self.push_undo();
+        self.drag = Some(d);
+    }
+
+    /// Land a razor verb in history exactly when it changed something: the
+    /// verb already ran (RazorState's methods mutate in place and report), so
+    /// the pushed snapshot carries the PRE-verb razor the caller cloned. A
+    /// refused verb (e.g. removing the last kept segment) pushes nothing.
+    fn push_undo_razor(&mut self, pre: RazorState) {
+        let mut s = self.snapshot();
+        s.razor = pre;
+        self.push_snapshot(s);
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Ctrl+Z: land any in-flight gesture, then restore the previous document
+    /// state. A top equal to the current document (a no-op gesture's eager
+    /// push) is skipped silently so undo never feels dead. Returns the one
+    /// playback-restart action when audio is live (the ADR 0068 contract:
+    /// voice + music re-cue against the restored document together).
+    fn undo(&mut self, ctx: &egui::Context) -> Option<EditorAction> {
+        if self.drag.is_some() {
+            self.finish_timeline_drag();
+        }
+        let cur = self.snapshot();
+        if self.undo_stack.back() == Some(&cur) {
+            self.undo_stack.pop_back();
+        }
+        let s = self.undo_stack.pop_back()?;
+        self.redo_stack.push(cur);
+        self.restore(s, ctx)
+    }
+
+    /// Ctrl+Shift+Z / Ctrl+Y: mirror of [`Self::undo`]. The step returning to
+    /// the undo ring bypasses [`Self::push_snapshot`] — redo must survive.
+    fn redo(&mut self, ctx: &egui::Context) -> Option<EditorAction> {
+        if self.drag.is_some() {
+            self.finish_timeline_drag();
+        }
+        let s = self.redo_stack.pop()?;
+        self.undo_stack.push_back(self.snapshot());
+        if self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.pop_front();
+        }
+        self.restore(s, ctx)
+    }
+
+    /// Write one snapshot back over the document and heal everything derived
+    /// (ADR 0069 decision 4): gestures cancel, caches invalidate, selections
+    /// clear (indices may point past shrunk lanes), the camera audit re-runs,
+    /// the playhead/viewport clamp to the possibly-changed output duration,
+    /// the intro re-decodes only when its path changed, and evicted music PCM
+    /// re-decodes so a deleted-then-undone clip PLAYS again.
+    fn restore(&mut self, s: Snapshot, ctx: &egui::Context) -> Option<EditorAction> {
+        self.transcript = s.transcript;
+        self.transcript_dirty = s.transcript_dirty;
+        self.manual_units = s.manual_units;
+        self.manual_places = s.manual_places;
+        self.razor = s.razor;
+        self.cut_marker = s.cut_marker;
+        self.plan = s.plan;
+        self.kind = s.kind;
+        self.seam = s.seam;
+        self.gameplay = s.gameplay;
+        self.facecam = s.facecam;
+        self.fullcam = s.fullcam;
+        self.fullgameplay = s.fullgameplay;
+        self.style = s.style;
+        self.preset = s.preset;
+        self.placement = s.placement;
+        self.camera_mode = s.camera_mode;
+        self.motion = s.motion;
+        self.music = s.music;
+        self.trk_music = s.trk_music;
+        self.trk_auto = s.trk_auto;
+        self.trk_manual = s.trk_manual;
+        self.speakers_eye = s.speakers_eye;
+        match s.intro {
+            None => self.intro = None,
+            Some((path, d)) => {
+                if self.intro.as_ref().map(|i| &i.path) != Some(&path) {
+                    // Changed path: decode through the production path (the
+                    // texture is derived — never snapshotted).
+                    self.set_intro_image(ctx, path.clone());
+                }
+                match &mut self.intro {
+                    Some(i) if i.path == path => i.duration_s = d,
+                    // Decode refused (the file vanished mid-session): drop
+                    // the block rather than keep an image that cannot exist.
+                    _ => self.intro = None,
+                }
+            }
+        }
+        // Heal evicted music PCM (`remove_music` evicts on last reference —
+        // the ADR 0068 handoff watch-out). A file that no longer decodes
+        // stays silent in the preview (`music_cues` skips it) and the render
+        // fails loudly on the missing path — the last-ditch guard, not the plan.
+        let missing: Vec<std::path::PathBuf> = self
+            .music
+            .iter()
+            .map(|m| m.path.clone())
+            .filter(|p| !self.music_pcm.contains_key(p))
+            .collect();
+        for p in missing {
+            self.ensure_music_pcm(&p);
+        }
+        self.drag = None;
+        self.lines_dirty = true;
+        self.overlay_cache = None;
+        self.panel_sort_pending = false;
+        self.sel_unit = None;
+        self.sel_manual = None;
+        self.sel_music = None;
+        self.focus_caption = None;
+        self.scroll_to_sel = false;
+        self.strip_menu_t = None;
+        self.undo_coalesce = None;
+        self.refresh_camera_audit();
+        let out = self.out_dur();
+        self.playhead_s = self.playhead_s.clamp(0.0, out);
+        self.viewport.clamp(out);
+        if self.playing.is_some() {
+            // The one restart contract (ADR 0068): every sink stops, voice +
+            // music re-cue together against the restored document.
+            Some(self.restart_playback(self.playhead_s))
+        } else {
+            None
+        }
     }
 
     /// Keep `lines` in step with the current genre and any operator edits.
@@ -1060,38 +1350,49 @@ impl EditorState {
     /// refused HERE, before it can sink a render. The clip lands at the
     /// playhead on the one track, clamped so nothing overlaps.
     fn add_music(&mut self, path: std::path::PathBuf) {
-        if !self.music_pcm.contains_key(&path) {
-            let cancel = yc_ingest::CancelToken::new();
-            let probe = match yc_ingest::probe_audio(&self.ffprobe, &path, &cancel) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("music rejected: {} did not probe as audio ({e:#})", path.display());
-                    return;
-                }
-            };
-            let samples = match yc_ingest::decode_audio_pcm_s16(&self.ffmpeg, &path) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("music rejected: ffmpeg could not decode {} ({e:#})", path.display());
-                    return;
-                }
-            };
-            let ch = probe.channels.max(1);
-            // PCM-derived duration is the trim clamp's ground truth (the
-            // container's stated duration can lie by a frame or two).
-            let duration_s = (samples.len() / ch as usize) as f64 / probe.sample_rate.max(1) as f64;
-            self.music_pcm.insert(
-                path.clone(),
-                MusicPcm {
-                    sr: probe.sample_rate,
-                    ch,
-                    samples: std::sync::Arc::new(samples),
-                    duration_s,
-                },
-            );
-        }
-        let file_dur = self.music_pcm[&path].duration_s;
+        let Some(file_dur) = self.ensure_music_pcm(&path) else {
+            return;
+        };
         self.place_music_clip(path, file_dur);
+    }
+
+    /// Probe + decode one music file into the per-path PCM cache — the decode
+    /// half of [`Self::add_music`], shared with [`Self::restore`]'s heal (a
+    /// deleted-then-undone clip must PLAY again, ADR 0069). Returns the
+    /// PCM-derived duration; a file neither tool can read is refused (`None`).
+    fn ensure_music_pcm(&mut self, path: &std::path::Path) -> Option<f64> {
+        if let Some(pcm) = self.music_pcm.get(path) {
+            return Some(pcm.duration_s);
+        }
+        let cancel = yc_ingest::CancelToken::new();
+        let probe = match yc_ingest::probe_audio(&self.ffprobe, path, &cancel) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("music rejected: {} did not probe as audio ({e:#})", path.display());
+                return None;
+            }
+        };
+        let samples = match yc_ingest::decode_audio_pcm_s16(&self.ffmpeg, path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("music rejected: ffmpeg could not decode {} ({e:#})", path.display());
+                return None;
+            }
+        };
+        let ch = probe.channels.max(1);
+        // PCM-derived duration is the trim clamp's ground truth (the
+        // container's stated duration can lie by a frame or two).
+        let duration_s = (samples.len() / ch as usize) as f64 / probe.sample_rate.max(1) as f64;
+        self.music_pcm.insert(
+            path.to_path_buf(),
+            MusicPcm {
+                sr: probe.sample_rate,
+                ch,
+                samples: std::sync::Arc::new(samples),
+                duration_s,
+            },
+        );
+        Some(duration_s)
     }
 
     /// The pure placement half of [`Self::add_music`]: the clip lands at the
@@ -1118,6 +1419,7 @@ impl EditorState {
             tracing::warn!("music: no room at the playhead (the track has no overlap)");
             return;
         }
+        self.push_undo();
         let clip = yc_core::MusicClip {
             path,
             at_s: at,
@@ -1136,6 +1438,7 @@ impl EditorState {
         if i >= self.music.len() {
             return;
         }
+        self.push_undo();
         let path = self.music.remove(i).path;
         if !self.music.iter().any(|m| m.path == path) {
             self.music_pcm.remove(&path);
@@ -1149,11 +1452,13 @@ impl EditorState {
     /// inside the clip (with min-length headroom).
     fn trim_music_left_to_playhead(&mut self, i: usize) {
         let ph = self.playhead_s;
-        let Some(m) = self.music.get_mut(i) else { return };
+        let Some(m) = self.music.get(i) else { return };
         if ph <= m.at_s || ph >= m.at_s + m.duration_s() - yc_core::MusicClip::MIN_S {
             tracing::info!("music trim refused: playhead outside the selected clip");
             return;
         }
+        self.push_undo();
+        let m = &mut self.music[i];
         let cut = ph - m.at_s;
         m.in_s += cut;
         m.at_s = ph;
@@ -1162,11 +1467,13 @@ impl EditorState {
     /// ⏵✂ on a SELECTED music clip: trim its right edge to the playhead.
     fn trim_music_right_to_playhead(&mut self, i: usize) {
         let ph = self.playhead_s;
-        let Some(m) = self.music.get_mut(i) else { return };
+        let Some(m) = self.music.get(i) else { return };
         if ph <= m.at_s + yc_core::MusicClip::MIN_S || ph >= m.at_s + m.duration_s() {
             tracing::info!("music trim refused: playhead outside the selected clip");
             return;
         }
+        self.push_undo();
+        let m = &mut self.music[i];
         m.out_s = m.in_s + (ph - m.at_s);
     }
 
@@ -1179,6 +1486,8 @@ impl EditorState {
         if cut < yc_core::MusicClip::MIN_S || m.duration_s() - cut < yc_core::MusicClip::MIN_S {
             return;
         }
+        self.push_undo();
+        let m = &self.music[i];
         let right = yc_core::MusicClip {
             path: m.path.clone(),
             at_s: at_out,
@@ -1279,6 +1588,7 @@ impl EditorState {
     fn reset_to_auto(&mut self) {
         let (kind, seam, gameplay, facecam, fullcam, fullgameplay) =
             seed_fields(&self.auto_layout, self.src_w, self.src_h);
+        self.push_undo();
         self.kind = kind;
         self.seam = seam;
         self.gameplay = gameplay;
@@ -1375,6 +1685,12 @@ impl EditorState {
         prefs: &mut crate::settings::AppSettings,
     ) -> EditorAction {
         let mut action = EditorAction::None;
+
+        // Undo burst boundary (ADR 0069): a new pointer press separates two
+        // quick gestures into two steps even inside the coalescing window.
+        if ui.input(|i| i.pointer.any_pressed()) {
+            self.press_seq = self.press_seq.wrapping_add(1);
+        }
 
         // Pull the newest decoded frame(s) up front, so the frame count the
         // playhead reads below and the texture the crop is drawn over are the
@@ -1605,21 +1921,34 @@ impl EditorState {
 
     /// Keyboard shortcuts. Returns an action when one needs the app (play).
     fn handle_keys(&mut self, ui: &egui::Ui) -> Option<EditorAction> {
-        let (space, esc, left, right, up, down, plus, minus, zero, shift, del) = ui.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
-                i.key_pressed(egui::Key::Minus),
-                i.key_pressed(egui::Key::Num0),
-                i.modifiers.shift,
-                i.key_pressed(egui::Key::Delete),
-            )
-        });
+        let (space, esc, left, right, up, down, plus, minus, zero, shift, del, cmd, z, y) =
+            ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::Escape),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+                    i.key_pressed(egui::Key::Minus),
+                    i.key_pressed(egui::Key::Num0),
+                    i.modifiers.shift,
+                    i.key_pressed(egui::Key::Delete),
+                    i.modifiers.command,
+                    i.key_pressed(egui::Key::Z),
+                    i.key_pressed(egui::Key::Y),
+                )
+            });
+        // Undo/redo (ADR 0069): Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y. This handler
+        // only runs when NO widget has focus, so egui's own in-field text
+        // undo stays intact inside text boxes.
+        if cmd && (y || (z && shift)) {
+            return self.redo(ui.ctx());
+        }
+        if cmd && z {
+            return self.undo(ui.ctx());
+        }
         if esc {
             if self.show_export {
                 self.show_export = false;
@@ -1646,7 +1975,10 @@ impl EditorState {
                 Some(i) if !self.trk_music.lock => self.remove_music(i),
                 Some(_) => {}
                 None if self.playhead_s >= self.intro_d() => {
-                    self.razor.remove_segment_at(self.src_t());
+                    let pre = self.razor.clone();
+                    if self.razor.remove_segment_at(self.src_t()) {
+                        self.push_undo_razor(pre);
+                    }
                 }
                 None => {}
             }
@@ -1660,10 +1992,13 @@ impl EditorState {
                 (down as i8 - up as i8) as f32 * step,
             );
             if dx != 0.0 || dy != 0.0 {
+                // A held key autorepeats — one nudge burst = one undo step.
+                self.push_undo_coalesced(("key-nudge", 0), ui);
                 let crop = self.active_crop_mut();
                 *crop = yc_frame::pan_crop(*crop, sw, sh, dx, dy);
             }
             if plus || minus {
+                self.push_undo_coalesced(("key-zoom", 0), ui);
                 let f = if plus { 0.92 } else { 1.0 / 0.92 };
                 let crop = self.active_crop_mut();
                 let (ax, ay) = (crop.x + crop.w * 0.5, crop.y + crop.h * 0.5);
@@ -1882,8 +2217,21 @@ impl EditorState {
                 draw_panel(&painter, top, tex, gameplay, self.src_w, self.src_h, "");
                 draw_panel(&painter, bot, tex, facecam, self.src_w, self.src_h, "");
                 if manual {
-                    pan_zoom(ui, top, "gp", &mut self.gameplay, self.src_w, self.src_h);
-                    pan_zoom(ui, bot, "fc", &mut self.facecam, self.src_w, self.src_h);
+                    // Copy-mutate-compare-writeback (ADR 0069): the undo push
+                    // sees the pre-drag state, a no-op drag writes nothing,
+                    // and one burst = one step.
+                    let mut g = self.gameplay;
+                    pan_zoom(ui, top, "gp", &mut g, self.src_w, self.src_h);
+                    if g != self.gameplay {
+                        self.push_undo_coalesced(("crop-gp", 0), ui);
+                        self.gameplay = g;
+                    }
+                    let mut f = self.facecam;
+                    pan_zoom(ui, bot, "fc", &mut f, self.src_w, self.src_h);
+                    if f != self.facecam {
+                        self.push_undo_coalesced(("crop-fc", 0), ui);
+                        self.facecam = f;
+                    }
                     self.drag_seam(ui, canvas, canvas.height());
                 }
                 let seam_y = canvas.top() + seam * canvas.height();
@@ -1895,11 +2243,19 @@ impl EditorState {
             Layout::FullFrame { crop } => {
                 draw_panel(&painter, canvas, tex, crop, self.src_w, self.src_h, "");
                 if manual {
-                    let target = match self.kind {
-                        LayoutKind::FullCam => &mut self.fullcam,
-                        _ => &mut self.fullgameplay,
+                    let (cur, key) = match self.kind {
+                        LayoutKind::FullCam => (self.fullcam, ("crop-cam", 0)),
+                        _ => (self.fullgameplay, ("crop-gpl", 0)),
                     };
-                    pan_zoom(ui, canvas, "full", target, self.src_w, self.src_h);
+                    let mut c = cur;
+                    pan_zoom(ui, canvas, "full", &mut c, self.src_w, self.src_h);
+                    if c != cur {
+                        self.push_undo_coalesced(key, ui);
+                        match self.kind {
+                            LayoutKind::FullCam => self.fullcam = c,
+                            _ => self.fullgameplay = c,
+                        }
+                    }
                 } else if self.camera_mode == CameraMode::ActiveSpeaker {
                     // Reframe THE SHOT by dragging the output directly (the
                     // Original view's crop box is the precision tool; this is
@@ -1907,6 +2263,7 @@ impl EditorState {
                     let mut c = *crop;
                     pan_zoom(ui, canvas, "as-shot-out", &mut c, self.src_w, self.src_h);
                     if c != *crop {
+                        self.push_undo_coalesced(("as-shot", 0), ui);
                         if let Some(plan) = &mut self.plan {
                             if let Some(shot) = plan.shot_at_mut(shown_t) {
                                 shot.layout = Layout::FullFrame { crop: c };
@@ -2031,20 +2388,43 @@ impl EditorState {
         }
 
         // Manual mode: the crop boxes are direct-manipulation targets.
+        // Copy-mutate-compare-writeback (ADR 0069): the undo push sees the
+        // pre-drag state; a burst (drag or scroll-zoom run) = one step. The
+        // keys are shared with the Preview-side pan_zoom of the same crop.
         if self.camera_mode == CameraMode::Manual {
             match self.kind {
                 LayoutKind::Stacked => {
-                    let (g, f) = (self.gameplay, self.facecam);
-                    crop_box_interaction(ui, frame_rect, to_screen(&g), "src-gp", &mut self.gameplay, sw, sh);
-                    crop_box_interaction(ui, frame_rect, to_screen(&f), "src-fc", &mut self.facecam, sw, sh);
+                    let (g0, f0) = (self.gameplay, self.facecam);
+                    let mut g = g0;
+                    crop_box_interaction(ui, frame_rect, to_screen(&g0), "src-gp", &mut g, sw, sh);
+                    if g != g0 {
+                        self.push_undo_coalesced(("crop-gp", 0), ui);
+                        self.gameplay = g;
+                    }
+                    let mut f = f0;
+                    crop_box_interaction(ui, frame_rect, to_screen(&f0), "src-fc", &mut f, sw, sh);
+                    if f != f0 {
+                        self.push_undo_coalesced(("crop-fc", 0), ui);
+                        self.facecam = f;
+                    }
                 }
                 LayoutKind::FullCam => {
-                    let c = self.fullcam;
-                    crop_box_interaction(ui, frame_rect, to_screen(&c), "src-cam", &mut self.fullcam, sw, sh);
+                    let c0 = self.fullcam;
+                    let mut c = c0;
+                    crop_box_interaction(ui, frame_rect, to_screen(&c0), "src-cam", &mut c, sw, sh);
+                    if c != c0 {
+                        self.push_undo_coalesced(("crop-cam", 0), ui);
+                        self.fullcam = c;
+                    }
                 }
                 LayoutKind::FullGameplay => {
-                    let c = self.fullgameplay;
-                    crop_box_interaction(ui, frame_rect, to_screen(&c), "src-gpl", &mut self.fullgameplay, sw, sh);
+                    let c0 = self.fullgameplay;
+                    let mut c = c0;
+                    crop_box_interaction(ui, frame_rect, to_screen(&c0), "src-gpl", &mut c, sw, sh);
+                    if c != c0 {
+                        self.push_undo_coalesced(("crop-gpl", 0), ui);
+                        self.fullgameplay = c;
+                    }
                 }
             }
         } else if self.camera_mode == CameraMode::ActiveSpeaker {
@@ -2065,8 +2445,11 @@ impl EditorState {
                 });
             if let Some(c0) = shot_crop {
                 let mut c = c0;
-                if crop_box_interaction(ui, frame_rect, to_screen(&c0), "src-shot", &mut c, sw, sh)
-                {
+                crop_box_interaction(ui, frame_rect, to_screen(&c0), "src-shot", &mut c, sw, sh);
+                // Value compare, not the returned flag: a zero-delta corner
+                // tick reports "changed" without changing anything.
+                if c != c0 {
+                    self.push_undo_coalesced(("as-shot", 0), ui);
                     if let Some(plan) = &mut self.plan {
                         if let Some(shot) = plan.shot_at_mut(t) {
                             shot.layout = Layout::FullFrame { crop: c };
@@ -2082,6 +2465,7 @@ impl EditorState {
             // from the AI crop.
             let resp = ui.interact(frame_rect, ui.id().with("src-takeover"), Sense::click_and_drag());
             if resp.drag_started() || resp.double_clicked() {
+                self.push_undo();
                 if let Layout::FullFrame { crop } = layout {
                     self.kind = LayoutKind::FullGameplay;
                     self.fullgameplay = crop;
@@ -2161,6 +2545,7 @@ impl EditorState {
         else {
             return;
         };
+        self.push_undo();
         match self.camera_mode {
             CameraMode::ActiveSpeaker => {
                 let (src_w, src_h) = (self.src_w, self.src_h);
@@ -2199,6 +2584,7 @@ impl EditorState {
         if self.transcript.is_none() {
             return; // the pre-pass still owns captions
         }
+        self.push_undo();
         // Captions are source artifacts: inserted from inside the intro the
         // caption lands at the clip's first burnable instant (source 0).
         let at = self.src_t();
@@ -2214,6 +2600,7 @@ impl EditorState {
     /// Remove one of the operator's captions, keeping the placement pairing.
     fn remove_manual_caption(&mut self, i: usize) {
         if i < self.manual_units.len() {
+            self.push_undo();
             self.manual_units.remove(i);
             self.manual_places.remove(i);
             self.sel_manual = None;
@@ -2243,6 +2630,10 @@ impl EditorState {
         if self.src_fps > 0.0 {
             t = (t * self.src_fps).round() / self.src_fps;
         }
+        if self.plan.is_none() {
+            return;
+        }
+        self.push_undo();
         if let Some(plan) = &mut self.plan {
             if split_plan_at(plan, t) {
                 self.refresh_camera_audit();
@@ -2253,6 +2644,10 @@ impl EditorState {
     /// Remove the cut between shots `boundary-1` and `boundary` (the marker's
     /// right-click menu).
     fn delete_cut(&mut self, boundary: usize) {
+        if self.plan.is_none() {
+            return;
+        }
+        self.push_undo();
         if let Some(plan) = &mut self.plan {
             if delete_plan_cut(plan, boundary) {
                 self.refresh_camera_audit();
@@ -2676,6 +3071,32 @@ impl EditorState {
                     ),
                 );
             });
+            // Undo / redo (ADR 0069): depth in the tooltip, honest disabled
+            // states. ↺/↻ are subject to the tofu rule (ADR 0065 Am. 5) —
+            // the operator's eye rules at the feel gate.
+            ui.add_space(6.0);
+            let n_undo = self.undo_stack.len();
+            let n_redo = self.redo_stack.len();
+            if ui
+                .add_enabled(self.can_undo(), egui::Button::new("↺"))
+                .on_hover_text(format!("Undo (Ctrl+Z) · {n_undo} step{s}", s = if n_undo == 1 { "" } else { "s" }))
+                .on_disabled_hover_text("Nothing to undo")
+                .clicked()
+            {
+                if let Some(a) = self.undo(ui.ctx()) {
+                    action = Some(a);
+                }
+            }
+            if ui
+                .add_enabled(self.can_redo(), egui::Button::new("↻"))
+                .on_hover_text(format!("Redo (Ctrl+Y / Ctrl+Shift+Z) · {n_redo} step{s}", s = if n_redo == 1 { "" } else { "s" }))
+                .on_disabled_hover_text("Nothing to redo — redo clears when you make a new edit")
+                .clicked()
+            {
+                if let Some(a) = self.redo(ui.ctx()) {
+                    action = Some(a);
+                }
+            }
             // Timeline edit verbs (feature plan #2/#3).
             ui.add_space(6.0);
             if ui
@@ -2750,7 +3171,10 @@ impl EditorState {
                     match msel {
                         Some(i) => self.trim_music_left_to_playhead(i),
                         None => {
-                            self.razor.cut_left(self.src_t(), self.cut_marker, dur_full);
+                            let pre = self.razor.clone();
+                            if self.razor.cut_left(self.src_t(), self.cut_marker, dur_full) {
+                                self.push_undo_razor(pre);
+                            }
                         }
                     }
                 }
@@ -2766,11 +3190,15 @@ impl EditorState {
                     .on_disabled_hover_text(intro_refusal)
                     .clicked()
                 {
-                    self.cut_marker = Some(if self.src_fps > 0.0 {
+                    let at = if self.src_fps > 0.0 {
                         (self.src_t() * self.src_fps).round() / self.src_fps
                     } else {
                         self.src_t()
-                    });
+                    };
+                    if self.cut_marker != Some(at) {
+                        self.push_undo();
+                        self.cut_marker = Some(at);
+                    }
                 }
                 if ui
                     .add_enabled(
@@ -2799,7 +3227,10 @@ impl EditorState {
                     match msel {
                         Some(i) => self.trim_music_right_to_playhead(i),
                         None => {
-                            self.razor.cut_right(self.src_t(), self.cut_marker, dur_full);
+                            let pre = self.razor.clone();
+                            if self.razor.cut_right(self.src_t(), self.cut_marker, dur_full) {
+                                self.push_undo_razor(pre);
+                            }
                         }
                     }
                 }
@@ -2824,6 +3255,9 @@ impl EditorState {
                     .add_filter("image", &["jpg", "jpeg", "png", "webp"])
                     .pick_file()
                 {
+                    // Push here, not inside set_intro_image — restore() heals
+                    // through that path and must never push (ADR 0069).
+                    self.push_undo();
                     self.set_intro_image(ui.ctx(), path);
                 }
             }
@@ -3169,8 +3603,7 @@ impl EditorState {
                 }
                 if eresp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
                     if let Some(pos) = eresp.interact_pointer_pos() {
-                        self.drag =
-                            Some(TimelineDrag::IntroTrim { orig_d: d, grab_t: x_to_s(pos.x) });
+                        self.begin_drag(TimelineDrag::IntroTrim { orig_d: d, grab_t: x_to_s(pos.x) });
                     }
                 }
                 // Paint: dark card, the decoded image aspect-fit at the left,
@@ -3226,10 +3659,12 @@ impl EditorState {
                 .add_filter("image", &["jpg", "jpeg", "png", "webp"])
                 .pick_file()
             {
+                self.push_undo();
                 self.set_intro_image(ui.ctx(), path);
             }
         }
         if intro_remove {
+            self.push_undo();
             // The playhead was OUTPUT time under the old D: what it pointed
             // at keeps playing — a park inside the removed intro lands on
             // the clip head, everything after shifts left by D.
@@ -3780,8 +4215,12 @@ impl EditorState {
             }
         }
         if let Some((i, g)) = music_gain {
-            if let Some(m) = self.music.get_mut(i) {
-                m.gain = g.clamp(0.0, 2.0);
+            // The gain slider coalesces like a DragValue (ADR 0069): one
+            // slider ride = one undo step.
+            let g = g.clamp(0.0, 2.0);
+            if self.music.get(i).is_some_and(|m| m.gain != g) {
+                self.push_undo_coalesced(("mus-gain", i), ui);
+                self.music[i].gain = g;
             }
         }
         if let Some((i, at_out)) = music_split {
@@ -3794,18 +4233,18 @@ impl EditorState {
             self.sel_music = Some(i);
         }
         if let Some(d) = begin_drag {
-            self.drag = Some(d);
+            self.begin_drag(d);
         }
         if let Some((lane, i)) = delete_unit {
             match lane {
                 CapLane::Auto => {
-                    if let Some(t) = &mut self.transcript {
-                        if i < t.units.len() {
-                            t.units.remove(i);
-                            self.sel_unit = None;
-                            self.transcript_dirty = true;
-                            self.lines_dirty = true;
-                        }
+                    if self.transcript.as_ref().is_some_and(|t| i < t.units.len()) {
+                        self.push_undo();
+                        let t = self.transcript.as_mut().expect("length checked above");
+                        t.units.remove(i);
+                        self.sel_unit = None;
+                        self.transcript_dirty = true;
+                        self.lines_dirty = true;
                     }
                 }
                 CapLane::Manual => self.remove_manual_caption(i),
@@ -3981,7 +4420,7 @@ impl EditorState {
                 }
             }
             if let Some(d) = begin_cut {
-                self.drag = Some(d);
+                self.begin_drag(d);
             }
             if let Some(i) = delete_cut {
                 self.delete_cut(i);
@@ -4064,10 +4503,13 @@ impl EditorState {
                 );
             }
             if let Some(d) = begin_razor {
-                self.drag = Some(d);
+                self.begin_drag(d);
             }
             if let Some(k) = delete_razor {
-                self.razor.delete_cut(k);
+                let pre = self.razor.clone();
+                if self.razor.delete_cut(k) {
+                    self.push_undo_razor(pre);
+                }
             }
         }
 
@@ -4089,7 +4531,7 @@ impl EditorState {
             }
             if resp.drag_started_by(egui::PointerButton::Primary) && self.drag.is_none() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    self.drag = Some(TimelineDrag::Marker { orig_t: m, grab_t: x_to_s(pos.x) });
+                    self.begin_drag(TimelineDrag::Marker { orig_t: m, grab_t: x_to_s(pos.x) });
                 }
             }
             let mut clear_marker = false;
@@ -4105,6 +4547,7 @@ impl EditorState {
                 }
             });
             if clear_marker {
+                self.push_undo();
                 self.cut_marker = None;
             } else {
                 let col = theme::INFO.gamma_multiply(if hot { 1.0 } else { 0.8 });
@@ -4146,18 +4589,27 @@ impl EditorState {
                 } else {
                     at
                 };
-                self.razor.add_cut(t, dur);
+                let pre = self.razor.clone();
+                if self.razor.add_cut(t, dur) {
+                    self.push_undo_razor(pre);
+                }
                 ui.close();
             }
             if ui.button("⏷ Place cut marker here").clicked() {
-                self.cut_marker = Some(at);
+                if self.cut_marker != Some(at) {
+                    self.push_undo();
+                    self.cut_marker = Some(at);
+                }
                 ui.close();
             }
             let seg = self.razor.seg_index_at(at);
             let removed = *self.razor.removed.get(seg).unwrap_or(&false);
             let label = if removed { "Restore this segment" } else { "Remove this segment from the export" };
             if ui.button(label).clicked() {
-                if !self.razor.toggle_segment(seg) && !removed {
+                let pre = self.razor.clone();
+                if self.razor.toggle_segment(seg) {
+                    self.push_undo_razor(pre);
+                } else if !removed {
                     // The refusal case: this is the last kept segment.
                     tracing::info!("razor: refused to remove the last kept segment");
                 }
@@ -4386,6 +4838,7 @@ impl EditorState {
                 (label, 0),
                 eye_tip,
             ) {
+                self.push_undo();
                 f.eye = !f.eye;
             }
             if track_toggle(
@@ -4398,6 +4851,7 @@ impl EditorState {
                 "Lock this track — timeline drags, trims, and deletes are ignored \
                  (the caption panel still edits)",
             ) {
+                self.push_undo();
                 f.lock = !f.lock;
             }
             if is_auto {
@@ -4431,6 +4885,7 @@ impl EditorState {
                 "Mute the Music track. OFF keeps ALL music OUT of the export (and the \
                  preview) — the clips stay on the timeline, dimmed, editable.",
             ) {
+                self.push_undo();
                 f.mute = !f.mute;
             }
             if track_toggle(
@@ -4443,6 +4898,7 @@ impl EditorState {
                 "Lock the Music track — timeline drags, trims, splits, and deletes are \
                  ignored (clicks still select)",
             ) {
+                self.push_undo();
                 f.lock = !f.lock;
             }
             self.trk_music = f;
@@ -4477,6 +4933,7 @@ impl EditorState {
                 "Show the speaker analysis lanes (who's on camera / voice evidence). \
                  Analysis only — never part of the export.",
             ) {
+                self.push_undo();
                 self.speakers_eye = !self.speakers_eye;
             }
             ph.text(
@@ -4602,6 +5059,10 @@ impl EditorState {
 
         let mut dirty = false;
         let mut manual_dirty = false;
+        // One undo step per editing session (ADR 0069): set on focus-gain /
+        // drag-start of any row widget, landed AFTER the row loop (the
+        // borrow of `transcript` must end first) and BEFORE the verbs apply.
+        let mut want_push = false;
         // A time widget being edited RIGHT NOW: sorting must wait for it (a
         // mid-edit resort swaps the row under the operator's cursor — the
         // "editing replaced the other caption" bug, 2026-07-12).
@@ -4660,6 +5121,9 @@ impl EditorState {
                                 u.end_s = start + d.max(0.05);
                                 dirty = true;
                             }
+                            if resp.gained_focus() || resp.drag_started() {
+                                want_push = true;
+                            }
                             if resp.clicked() || resp.gained_focus() {
                                 self.sel_unit = Some(i);
                             }
@@ -4682,6 +5146,9 @@ impl EditorState {
                             if eresp.changed() {
                                 u.end_s = end.max(u.start_s + CAP_MIN_S);
                                 dirty = true;
+                            }
+                            if eresp.gained_focus() || eresp.drag_started() {
+                                want_push = true;
                             }
                             if eresp.clicked() || eresp.gained_focus() {
                                 self.sel_unit = Some(i);
@@ -4731,6 +5198,7 @@ impl EditorState {
                             dirty = true;
                         }
                         if text_resp.gained_focus() {
+                            want_push = true;
                             self.sel_unit = Some(i);
                             seek = Some(u.start_s);
                         }
@@ -4795,6 +5263,13 @@ impl EditorState {
                                     u.end_s = end.max(u.start_s + CAP_MIN_S);
                                     manual_dirty = true;
                                 }
+                                if resp.gained_focus()
+                                    || resp.drag_started()
+                                    || eresp.gained_focus()
+                                    || eresp.drag_started()
+                                {
+                                    want_push = true;
+                                }
                                 if resp.clicked()
                                     || resp.gained_focus()
                                     || eresp.clicked()
@@ -4839,6 +5314,7 @@ impl EditorState {
                                 manual_dirty = true;
                             }
                             if text_resp.gained_focus() {
+                                want_push = true;
                                 self.sel_manual = Some(i);
                                 seek = Some(u.start_s);
                             }
@@ -4865,38 +5341,60 @@ impl EditorState {
             }
         });
 
-        // Apply the row actions after the loop (indices stay valid).
+        // One undo step per editing session or row verb (ADR 0069): the push
+        // lands after the row loop's `transcript` borrow ends and BEFORE the
+        // verbs below mutate. Focus-gain frames carry no edits, so deferring
+        // the session push to here costs nothing.
+        if want_push
+            || censor.is_some()
+            || split.is_some()
+            || merge.is_some()
+            || delete.is_some()
+            || delete_manual.is_some()
+        {
+            self.push_undo();
+        }
+        // Apply the row actions after the loop (indices stay valid); each
+        // re-borrows the transcript so the push above could take &mut self.
         if let Some(i) = censor {
-            let u = &mut transcript.units[i];
-            u.text = censor_text(&u.text);
-            dirty = true;
+            if let Some(t) = self.transcript.as_mut() {
+                let u = &mut t.units[i];
+                u.text = censor_text(&u.text);
+                dirty = true;
+            }
         }
         if let Some(i) = split {
-            let u = transcript.units[i].clone();
-            if let Some((a, b)) = split_unit(&u) {
-                transcript.units[i] = a;
-                transcript.units.insert(i + 1, b);
-                dirty = true;
+            if let Some(t) = self.transcript.as_mut() {
+                let u = t.units[i].clone();
+                if let Some((a, b)) = split_unit(&u) {
+                    t.units[i] = a;
+                    t.units.insert(i + 1, b);
+                    dirty = true;
+                }
             }
         }
         if let Some(i) = merge {
-            if i + 1 < transcript.units.len() {
-                let next = transcript.units.remove(i + 1);
-                let u = &mut transcript.units[i];
-                u.text = format!("{} {}", u.text.trim_end(), next.text.trim_start());
-                u.end_s = next.end_s.max(u.end_s);
-                dirty = true;
+            if let Some(t) = self.transcript.as_mut() {
+                if i + 1 < t.units.len() {
+                    let next = t.units.remove(i + 1);
+                    let u = &mut t.units[i];
+                    u.text = format!("{} {}", u.text.trim_end(), next.text.trim_start());
+                    u.end_s = next.end_s.max(u.end_s);
+                    dirty = true;
+                }
             }
         }
         if let Some(i) = delete {
-            transcript.units.remove(i);
-            self.sel_unit = None;
-            dirty = true;
+            if let Some(t) = self.transcript.as_mut() {
+                t.units.remove(i);
+                self.sel_unit = None;
+                dirty = true;
+            }
         }
         if let Some(i) = delete_manual {
             if i < self.manual_units.len() {
-                // Inline while `transcript` is still borrowed (disjoint
-                // fields): same pairing contract as remove_manual_caption.
+                // Inline (the deferred push above already covers it): same
+                // pairing contract as remove_manual_caption.
                 self.manual_units.remove(i);
                 self.manual_places.remove(i);
                 self.sel_manual = None;
@@ -4915,9 +5413,11 @@ impl EditorState {
         // once no time widget is active: sorting mid-edit swaps the row under
         // the operator's cursor and the edit lands on the WRONG caption.
         if self.panel_sort_pending && !time_edit_active {
-            transcript.units.sort_by(|a, b| {
-                a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            if let Some(t) = self.transcript.as_mut() {
+                t.units.sort_by(|a, b| {
+                    a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             self.sort_manual_units(); // placements ride along
             self.panel_sort_pending = false;
         }
@@ -4974,7 +5474,10 @@ impl EditorState {
                         .on_hover_text("First use runs the speaker analysis (CPU, ~10-30 s)");
                 }
                 if resp.clicked() {
-                    self.camera_mode = mode;
+                    if self.camera_mode != mode {
+                        self.push_undo();
+                        self.camera_mode = mode;
+                    }
                     if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group)
                         && self.speakers.is_none()
                         && self.speaker_job == SpeakerJob::NotRun
@@ -5065,22 +5568,31 @@ impl EditorState {
                         (self.kind == LayoutKind::FullGameplay, "Wide"),
                     ],
                 ) {
-                    self.kind = kinds[i];
+                    if self.kind != kinds[i] {
+                        self.push_undo();
+                        self.kind = kinds[i];
+                    }
                 }
                 if self.kind == LayoutKind::Stacked {
                     ui.horizontal(|ui| {
                         ui.label("Seam");
+                        // The slider edits a local so the undo push (one per
+                        // slider ride — shared burst key with the canvas
+                        // seam drag) sees the pre-change state.
+                        let mut seam = self.seam;
                         let resp = ui.add(
-                            egui::Slider::new(&mut self.seam, 0.2..=0.85).show_value(false),
+                            egui::Slider::new(&mut seam, 0.2..=0.85).show_value(false),
                         );
-                        if resp.changed() {
-                            let (ga, fa) = yc_frame::stacked_panel_aspects(self.seam);
+                        if resp.changed() && seam != self.seam {
+                            self.push_undo_coalesced(("seam", 0), ui);
+                            let (ga, fa) = yc_frame::stacked_panel_aspects(seam);
                             self.gameplay = yc_frame::reaspect_keep_center(
                                 self.gameplay, ga, self.src_w, self.src_h,
                             );
                             self.facecam = yc_frame::reaspect_keep_center(
                                 self.facecam, fa, self.src_w, self.src_h,
                             );
+                            self.seam = seam;
                         }
                     });
                 }
@@ -5099,7 +5611,11 @@ impl EditorState {
                         }
                     }
                     if let Some(i) = pick {
-                        self.motion = if i == 0 { None } else { Some(MOTION_PRESETS[i - 1].0) };
+                        let new = if i == 0 { None } else { Some(MOTION_PRESETS[i - 1].0) };
+                        if self.motion != new {
+                            self.push_undo();
+                            self.motion = new;
+                        }
                     }
                     if self.motion.is_some() {
                         ui.weak("Renders as a glide/cut of your framing — the crop tools edit the start frame.");
@@ -5132,10 +5648,13 @@ impl EditorState {
                     .collect();
                 if let Some(j) = theme::chip_row(ui, &opts) {
                     let i = row_idx * 3 + j;
-                    self.style = presets[i].clone();
-                    self.preset = Some(i);
-                    self.lines_dirty = true;
-                    self.overlay_cache = None;
+                    if self.style != presets[i] || self.preset != Some(i) {
+                        self.push_undo();
+                        self.style = presets[i].clone();
+                        self.preset = Some(i);
+                        self.lines_dirty = true;
+                        self.overlay_cache = None;
+                    }
                 }
             }
             // The operator's own saved looks (feature plan #12), persisted in
@@ -5166,10 +5685,13 @@ impl EditorState {
                     });
                 }
                 if let Some(i) = apply {
-                    self.style = prefs.caption_presets[i].style.clone();
-                    self.preset = None;
-                    self.lines_dirty = true;
-                    self.overlay_cache = None;
+                    if self.style != prefs.caption_presets[i].style {
+                        self.push_undo();
+                        self.style = prefs.caption_presets[i].style.clone();
+                        self.preset = None;
+                        self.lines_dirty = true;
+                        self.overlay_cache = None;
+                    }
                 }
                 if let Some(i) = delete {
                     prefs.caption_presets.remove(i);
@@ -5184,6 +5706,7 @@ impl EditorState {
         theme::card().show(ui, |ui| {
             {
                 let before = self.style.clone();
+                let preset_before = self.preset;
                 // Label on its own line so the genre chips join the SAME
                 // column grid as the preset/framing rows (inline labels made
                 // this one row narrower — the asymmetry the operator flagged).
@@ -5228,6 +5751,16 @@ impl EditorState {
                     }
                 });
                 if self.style != before {
+                    // The knobs mutate in place during `add`, so the pushed
+                    // snapshot carries the pre-knob style (`before`); a
+                    // slider ride coalesces into one step (ADR 0069).
+                    if !self.burst_continues(("style", 0), ui) {
+                        let mut s = self.snapshot();
+                        s.style = before.clone();
+                        s.preset = preset_before;
+                        self.push_snapshot(s);
+                    }
+                    self.arm_burst(("style", 0), ui);
                     self.preset = None; // customized: no chip is "the" preset
                     self.lines_dirty = self.style.genre != before.genre || self.lines_dirty;
                     self.overlay_cache = None;
@@ -5243,6 +5776,7 @@ impl EditorState {
                                 p.scale * 100.0
                             ));
                             if ui.small_button("Reset").clicked() {
+                                self.push_undo();
                                 self.placement = None;
                             }
                         });
@@ -5766,8 +6300,12 @@ impl EditorState {
             }
         }
         if let Some((i, pl)) = set_place {
-            if let Some(slot) = self.manual_places.get_mut(i) {
-                *slot = pl;
+            // One site lands drag, scroll-resize AND the reset verb: the
+            // burst key folds a drag/scroll run into one step, while the
+            // reset's own click bumps the press sequence — its own step.
+            if self.manual_places.get(i).is_some_and(|cur| *cur != pl) {
+                self.push_undo_coalesced(("man-place", i), ui);
+                self.manual_places[i] = pl;
             }
         }
 
@@ -5821,20 +6359,28 @@ impl EditorState {
                     Stroke::new(1.0, theme::GOLD.gamma_multiply(0.4)),
                 );
             }
-            self.placement = Some(CaptionPlacement {
+            let new = CaptionPlacement {
                 x_frac: x.clamp(0.05, 0.95),
                 y_frac: y.clamp(0.03, 0.97),
                 scale: place.scale,
-            });
+            };
+            if self.placement != Some(new) {
+                self.push_undo_coalesced(("cap-place", 0), ui);
+                self.placement = Some(new);
+            }
         } else if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
                 let factor = (scroll * 0.0015).exp();
-                self.placement = Some(CaptionPlacement {
+                let new = CaptionPlacement {
                     scale: (place.scale * factor)
                         .clamp(CaptionPlacement::SCALE_MIN, CaptionPlacement::SCALE_MAX),
                     ..place
-                });
+                };
+                if self.placement != Some(new) {
+                    self.push_undo_coalesced(("cap-scale", 0), ui);
+                    self.placement = Some(new);
+                }
                 ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
             }
         }
@@ -5855,6 +6401,9 @@ impl EditorState {
         if resp.dragged() {
             let new_seam = (self.seam + resp.drag_delta().y / canvas_h).clamp(0.2, 0.85);
             if (new_seam - self.seam).abs() > f32::EPSILON {
+                // One seam drag = one undo step (shared key with the panel's
+                // seam slider — same document control, ADR 0069).
+                self.push_undo_coalesced(("seam", 0), ui);
                 let (ga, fa) = yc_frame::stacked_panel_aspects(new_seam);
                 self.gameplay =
                     yc_frame::reaspect_keep_center(self.gameplay, ga, self.src_w, self.src_h);
@@ -6747,6 +7296,262 @@ mod tests {
         assert!(ed.music_pcm.is_empty(), "the PCM cache leaves with the last clip");
         assert_eq!(ed.razor.cuts.len(), cuts_before);
         assert_eq!(ed.sel_music, None);
+    }
+
+    // ---- undo/redo (ADR 0069) ----------------------------------------------
+
+    #[test]
+    fn undo_one_gesture_lands_one_step_and_round_trips_byte_equal() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        ed.transcript = Some(yc_core::Transcript {
+            language: yc_core::Language::En,
+            units: vec![cap(1.0, 2.0), cap(3.0, 4.0)],
+        });
+        let before = ed.snapshot();
+        // A multi-frame caption drag lands ONE snapshot, at the None→Some
+        // transition — never one per frame.
+        ed.begin_drag(TimelineDrag::CapMove {
+            targets: vec![(CapLane::Auto, 0)],
+            orig: vec![(1.0, 2.0)],
+            grab_t: 1.0,
+        });
+        ed.apply_timeline_drag(1.5, 0.0);
+        ed.apply_timeline_drag(2.0, 0.0);
+        ed.apply_timeline_drag(2.5, 0.0);
+        ed.finish_timeline_drag();
+        assert_eq!(ed.undo_stack.len(), 1, "one gesture = one step");
+        let after = ed.snapshot();
+        assert!(before != after, "the drag moved the caption");
+        assert!(ed.undo(&ctx).is_none(), "not playing: no restart action");
+        assert!(ed.snapshot() == before, "undo restores the document byte-equal");
+        assert!(ed.lines_dirty, "restore invalidates the derived line model");
+        assert!(ed.redo(&ctx).is_none());
+        assert!(ed.snapshot() == after, "redo mirrors the undone step");
+        assert!(ed.undo(&ctx).is_none());
+        assert!(ed.snapshot() == before, "undo→redo→undo keeps round-tripping");
+    }
+
+    #[test]
+    fn undo_intro_trim_round_trips_and_clamps_the_playhead() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        with_intro(&mut ed, 1.0);
+        let before = ed.snapshot();
+        ed.begin_drag(TimelineDrag::IntroTrim { orig_d: 1.0, grab_t: 0.0 });
+        ed.apply_timeline_drag(0.8, 0.0);
+        ed.finish_timeline_drag();
+        assert_eq!(ed.undo_stack.len(), 1);
+        assert!((ed.intro_d() - 1.8).abs() < 1e-9, "the edge drag stretched the intro");
+        // Park at the new tail: the undo shrinks out_dur — the playhead clamps.
+        ed.playhead_s = ed.out_dur();
+        ed.undo(&ctx);
+        assert!(ed.snapshot() == before, "same-path intro restores without a re-decode");
+        assert!((ed.intro_d() - 1.0).abs() < 1e-9);
+        assert!((ed.playhead_s - ed.out_dur()).abs() < 1e-9, "playhead clamped to the restored duration");
+
+        // Undoing an intro REMOVE re-decodes through set_intro_image; with no
+        // real ffmpeg in unit tests the decode refuses and the block honestly
+        // drops (production heals through the pinned ffmpeg — the feel gate
+        // covers it). No panic, no phantom block with an impossible image.
+        ed.push_undo();
+        ed.intro = None;
+        ed.undo(&ctx);
+        assert!(ed.intro.is_none(), "decode refused: no phantom intro");
+    }
+
+    #[test]
+    fn undo_music_verbs_one_step_each_and_delete_restores_the_spec() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        let i = with_music(&mut ed, 20.0, 1.0, 9.0);
+        let before = ed.snapshot();
+        ed.playhead_s = 22.0;
+        ed.trim_music_left_to_playhead(i);
+        assert_eq!(ed.undo_stack.len(), 1, "a trim verb = one step");
+        assert_eq!(ed.music[i].at_s, 22.0);
+        ed.undo(&ctx);
+        assert!(ed.snapshot() == before);
+        // A REFUSED verb (playhead outside the clip) pushes nothing.
+        ed.playhead_s = 50.0;
+        ed.trim_music_left_to_playhead(i);
+        assert!(ed.undo_stack.is_empty(), "refused verbs never stack");
+        // Delete, then undo: the clip returns AND the spec carries it again
+        // (the ADR 0068 handoff watch-out). The PCM heal re-probes through
+        // ensure_music_pcm; without a real ffprobe here the decode refuses,
+        // and music_cues SKIPS the PCM-less clip instead of panicking (the
+        // last-ditch guard — production re-decodes the real file).
+        ed.remove_music(i);
+        assert!(ed.music.is_empty() && ed.music_pcm.is_empty());
+        assert_eq!(ed.undo_stack.len(), 1, "a delete verb = one step");
+        assert!(ed.redo_stack.is_empty(), "a new edit after undo cleared redo");
+        ed.undo(&ctx);
+        assert_eq!(ed.music.len(), 1, "the deleted clip returns");
+        assert_eq!(ed.render_spec().music.len(), 1, "the spec carries it again");
+        assert!(ed.music_cues(0.0).is_empty(), "PCM-less clip skipped, no panic");
+    }
+
+    #[test]
+    fn undo_razor_verbs_land_exactly_when_they_change_something() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        let before = ed.snapshot();
+        // The site pattern: the pre-verb clone rides the snapshot only when
+        // the verb reports a change.
+        let pre = ed.razor.clone();
+        assert!(ed.razor.cut_left(4.0, None, 60.0));
+        ed.push_undo_razor(pre);
+        assert_eq!(ed.undo_stack.len(), 1);
+        // A refused verb (nothing left of the playhead to cut) never pushes.
+        assert!(!ed.razor.cut_left(0.05, None, 60.0));
+        assert_eq!(ed.undo_stack.len(), 1);
+        ed.undo(&ctx);
+        assert!(ed.snapshot() == before, "cuts and removed flags restored together");
+    }
+
+    #[test]
+    fn undo_cap_holds_100_drops_oldest_and_a_new_edit_clears_redo() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        for k in 0..150 {
+            ed.push_undo();
+            ed.cut_marker = Some(k as f64);
+        }
+        assert_eq!(ed.undo_stack.len(), 100, "the ring caps at 100");
+        assert_eq!(
+            ed.undo_stack.front().and_then(|s| s.cut_marker),
+            Some(49.0),
+            "the oldest steps dropped from the front"
+        );
+        ed.undo(&ctx);
+        assert_eq!(ed.cut_marker, Some(148.0));
+        assert_eq!(ed.redo_stack.len(), 1);
+        ed.push_undo();
+        ed.cut_marker = Some(999.0);
+        assert!(ed.redo_stack.is_empty(), "a new edit after undo clears redo");
+        // Walk to the ring's floor: exactly the held steps, then quiet.
+        let mut walked = 0;
+        while ed.can_undo() {
+            ed.undo(&ctx);
+            walked += 1;
+            assert!(walked <= 200, "undo must terminate");
+        }
+        assert_eq!(walked, 100);
+        assert_eq!(ed.cut_marker, Some(49.0), "the floor is the oldest kept step");
+        assert!(ed.undo(&ctx).is_none(), "an empty ring is quiet, never a panic");
+    }
+
+    #[test]
+    fn restore_resets_gesture_selection_and_derived_state() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        ed.push_undo();
+        ed.manual_units = vec![cap(1.0, 2.0)];
+        ed.manual_places = vec![None];
+        // Junk that must heal on restore — none of it is document state.
+        ed.drag = Some(TimelineDrag::Marker { orig_t: 1.0, grab_t: 0.0 });
+        ed.sel_unit = Some(5);
+        ed.sel_manual = Some(3);
+        ed.sel_music = Some(9);
+        ed.lines_dirty = false;
+        ed.panel_sort_pending = true;
+        ed.scroll_to_sel = true;
+        ed.focus_caption = Some((CapLane::Auto, 1));
+        ed.strip_menu_t = Some(3.0);
+        ed.undo(&ctx);
+        assert!(ed.manual_units.is_empty(), "the edit undone");
+        assert!(ed.drag.is_none(), "no gesture survives a restore");
+        assert!(ed.lines_dirty, "line model invalidated");
+        assert!(ed.sel_unit.is_none() && ed.sel_manual.is_none() && ed.sel_music.is_none());
+        assert!(!ed.panel_sort_pending && !ed.scroll_to_sel);
+        assert!(ed.focus_caption.is_none() && ed.strip_menu_t.is_none());
+    }
+
+    #[test]
+    fn no_op_gestures_collapse_and_undo_skips_the_trailing_duplicate() {
+        let ctx = egui::Context::default();
+        let mut ed = editor_state();
+        with_music(&mut ed, 20.0, 0.0, 8.0);
+        let before = ed.snapshot();
+        // Three grab-without-move gestures: the eager pushes collapse to ONE
+        // (equal-to-top is dropped)…
+        for _ in 0..3 {
+            ed.begin_drag(TimelineDrag::MusMove { idx: 0, orig_at: 20.0, grab_t: 0.0 });
+            ed.finish_timeline_drag();
+        }
+        assert_eq!(ed.undo_stack.len(), 1);
+        // …and undo skips the survivor (top == current document), so Ctrl+Z
+        // never feels dead: with no real edit there is nothing to undo.
+        assert!(ed.undo(&ctx).is_none());
+        assert!(ed.snapshot() == before, "document untouched");
+        assert!(!ed.can_undo(), "the no-op step evaporated");
+        // A real drag then lands one true step and undoes to the same base.
+        ed.begin_drag(TimelineDrag::MusMove { idx: 0, orig_at: 20.0, grab_t: 0.0 });
+        ed.apply_timeline_drag(2.0, 0.0);
+        ed.finish_timeline_drag();
+        assert_eq!(ed.undo_stack.len(), 1);
+        assert!(ed.music[0].at_s != 20.0);
+        ed.undo(&ctx);
+        assert!(ed.snapshot() == before);
+    }
+
+    #[test]
+    fn coalesced_pushes_land_one_step_per_burst() {
+        let mut ed = editor_state();
+        let ctx = egui::Context::default();
+        // The full call-site shape: push, then the per-frame writeback — the
+        // composition a 60-tick drag runs (never one step per tick).
+        let mut tick = |ed: &mut EditorState, t: f64, key: (&'static str, usize)| {
+            let _ = ctx.run(egui::RawInput { time: Some(t), ..Default::default() }, |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ed.push_undo_coalesced(key, ui);
+                    ed.seam += 0.01; // the change the site just detected
+                });
+            });
+        };
+        tick(&mut ed, 0.0, ("seam", 0));
+        tick(&mut ed, 0.4, ("seam", 0));
+        tick(&mut ed, 0.9, ("seam", 0));
+        assert_eq!(ed.undo_stack.len(), 1, "a whole burst = one step");
+        tick(&mut ed, 1.0, ("crop-gp", 0));
+        assert_eq!(ed.undo_stack.len(), 2, "a different key is a different step");
+        tick(&mut ed, 1.1, ("crop-gp", 0));
+        assert_eq!(ed.undo_stack.len(), 2, "the index/key still coalesces");
+        ed.press_seq = ed.press_seq.wrapping_add(1);
+        tick(&mut ed, 1.2, ("crop-gp", 0));
+        assert_eq!(ed.undo_stack.len(), 3, "a new pointer press opens a new step");
+        tick(&mut ed, 9.0, ("crop-gp", 0));
+        assert_eq!(ed.undo_stack.len(), 4, "an idle gap past the window opens a new step");
+        // A verb between ticks breaks the burst: the verb owns its own step
+        // (push + its mutation) and the resumed burst opens another.
+        ed.push_undo();
+        ed.cut_marker = Some(1.0);
+        assert_eq!(ed.undo_stack.len(), 5);
+        tick(&mut ed, 9.1, ("crop-gp", 0));
+        assert_eq!(ed.undo_stack.len(), 6, "a verb between ticks splits the burst");
+        // Undo walks back exactly one burst: the seam returns to the value
+        // the last burst's push captured.
+        let ctx2 = egui::Context::default();
+        let seam_before_last = ed.undo_stack.back().map(|s| s.seam);
+        ed.undo(&ctx2);
+        assert_eq!(Some(ed.seam), seam_before_last);
+    }
+
+    #[test]
+    fn worker_arrivals_never_push_history() {
+        let mut ed = editor_state();
+        ed.set_captions(yc_core::Transcript {
+            language: yc_core::Language::En,
+            units: vec![cap(1.0, 2.0)],
+        });
+        assert!(ed.undo_stack.is_empty(), "a caption arrival is not an operator op");
+        ed.set_speakers(
+            yc_frame::speaker::SpeakerAnalysis::default(),
+            CameraPlan::default(),
+            None,
+        );
+        assert!(ed.undo_stack.is_empty(), "a speaker arrival is not an operator op");
+        assert!(ed.redo_stack.is_empty());
     }
 
     #[test]
