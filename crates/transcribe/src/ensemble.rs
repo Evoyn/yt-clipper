@@ -1022,6 +1022,69 @@ fn edit1(a: &str, b: &str) -> bool {
     long[i + 1..] == short[i..]
 }
 
+#[cfg(feature = "align")]
+thread_local! {
+    /// The forced aligner, held RESIDENT across the jobs the worker runs
+    /// back-to-back. Loading it costs ~1.9 s — a 1.2 GB ONNX session (measured
+    /// 2026-07-14) — and it used to be rebuilt for every single clip, so a
+    /// 10-clip batch render burned ~19 s on nothing but reloads. Keyed by model
+    /// dir, so a different model still reloads.
+    ///
+    /// Thread-local because the pipeline worker is the one thread that
+    /// transcribes (and `ort`'s session is not `Send`), and dropped by
+    /// [`release_resident_models`] the moment that worker runs out of queued
+    /// work. That last part is the point: residency exists to serve a BATCH,
+    /// not to squat on 1.2 GB of RAM while the app sits idle — the whisper
+    /// precedent, which holds its model across the refine loop and `drop`s it
+    /// at the end (ADR 0007).
+    static RESIDENT_ALIGNER: std::cell::RefCell<Option<(PathBuf, crate::align::Aligner)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` against the resident aligner for `dir`, loading it if this thread
+/// does not already hold that model. `None` (with a warn) if the load failed —
+/// the caller's fallback timing skeleton then stands.
+#[cfg(feature = "align")]
+fn with_resident_aligner<T>(
+    dir: &Path,
+    f: impl FnOnce(&mut crate::align::Aligner) -> Result<T>,
+) -> Option<Result<T>> {
+    RESIDENT_ALIGNER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(held, _)| held != dir) {
+            let t = Instant::now();
+            match crate::align::Aligner::load(dir) {
+                Ok(a) => {
+                    tracing::info!(
+                        "forced-align: loaded the aligner in {:.1}s (resident until the worker idles)",
+                        t.elapsed().as_secs_f64()
+                    );
+                    *slot = Some((dir.to_path_buf(), a));
+                }
+                Err(e) => {
+                    tracing::warn!("forced-align: model load failed ({e:#}) - DTW timing stands");
+                    return None;
+                }
+            }
+        }
+        let (_, aligner) = slot.as_mut().expect("loaded above or already held");
+        Some(f(aligner))
+    })
+}
+
+/// Free every model this thread holds resident (today: the forced aligner's
+/// 1.2 GB ONNX session). The pipeline worker calls this when its job queue runs
+/// dry — see [`RESIDENT_ALIGNER`]. A no-op on builds without `align`, and safe
+/// to call when nothing is held.
+pub fn release_resident_models() {
+    #[cfg(feature = "align")]
+    RESIDENT_ALIGNER.with(|cell| {
+        if cell.borrow_mut().take().is_some() {
+            tracing::info!("forced-align: worker idle - released the resident aligner");
+        }
+    });
+}
+
 /// The forced-alignment timing pass (ADR 0054): align the words to the
 /// caption audio with the wav2vec2-CTC model and build the units straight from
 /// the per-word spans. Returns `None` (with a warn) on ANY failure — model
@@ -1053,19 +1116,13 @@ fn forced_align_fusion(
         return None;
     }
     let started = Instant::now();
-    let mut aligner = match crate::align::Aligner::load(dir) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!("forced-align: model load failed ({e:#}) - DTW timing stands");
-            return None;
-        }
-    };
-    let spans = match aligner.align_words(merged, samples, sample_rate) {
-        Ok(s) => s,
-        Err(e) => {
+    let spans = match with_resident_aligner(dir, |a| a.align_words(merged, samples, sample_rate)) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
             tracing::warn!("forced-align: alignment failed ({e:#}) - DTW timing stands");
             return None;
         }
+        None => return None, // load failed; already warned
     };
     let aligned_n = spans.iter().filter(|s| s.is_some()).count();
     // Under half aligned means the model/vocab and the words disagree

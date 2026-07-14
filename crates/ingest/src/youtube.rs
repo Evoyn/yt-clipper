@@ -536,8 +536,9 @@ pub fn pad_range(range: TimeRange, duration_s: Option<f64>) -> TimeRange {
 }
 
 /// Resolve the VOD's format list (`yt-dlp -j`) for the tier decision — one
-/// webpage/API round-trip, per attempt (the DASH URLs it yields are signed
-/// and expire in hours, so they are never persisted).
+/// webpage/API round-trip. Resolved ONCE per [`fetch_segment`] and reused
+/// across its retries (see there); the signed DASH URLs it yields stay valid
+/// for hours, far longer than a retry loop, and are never persisted.
 fn resolve_formats(sc: &Sidecars, url: &str, cancel: &CancelToken) -> Result<serde_json::Value> {
     let args: Vec<String> =
         vec!["-j".into(), "--no-playlist".into(), "--no-warnings".into(), url.into()];
@@ -560,6 +561,16 @@ fn resolve_formats(sc: &Sidecars, url: &str, cancel: &CancelToken) -> Result<ser
 /// Retries transient failures up to [`SEGMENT_FETCH_ATTEMPTS`] times (one bad
 /// webpage response would otherwise abort a whole batch render); a user
 /// cancel is terminal and never retried.
+///
+/// The `-j` format resolve is done ONCE and reused across those retries. The
+/// healing the retry exists for lives in re-invoking the yt-dlp **download**
+/// (which resolves its own formats and, on a fresh run, almost always gets
+/// itag 301 back — see [`SEGMENT_FETCH_ATTEMPTS`]), not in re-running our `-j`,
+/// whose only job is choosing between muxed-HLS and the native DASH tier. A
+/// failing segment used to spawn up to EIGHT yt-dlp processes (4 extractions +
+/// 4 downloads) for that one decision. A resolve that *itself* failed, or that
+/// yielded no DASH pair, is not cached — that one gets a fresh look next
+/// attempt, so a flaky `-j` response still heals.
 pub fn fetch_segment(
     sc: &Sidecars,
     url: &str,
@@ -569,6 +580,7 @@ pub fn fetch_segment(
 ) -> Result<PathBuf> {
     let args = segment_args(url, padded, &sc.ffmpeg, workdir);
     let mut last_err: Option<anyhow::Error> = None;
+    let mut resolved: Option<serde_json::Value> = None;
     for attempt in 1..=SEGMENT_FETCH_ATTEMPTS {
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
@@ -577,13 +589,19 @@ pub fn fetch_segment(
         // .part; a failed tier-2 leaves dashpart_* stream sections).
         clear_prefix(workdir, "segment.");
         clear_prefix(workdir, "dashpart_");
-        match resolve_formats(sc, url, cancel) {
-            Err(e) if cancel.is_cancelled() => return Err(e),
-            // Resolution hiccup: the yt-dlp tier below re-resolves itself.
-            Err(e) => tracing::warn!("format resolve failed (yt-dlp tier retries it): {e:#}"),
-            Ok(formats) => {
-                if !crate::dash::has_muxed_hls(&formats) {
-                    if let Some((v, a)) = crate::dash::pick_dash_pair(&formats) {
+        if resolved.is_none() {
+            match resolve_formats(sc, url, cancel) {
+                Err(e) if cancel.is_cancelled() => return Err(e),
+                // Resolution hiccup: the yt-dlp tier below re-resolves itself,
+                // and the next attempt re-resolves this too (not cached).
+                Err(e) => tracing::warn!("format resolve failed (yt-dlp tier retries it): {e:#}"),
+                Ok(formats) => resolved = Some(formats),
+            }
+        }
+        if let Some(formats) = &resolved {
+            if !crate::dash::has_muxed_hls(formats) {
+                match crate::dash::pick_dash_pair(formats) {
+                    Some((v, a)) => {
                         match crate::dash::fetch_dash_section(
                             &v,
                             &a,
@@ -601,6 +619,10 @@ pub fn fetch_segment(
                             ),
                         }
                     }
+                    // No DASH pair in this format list and no muxed HLS either:
+                    // the list itself is suspect, so don't cache it — a fresh
+                    // `-j` next attempt is exactly the flakiness the retry heals.
+                    None => resolved = None,
                 }
             }
         }

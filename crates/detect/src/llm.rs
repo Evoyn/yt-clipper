@@ -109,27 +109,71 @@ pub fn build_prompt(transcript: &str, ctx: &Context, language: Language) -> Stri
     )
 }
 
-/// First integer in `[0, SCORE_MAX]` appearing in `s` (the lenient fallback when
-/// JSON parsing fails - e.g. the grammar was unavailable and the model rambled).
-fn first_score(s: &str) -> Option<f32> {
+/// Integers in `[0, SCORE_MAX]` that could plausibly BE the score, in order.
+///
+/// The two shapes that are numbers but never scores — and that a bare
+/// first-integer scan happily mistook for one:
+/// - an **ordinal**: "after the 3rd try" is not a 3;
+/// - a **denominator**: the 10 in "7 out of 10" / "7/10" is the scale, not the
+///   verdict.
+///
+/// `s` is expected lowercased (the ordinal suffixes are matched literally).
+fn score_candidates(s: &str) -> Vec<f32> {
     let b = s.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i].is_ascii_digit() {
-            let start = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            if let Ok(n) = s[start..i].parse::<u32>() {
-                if n <= SCORE_MAX {
-                    return Some(n as f32);
-                }
-            }
-        } else {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
         }
+        let Ok(n) = s[start..i].parse::<u32>() else { continue };
+        if n > SCORE_MAX {
+            continue;
+        }
+        let after = &s[i..];
+        if ["st", "nd", "rd", "th"].iter().any(|suf| after.starts_with(suf)) {
+            continue; // ordinal
+        }
+        let before = s[..start].trim_end();
+        if before.ends_with('/') || before.ends_with("out of") {
+            continue; // denominator
+        }
+        out.push(n as f32);
     }
-    None
+    out
+}
+
+/// The score a rambling model meant, when JSON parsing failed (the grammar was
+/// unavailable and it wrote prose instead of an object).
+///
+/// A `score`-labelled number wins outright — that is the model answering the
+/// question it was asked. Otherwise the FIRST plausible candidate stands, as
+/// before; what changed on 2026-07-14 is that ordinals and denominators are no
+/// longer candidates. The old scan read "after the 3rd try, I'd say 8" as a
+/// **3** — a wrong score entering the ranking, silently. Bounded (fallback-only,
+/// clamped) but simply the wrong digit.
+fn fallback_score(s: &str) -> Option<f32> {
+    // Work on one lowercased copy: the label match is case-insensitive and
+    // digits are unaffected, so every index below stays consistent.
+    let lower = s.to_lowercase();
+    if let Some(at) = lower.rfind("score") {
+        let tail = &lower[at + "score".len()..];
+        // Only a number that FOLLOWS the label with nothing but punctuation or
+        // space between — otherwise "score" was just a word in a sentence.
+        let lead: String =
+            tail.chars().take_while(|c| !c.is_ascii_digit() && *c != '\n').collect();
+        if lead.chars().all(|c| c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\'' | '*')) {
+            if let Some(&n) = score_candidates(tail).first() {
+                return Some(n);
+            }
+        }
+    }
+    score_candidates(&lower).first().copied()
 }
 
 /// One parsed judgment: the clip-worthiness score, the one-line reason, and the
@@ -172,7 +216,7 @@ pub fn parse_output(raw: &str) -> Judgment {
         }
     }
     Judgment {
-        score: clamp(first_score(raw).unwrap_or(0.0)),
+        score: clamp(fallback_score(raw).unwrap_or(0.0)),
         reason: raw.trim().to_string(),
         title: String::new(),
     }
@@ -335,9 +379,24 @@ mod tests {
     }
 
     #[test]
+    fn fallback_ignores_ordinals_and_denominators() {
+        // The review's case: the old scan took the FIRST integer anywhere and
+        // read the ordinal as the verdict.
+        assert_eq!(parse_output("after the 3rd try, I'd say 8").score, 8.0);
+        // Denominators are the scale, not the score — either spelling.
+        assert_eq!(parse_output("I'd give it 7 out of 10").score, 7.0);
+        assert_eq!(parse_output("solid 6/10 honestly").score, 6.0);
+        // A labelled score wins outright, wherever it sits.
+        assert_eq!(parse_output("lots of reasons here... Score: 9").score, 9.0);
+        assert_eq!(parse_output("in the 1st half he pops off. score = 4").score, 4.0);
+        // ...but "score" as prose does not hijack a following number.
+        assert_eq!(parse_output("I would score this moment a 5").score, 5.0);
+    }
+
+    #[test]
     fn parse_output_falls_back_to_first_integer() {
         let j = parse_output("I'd say 7 out of 10, lots of hype");
-        assert_eq!(j.score, 7.0); // first 0-10 integer (the 7, not the 10)
+        assert_eq!(j.score, 7.0); // the 7 — the 10 is the denominator
         assert!(j.reason.contains("hype"));
         assert!(j.title.is_empty()); // no title recoverable from free prose
     }

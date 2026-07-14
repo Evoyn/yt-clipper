@@ -458,7 +458,26 @@ pub fn spawn(
         // The clip prepared for the nudge editor, held between Prepare and its
         // Render(s) (ADR 0012). Invalidated by a new Import or Prepare.
         let mut prepared: Option<PreparedClip> = None;
-        while let Ok(job) = rx_job.recv() {
+        loop {
+            // Take the next job WITHOUT blocking first: a job already waiting
+            // means the batch is still flowing, and the models held resident
+            // across it stay hot (the forced aligner is a 1.2 GB ONNX session
+            // that costs ~1.9 s to build — clips 2..N of a batch render must
+            // not each pay it again). Only when the queue runs dry do we free
+            // them and park: residency serves a batch, it does not squat on
+            // RAM while the operator is thinking. Mirrors whisper's own
+            // hold-across-the-loop-then-drop (ADR 0007).
+            let job = match rx_job.try_recv() {
+                Ok(job) => job,
+                Err(mpsc::TryRecvError::Empty) => {
+                    yc_transcribe::ensemble::release_resident_models();
+                    match rx_job.recv() {
+                        Ok(job) => job,
+                        Err(_) => break, // the UI hung up (app exit)
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
             // A cancel of the previous job must not bleed into this one - except
             // into the pre-pass jobs queued behind it (Prepare chains Transcribe,
             // then AnalyzeSpeakers): those belong to the editor session the cancel

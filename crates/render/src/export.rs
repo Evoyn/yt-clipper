@@ -192,6 +192,31 @@ fn shot_chain(shot: &Shot, in_label: &str, out_label: &str) -> String {
     layout_chain(&shot.layout, in_label, out_label)
 }
 
+/// Rename a finished graph's TERMINAL pad, for the wrap functions that
+/// re-terminate one ([`prepend_intro`], [`mix_music`], [`fade_edges`] — each
+/// takes a complete graph and splices a stage onto its end).
+///
+/// A blind `str::replace` is correct here only because `[out]`/`[aout]` are
+/// unique by construction — every builder emits them exactly once, as the last
+/// thing it writes. That is an INVARIANT, not a fact about the string: the day a
+/// filter chain names an intermediate pad `[out]`, a blind replace would rewire
+/// the wrong edge and the export would be quietly, plausibly wrong (a wrap
+/// silently reading from the middle of the graph). So check it. Debug builds and
+/// the test suite panic on the spot; a release build screams into the log rather
+/// than failing a render on a graph that is probably still fine — a wrong Short
+/// beats no Short only if you are TOLD.
+fn rename_pad(graph: &str, from: &str, to: &str) -> String {
+    let n = graph.matches(from).count();
+    if n != 1 {
+        tracing::error!(
+            "filtergraph label {from} appears {n}x (expected exactly 1) - a wrap is about to \
+             rewire the wrong edge; the export may be silently wrong"
+        );
+        debug_assert_eq!(n, 1, "filtergraph label {from} is not unique: {graph}");
+    }
+    graph.replace(from, to)
+}
+
 /// Wrap a finished graph with the thumbnail-intro prepend (ADR 0067, plan #5):
 /// the image (ffmpeg input **1**, see [`export_args`]' `intro`) scales/pads to
 /// the canvas (aspect-fit, black bars), matches `fps`+SAR+format, gains
@@ -209,9 +234,12 @@ fn shot_chain(shot: &Shot, in_label: &str, out_label: &str) -> String {
 /// otherwise the main audio joins from the raw `[0:a]`.
 pub fn prepend_intro(graph: &str, intro_d: f64, fps: f64, razor_audio: bool) -> String {
     let fps = if fps.is_finite() && fps > 0.0 { fps } else { 30.0 };
-    let g = graph.replace("[out]", "[mainv]");
-    let (g, main_a) =
-        if razor_audio { (g.replace("[aout]", "[maina]"), "[maina]") } else { (g, "[0:a]") };
+    let g = rename_pad(graph, "[out]", "[mainv]");
+    let (g, main_a) = if razor_audio {
+        (rename_pad(&g, "[aout]", "[maina]"), "[maina]")
+    } else {
+        (g, "[0:a]")
+    };
     format!(
         "{g};\
          [1:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
@@ -249,7 +277,7 @@ pub fn mix_music(graph: &str, clips: &[yc_core::MusicClip], input_base: usize) -
     }
     const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
     let (g, main_a) = if graph.contains("[aout]") {
-        (graph.replace("[aout]", "[premix]"), "[premix]")
+        (rename_pad(graph, "[aout]", "[premix]"), "[premix]")
     } else {
         (graph.to_string(), "[0:a]")
     };
@@ -321,9 +349,12 @@ pub fn fade_edges(
         video.push(format!("fade=t=out:st={st}:d={}:c={color}", f.out_s));
         audio.push(format!("afade=t=out:st={st}:d={}", f.out_s));
     }
-    let g = graph.replace("[out]", "[prefade]");
-    let (g, main_a) =
-        if has_graph_audio { (g.replace("[aout]", "[preafade]"), "[preafade]") } else { (g, "[0:a]") };
+    let g = rename_pad(graph, "[out]", "[prefade]");
+    let (g, main_a) = if has_graph_audio {
+        (rename_pad(&g, "[aout]", "[preafade]"), "[preafade]")
+    } else {
+        (g, "[0:a]")
+    };
     let wrapped = format!(
         "{g};[prefade]{v}[out];{main_a}{a}[aout]",
         v = video.join(","),
@@ -522,6 +553,17 @@ pub fn run_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "not unique")]
+    fn a_colliding_terminal_label_is_caught_not_silently_rewired() {
+        // The unguarded `str::replace` these wraps are built on is correct only
+        // while `[out]` is unique. Hand it a graph where it is not, and it must
+        // say so rather than quietly rewire the wrong edge (which would export
+        // a plausible, wrong Short).
+        let bogus = "[0:v]crop=1:1:0:0[out];[out]scale=2:2[out]";
+        let _ = prepend_intro(bogus, 1.0, 30.0, false);
+    }
 
     #[test]
     fn stacked_graph_crops_scales_vstacks_and_burns() {

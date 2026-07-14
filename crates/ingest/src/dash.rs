@@ -247,9 +247,15 @@ pub fn read_range(
         r.headers().get("content-length")?.to_str().ok()?.parse().ok()
     };
     let mut resp = via_header()?;
-    if resp.status().as_u16() != 206 && content_len(&resp) != Some(want) {
-        // Header ignored (200 + full file, or an error page): do NOT stream
-        // it — that is the whole-file pull this module exists to avoid.
+    // A `Range:` request that the server HONOURED answers 206 — nothing else
+    // does. Until 2026-07-14 a 200 was also accepted whenever its
+    // content-length happened to equal the window we asked for, which is
+    // exactly the whole-file pull this module exists to avoid (a short enough
+    // representation, or an unlucky coincidence, and we would stream the lot).
+    // A 200 here means the header was ignored, full stop: retry through the
+    // `?range=` parameter, where googlevideo answers 200 with just the window
+    // and the content-length check below is the real guard.
+    if resp.status().as_u16() != 206 {
         resp = via_param()?;
         let got = content_len(&resp);
         anyhow::ensure!(

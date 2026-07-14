@@ -92,6 +92,12 @@ required-features = ["align"]
 name = "whisper_align_diag"
 required-features = ["align"]
 
+# Measures the aligner's per-clip session load + proves the resident-across-a-
+# batch fix (perf slice 2026-07-14); drives the real ort session.
+[[example]]
+name = "align_load_bench"
+required-features = ["align"]
+
 # The laughter-aware hold-trim instrument (ADR 0062) drives the reaction
 # tagger's ort session (yc-frame/voice, via `face`).
 [[example]]
