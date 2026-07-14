@@ -4,6 +4,40 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-14 — The app stops paying for the same work twice (speaker clustering 604× faster; the aligner loads once, not per clip)
+
+The performance half of the codebase review. Nothing about your Shorts
+changes — every fixture renders byte-for-byte identically. The app just
+stops burning time it never needed to spend.
+
+- **Speaker clustering: 604× faster on a full-length clip.** Working out
+  who's talking used to re-measure every voice against every other voice
+  from scratch on every single step — and then do the whole thing eight
+  times over, once per threshold it tries. It now measures once and
+  reuses it, and (the bigger one) it turns out the threshold only decides
+  where the process *stops*, never what it does — so all eight passes are
+  cuts of one run. A 3-minute clip's camera plan used to spend **3.3
+  seconds** just clustering; it's now **5.5 milliseconds**.
+- **The caption aligner loads once per batch, not once per clip.** It's a
+  1.2 GB model that takes ~2-3.5 seconds to load, and it was being rebuilt
+  for every single clip — a 10-clip batch render wasted ~20-30 seconds on
+  nothing but reloading. Now it stays loaded while clips are queued
+  (clip 2 went from 3559 ms to **174 ms**) and is freed the moment the
+  queue empties, so an idle app isn't sitting on 1.2 GB of your RAM.
+- **A failing download spawns one yt-dlp, not eight.** A flaky segment
+  fetch re-ran the full format lookup on every retry. It's looked up once
+  now — and the retry still heals the same failures it always did.
+- **Three small correctness holes closed on the way past**: the LLM
+  fallback score read "after the 3rd try, I'd say 8" as a **3** (and "7
+  out of 10" as a 10); a ranged download could accept a whole-file reply;
+  and the filtergraph wrapper now shouts if a label collides instead of
+  silently rewiring your export.
+- I also found the **speaker diag harness hadn't compiled since the fade
+  work** — the regression check we gate camera changes on couldn't be run
+  at all. Fixed; both fixtures pass exactly as before.
+
+459 tests green, lint gate clean, release build clean.
+
 ## 2026-07-14 — Six review fixes: captions can't be corrupted, failures explain themselves, closing the app kills its work
 
 Slice 1 of the codebase-review arc (your pick from
