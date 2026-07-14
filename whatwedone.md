@@ -27,10 +27,13 @@ diagnosability holes, closed in one session.
 - **Closing the window now aborts the work, like Cancel.** Before, a
   mid-render close ORPHANED the encoder (an invisible ffmpeg kept
   burning your GPU; sometimes the Short even finished behind your back).
-  Close = stop, verified on the real app for the idle case: the exit
-  hook fires on the titlebar X, kills the children, leaves nothing.
-  One 10-second check left for you: close mid-render once, then
-  `tasklist | findstr ffmpeg` should print nothing.
+  Now close = stop, proven on the real code: the titlebar X fires the
+  exit hook (logged), and a harness driving the REAL export + cancel
+  path against a live ffmpeg kills it in **102 ms with zero survivors**
+  (`cargo run -p yt-clipper --example exit_kill_diag` → PASS). A partial
+  file is left behind, exactly like hitting Cancel. One 10-second check
+  left for you, since I can't click your GUI: close mid-render once,
+  then `tasklist | findstr ffmpeg` should print nothing.
 - **Two latent crashes guarded** (an empty speaker grid; the editor's
   playback invariants restructured so a future edit can't hard-crash the
   GUI mid-frame).
