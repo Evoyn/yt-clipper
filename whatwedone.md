@@ -4,6 +4,48 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-14 — Six review fixes: captions can't be corrupted, failures explain themselves, closing the app kills its work
+
+Slice 1 of the codebase-review arc (your pick from
+`docs/code-review-2026-07-13.md`): the six cheap correctness and
+diagnosability holes, closed in one session.
+
+- **Typed captions now burn exactly as typed.** A manual caption
+  containing `{`, `}`, `\`, or a newline used to corrupt or blank the
+  burned event (braces open ASS override blocks). Now every caption —
+  yours AND whisper's — is escaped at the ASS boundary. The plan said
+  "double the backslash"; a real burn proved libass renders that as TWO
+  backslashes (and `c:\new` gained a phantom line break!), so the fix
+  uses an invisible zero-width break instead — measured, not guessed.
+  Your eye gates it: `cargo run -p yt-clipper --example escape_burn_diag`
+  then look at `target/escape_burn/escape_burn.png`.
+- **When ffmpeg or yt-dlp fails, the error now TELLS YOU WHY.** Both
+  used to report only an exit code (their stderr went nowhere in the
+  GUI). Now the failure message carries the tool's own last words — e.g.
+  "ERROR: [generic] 'not-a-url' is not a valid URL" — for the two most
+  failure-prone children in the app.
+- **Closing the window now aborts the work, like Cancel.** Before, a
+  mid-render close ORPHANED the encoder (an invisible ffmpeg kept
+  burning your GPU; sometimes the Short even finished behind your back).
+  Close = stop, verified on the real app for the idle case: the exit
+  hook fires on the titlebar X, kills the children, leaves nothing.
+  One 10-second check left for you: close mid-render once, then
+  `tasklist | findstr ffmpeg` should print nothing.
+- **Two latent crashes guarded** (an empty speaker grid; the editor's
+  playback invariants restructured so a future edit can't hard-crash the
+  GUI mid-frame).
+- **The lint gate is finally clean**: `cargo clippy --workspace
+  --all-targets` exits 0 and can gate from now on; the ONNX runtime is
+  pinned ONCE for the whole workspace (no more ABI-skew risk between
+  detect/frame/transcribe).
+- 454 tests green (4 new), release build clean, captions byte-identical
+  for text without specials (the golden pins never moved).
+
+Next up (queued): the performance slice — the O(n³) speaker clustering,
+model sessions that reload from disk every clip, and the yt-dlp retry
+that re-extracts formats per attempt. `read nextprompt-perf.md and
+follow it.`
+
 ## 2026-07-13 — Fade in/out at the Short's edges: video and ALL the sound together
 
 Your pick ("next we will work on the fade out effect both in the music
