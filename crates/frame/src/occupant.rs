@@ -233,9 +233,9 @@ pub fn build_occupant_map(entries: &[FaceEntry], n_segs: usize) -> Option<Occupa
     // Run the agglomeration to ONE cluster for the full trail, then cut at
     // the largest gap — the same-face/different-face margin decides, and the
     // trail is kept on the map for printing.
-    let full = crate::voice::cluster_cosine(&embs, 10.0);
-    let cut = gap_cut(&full.merges);
-    let cl = crate::voice::cluster_cosine(&embs, cut);
+    let trail = crate::voice::agglomerate(&embs);
+    let cut = gap_cut(trail.merges());
+    let cl = trail.cut(cut);
     // cluster_cosine orders ids by size (desc), so every 2+-entry person
     // precedes every singleton: persons are exactly the ids below n_persons.
     let mut counts = vec![0usize; cl.k];
@@ -293,7 +293,7 @@ pub fn build_occupant_map(entries: &[FaceEntry], n_segs: usize) -> Option<Occupa
         n_persons,
         seg_camera,
         camera_visits,
-        merges: full.merges,
+        merges: trail.merges().to_vec(),
         cut,
         assignment: cl.assignment,
     })

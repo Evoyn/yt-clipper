@@ -1054,6 +1054,8 @@ fn main() -> anyhow::Result<()> {
             "camera_diag.fg",
             "../camera_smoothing.mp4",
             false,
+            None,
+            &[],
         );
         println!("rendering ../camera_smoothing.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1067,6 +1069,8 @@ fn main() -> anyhow::Result<()> {
             "camera_diag.fg",
             "../diar_integration.mp4",
             false,
+            None,
+            &[],
         );
         println!("rendering ../diar_integration.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1082,6 +1086,8 @@ fn main() -> anyhow::Result<()> {
             "camera_diag.fg",
             "../diar_person.mp4",
             false,
+            None,
+            &[],
         );
         println!("rendering ../diar_person.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1097,6 +1103,8 @@ fn main() -> anyhow::Result<()> {
             "camera_diag.fg",
             "../diar_reaction.mp4",
             false,
+            None,
+            &[],
         );
         println!("rendering ../diar_reaction.mp4 ...");
         yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
@@ -1120,6 +1128,8 @@ fn main() -> anyhow::Result<()> {
                     "camera_presence.fg",
                     &out,
                     false,
+                    None,
+                    &[],
                 );
                 println!("rendering {out} (solo-presence rewritten plan) ...");
                 yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;

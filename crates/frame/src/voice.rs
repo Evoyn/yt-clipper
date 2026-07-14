@@ -230,47 +230,138 @@ pub struct Clustering {
     pub k: usize,
 }
 
-pub fn cluster_cosine(embs: &[Vec<f32>], threshold: f32) -> Clustering {
+/// Every merge the agglomeration makes, in order, run all the way down to one
+/// cluster — the dendrogram as a replayable trail.
+///
+/// The insight that makes it worth having: **`threshold` never influences WHICH
+/// pair merges next, only WHERE THE TRAIL STOPS.** The greedy step always takes
+/// the globally closest pair; the threshold is just the bar it must clear. So
+/// every threshold's clustering is a *prefix* of this one trail, and the
+/// CV-scored sweep ([`build_lane`], 7 thresholds + the final pick) and the
+/// occupant map's run-then-cut ([`crate::occupant::build_occupant_map`]) each
+/// cost ONE agglomeration instead of eight and two.
+///
+/// The trail also keeps the merge ORDER load-bearing: [`crate::occupant::gap_cut`]
+/// reads consecutive gaps along it, so the greedy global-minimum sequence must
+/// be reproduced exactly (an NN-chain would emit the same dendrogram in a
+/// different order and silently move the cut).
+pub struct Trail {
+    n: usize,
+    /// The two cluster-LIST POSITIONS merged at each step (`q > p`; `q`'s
+    /// members are appended to `p` and `q` is removed, shifting the rest down).
+    /// List positions, not window ids, so a replay reproduces the cluster order
+    /// exactly — and with it the stable size-tie order the assignment ids get.
+    pairs: Vec<(usize, usize)>,
+    /// The accepted distance at each step, 1:1 with `pairs`.
+    dists: Vec<f32>,
+}
+
+impl Trail {
+    /// Every merge distance in order — the same trail [`Clustering::merges`]
+    /// carries, without cutting first.
+    pub fn merges(&self) -> &[f32] {
+        &self.dists
+    }
+
+    /// The clustering at `threshold`: replay the trail, stopping at the first
+    /// merge that fails to clear the bar (the greedy loop's own `break`).
+    pub fn cut(&self, threshold: f32) -> Clustering {
+        let mut members: Vec<Vec<usize>> = (0..self.n).map(|i| vec![i]).collect();
+        let mut merges = Vec::new();
+        for (&(p, q), &d) in self.pairs.iter().zip(&self.dists) {
+            if !(d < threshold) {
+                break;
+            }
+            let b = members.remove(q);
+            members[p].extend(b);
+            merges.push(d);
+        }
+        members.sort_by_key(|m| std::cmp::Reverse(m.len()));
+        let mut assignment = vec![0usize; self.n];
+        for (c, m) in members.iter().enumerate() {
+            for &i in m {
+                assignment[i] = c;
+            }
+        }
+        Clustering { assignment, merges, k: members.len() }
+    }
+}
+
+/// Run the average-linkage agglomeration to a single cluster, recording the
+/// [`Trail`]. Cut it at any threshold(s) afterwards — see [`Trail`] for why one
+/// run answers every threshold.
+///
+/// The cost that used to dominate this crate: the previous implementation
+/// recomputed *every* cluster pair's member-by-member distances from scratch on
+/// *every* merge — O(n³·d) with d = 192-dim embeddings, run ~10× per camera plan.
+/// Here the pairwise distances are computed once and the cluster distances are
+/// maintained incrementally: average linkage is a SUM over member pairs divided
+/// by `|i|·|j|`, and merging two clusters just ADDS their sums
+/// (`sum(k, i∪j) = sum(k,i) + sum(k,j)` — the Lance–Williams recurrence in its
+/// exact, division-free form), so a merge costs O(n) instead of O(n²·d).
+///
+/// Sums accumulate in f64: they are added into repeatedly (unlike the old
+/// recompute-from-scratch, whose error never compounded), and f64 keeps that
+/// compounding far below the f32 resolution the comparisons happen at. The
+/// arithmetic is therefore not bit-identical to the old loop — the summation
+/// grouping differs by ~1 ulp — which can only change an outcome by flipping a
+/// tie that was already within a rounding error. Guarded two ways: a property
+/// test against the old implementation kept verbatim as a test oracle, and the
+/// production fixtures (ANTITESA/Deddy camera plans) pinned byte-for-byte.
+pub fn agglomerate(embs: &[Vec<f32>]) -> Trail {
     let n = embs.len();
-    let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
-    let mut merges = Vec::new();
-    // Pairwise cosine distances between windows (embeddings are unit-norm).
-    let dist = |a: usize, b: usize| -> f32 {
-        1.0 - embs[a].iter().zip(embs[b].iter()).map(|(x, y)| x * y).sum::<f32>()
-    };
-    loop {
+    // Pairwise cosine distances between windows (embeddings are unit-norm),
+    // computed ONCE. `sums[i*n + j]` then holds the sum of member-pair
+    // distances between clusters i and j.
+    let mut sums = vec![0f64; n * n];
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let d = 1.0 - embs[a].iter().zip(embs[b].iter()).map(|(x, y)| x * y).sum::<f32>();
+            sums[a * n + b] = d as f64;
+            sums[b * n + a] = d as f64;
+        }
+    }
+    let mut size = vec![1usize; n];
+    // Cluster slots in CURRENT LIST ORDER. The old loop merged at list indices
+    // and `Vec::remove`d the absorbed one, which shifts the rest down while
+    // preserving their relative order — `live` mirrors exactly that, so the
+    // scan order (and with it the first-minimum-wins tie-break) is identical.
+    let mut live: Vec<usize> = (0..n).collect();
+    let mut pairs = Vec::new();
+    let mut dists = Vec::new();
+    while live.len() > 1 {
         let mut best: Option<(usize, usize, f32)> = None;
-        for i in 0..members.len() {
-            for j in i + 1..members.len() {
-                let mut sum = 0f32;
-                for &a in &members[i] {
-                    for &b in &members[j] {
-                        sum += dist(a, b);
-                    }
-                }
-                let d = sum / (members[i].len() * members[j].len()) as f32;
+        for p in 0..live.len() {
+            for q in (p + 1)..live.len() {
+                let (i, j) = (live[p], live[q]);
+                let d = (sums[i * n + j] / (size[i] * size[j]) as f64) as f32;
                 if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
-                    best = Some((i, j, d));
+                    best = Some((p, q, d));
                 }
             }
         }
-        match best {
-            Some((i, j, d)) if d < threshold => {
-                let b = members.remove(j);
-                members[i].extend(b);
-                merges.push(d);
+        let (p, q, d) = best.expect("more than one live cluster yields a pair");
+        let (i, j) = (live[p], live[q]);
+        for &k in &live {
+            if k != i && k != j {
+                let s = sums[i * n + k] + sums[j * n + k];
+                sums[i * n + k] = s;
+                sums[k * n + i] = s;
             }
-            _ => break,
         }
+        size[i] += size[j];
+        live.remove(q);
+        pairs.push((p, q));
+        dists.push(d);
     }
-    members.sort_by_key(|m| std::cmp::Reverse(m.len()));
-    let mut assignment = vec![0usize; n];
-    for (c, m) in members.iter().enumerate() {
-        for &i in m {
-            assignment[i] = c;
-        }
-    }
-    Clustering { assignment, merges, k: members.len() }
+    Trail { n, pairs, dists }
+}
+
+/// The clustering at one threshold. Callers needing several thresholds over the
+/// same embeddings should [`agglomerate`] once and [`Trail::cut`] repeatedly —
+/// this is that, for a single cut.
+pub fn cluster_cosine(embs: &[Vec<f32>], threshold: f32) -> Clustering {
+    agglomerate(embs).cut(threshold)
 }
 
 /// Embedding window length / hop (seconds) — WeSpeaker's own diarizer
@@ -756,8 +847,12 @@ pub fn build_lane(
         embs.len()
     ));
     let mut pick: Option<(f32, f64)> = None;
+    // ONE agglomeration for the whole sweep AND the final pick: the threshold
+    // only decides where the merge trail stops, never which pair merges next
+    // (see [`Trail`]), so all eight clusterings are cuts of the same trail.
+    let trail = agglomerate(embs);
     for &t in &SWEEP_THRESHOLDS {
-        let cl = cluster_cosine(embs, t);
+        let cl = trail.cut(t);
         let lane = bin_clusters(&cl.assignment);
         let joined = join_on(&lane, cl.k, &|_| true);
         // The sweep scores THE join that ships: person-scoped when the map is
@@ -814,7 +909,7 @@ pub fn build_lane(
     }
     let thr = pick.map(|(t, _)| t).unwrap_or(0.45);
     lines.push(format!("picked thr {thr:.2} (best cv score)"));
-    let cl = cluster_cosine(embs, thr);
+    let cl = trail.cut(thr);
     let cluster = bin_clusters(&cl.assignment);
     let joined = join_on(&cluster, cl.k, &|_| true);
 
@@ -1740,6 +1835,142 @@ mod tests {
             diag.lines.iter().any(|l| l.contains("V0 speaks")),
             "it stays a printed suspect for the operator's ear"
         );
+    }
+
+    /// The pre-2026-07-14 implementation, kept verbatim as the ORACLE the
+    /// cached agglomeration is property-tested against: recompute every cluster
+    /// pair's member-by-member distances from scratch on every merge. O(n³·d) —
+    /// which is precisely why production no longer runs it.
+    fn cluster_cosine_naive(embs: &[Vec<f32>], threshold: f32) -> Clustering {
+        let n = embs.len();
+        let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+        let mut merges = Vec::new();
+        let dist = |a: usize, b: usize| -> f32 {
+            1.0 - embs[a].iter().zip(embs[b].iter()).map(|(x, y)| x * y).sum::<f32>()
+        };
+        loop {
+            let mut best: Option<(usize, usize, f32)> = None;
+            for i in 0..members.len() {
+                for j in i + 1..members.len() {
+                    let mut sum = 0f32;
+                    for &a in &members[i] {
+                        for &b in &members[j] {
+                            sum += dist(a, b);
+                        }
+                    }
+                    let d = sum / (members[i].len() * members[j].len()) as f32;
+                    if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                        best = Some((i, j, d));
+                    }
+                }
+            }
+            match best {
+                Some((i, j, d)) if d < threshold => {
+                    let b = members.remove(j);
+                    members[i].extend(b);
+                    merges.push(d);
+                }
+                _ => break,
+            }
+        }
+        members.sort_by_key(|m| std::cmp::Reverse(m.len()));
+        let mut assignment = vec![0usize; n];
+        for (c, m) in members.iter().enumerate() {
+            for &i in m {
+                assignment[i] = c;
+            }
+        }
+        Clustering { assignment, merges, k: members.len() }
+    }
+
+    /// Deterministic unit-norm embeddings around `k` centers — the shape the
+    /// real windows have (a voice's windows cluster tightly, voices sit apart),
+    /// generated without a `rand` dependency so the test is reproducible.
+    fn synth_embs(n: usize, dim: usize, k: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut s = seed | 1;
+        let mut next = || {
+            // xorshift64*, scaled to [-1, 1).
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+        let centers: Vec<Vec<f32>> =
+            (0..k).map(|_| (0..dim).map(|_| next()).collect()).collect();
+        (0..n)
+            .map(|i| {
+                let c = &centers[i % k];
+                let v: Vec<f32> = c.iter().map(|x| x + 0.35 * next()).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+                v.into_iter().map(|x| x / norm).collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cached_agglomeration_matches_the_naive_oracle() {
+        // The identity bar for the O(n³·d) -> cached rewrite: same assignments,
+        // same k, same merge trail (to f32 rounding) as the implementation it
+        // replaced — across cluster counts, dimensions, and every threshold the
+        // sweep uses plus the degenerate ends.
+        for (n, dim, k, seed) in
+            [(18usize, 3usize, 3usize, 7u64), (40, 16, 4, 11), (64, 192, 2, 23), (25, 8, 5, 41)]
+        {
+            let embs = synth_embs(n, dim, k, seed);
+            for &t in &[0.0f32, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 1.0, 10.0] {
+                let fast = cluster_cosine(&embs, t);
+                let slow = cluster_cosine_naive(&embs, t);
+                assert_eq!(fast.k, slow.k, "k differs (n={n} dim={dim} k={k} thr={t})");
+                assert_eq!(
+                    fast.assignment, slow.assignment,
+                    "assignment differs (n={n} dim={dim} k={k} thr={t})"
+                );
+                assert_eq!(
+                    fast.merges.len(),
+                    slow.merges.len(),
+                    "merge count differs (n={n} dim={dim} k={k} thr={t})"
+                );
+                for (a, b) in fast.merges.iter().zip(&slow.merges) {
+                    assert!(
+                        (a - b).abs() < 1e-5,
+                        "merge distance drifted: {a} vs {b} (n={n} dim={dim} thr={t})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_trail_answers_every_threshold() {
+        // The sweep's whole saving: a cut of the shared trail IS the clustering
+        // a fresh run at that threshold would produce (the threshold never
+        // steers the merge order, only where it stops).
+        let embs = synth_embs(30, 12, 3, 99);
+        let trail = agglomerate(&embs);
+        for &t in &SWEEP_THRESHOLDS {
+            let cut = trail.cut(t);
+            let fresh = cluster_cosine(&embs, t);
+            assert_eq!(cut.assignment, fresh.assignment, "cut != fresh run at thr {t}");
+            assert_eq!(cut.merges, fresh.merges, "merge trail differs at thr {t}");
+        }
+        // And the full trail is what a merge-everything run records — the
+        // occupant map's gap_cut reads exactly this.
+        assert_eq!(trail.merges(), cluster_cosine(&embs, 10.0).merges.as_slice());
+        assert_eq!(trail.merges().len(), embs.len() - 1, "runs down to one cluster");
+    }
+
+    #[test]
+    fn agglomerate_handles_degenerate_inputs() {
+        assert_eq!(agglomerate(&[]).merges().len(), 0);
+        assert_eq!(cluster_cosine(&[], 0.5).k, 0);
+        let one = vec![vec![1.0f32, 0.0]];
+        assert_eq!(agglomerate(&one).merges().len(), 0);
+        assert_eq!(cluster_cosine(&one, 0.5).k, 1);
+        // Identical embeddings: every distance is exactly 0, so a 0-threshold
+        // merges nothing (strictly less) and any positive threshold fuses all.
+        let same = vec![vec![1.0f32, 0.0]; 5];
+        assert_eq!(cluster_cosine(&same, 0.0).k, 5);
+        assert_eq!(cluster_cosine(&same, 0.1).k, 1);
     }
 
     #[test]
