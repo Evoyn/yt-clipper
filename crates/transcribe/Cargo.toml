@@ -14,7 +14,7 @@ serde_json.workspace = true
 # Forced-alignment timing skeleton (ADR 0053/0054): the wav2vec2-CTC ONNX
 # session behind the `align` feature. Same runtime the face/voice/ser models
 # share; the Viterbi + tokenization in `align` are pure and always compiled.
-ort = { version = "2.0.0-rc.12", optional = true }
+ort = { workspace = true, optional = true }
 # `tracing_backend` routes whisper.cpp/ggml's own logging through `tracing`, so
 # its verbose per-token DEBUG dump is dropped by the app's `info` filter instead
 # of flooding stderr (install via `install_logging_hooks`).

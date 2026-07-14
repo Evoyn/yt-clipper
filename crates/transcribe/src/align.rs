@@ -429,6 +429,9 @@ mod tests {
     }
 
     #[test]
+    // Row 0 / column 0 spelled out (`0 * 6 + 0`) for symmetry with the frames
+    // below — the grid layout is the point.
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     fn emission_to_seconds_uses_dur_over_frames() {
         let v = vocab();
         let lo = -20.0f32;

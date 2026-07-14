@@ -29,6 +29,14 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# ONNX Runtime — detect (ser/sep), frame (face/voice), and transcribe (align)
+# all link the SAME runtime DLL, so the version is pinned once here: an
+# independent bump in one crate would skew the ABI the others load.
+ort = "2.0.0-rc.12"
+# WAV read/write (ingest extraction + detect fixtures).
+hound = "3"
+# rustls HTTP: native DASH section fetch (ADR 0060) + in-app downloads (ADR 0041).
+ureq = "3"
 # Workspace crates
 yc-core = { path = "crates/core" }
 yc-ingest = { path = "crates/ingest" }

@@ -478,6 +478,9 @@ mod tests {
     }
 
     #[test]
+    // Row 0 spelled out (`0 * w`) to match the row-math shape of its
+    // neighbours — the (row * w + col) layout is the point.
+    #[allow(clippy::erasing_op)]
     fn warp_translation_shifts() {
         // dest->src map x+2: dest (0,0) shows src (2,0).
         let (w, h) = (6usize, 4usize);

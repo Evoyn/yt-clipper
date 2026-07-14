@@ -438,14 +438,19 @@ struct PreparedClip {
     title: Option<String>,
 }
 
-/// Spawn the worker thread. Returns the job sender, the progress receiver, and a
-/// [`CancelToken`] the UI flips to kill an in-flight download.
-pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelToken) {
+/// Spawn the worker thread. Returns the job sender, the progress receiver, a
+/// [`CancelToken`] the UI flips to kill an in-flight download, and the worker's
+/// [`JoinHandle`] — the app's exit hook polls it so a window close can wait
+/// (bounded) for the worker's kill paths to reap any child before the process
+/// dies (an unwaited close used to orphan a mid-render ffmpeg/NVENC child).
+pub fn spawn(
+    paths: PipelinePaths,
+) -> (Sender<Job>, Receiver<Progress>, CancelToken, thread::JoinHandle<()>) {
     let (tx_job, rx_job) = mpsc::channel::<Job>();
     let (tx_prog, rx_prog) = mpsc::channel::<Progress>();
     let cancel = CancelToken::new();
     let worker_cancel = cancel.clone();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         // Mutable only for `deno_dir`: a Download can materialize the deno
         // sidecar after startup resolved it absent (ADR 0041).
         let mut paths = paths;
@@ -644,7 +649,7 @@ pub fn spawn(paths: PipelinePaths) -> (Sender<Job>, Receiver<Progress>, CancelTo
             }
         }
     });
-    (tx_job, rx_prog, cancel)
+    (tx_job, rx_prog, cancel, worker)
 }
 
 /// A job that ended in error reports as `Cancelled` if the token was flipped

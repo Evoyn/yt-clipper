@@ -836,6 +836,44 @@ pub fn wait_killable(
     }
 }
 
+/// Drain a child's piped stderr on its own thread, keeping only the last
+/// ~8 KB. For chatty children (ffmpeg narrates the whole encode on stderr,
+/// yt-dlp its warnings): the pipe MUST be drained while the parent waits — an
+/// undrained pipe fills its buffer and blocks the child — but on failure only
+/// the tail matters, the fatal line is at the end. The thread finishes on its
+/// own once the child exits or is killed (the pipe closes either way); join it
+/// after the wait. Callers report the tail (lossy UTF-8) in their error.
+pub fn drain_stderr_tail(
+    mut pipe: std::process::ChildStderr,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        const TAIL: usize = 8 * 1024;
+        let mut ring: Vec<u8> = Vec::with_capacity(2 * TAIL);
+        let mut buf = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut pipe, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    ring.extend_from_slice(&buf[..n]);
+                    if ring.len() > 2 * TAIL {
+                        ring.drain(..ring.len() - TAIL);
+                    }
+                }
+            }
+        }
+        ring
+    })
+}
+
+/// The last `chars` characters of a captured stderr tail, lossy-decoded and
+/// trimmed — the shape every subprocess failure message reports (the
+/// `decode_one` precedent: load noise first, the fatal line last).
+pub fn stderr_tail_str(tail: &[u8], chars: usize) -> String {
+    let err = String::from_utf8_lossy(tail);
+    let skip = err.chars().count().saturating_sub(chars);
+    err.chars().skip(skip).collect::<String>().trim().to_string()
+}
+
 /// Write `contents` to `path` via a same-directory temp file + rename, so a
 /// crash / kill / power-loss mid-write can never leave a truncated file. Every
 /// persisted store (project.json, creators.json, review.json, the dialect
@@ -968,6 +1006,36 @@ mod tests {
         // Some(default) must mean exactly the built-in anchor.
         let d = CaptionPlacement::default();
         assert_eq!((d.x_frac, d.y_frac, d.scale), (0.5, CAPTION_Y_FRAC, 1.0));
+    }
+
+    #[test]
+    fn drain_stderr_tail_keeps_the_end_of_a_real_pipe() {
+        // A real child writing to a piped stderr: the drain thread must return
+        // the tail after the child exits, and the report helper must keep the
+        // END (the fatal line) when asked for fewer chars than were written.
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "echo first-line 1>&2 & echo fatal-tail 1>&2"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "echo first-line >&2; echo fatal-tail >&2"]);
+            c
+        };
+        let mut child = cmd
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let tail_h = drain_stderr_tail(child.stderr.take().expect("piped"));
+        let _ = child.wait();
+        let tail = tail_h.join().expect("drain thread");
+        let all = stderr_tail_str(&tail, 600);
+        assert!(all.contains("first-line") && all.contains("fatal-tail"), "full tail: {all}");
+        // 20 chars spans the second line (cmd's `echo x 1>&2` emits a trailing
+        // space) but not the first.
+        let clipped = stderr_tail_str(&tail, 20);
+        assert!(clipped.contains("fatal-tail"), "keeps the end: {clipped}");
+        assert!(!clipped.contains("first-line"), "drops the front: {clipped}");
     }
 
     #[test]

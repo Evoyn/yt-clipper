@@ -1772,7 +1772,7 @@ impl EditorState {
         let dur = self.range.duration_s();
         let d_intro = self.intro_d();
         let out_dur = self.out_dur();
-        if let Some((_, offset)) = self.playing {
+        if let Some((started, offset)) = self.playing {
             if offset < d_intro && self.live.is_none() {
                 // Inside the thumbnail intro (ADR 0067): the image holds on
                 // the wall-clock anchor — no decode, no audio (nothing burns
@@ -1780,7 +1780,7 @@ impl EditorState {
                 // source 0 and the audio starts through the video_aligned
                 // re-anchor below, the machinery that already models "video
                 // not started yet".
-                let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
+                let waited = started.elapsed().as_secs_f64();
                 self.playhead_s = offset + waited;
                 if self.playhead_s >= d_intro {
                     self.playhead_s = d_intro;
@@ -1793,15 +1793,19 @@ impl EditorState {
                 }
             } else {
                 let video_secs = self.live.as_ref().and_then(|l| l.video_secs());
-                let waited = self.playing.expect("playing").0.elapsed().as_secs_f64();
+                let waited = started.elapsed().as_secs_f64();
                 let stalled = self.live.is_none() || (video_secs.is_none() && waited > 1.5);
+                // The wall-clock anchor playback times from — re-anchored to
+                // NOW (with `self.playing`) when the first live frame lands.
+                let mut anchor = started;
                 if !self.video_aligned && (video_secs.is_some() || stalled) {
                     // First frame on screen (or give-up): start the audio here
                     // so it runs with the video, not the ~0.1-0.5 s-earlier
                     // Play instant. Music re-cues to the same anchor (the app
                     // clears every sink first — never two over each other).
                     self.video_aligned = true;
-                    self.playing = Some((Instant::now(), offset));
+                    anchor = Instant::now();
+                    self.playing = Some((anchor, offset));
                     action = EditorAction::Play {
                         voice: Some(self.play_range_from(offset)),
                         music: self.music_cues(offset),
@@ -1812,7 +1816,7 @@ impl EditorState {
                 } else if let Some(v) = self.live.as_ref().and_then(|l| l.video_secs()) {
                     offset + v // follow the video, frame for frame
                 } else {
-                    offset + self.playing.expect("playing").0.elapsed().as_secs_f64() // filmstrip
+                    offset + anchor.elapsed().as_secs_f64() // filmstrip
                 };
                 if self.playhead_s >= out_dur {
                     self.playhead_s = out_dur;

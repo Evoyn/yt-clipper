@@ -8,7 +8,7 @@ license.workspace = true
 yc-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-ort = { version = "2.0.0-rc.12", optional = true }
+ort = { workspace = true, optional = true }
 
 [features]
 # Ultraface face detection via ONNX Runtime (ADR 0011). Off by default so the

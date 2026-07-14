@@ -122,6 +122,42 @@ fn ass_time(s: f64) -> String {
     )
 }
 
+/// Escape caption text for a Dialogue event's Text field so it renders exactly
+/// as typed instead of steering libass: unescaped `{`/`}` open/close an
+/// override block (swallowing the text between them) and a `\` can pair with
+/// the next character into `\N`/`\n`/`\h`. Braces escape as `\{`/`\}`; a
+/// literal backslash is BROKEN with a zero-width space (U+200B) rather than
+/// doubled — measured on the sidecar ffmpeg/libass burn (2026-07-14): `\\`
+/// renders as TWO backslashes and `C:\\NEW` still recombines into `\` + `\N`
+/// (a hard line break), while `\`+ZWSP renders one backslash and the ZWSP is
+/// zeroed by shaping. Real newlines become explicit `\N` breaks (`\r` from a
+/// CRLF paste is dropped, the `\n` alone carries the break). Applied at the
+/// ASS-WRITE boundary only: `preview_lines` feeds both the burn and the
+/// editor's canvas overlay (ADR 0036), and the canvas draws text raw —
+/// escaping upstream would paint `\{` on screen.
+fn escape_ass(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\u{200B}"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '\n' => out.push_str("\\N"),
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One `Dialogue:` event line — every burned event goes through here. `layer`
+/// 1 draws over layer 0 (the manual stream sits above the auto captions,
+/// ADR 0065); `text` is the fully-assembled Text field: override tags plus
+/// already-[`escape_ass`]-ed words.
+fn dialogue(layer: u8, start_s: f64, end_s: f64, text: &str) -> String {
+    format!("Dialogue: {layer},{},{},Caption,,0,0,0,,{text}\n", ass_time(start_s), ass_time(end_s))
+}
+
 /// One caption word as both the ASS emitters and the editor's preview overlay
 /// see it: text pre-uppercased (the burn-in is all-caps), clip-relative timing.
 #[derive(Debug, Clone, PartialEq)]
@@ -408,13 +444,12 @@ pub fn generate_ass(
             };
             let u = &c.unit;
             let end = u.end_s.max(u.start_s + WORD_MIN_S);
-            s.push_str(&format!(
-                "Dialogue: 1,{},{},Caption,,0,0,0,,{{\\an5\\pos({mx},{my}){tag}}}{}{}\n",
-                ass_time(u.start_s),
-                ass_time(end),
+            let text = format!(
+                "{{\\an5\\pos({mx},{my}){tag}}}{}{}",
                 rolling_pop_tags(0),
-                u.text.to_uppercase(),
-            ));
+                escape_ass(&u.text.to_uppercase()),
+            );
+            s.push_str(&dialogue(1, u.start_s, end, &text));
         }
     }
 
@@ -429,13 +464,12 @@ fn huge_word_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32) -> String {
     let mut s = String::new();
     for l in lines {
         let Some(w) = l.words.first() else { continue };
-        let text = format!("{{\\an5\\pos({pos_x},{pos_y})}}{}{}", rolling_pop_tags(0), w.text);
-        s.push_str(&format!(
-            "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(l.start_s),
-            ass_time(l.end_s),
-            text
-        ));
+        let text = format!(
+            "{{\\an5\\pos({pos_x},{pos_y})}}{}{}",
+            rolling_pop_tags(0),
+            escape_ass(&w.text)
+        );
+        s.push_str(&dialogue(0, l.start_s, l.end_s, &text));
     }
     s
 }
@@ -713,18 +747,13 @@ fn rolling_pop_events(lines: &[PreviewLine], pos_x: u32, pos_y: u32) -> String {
         for (i, w) in l.words.iter().enumerate() {
             let on_ms = ((w.start_s - l.start_s) * 1000.0).round() as i64;
             text.push_str(&rolling_pop_tags(on_ms));
-            text.push_str(&w.text);
+            text.push_str(&escape_ass(&w.text));
             if i + 1 < l.words.len() {
                 text.push(' ');
             }
         }
 
-        s.push_str(&format!(
-            "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(l.start_s),
-            ass_time(l.end_s),
-            text
-        ));
+        s.push_str(&dialogue(0, l.start_s, l.end_s, &text));
     }
     s
 }
@@ -763,18 +792,13 @@ fn karaoke_fill_events(
             let next_on = l.words.get(i + 1).map_or(w.end_s, |n| n.start_s);
             let dur_cs = (((next_on - w.start_s) * 100.0).round() as i64).max(1);
             text.push_str(&format!("{{\\k{dur_cs}}}"));
-            text.push_str(&w.text);
+            text.push_str(&escape_ass(&w.text));
             if i + 1 < l.words.len() {
                 text.push(' ');
             }
         }
 
-        s.push_str(&format!(
-            "Dialogue: 0,{},{},Caption,,0,0,0,,{}\n",
-            ass_time(l.start_s),
-            ass_time(l.end_s),
-            text
-        ));
+        s.push_str(&dialogue(0, l.start_s, l.end_s, &text));
     }
     s
 }
@@ -918,6 +942,46 @@ mod tests {
             ass.contains(&format!("{{\\an5\\pos({x},{y})\\fs{size}}}")),
             "own anchor + scaled font: {ass}"
         );
+    }
+
+    #[test]
+    fn escape_pins_each_special_through_the_manual_emitter() {
+        // The reachable-today path (ADR 0065): operator-typed text with ASS
+        // specials must burn as typed, not open an override block or pair a
+        // backslash into `\N`. Pinned through generate_ass, not the helper.
+        let man = |text: &str| ManualCaption {
+            unit: CaptionUnit { text: text.into(), start_s: 0.0, end_s: 1.0 },
+            placement: None,
+        };
+        // Mixed string — the operator's-eye gate text.
+        let ass = generate_ass(&units(&["hi"]), &style(), None, &[man("{test} \\ and a brace")]);
+        assert!(
+            ass.contains("\\{TEST\\} \\\u{200B} AND A BRACE"),
+            "braces escaped, backslash ZWSP-broken: {ass}"
+        );
+        assert!(!ass.contains("{TEST}"), "raw brace block would swallow the text: {ass}");
+        // Backslash-before-letter (the C:\new trap): the ZWSP break keeps the
+        // pair from recombining into `\N` — measured on the libass burn.
+        let ass = generate_ass(&units(&["hi"]), &style(), None, &[man("c:\\new")]);
+        assert!(ass.contains("C:\\\u{200B}NEW"), "backslash survives un-paired: {ass}");
+        // A typed newline becomes the explicit ASS hard break (CR dropped).
+        let ass = generate_ass(&units(&["hi"]), &style(), None, &[man("one\r\ntwo")]);
+        assert!(ass.contains("ONE\\NTWO"), "newline -> \\N: {ass}");
+    }
+
+    #[test]
+    fn escape_applies_in_every_auto_genre_emitter() {
+        // Whisper can token braces/backslashes too — all three genre emitters
+        // escape at the ASS-write boundary (the canvas overlay upstream still
+        // sees the raw text, ADR 0036).
+        for genre in [CaptionGenre::HugeWord, CaptionGenre::RollingPop, CaptionGenre::KaraokeFill] {
+            let mut st = style();
+            st.genre = genre;
+            let ass = generate_ass(&units(&["{hi}", "a\\b"]), &st, None, &[]);
+            assert!(ass.contains("\\{HI\\}"), "{genre:?} braces: {ass}");
+            assert!(ass.contains("A\\\u{200B}B"), "{genre:?} backslash: {ass}");
+            assert!(!ass.contains("{HI}"), "{genre:?} raw block leaked: {ass}");
+        }
     }
 
     #[test]

@@ -496,14 +496,26 @@ pub fn run_export(
         .no_console()
         .current_dir(workdir)
         .args(args)
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    // ffmpeg narrates the WHOLE encode on stderr (progress lines) — drain it
+    // concurrently or the full pipe buffer blocks the child. Before this,
+    // stderr was inherited, and under `no_console()` in the GUI it went
+    // NOWHERE: a field export failure reported only an exit status.
+    let tail_h = yc_core::drain_stderr_tail(child.stderr.take().expect("stderr piped above"));
     let status = yc_core::wait_killable(&mut child, should_cancel)
         .context("waiting on ffmpeg export")?;
+    // Exit or kill closed the pipe, so the drain finishes on its own.
+    let tail = tail_h.join().unwrap_or_default();
     let Some(status) = status else {
         anyhow::bail!("cancelled");
     };
-    anyhow::ensure!(status.success(), "ffmpeg export failed ({status})");
+    anyhow::ensure!(
+        status.success(),
+        "ffmpeg export failed ({status}): {}",
+        yc_core::stderr_tail_str(&tail, 600)
+    );
     Ok(())
 }
 

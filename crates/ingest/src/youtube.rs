@@ -164,10 +164,14 @@ fn with_deno_path(cmd: &mut Command, deno_dir: Option<&Path>) {
     }
 }
 
-/// Spawn `program` with `args`, register it with `cancel`, and wait. stdout and
-/// stderr are inherited (download progress shows in the console / log). A
-/// cancelled run returns an error whose source is the cancel - callers detect
-/// it via `cancel.is_cancelled()` rather than string matching.
+/// Spawn `program` with `args`, register it with `cancel`, and wait. stdout is
+/// inherited (download progress shows in the console / log); stderr is drained
+/// to a bounded tail so a failure can REPORT it — yt-dlp is the most
+/// failure-prone child in the app ("Requested format is not available", nsig
+/// breakage) and used to yield the least diagnosable error (exit status only,
+/// its stderr lost under the GUI's `no_console()`). A cancelled run returns an
+/// error whose source is the cancel - callers detect it via
+/// `cancel.is_cancelled()` rather than string matching.
 fn run(program: &Path, args: &[String], deno_dir: Option<&Path>, cancel: &CancelToken) -> Result<()> {
     if cancel.is_cancelled() {
         anyhow::bail!("cancelled");
@@ -176,21 +180,32 @@ fn run(program: &Path, args: &[String], deno_dir: Option<&Path>, cancel: &Cancel
     cmd.args(args);
     with_deno_path(&mut cmd, deno_dir);
     cmd.no_console();
+    cmd.stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", program.display()))?;
+    let tail_h = yc_core::drain_stderr_tail(child.stderr.take().expect("stderr piped above"));
     if !cancel.register(child.id()) {
         kill_tree(child.id());
         let _ = child.wait();
+        let _ = tail_h.join();
         anyhow::bail!("cancelled");
     }
     let status = child.wait();
     cancel.clear();
+    // Exit (or the cancel's tree-kill) closed the pipe - the drain finishes on
+    // its own.
+    let tail = tail_h.join().unwrap_or_default();
     let status = status.with_context(|| format!("waiting on {}", program.display()))?;
     if cancel.is_cancelled() {
         anyhow::bail!("cancelled");
     }
-    anyhow::ensure!(status.success(), "{} failed ({status})", program.display());
+    anyhow::ensure!(
+        status.success(),
+        "{} failed ({status}): {}",
+        program.display(),
+        yc_core::stderr_tail_str(&tail, 600)
+    );
     Ok(())
 }
 

@@ -35,7 +35,7 @@ fn main() -> eframe::Result<()> {
 
     let paths = AppPaths::resolve();
     let deno_dir = paths.deno_dir();
-    let (to_worker, from_worker, cancel) = pipeline::spawn(pipeline::PipelinePaths {
+    let (to_worker, from_worker, cancel, worker) = pipeline::spawn(pipeline::PipelinePaths {
         ffmpeg: paths.ffmpeg(),
         ffprobe: paths.ffprobe(),
         ytdlp: paths.ytdlp(),
@@ -364,6 +364,7 @@ fn main() -> eframe::Result<()> {
                 to_worker,
                 from_worker,
                 cancel,
+                worker: Some(worker),
             }))
         }),
     )
@@ -694,6 +695,10 @@ struct App {
     to_worker: Sender<Job>,
     from_worker: Receiver<Progress>,
     cancel: CancelToken,
+    /// The pipeline worker's thread handle, taken by [`eframe::App::on_exit`]:
+    /// a window close cancels the in-flight job and waits (bounded) for the
+    /// worker's kill paths to reap any child process before the process dies.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 /// egui's `Spinner`, minus its `request_repaint()`. The stock widget requests an
@@ -844,6 +849,30 @@ fn correct_from_env() -> bool {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        // A hard window-close mid-job used to ORPHAN the worker's child: the
+        // worker thread dies with the process but its ffmpeg/NVENC (or
+        // yt-dlp tree) keeps running headless — only an explicit Cancel ran
+        // the kill paths. Close now means Cancel. Flip the token (kills the
+        // registered yt-dlp tree synchronously; `wait_killable`/`decode_one`
+        // polls notice within ~50 ms and kill their child), swap the job
+        // sender dead so the worker drains the queue (the 2026-07-03 cancel
+        // semantics) and exits its recv loop, then give it a bounded beat to
+        // land those kills before the process dies. Bounded so a wedged child
+        // can never hold the window open; in-process GPU work (whisper) holds
+        // no child and simply dies with the process, as before.
+        tracing::info!("window closed: cancelling the in-flight job before exit");
+        self.cancel.cancel();
+        let (dead, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.to_worker, dead));
+        if let Some(worker) = self.worker.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Drain worker messages.
         while let Ok(msg) = self.from_worker.try_recv() {

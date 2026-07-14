@@ -10,8 +10,8 @@ anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-hound = "3"
-ort = { version = "2.0.0-rc.12", optional = true }
+hound.workspace = true
+ort = { workspace = true, optional = true }
 
 [features]
 # Speech-emotion (arousal) inference via ONNX Runtime (ADR 0008). Off by

@@ -649,6 +649,11 @@ fn smooth(series: &[f32], win: usize) -> Vec<f32> {
 /// Per-bin voice-activity gate over the clip's 16 kHz mono samples: RMS above
 /// both an absolute floor and a fraction of the clip's loud (p90) reference.
 pub fn voiced_bins(samples: &[f32], sr: u32, bin_s: f64, n_bins: usize) -> Vec<bool> {
+    // An empty grid has no voiced bins — and the p90 index below would panic
+    // on the empty rms vector (degenerate / zero-length clip).
+    if n_bins == 0 {
+        return Vec::new();
+    }
     let mut rms = vec![0f32; n_bins];
     let per = ((sr as f64) * bin_s).max(1.0) as usize;
     for (i, r) in rms.iter_mut().enumerate() {
@@ -2291,6 +2296,15 @@ mod tests {
         let v = voiced_bins(&samples, sr, bin, 10);
         assert!(v[..5].iter().all(|x| !x), "silent half: {v:?}");
         assert!(v[5..].iter().all(|x| *x), "loud half: {v:?}");
+    }
+
+    #[test]
+    fn voiced_bins_empty_grid_returns_instead_of_panicking() {
+        // A degenerate / zero-length clip: no bins means no voiced bins — the
+        // p90 index on the empty rms vector used to panic (`sorted[0]`).
+        assert!(voiced_bins(&[], 16_000, 0.2, 0).is_empty());
+        // Zero bins with real samples is the same degenerate grid.
+        assert!(voiced_bins(&[0.3; 16_000], 16_000, 0.2, 0).is_empty());
     }
 
     // A static-wide-shot track: face at a fixed position, visible every bin.
