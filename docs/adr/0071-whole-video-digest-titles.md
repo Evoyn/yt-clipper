@@ -104,6 +104,85 @@ Scores/ranks are NOT pinned frozen: the reframed rubric may legitimately move
 podcast-flavored candidates. The bars above are the mechanical floor; the
 operator's eye on the table is the judgment call.
 
+## Outcome (2026-07-18)
+
+**All five mechanical bars PASS; bar 6 (your eye on the table below) is open.**
+B ran headless `--detect` on the ECA podcast (`LeR59VmXiSc`, cached
+`analysis.wav`, release build with `face,align,ser`, GPU at desktop idle);
+your `project.json`/`review.json` were byte-backed-up first and restored
+SHA-identical after (`DA7B6640…`/`CDBF3B17…`; the fresh outputs live in the
+session scratchpad, the backup pair stays at `data/_backup_title_ab/`).
+
+1. **Parse 25/25** — every Moment titled, longest 55 chars, none empty.
+2. **Language 0/25 English** (A had 5/25) — the per-prompt closing reminder
+   held even though the digest itself came out in English (see residuals).
+3. **Filler/parroting 0/25** — A's "Nutritional advice gone wrong" is now
+   "Dibilang Narkoba, Gue Jawab Kau Tau?"; no title copies a prompt example
+   (the `Gemini vs Scorpio: Mana Lebih Baik?` shape-adaptation is the
+   intended behavior, not a copy).
+4. **Tests** — yc-detect 57, app 66, judge 1, all pinned clauses extended and
+   green; clippy `--workspace --all-targets` exit 0.
+5. **Cost** — the digest inference took **4.4 s** (model loaded 13:45:26.3 →
+   digest ready 13:45:30.6, 636-char brief), 13x under the 60 s bar; the 25
+   verdicts followed in ~73 s (~2.9 s each), whole detect ~13 min.
+
+The digest it wrote (englished, see residuals): *"discussion show where Deddy
+Corbuzier, Pandy, Nino, and Vadi discuss … 'red flags' in relationships …
+jokes about Gemini and Capricorn … being recorded without consent …"* — the
+show, the guests, and the running topics are all real, and the titles below
+visibly lean on them.
+
+### Before/after, paired by start time (rank = that run's ordering)
+
+| start | A rank | A title (your saved table) | B rank | B title (this change) |
+|---|---|---|---|---|
+| 0m12s | #7 | Diskusi tentang generasi Z | #24 | Musuh Rezim? Apa Artinya? |
+| 3m01s | #5 | Mengobrol tentang zodiak Gemini | #9 | Gemini vs Scorpio: Mana Lebih Baik? |
+| 5m27s | #23 | Diskusi Natalan Antara Penonton | #3 | Corbuzier nyebut Capricorn pintar |
+| 7m36s | #17 | Momen Anak Pinjam Jaket | #7 | Ditangkap Kamera Tanpa Izin! |
+| 10m09s | #21 | Fadli bertemu bully di rumahnya | #13 | Fadi dikasih jaket begitu? |
+| 11m51s | #10 | Nino sedih lihat dia dari zero | #8 | Fadi Botak dan Celahnya |
+| 15m52s | #4 | Faddy ngomongin komentar fans | #2 | 'Tokoh Antagonis di Sinetron Jadi Jahat di Dunia Nyata' |
+| 19m03s | #11 | Mas Panji bercanda tentang komentar | #1 | Dasar Pemabuk Gitu! |
+| 21m15s | #14 | Debating on Twitter, gue ngerti now | #12 | Ken, kita berdua debrief ya |
+| 29m10s | #2 | Deddy mode on, Fadi scared | #16 | Om Deddy Menyapu Fadi! |
+| 31m01s | #12 | Bercanda tentang menjadi korban | #15 | Becanda yang menjatuhkan orang |
+| 32m16s | #15 | Mabuk-mabukan dan Tips Memabuk | #21 | Manfaat Mabuk Menurut Dia |
+| 33m41s | #6 | Kepala kayak biji wijen, lucu banget! | #11 | Kepala kayak biji wijen? |
+| 36m44s | #16 | Nutritional advice gone wrong | #20 | Dibilang Narkoba, Gue Jawab Kau Tau? |
+| 38m00s | #1 | Bapak 42 Tahu Gak? | #6 | Bapak 42 Tahu Gak? |
+| 39m25s | #22 | Echa bikin album lagu baru | #14 | Echa Bikin Album Lagu Baru! |
+| 42m33s | #13 | Pertanyaan Unik dari Orang Tua | #10 | Pilih ASKA atau Celebrity? |
+| 44m02s | #8 | Om Deddy Ternyata Berbeda Di Depan Kamera | #4 | Deddy Bercerita Tentang Rasa Sayang yang Menyeramkan |
+| 45m21s | #20 | Daddy's gossip style revealed | #17 | Daddy Gosip Banget |
+| 48m12s | #18 | Membicarakan Proses Membuat Lagu | #23 | Terkait Proses Bikin Lagu |
+| 51m11s | #19 | Momen Awal Menyapa di YouTube | #19 | Nge-Prank Co-Host itu Begini! |
+| 52m09s | #9 | Diskusi tentang Om Deddy dan onde-onde | #5 | Om Deddy jadi onde-onde |
+| 54m19s | #25 | Bicara tentang sabun multi tujuan | #25 | Bicara Produk Ekologis |
+| 77m28s | #24 | Tanya Lagu Baru Lin Buat Gamilla | #22 | Kursi Bolong di Acara Ini |
+| 79m01s | #3 | Membahas Lagu Botak Botak Mania | #18 | Botak Botak Mania - Jadi Album? |
+
+Rank moves are the reframed rubric doing its job (a podcast rubric scoring a
+podcast); starts drift a few seconds on some rows from whisper refine
+nondeterminism + sentence snapping, not from this change.
+
+### Residuals (honest, for the next slice or your call)
+
+- **The digest came out in English** despite `DIGEST_SYSTEM` asking for the
+  transcript's language. It is internal context only and the titles stayed
+  Indonesian, but a per-prompt language reminder (the same fix that worked
+  for titles) would pin it.
+- **2/25 titles still topic-describe** ("Terkait Proses Bikin Lagu", "Bicara
+  Produk Ekologis") — both bottom-quartile moments with thin transcripts;
+  down from ~10/25 in A.
+- **"Ken, kita berdua debrief ya"** (21m15s) reads like a transcript garble
+  ("Ken" is likely a mis-heard name) — a caption-accuracy issue upstream of
+  titles, not a title-rule failure.
+
+**Your eye gates the ship** (bar 6): if these titles are wrong for your
+channel, `git revert` of the implementation commit restores the old prompt
+wholesale — the ADR and the A/B table stay as the record either way.
+
 ## Considered options
 
 - **Whole-VOD transcription pre-pass (b).** Rejected for this slice on

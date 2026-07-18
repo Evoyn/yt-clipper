@@ -4,6 +4,43 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-18 — Titles now know what the video is (your title-generation plan, shipped; your eye gates it)
+
+Your `feature-implementation-plan.md` title item, run in automatic mode: the
+judge now reads the WHOLE video before titling any clip, and the title rules
+were rebuilt around your example shapes.
+
+- **What was wrong**: each title was written from one clip's 30-90 s
+  transcript alone — the model had no idea it was even watching a podcast.
+  Your saved ECA table shows it: "Diskusi tentang..." topic labels, **5 of
+  25 titles in English**, one containing the banned "gone wrong".
+- **What ships**: before scoring, the judge writes itself a short brief of
+  the whole video (from your VOD's uploaded title + every candidate's
+  transcript — ONE extra inference, measured at **4.4 seconds**), then
+  every title is written with that brief in hand, under new rules built
+  from your examples: curiosity-gap questions, warnings, bold claims,
+  single-quoted phrases, an explicit never-translate-to-English lock, and
+  a ban on dead "Membahas X" topic labels. Whole-VOD transcription was
+  refused on cost honesty (+70 min per 80-min VOD) — the ADR records the
+  escalation path if you ever want it.
+- **Proof on your real VOD** (ECA podcast, bars pre-registered in ADR
+  0071 before any prompt change): 25/25 titled, **0 English** (was 5),
+  0 banned filler, 0 copying of the example titles. "Nutritional advice
+  gone wrong" became "Dibilang Narkoba, Gue Jawab Kau Tau?"; "Diskusi
+  tentang generasi Z" became "Musuh Rezim? Apa Artinya?". **The full
+  before/after table is in ADR 0071 for your eye — that's the gate.**
+  Ranks moved (the rubric now knows podcasts exist); the table shows
+  every move.
+- **Your data**: project.json + review.json were byte-backed-up, the A/B
+  ran, both restored SHA-verified identical. The backup pair stays at
+  `data/_backup_title_ab/` (delete at will). A single revert of the
+  implementation commit restores the old titles if you refuse the table.
+
+Suites green (detect 57, app 66, judge 1), clippy gate exit 0, release
+build clean. The digest also lands on each project.json for the review
+trail — the one cosmetic residual: the brief itself comes out in English
+(titles don't; listed in the ADR with the fix shape).
+
 ## 2026-07-14 — The app stops paying for the same work twice (speaker clustering 604× faster; the aligner loads once, not per clip)
 
 The performance half of the codebase review. Nothing about your Shorts
