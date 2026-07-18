@@ -1,54 +1,50 @@
-# Session prompt — title-gen verdict + next arc (queued 2026-07-18)
+# Session prompt — post-title-arc: residuals + next feature (queued 2026-07-18, verdict IN)
 
-The two-stage digest titles SHIPPED (ADR 0071, commits `838e626` +
-`5c54600` + the outcome commit; handoff
-`handoffs/2026-07-18-title-digest.md`). Five mechanical bars passed on the
-ECA A/B; **bar 6 — the operator's eye — is the open gate.**
+The title arc CLOSED with the operator's eye, same day, two verdicts deep
+(ADR 0071 + its Outcome; handoff `handoffs/2026-07-18-title-digest.md`):
 
-## First: collect the verdict (no code until this is answered)
+1. Iteration 1 (digest + curiosity-gap rules): "we need more catchy and
+   hooking" — refused as too flat.
+2. Iteration 2 (two-beat hook+payoff build): **"i like it now"** — the
+   shouty two-beat energy is APPROVED, including whole-phrase ALL-CAPS
+   (do NOT re-leash caps; the operator explicitly kept the style).
+3. Shipped as v2.2 = iteration 2's energy + three honesty leashes (payoff
+   from THIS clip's words, names letter-for-letter, single-beat fallback on
+   thin transcripts). The final ECA table is in ADR 0071 for the record.
 
-Put the ADR 0071 before/after table in front of the operator and ask for a
-ruling, per the gate-on-the-burn rule:
+## Rules of this ground (hard-won today, don't relearn)
 
-1. **Titles**: are the B-column titles right for the channel? (0 English,
-   0 filler, curiosity-gap shapes; 2 bottom-quartile rows still
-   topic-describe — acceptable residual or not?)
-2. **Ranks**: the podcast-aware rubric moved ranks hard (old #1 → #6, old
-   #11 → #1). Right direction, or does the rubric need a leash?
-3. If refused: one `git revert` of `5c54600` restores the old prompt; the
-   ADR + table stay as the record.
+- The prompt pins in `crates/detect/src/llm.rs::tests` now encode BOTH
+  verdicts — extend, never delete, and never re-add a caps leash.
+- Prompt-only iterations rebuild ONLY the judge:
+  `scripts\cargo-cuda.bat build --release -p yc-llm-judge` (no --features;
+  the crate declares none). App rebuilds are needed only for IPC changes.
+- ECA A/B mechanics: byte-backup project/review json first, run headless
+  `--detect` DETACHED (`Start-Process cmd /c` wrapper; the 10-min tool cap
+  kills backgrounded runs), watch via `tail -F` Monitor, restore
+  SHA-verified after. Launch ONLY behind a sustained idle gate that also
+  checks for the operator's own yt-clipper.exe — their session appeared
+  mid-slice today and a conditional launch is the shape that works.
 
-They may also want a real Promote so a title names an actual rendered file
-(that is the true burn; `segment_seek` + the Studio flow — cheap now, the
-segment is cached).
+## Open residuals (small, pick as ride-alongs)
 
-## Small residuals ready to ride along after a positive verdict (pick ≤1)
+- **Digest brief emits in English** (internal-only): add the closing
+  language-reminder line to `build_digest_prompt` + pin. ~30 min.
+- Bottom-ranked thin-transcript titles stay tame ("Bicara tentang Sabun
+  Ekologis") — by design (honest fallback); only revisit if the operator
+  asks.
+- Transcript garbles can surface in titles ("Ken" at 21m15s) — that is
+  caption-accuracy work, `nextprompt-caption-general.md` is the queued
+  head for it.
 
-- **Digest language pin** (~30 min): the brief came out in English; add the
-  same closing-reminder pattern that fixed titles to
-  `build_digest_prompt`, pin it in a test. Internal-only, zero risk.
-- The 2 dead titles + the "Ken" garble are transcript-thinness /
-  caption-accuracy issues — NOT title-rule work; they belong to the caption
-  lane (`nextprompt-caption-general.md` is the queued head for that, and
-  caption work must generalize per the operator's standing rule).
+## The next arc: grill it
 
-## Then: grill the next arc (do not pick silently)
-
-The operator's `feature-implementation-plan.md` items still open, best
-first-guesses from the ADR trail (0064-0070 closed timeline/volume/
-thumbnail/music/undo/fades; 0071 closed titles):
-
-- **#2 Manual caption editing** (New Caption button; insert/drag/resize/
-  delete alongside AI captions) — egui, timeline-heavy.
-- **#12 Favorite font presets** (save/rename/delete caption style presets)
-  — smaller egui slice, pairs with the Studio's existing 6 presets.
-- **#10 Transition library** beyond the shipped fades (cross dissolve,
-  blur, dip, flash, zoom) — render/filtergraph work.
-- **#8 Auto Zoom with AI keyframes** (presets: Subtle/Podcast/Dramatic/
-  Interview) — builds on the shipped keyframe transforms.
-
-/grill-with-docs on whichever the operator picks (unless they again say
-"do it automatically" — then pick the smallest coherent slice, pre-register
-bars in an ADR first, one implementation, and validate on the production
-path). Standing rules: quality over runtime; PS 5.1 quoting; `git commit
--F`; handoff + whatwedone + fresh nextprompt + the starter line at finish.
+Remaining `feature-implementation-plan.md` items (ADRs 0064-0071 closed
+timeline/volume/thumbnail/music/undo/fades/titles): **#2 Manual caption
+editing**, **#12 Favorite font presets**, **#10 Transition library**,
+**#8 Auto Zoom keyframes**. /grill-with-docs on the operator's pick —
+unless they say "do it automatically" again: then pick the smallest
+coherent slice, pre-register bars in an ADR first, one implementation,
+validate on the production path. Standing rules: quality over runtime,
+PS 5.1 quoting, `git commit -F`, handoff + whatwedone + fresh nextprompt
++ the starter line at finish.

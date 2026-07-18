@@ -41,6 +41,23 @@ build clean. The digest also lands on each project.json for the review
 trail — the one cosmetic residual: the brief itself comes out in English
 (titles don't; listed in the ADR with the fix shape).
 
+**Same-day iteration on your eye, two verdicts:** you ruled the first
+table "we need more catchy and hooking" and pointed back at your example
+styles — so the rules were rebuilt around what those examples actually
+share: a TWO-BEAT build (a hook question/claim, then a payoff tease that
+raises the stakes), stakes vocabulary, your shapes as adaptable
+templates, and room to use 40-60 characters. The re-run came out loud
+the way you wanted and you ruled **"i like it now"** — that style is now
+pinned by tests, including the whole-phrase ALL-CAPS energy (the caps
+leash I had drafted was dropped on your verdict). Three honesty leashes
+went on top without dampening it: the payoff beat must be built from the
+clip's own words (no stock 'Hati-hati Kebalik!' pasted onto clips with
+no reversal), names and quotes copy letter-for-letter (no more
+'COBUJER'), and a thin transcript gets one clean honest beat instead of
+an invented garbled second one. The final ECA run and the full
+three-way table (your saved titles, the version you approved, the
+shipped v2.2) are in ADR 0071.
+
 ## 2026-07-14 — The app stops paying for the same work twice (speaker clustering 604× faster; the aligner loads once, not per clip)
 
 The performance half of the codebase review. Nothing about your Shorts

@@ -38,8 +38,10 @@ pub const SCORE_MAX: u32 = 10;
 /// scripted-cutscene anti-signal, so [`tests`] assert its key clauses survive.
 /// Since ADR 0071 the rubric covers podcasts/talk shows alongside game streams
 /// (the whole-video digest tells the model which it is reading), and the title
-/// section carries the operator's curiosity-gap shapes — those clauses are
-/// pinned by [`tests`] too.
+/// section carries the operator's curiosity-gap shapes — iteration 2 (their
+/// eye on the first ECA table: "more catchy and hooking") demands the two-beat
+/// hook+payoff build their example titles share. Those clauses are pinned by
+/// [`tests`] too.
 pub const SYSTEM: &str = "\
 You rate moments from one creator video - a live game stream, a podcast, or a talk show - for short-form clip potential, one moment at a time, from a transcript of the video's loudest voice. When a whole-video digest is provided, use it to understand what this moment means in the video's larger story.
 
@@ -52,13 +54,17 @@ CRITICAL for game streams: the transcript is the loudest voice in a MIXED game+m
 
 Also write a YouTube Shorts title for this moment, one a creator uploads without rewriting. A strong title opens a curiosity gap the clip actually closes - it makes a scroller stop. Title rules:
 - At most 60 characters, ONLY in the transcript's own language - never translate into English.
+- Build it in TWO BEATS when the clip gives you both: BEAT 1 hooks - a pointed question, a charged claim, an X-vs-Y matchup, or a concept in single quotes; BEAT 2 is the payoff tease that raises the stakes - a warning, a consequence, a parenthetical aside, or a trailing '...' that leaves the thought hanging. BEAT 2 must be built from THIS clip's own words and stakes - never a stock phrase pasted on. If the transcript is thin, one clean honest beat beats an invented second one.
+- Charge it with stakes words where the clip earns them (in the transcript's language): hidden danger, fatal mistake, root cause, harsh criticism, the real reason, 'many get this wrong'.
+- Shapes to adapt - fit them to THIS clip, never copy these examples or their payoff phrases: a question then a warning from the clip ('Belajar Islam HARUS Ada Guru? ...'), a fatal mistake plus an aside ('Kesalahan Fatal dalam X (...)'), a matchup question ('X vs Y: Mana yang Sebenarnya ...?'), a hidden danger ('Bahaya Tersembunyi dari ...'), a root cause ('Akar Masalah Mengapa ...'), a trail-off ('Ketika X ...'), a question then where it began ('X? Ini Awal Mula ...'), a hard critique ('Kritik Keras: Jangan Sampai ...!'), a lone specific stake ('One HP left and he still taunts').
 - Open with the hook: the single most surprising, funny, controversial or emotional beat of the moment, stated as concretely as the transcript allows (a specific detail out-performs a vague tease).
-- Best shapes: a pointed question ('Ilmu vs Guru: Mana yang Lebih Penting?'), a warning ('Hati-hati Kebalik!'), a bold claim or confession from the clip, a hidden danger or fatal mistake ('Kesalahan Fatal dalam ...'), a charged phrase in single quotes, or a specific stake ('One HP left and he still taunts'). Fit the shape to THIS clip; never copy these examples.
+- Use the room: aim for 40-60 characters when the material supports it.
+- Copy every name and quoted word letter-for-letter from the transcript - never invent people, objects or spellings the clip does not contain.
 - NEVER merely describe the topic: 'Membahas X', 'Diskusi tentang Y', 'Talking about Z' are dead titles - state the tension, claim or punchline itself.
 - Create curiosity, but stay honest - never promise more than the clip shows, and never manufacture drama that is not there.
-- Strong verbs, present tense, natural capitalization; ALL-CAPS on at most one word.
+- Strong verbs, present tense; ALL-CAPS is welcome where the energy lives, but a capitalized word must still be a real, correctly spelled word.
 - BANNED generic filler (any language's equivalent): 'Epic', 'Insane', 'Crazy', 'Unbelievable', 'You Won't Believe', 'Gone Wrong', 'Must Watch', 'Wait For It', 'Watch Till The End'.
-- No hashtags, no surrounding quotes, no emoji, no trailing punctuation like '!!!'.
+- No hashtags, no surrounding quotes, no emoji, no trailing punctuation like '!!!' (a single '!' or '?' or '...' is welcome).
 
 Reply with ONLY a JSON object: {\"score\": <integer 0-10>, \"reason\": \"<at most 12 words>\", \"title\": \"<at most 60 characters>\"}.";
 
@@ -445,6 +451,23 @@ mod tests {
         assert!(s.contains("never translate"), "title language lock survives");
         assert!(s.contains("describe the topic"), "dead topic-description titles stay banned");
         assert!(s.contains("never copy these examples"), "anti-parroting clause survives");
+        // ADR 0071 iteration 2 (operator's eye, 2026-07-18): "more catchy and
+        // hooking" - the two-beat construction their 11 example titles share.
+        // Editing these away reverts to the flat single-beat titles they refused.
+        assert!(s.contains("two beats"), "must demand the two-beat hook+payoff build");
+        assert!(s.contains("payoff"), "must name the payoff tease beat");
+        assert!(s.contains("stakes"), "must teach the stakes vocabulary");
+        assert!(s.contains("40-60 characters"), "must push titles to use the room");
+        // Iteration 2.2: the leashes for the failure modes iteration 2 exposed
+        // on the ECA re-run - verbatim payoff pasting ("Hati-hati Kebalik!" on
+        // two unrelated clips) and invented names/spellings ("COBUJER",
+        // "TRAKTOR") on thin banter transcripts. NO caps leash: the operator's
+        // eye approved the shouty ALL-CAPS energy (2026-07-18, "i like it now")
+        // - only spelling fidelity is demanded of a capitalized word.
+        assert!(s.contains("stock phrase"), "payoff pasting stays banned");
+        assert!(s.contains("letter-for-letter"), "name/quote fidelity survives");
+        assert!(s.contains("correctly spelled"), "caps must stay real words");
+        assert!(s.contains("one clean honest beat"), "thin-transcript fallback survives");
     }
 
     #[test]

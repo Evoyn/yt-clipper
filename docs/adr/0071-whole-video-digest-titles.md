@@ -183,6 +183,71 @@ nondeterminism + sentence snapping, not from this change.
 channel, `git revert` of the implementation commit restores the old prompt
 wholesale — the ADR and the A/B table stay as the record either way.
 
+## Outcome, same day: the eye loop — two verdicts → v2.2 (final, approved)
+
+Bar 6 ran live, twice, and closed affirmatively:
+
+1. **Verdict 1 on the table above: "we need more catchy and hooking"**, the
+   11 example styles re-pasted. Structural read of those examples: nearly
+   all are TWO-BEAT — a hook (question / charged claim / scare-quoted
+   concept) plus a payoff tease that raises stakes ("Hati-hati Kebalik!",
+   "Ini Awal Mula Masalahnya", "(Banyak yang Salah Kaprah)", a trailing
+   "..."), charged with stakes words (Bahaya Tersembunyi, Kesalahan Fatal,
+   Akar Masalah, Kritik Keras), 40-60 chars. **Iteration 2** encoded that
+   and the re-run went 24/25 two-beat, avg length 28→37.4 — but FAILED the
+   pre-registered parrot bar (2 verbatim 'Hati-hati Kebalik!' pastes),
+   shouted whole phrases in ALL-CAPS, and garbled words on thin banter
+   ("COBUJER", "TRAKTOR", "BJI WIJEN").
+2. **Verdict 2 on iteration 2's titles: "i like it now."** The energy —
+   including the caps — is approved. The drafted whole-phrase caps leash
+   was therefore DROPPED (pinned as such in the tests; do not re-add).
+3. **v2.2 shipped** = iteration 2's construction + three honesty leashes
+   that do not dampen it: BEAT 2 must be built from THIS clip's own words
+   (template payoffs are elided from the prompt entirely — only '...'
+   stubs remain), names and quoted words copy letter-for-letter, and a
+   thin transcript earns one clean honest beat instead of an invented
+   second one; a capitalized word must still be a correctly spelled real
+   word. Final ECA run: **all bars pass** — 25/25 titled ≤60, 0 English,
+   0 filler, **0 parroting**, 25/25 two-beat, avg 35.2 chars; digest
+   reproduced at 636 chars, cost unchanged. **Operator smoke-tested the
+   result and ruled it good** — the arc is closed.
+
+### The three runs, paired by start time (baseline → approved energy → shipped v2.2)
+
+| start | baseline (saved) | iteration 2 (verdict: "i like it now") | v2.2 (shipped) |
+|---|---|---|---|
+| 0m12s | Diskusi tentang generasi Z | MUSUH GEN Z? KENAPA TUH? | Deddy Corbuzier: Lo Musuh Gen Z? |
+| 3m01s | Mengobrol tentang zodiak Gemini | GEMINI APA SIH? Maksudnya Ada Red Flag! | Gemini Tidak Banyak Red Flag? Kenapa Aska? |
+| 5m27s | Diskusi Natalan Antara Penonton | GEMINI VS CAPRICORN: Mana yang Lebih Pintar? | Gemini vs Capricorn: Mana yang Lebih Pintar? |
+| 7m36s | Momen Anak Pinjam Jaket | Capricorn Bro Wiss! Dia Pakai Jaket Gue? | Capricorn Serang Pak Yaya Dengan Jaket Gue? |
+| 10m09s | Fadli bertemu bully di rumahnya | FRAMING GILATAN! Kenapa Dia Muka Baik? | Fadi Masuk Benteng, Gue Usilin Dia Balik! |
+| 11m51s | Nino sedih lihat dia dari zero | KASIAN NIH KAYAK GAK SIH? Fadi dan Nino | Fadi Botak? Ini Jawabannya! |
+| 15m52s | Faddy ngomongin komentar fans | Faddy yang Kuat? Aku Gak Tahan! | Faddy yang Kuat? Aku Gak Tahan! |
+| 19m03s | Mas Panji bercanda tentang komentar | MAS PANJI GAK ADA YANG NYERANG? Hati-hati Kebalik! | Dasar Pemabuk Gitu! Ada yang Nyerang? |
+| 21m15s | Debating on Twitter, gue ngerti now | Ken, kita berdua debrief ya?! | Ken, kita debrief ya... |
+| 29m10s | Deddy mode on, Fadi scared | OM DEDDY MULAI CHALLENGE! | Fadi vs Deddy: Siapa yang Benar-benar Siap? |
+| 31m01s | Bercanda tentang menjadi korban | Pemabuk? Dasar Lo Gitu! | Becanda yang menjatuhkan orang... |
+| 32m16s | Mabuk-mabukan dan Tips Memabuk | GEMINI VS CAPRICORN: APA MANFAATNYA? | Nino: Tips Menjadi Pemabuk, Gue Yang Memabuk! |
+| 33m41s | Kepala kayak biji wijen, lucu banget! | KEPALA LU KAYAK BJI WIJEN? Aiii Jago Dia! | Kepala Lu Kaya Wijen? Astaga! |
+| 36m44s | Nutritional advice gone wrong | KURANG GIZI? MAKSA DIA DENGAN TRAKTOR! | Dedi: 'Kau Tau' Gitu Ya? |
+| 38m00s | Bapak 42 Tahu Gak? | GAGALAN GAYA HIDUP? Gak Pakai Kacamata Usia 42+ | Bapak 42 Tahu Gak? Dia Nanya Umur! |
+| 39m25s | Echa bikin album lagu baru | ECHA BIKIN ALBUM LAGU BARU?! | Echa Bikin Album Lagu Baru! Wow! |
+| 42m33s | Pertanyaan Unik dari Orang Tua | Pilih ASKA Sama Celebrity atau Manusia? Gila! | Pilih ASKA Sama Celebrity Atau Manusia? |
+| 44m02s | Om Deddy Ternyata Berbeda Di Depan Kamera | EMANG GUE SAYANG? Ada Intimasi di Sini... | Deddy: Gue Sayang Lu, Lu Jaman-Jaman |
+| 45m21s | Daddy's gossip style revealed | Daddy GOSIP? Ini Bahan Gossipnya! | Daddy Gak Berdua? Ini Alasannya! |
+| 48m12s | Membicarakan Proses Membuat Lagu | Terkait Proses Bikin Lagu, Gue Sampai Sayang! | Deddy Sayang Banget sama Panji! |
+| 51m11s | Momen Awal Menyapa di YouTube | Kurang Ajar? Kenapa Dia Sering Ledek Co-Host! | Kritik Keras: Jangan Sampai Ngeledekin Co-Host! |
+| 52m09s | Diskusi tentang Om Deddy dan onde-onde | OM DEDDY COBUJER? Hati-hati Kebalik! | Om Deddy Jadi Onde-Onde Cobujer! |
+| 54m19s | Bicara tentang sabun multi tujuan | Bicara tentang Sabun Ekologis | Biodegradable Sabun Untuk Apa? |
+| 77m28s | Tanya Lagu Baru Lin Buat Gamilla | LOH, KURSINYA BOLONG! KENAPA NGGAK DIBAYAR? | Nah Kalau Misalkan... Ada yang Minta Tiket? |
+| 79m01s | Membahas Lagu Botak Botak Mania | Bobo - Eh Engga, Nama... (Botak Botak Mania?) | Dedi Tawar Nulis Lagu Bersama! |
+
+Residual carried forward: "Cobujer"/"Dedi" spelling drift in two v2.2
+titles mirrors the TRANSCRIPT's own phonetic garbling of the name — the
+letter-for-letter rule is copying faithfully from a garbled source. That is
+caption-accuracy work (name dictionary / dialect store), upstream of title
+rules. Operator data was byte-restored SHA-identical after every run.
+
 ## Considered options
 
 - **Whole-VOD transcription pre-pass (b).** Rejected for this slice on
