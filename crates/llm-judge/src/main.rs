@@ -5,9 +5,10 @@
 //! (LNK1169). So the llama.cpp inference runs *here*, in a binary that links
 //! llama only. The app shells out once per detect run — it writes a
 //! [`JudgeRequest`] (the whole candidate batch) as JSON to our stdin and reads a
-//! `Vec<`[`JudgeVerdict`]`>` (one per candidate, in request order) from our
-//! stdout. The GGUF loads once, scores the batch, and frees its VRAM when this
-//! process exits — sequential GPU staging holds across the process boundary.
+//! [`JudgeResponse`] (the ADR 0071 whole-video digest + one [`JudgeVerdict`]
+//! per candidate, in request order) from our stdout. The GGUF loads once, runs
+//! the digest inference, scores the batch, and frees its VRAM when this process
+//! exits — sequential GPU staging holds across the process boundary.
 //!
 //! stdout carries *only* the JSON response; all logging (ours and llama.cpp's
 //! own) goes to stderr so it never corrupts the payload.
@@ -26,7 +27,8 @@ use anyhow::Context as _;
 use anyhow::{anyhow, Result};
 use yc_core::Language;
 use yc_detect::llm::{
-    build_prompt, parse_output, Context, JudgeRequest, JudgeVerdict, Judgment, GRAMMAR, SYSTEM,
+    build_digest_prompt, build_prompt, parse_output, Context, JudgeRequest, JudgeResponse,
+    JudgeVerdict, Judgment, DIGEST_SYSTEM, GRAMMAR, SYSTEM,
 };
 
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -38,16 +40,28 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::TokenToStringError;
 
-/// Context window for one candidate's prompt+output. The prompt (system rubric +
-/// transcript + signals) is a few hundred tokens; 2048 leaves ample room (the
-/// llama.cpp default of 512 would overflow a dense transcript).
-const N_CTX: u32 = 2048;
+/// Context window for one candidate's prompt+output. The prompt is the system
+/// rubric (~600 tokens since the ADR 0071 title rules) + the whole-video digest
+/// (~200) + signals + a transcript that can run ~700 tokens on a dense 90-s
+/// Indonesian clip; 3072 keeps headroom where 2048 would brush the ceiling
+/// (the llama.cpp default of 512 would overflow outright). KV cost ~0.2 GB.
+const N_CTX: u32 = 3072;
 /// Cap on generated tokens — the JSON object is tiny (score + short reason + a
 /// <=60-char title; ADR 0015), this bounds a runaway. Raised from 96 to fit the
 /// added title field comfortably.
 const MAX_NEW_TOKENS: usize = 160;
 /// Hard cap on collected output bytes (defensive, alongside MAX_NEW_TOKENS).
 const MAX_OUT_BYTES: usize = 1024;
+
+/// Context window for the ONE whole-video digest inference (ADR 0071): the
+/// concatenated candidate excerpts are char-capped at 18k in
+/// `build_digest_prompt` (~5-6k tokens) — 8192 fits them with the rubric.
+/// Qwen2.5's native window is 32k; the KV cache at 8192 is ~0.5 GB, inside the
+/// 8 GB card once whisper has unloaded.
+const N_CTX_DIGEST: u32 = 8192;
+/// Generated-token cap for the digest brief: 3-5 sentences is ~100-160 tokens;
+/// 224 bounds a rambler without cutting an honest brief short.
+const MAX_DIGEST_TOKENS: usize = 224;
 
 /// Context window for the caption correction (ADR 0030): a full caption plus
 /// slang/name hints runs longer than a judge prompt, so 4096.
@@ -107,9 +121,31 @@ fn main() -> Result<()> {
     tracing::info!(candidates = req.candidates.len(), "llm-judge: scoring batch");
 
     let llm = Llm::load(Path::new(&req.model_path))?;
+
+    // Stage 1 (ADR 0071): ONE whole-video digest inference over the VOD's
+    // metadata + every candidate's excerpt, free prose, larger context. Soft:
+    // any failure just costs the per-candidate prompts their context section.
+    let digest = if req.candidates.is_empty() {
+        String::new()
+    } else {
+        match llm.complete(DIGEST_SYSTEM, &build_digest_prompt(&req), MAX_DIGEST_TOKENS, N_CTX_DIGEST)
+        {
+            Ok(d) => {
+                let d = d.trim().to_string();
+                tracing::info!("llm-judge: whole-video digest ready ({} chars)", d.len());
+                d
+            }
+            Err(e) => {
+                tracing::warn!("digest inference failed ({e:#}); scoring without it");
+                String::new()
+            }
+        }
+    };
+    let digest_ctx = (!digest.is_empty()).then_some(digest.as_str());
+
     let mut verdicts = Vec::with_capacity(req.candidates.len());
     for (i, c) in req.candidates.iter().enumerate() {
-        match llm.score(&c.transcript, &c.context(), req.language) {
+        match llm.score(&c.transcript, &c.context(), req.language, digest_ctx) {
             Ok(j) => verdicts.push(JudgeVerdict { score: j.score, reason: j.reason, title: j.title }),
             Err(e) => {
                 // A single bad candidate must not sink the batch: emit a 0 so the
@@ -121,8 +157,9 @@ fn main() -> Result<()> {
     }
     drop(llm); // free the GGUF's VRAM before we exit
 
-    let out = serde_json::to_vec(&verdicts).context("serializing verdicts")?;
-    std::io::stdout().write_all(&out).context("writing verdicts to stdout")?;
+    let response = JudgeResponse { digest, verdicts };
+    let out = serde_json::to_vec(&response).context("serializing response")?;
+    std::io::stdout().write_all(&out).context("writing response to stdout")?;
     Ok(())
 }
 
@@ -142,7 +179,7 @@ fn run_correct() -> Result<()> {
     let cap = correct_token_cap(user);
     tracing::info!("llm-correct: running caption-correction completion (token cap {cap})");
     let llm = Llm::load(Path::new(model_path))?;
-    let out = llm.complete(system, user, cap)?;
+    let out = llm.complete(system, user, cap, N_CTX_CORRECT)?;
     drop(llm); // free the GGUF's VRAM before we exit
     std::io::stdout().write_all(out.as_bytes()).context("writing completion to stdout")?;
     Ok(())
@@ -190,13 +227,23 @@ impl Llm {
     }
 
     /// Score one candidate's transcript. Returns the parsed [`Judgment`] (raw
-    /// 0..=SCORE_MAX score, reason, and generated Shorts title).
-    fn score(&self, transcript: &str, ctx: &Context, language: Language) -> Result<Judgment> {
+    /// 0..=SCORE_MAX score, reason, and generated Shorts title). `digest` is the
+    /// stage-1 whole-video brief (ADR 0071), `None` when it failed.
+    fn score(
+        &self,
+        transcript: &str,
+        ctx: &Context,
+        language: Language,
+        digest: Option<&str>,
+    ) -> Result<Judgment> {
         let messages = vec![
             LlamaChatMessage::new("system".to_string(), SYSTEM.to_string())
                 .map_err(|e| anyhow!("system message: {e}"))?,
-            LlamaChatMessage::new("user".to_string(), build_prompt(transcript, ctx, language))
-                .map_err(|e| anyhow!("user message: {e}"))?,
+            LlamaChatMessage::new(
+                "user".to_string(),
+                build_prompt(transcript, ctx, language, digest),
+            )
+            .map_err(|e| anyhow!("user message: {e}"))?,
         ];
         // add_ass=true leaves the prompt hanging at the assistant turn; the
         // template already supplies all special tokens, so add no extra BOS.
@@ -260,10 +307,11 @@ impl Llm {
         Ok(parse_output(&raw))
     }
 
-    /// Free-form completion for the correction spike (ADR 0030): the same decode
-    /// loop as [`score`] but with no grammar (raw text out) and a larger context.
-    /// Greedy / temp 0, so a given prompt is reproducible.
-    fn complete(&self, system: &str, user: &str, max_tokens: usize) -> Result<String> {
+    /// Free-form completion — the correction spike (ADR 0030) and the ADR 0071
+    /// whole-video digest: the same decode loop as [`score`] but with no grammar
+    /// (raw text out) and a caller-chosen context window. Greedy / temp 0, so a
+    /// given prompt is reproducible.
+    fn complete(&self, system: &str, user: &str, max_tokens: usize, n_ctx: u32) -> Result<String> {
         let messages = vec![
             LlamaChatMessage::new("system".to_string(), system.to_string())
                 .map_err(|e| anyhow!("system message: {e}"))?,
@@ -280,14 +328,14 @@ impl Llm {
             .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX_CORRECT))
-            .with_n_batch(N_CTX_CORRECT);
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx);
         let mut lctx = self
             .model
             .new_context(backend()?, ctx_params)
             .map_err(|e| anyhow!("new llama context: {e}"))?;
 
-        let mut batch = LlamaBatch::new(N_CTX_CORRECT as usize, 1);
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
         batch.add_sequence(&tokens, 0, false).map_err(|e| anyhow!("batch add: {e}"))?;
         lctx.decode(&mut batch).map_err(|e| anyhow!("decode prompt: {e}"))?;
 

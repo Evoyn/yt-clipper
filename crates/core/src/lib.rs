@@ -793,6 +793,11 @@ pub struct Project {
     pub vod: Vod,
     pub moments: Vec<Moment>,
     pub clips: Vec<Clip>,
+    /// The judge's whole-video digest brief (ADR 0071), refreshed by each
+    /// detect that reaches the LLM stage. Review context + the seed for any
+    /// future re-title flow. `None` on pre-0071 projects and llm-less detects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -892,7 +897,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 
 impl Project {
     pub fn new(vod: Vod) -> Self {
-        Self { vod, moments: Vec::new(), clips: Vec::new() }
+        Self { vod, moments: Vec::new(), clips: Vec::new(), digest: None }
     }
 
     pub fn load(path: &Path) -> Result<Self, ProjectError> {

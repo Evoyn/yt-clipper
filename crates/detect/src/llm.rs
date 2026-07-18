@@ -10,13 +10,17 @@
 //! to a tiny JSON object), yielding a 0-10 score; the scores are z-scored across
 //! the candidate set and weighted into `combined_score` exactly like the lexicon
 //! and arousal. The model reads only the transcript the refine pass already built
-//! - no audio - plus the corroborating per-candidate signals as context.
+//! - no audio - plus the corroborating per-candidate signals as context. Since
+//! ADR 0071 the batch is two-stage: ONE whole-video digest inference (the VOD's
+//! uploaded title + creator + every candidate's excerpt) runs first, and its
+//! brief feeds each per-candidate prompt so titles are written knowing what the
+//! video is, who speaks, and what the running tensions are.
 //!
 //! **The inference does not run here.** whisper.cpp and llama.cpp each vendor
 //! their own `ggml`, which cannot co-link into one binary (duplicate symbols), so
 //! the actual llama.cpp call lives in the separate `yc-llm-judge` binary, which
 //! links llama only (ADR 0010). The app shells out to it, passing a
-//! [`JudgeRequest`] over stdin and reading back a `Vec<`[`JudgeVerdict`]`>`. This
+//! [`JudgeRequest`] over stdin and reading back a [`JudgeResponse`]. This
 //! module owns the pieces both sides share: the prompt + the load-bearing
 //! mitigation, the lenient output parser, the z-score `apply`, and the IPC
 //! structs - all pure and unit-tested, so the mitigation is verifiable without a
@@ -32,26 +36,37 @@ pub const SCORE_MAX: u32 = 10;
 /// The system instruction: the rubric **and** the load-bearing game-narration
 /// mitigation (ADR 0009/0010). A regression here silently un-protects the #11
 /// scripted-cutscene anti-signal, so [`tests`] assert its key clauses survive.
+/// Since ADR 0071 the rubric covers podcasts/talk shows alongside game streams
+/// (the whole-video digest tells the model which it is reading), and the title
+/// section carries the operator's curiosity-gap shapes — those clauses are
+/// pinned by [`tests`] too.
 pub const SYSTEM: &str = "\
-You rate moments from a live game-streaming VOD for short-form clip potential, one moment at a time, from a transcript of the streamer's audio.
+You rate moments from one creator video - a live game stream, a podcast, or a talk show - for short-form clip potential, one moment at a time, from a transcript of the video's loudest voice. When a whole-video digest is provided, use it to understand what this moment means in the video's larger story.
 
-Score 0-10 how clip-worthy the STREAMER'S OWN reaction is:
-- 10: a peak genuine reaction - a big laugh, shock, hype, rage, a clutch play or a funny line.
+Score 0-10 how clip-worthy the speakers' OWN moment is:
+- 10: a peak genuine beat - a big laugh, shock, hype, rage, a clutch play, a heated claim, a confession, or a line that starts arguments.
 - 5: a mild reaction or moderately interesting talk.
 - 0: mundane talk, menu/UI reading, or nothing notable.
 
-CRITICAL: the transcript is the loudest voice in a MIXED game+microphone recording, so it may be scripted in-game dialogue or cutscene narration rather than the streamer. Score the STREAMER, not the game. A dramatic, emotional or shocking line that is clearly scripted game/cutscene narration is NOT clip-worthy on its own - score it low unless the streamer is audibly reacting to it. Use the provided signals to corroborate: high audience-chat and high vocal-arousal alongside reaction-like words point to a real streamer moment; dramatic words with flat arousal and no chat point to scripted game audio.
+CRITICAL for game streams: the transcript is the loudest voice in a MIXED game+microphone recording, so it may be scripted in-game dialogue or cutscene narration rather than the streamer. Score the STREAMER, not the game. A dramatic, emotional or shocking line that is clearly scripted game/cutscene narration is NOT clip-worthy on its own - score it low unless the streamer is audibly reacting to it. Use the provided signals to corroborate: high audience-chat and high vocal-arousal alongside reaction-like words point to a real moment; dramatic words with flat arousal and no chat point to scripted game audio.
 
-Also write a YouTube Shorts title for this moment, one a creator uploads without rewriting. Title rules:
-- At most 60 characters, in the transcript's own language.
-- Open with the hook: the single most surprising, funny or emotional beat of the moment, stated as concretely as the transcript allows (a specific detail out-performs a vague tease).
+Also write a YouTube Shorts title for this moment, one a creator uploads without rewriting. A strong title opens a curiosity gap the clip actually closes - it makes a scroller stop. Title rules:
+- At most 60 characters, ONLY in the transcript's own language - never translate into English.
+- Open with the hook: the single most surprising, funny, controversial or emotional beat of the moment, stated as concretely as the transcript allows (a specific detail out-performs a vague tease).
+- Best shapes: a pointed question ('Ilmu vs Guru: Mana yang Lebih Penting?'), a warning ('Hati-hati Kebalik!'), a bold claim or confession from the clip, a hidden danger or fatal mistake ('Kesalahan Fatal dalam ...'), a charged phrase in single quotes, or a specific stake ('One HP left and he still taunts'). Fit the shape to THIS clip; never copy these examples.
+- NEVER merely describe the topic: 'Membahas X', 'Diskusi tentang Y', 'Talking about Z' are dead titles - state the tension, claim or punchline itself.
 - Create curiosity, but stay honest - never promise more than the clip shows, and never manufacture drama that is not there.
 - Strong verbs, present tense, natural capitalization; ALL-CAPS on at most one word.
 - BANNED generic filler (any language's equivalent): 'Epic', 'Insane', 'Crazy', 'Unbelievable', 'You Won't Believe', 'Gone Wrong', 'Must Watch', 'Wait For It', 'Watch Till The End'.
 - No hashtags, no surrounding quotes, no emoji, no trailing punctuation like '!!!'.
-Good shapes: a bold claim from the clip (\"He calls the boss fight in one guess\"), a charged quote that stands alone (\"That's the last time I trust chat\"), or a specific stake (\"One HP left and he still taunts\").
 
 Reply with ONLY a JSON object: {\"score\": <integer 0-10>, \"reason\": \"<at most 12 words>\", \"title\": \"<at most 60 characters>\"}.";
+
+/// System instruction for the ONE whole-video digest inference (ADR 0071) that
+/// precedes the per-candidate scoring batch. Free prose (no grammar); its output
+/// is context for [`build_prompt`], not parsed data.
+pub const DIGEST_SYSTEM: &str = "\
+You brief a clip editor on one creator video before they cut and title its Shorts. You get the video's uploaded title, the creator or channel name, and transcript excerpts of its most notable moments in timeline order. Write a brief of 3 to 5 sentences covering: what kind of video this is (a podcast, an interview, a live game stream, a reaction, ...), who is hosting or speaking, the main topics, and the strongest tensions, claims, jokes or curiosities running through it. Be concrete - name the people and topics the way the transcript does. Write the brief in the transcript's language. Reply with ONLY the brief - no headings, no list, no quotes around it.";
 
 /// GBNF grammar constraining generation to
 /// `{"score": <0-10>, "reason": "<text>", "title": "<text>"}` so a local 7B emits
@@ -87,25 +102,85 @@ fn lang_name(l: Language) -> &'static str {
     }
 }
 
-/// Build the user-turn prompt for one candidate: the corroborating signals plus
-/// the transcript. Pure + unit-tested so the mitigation context is verifiable
-/// without the model. The system instruction ([`SYSTEM`]) carries the rubric.
-pub fn build_prompt(transcript: &str, ctx: &Context, language: Language) -> String {
+/// Build the user-turn prompt for one candidate: the whole-video digest (when
+/// stage 1 produced one — ADR 0071), the corroborating signals, and the
+/// transcript, closing on a title-language reinforcement (a 7B obeys the last
+/// line best; 5/25 saved ECA titles came out English before it). Pure +
+/// unit-tested so the mitigation context is verifiable without the model. The
+/// system instruction ([`SYSTEM`]) carries the rubric.
+pub fn build_prompt(
+    transcript: &str,
+    ctx: &Context,
+    language: Language,
+    digest: Option<&str>,
+) -> String {
     let body = transcript.trim();
     let body = if body.is_empty() { "(no speech transcribed)" } else { body };
+    let digest_section = match digest.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => format!("What the whole video is about (digest):\n\"\"\"\n{d}\n\"\"\"\n"),
+        None => String::new(),
+    };
     format!(
         "Transcript language: {lang}.\n\
+         {digest_section}\
          Corroborating signals (z-scored across this VOD's candidates; >0 is above average):\n\
          - audience chat rate: {chat}\n\
          - loudness: {loud}\n\
-         - streamer vocal arousal: {arou}\n\n\
+         - speaker vocal arousal: {arou}\n\n\
          Transcript:\n\"\"\"\n{body}\n\"\"\"\n\n\
-         Score this moment.",
+         Score this moment and write its title in {lang}.",
         lang = lang_name(language),
         chat = fz(ctx.chat_z),
         loud = fz(ctx.loudness_z),
         arou = fz(ctx.arousal_z),
         body = body,
+    )
+}
+
+/// Ceiling on one candidate's excerpt inside the digest prompt — the digest
+/// needs each moment's gist, not its every word.
+pub const DIGEST_EXCERPT_MAX_CHARS: usize = 600;
+/// Ceiling on ALL excerpt text in the digest prompt, so the one digest
+/// inference always fits its context window (chars, not tokens: ~3-4 chars per
+/// token for Indonesian/English keeps 18k chars ≈ 5-6k tokens under the
+/// judge's 8192 digest context with the rubric and headers).
+pub const DIGEST_TOTAL_MAX_CHARS: usize = 18_000;
+
+/// First `max_chars` characters of `s`, cut on a char boundary.
+fn take_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// Build the user turn for the ONE whole-video digest inference (ADR 0071):
+/// the VOD's uploaded title + creator name (the strongest topic signals the
+/// pipeline holds) and every candidate's transcript excerpt in timeline order.
+/// Excerpts are capped per candidate and in total so the prompt always fits
+/// the digest context window; empty transcripts are skipped. Pure +
+/// unit-tested, like [`build_prompt`].
+pub fn build_digest_prompt(req: &JudgeRequest) -> String {
+    let mut by_time: Vec<&JudgeCandidate> =
+        req.candidates.iter().filter(|c| !c.transcript.trim().is_empty()).collect();
+    by_time.sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal));
+    let cap = DIGEST_EXCERPT_MAX_CHARS.min(DIGEST_TOTAL_MAX_CHARS / by_time.len().max(1));
+    let mut excerpts = String::new();
+    for c in &by_time {
+        let (m, s) = ((c.start_s / 60.0) as u64, (c.start_s % 60.0) as u64);
+        excerpts.push_str(&format!("[at {m}m{s:02}s] {}\n", take_chars(c.transcript.trim(), cap)));
+    }
+    format!(
+        "Video language: {lang}.\n\
+         Creator/channel: {creator}\n\
+         Uploaded video title: {title}\n\n\
+         Transcript excerpts of the {n} most notable moments, in timeline order:\n\
+         {excerpts}\n\
+         Write the brief.",
+        lang = lang_name(req.language),
+        creator = if req.vod_creator.trim().is_empty() { "(unknown)" } else { &req.vod_creator },
+        title = if req.vod_title.trim().is_empty() { "(unknown)" } else { &req.vod_title },
+        n = by_time.len(),
     )
 }
 
@@ -252,7 +327,8 @@ pub fn apply(moments: &mut [Moment], scores: &[f32], weights: &Weights) {
 // --- IPC protocol with the `yc-llm-judge` sidecar binary (ADR 0010) ----------
 // whisper.cpp and llama.cpp can't co-link, so the inference runs out-of-process.
 // The app serializes a `JudgeRequest` to the child's stdin and reads back a
-// `Vec<JudgeVerdict>` (one per candidate, in order) from its stdout.
+// `JudgeResponse` (whole-video digest + one verdict per candidate, in order —
+// ADR 0071; a stale judge's bare verdict array still parses) from its stdout.
 
 /// One candidate to judge: the transcript plus its corroborating z-scored signals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +337,11 @@ pub struct JudgeCandidate {
     pub chat_z: Option<f32>,
     pub loudness_z: Option<f32>,
     pub arousal_z: Option<f32>,
+    /// Candidate start within the VOD (seconds) — orders the digest's excerpts
+    /// on the timeline (ADR 0071). Not shown in the per-candidate prompt.
+    /// `#[serde(default)]` so a pre-0071 request still deserializes.
+    #[serde(default)]
+    pub start_s: f64,
 }
 
 impl JudgeCandidate {
@@ -277,6 +358,13 @@ pub struct JudgeRequest {
     /// ADR 0002; the app passes its configured default).
     pub model_path: String,
     pub language: Language,
+    /// The VOD's uploaded title — the strongest topic signal the digest
+    /// inference gets (ADR 0071). `#[serde(default)]`: pre-0071 requests parse.
+    #[serde(default)]
+    pub vod_title: String,
+    /// The VOD's creator/channel name, digest context (ADR 0071).
+    #[serde(default)]
+    pub vod_creator: String,
     pub candidates: Vec<JudgeCandidate>,
 }
 
@@ -293,6 +381,31 @@ pub struct JudgeVerdict {
     /// title field) still deserializes.
     #[serde(default)]
     pub title: String,
+}
+
+/// The judge's whole reply (ADR 0071): the whole-video digest plus one verdict
+/// per candidate, in request order. Read it with [`parse_response`], which also
+/// accepts the pre-0071 bare verdict array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeResponse {
+    /// The stage-1 whole-video brief. Empty when the digest inference failed
+    /// (soft: per-candidate prompts just lose the context section) or when a
+    /// stale judge exe replied with a bare array.
+    #[serde(default)]
+    pub digest: String,
+    pub verdicts: Vec<JudgeVerdict>,
+}
+
+/// Parse the judge's stdout leniently: the current [`JudgeResponse`] object, or
+/// a pre-0071 judge exe's bare `Vec<JudgeVerdict>` array (digest empty). App /
+/// sidecar version skew then degrades to the old no-digest behavior instead of
+/// dropping the llm signal for the whole detect.
+pub fn parse_response(raw: &str) -> serde_json::Result<JudgeResponse> {
+    serde_json::from_str::<JudgeResponse>(raw).or_else(|object_err| {
+        serde_json::from_str::<Vec<JudgeVerdict>>(raw)
+            .map(|verdicts| JudgeResponse { digest: String::new(), verdicts })
+            .map_err(|_| object_err)
+    })
 }
 
 #[cfg(test)]
@@ -322,23 +435,122 @@ mod tests {
         assert!(s.contains("insane") && s.contains("epic"), "must name banned filler words");
         assert!(s.contains("honest"), "must forbid overpromising clickbait");
         assert!(s.contains("no emoji") && s.contains("no hashtags"), "format bans survive");
+        // ADR 0071: the genre-aware rubric + the operator's curiosity-gap title
+        // shapes. Editing these away reverts podcasts to the game-only rubric
+        // and titles to dead topic descriptions.
+        assert!(s.contains("podcast"), "rubric must cover podcasts/talk shows");
+        assert!(s.contains("digest"), "must point the model at the whole-video digest");
+        assert!(s.contains("curiosity gap"), "must demand a curiosity gap");
+        assert!(s.contains("question") && s.contains("warning"), "operator title shapes survive");
+        assert!(s.contains("never translate"), "title language lock survives");
+        assert!(s.contains("describe the topic"), "dead topic-description titles stay banned");
+        assert!(s.contains("never copy these examples"), "anti-parroting clause survives");
+    }
+
+    #[test]
+    fn digest_system_prompt_keeps_its_brief_contract() {
+        // ADR 0071: the stage-1 digest must stay a compact, transcript-language
+        // brief that names genre, speakers, topics and tensions — that is the
+        // context every title inference leans on.
+        let s = DIGEST_SYSTEM.to_lowercase();
+        assert!(s.contains("podcast") && s.contains("game stream"), "must name the genres");
+        assert!(s.contains("who is hosting or speaking"), "must identify the speakers");
+        assert!(s.contains("topics"), "must summarize the topics");
+        assert!(s.contains("tensions"), "must surface the tensions/claims");
+        assert!(s.contains("transcript's language"), "brief stays in the VOD's language");
+        assert!(s.contains("only the brief"), "free prose only — no headings/lists");
     }
 
     #[test]
     fn build_prompt_embeds_transcript_and_signals() {
         let ctx = Context { chat_z: Some(1.8), loudness_z: Some(-0.3), arousal_z: None };
-        let p = build_prompt("Kaget mampus", &ctx, Language::Id);
+        let p = build_prompt("Kaget mampus", &ctx, Language::Id, None);
         assert!(p.contains("Kaget mampus"));
         assert!(p.contains("Bahasa Indonesia"));
         assert!(p.contains("+1.80")); // chat z, signed
         assert!(p.contains("-0.30")); // loudness z, signed
         assert!(p.contains("n/a")); // arousal absent
+        // ADR 0071: the closing language reinforcement — the recency-position
+        // fix for the 5/25 English titles on the saved Indonesian ECA table.
+        assert!(p.trim_end().ends_with("write its title in Bahasa Indonesia."));
+        // No digest given -> no digest section (and no stray header).
+        assert!(!p.contains("digest"));
+    }
+
+    #[test]
+    fn build_prompt_embeds_the_digest_when_present() {
+        let d = "Podcast Deddy Corbuzier bersama Echa membahas red flag cowok.";
+        let p = build_prompt("Kaget mampus", &Context::default(), Language::Id, Some(d));
+        assert!(p.contains("What the whole video is about (digest):"));
+        assert!(p.contains(d));
+        // The digest sits before the signals, the transcript after — the moment
+        // stays the star of the prompt.
+        assert!(p.find(d).unwrap() < p.find("Corroborating signals").unwrap());
+        // Blank digests collapse to the no-digest shape instead of an empty header.
+        let blank = build_prompt("Kaget", &Context::default(), Language::Id, Some("  "));
+        assert!(!blank.contains("digest"));
     }
 
     #[test]
     fn build_prompt_handles_empty_transcript() {
-        let p = build_prompt("   ", &Context::default(), Language::En);
+        let p = build_prompt("   ", &Context::default(), Language::En, None);
         assert!(p.contains("(no speech transcribed)"));
+    }
+
+    #[test]
+    fn digest_prompt_orders_caps_and_labels_excerpts() {
+        let mk = |start_s: f64, text: &str| JudgeCandidate {
+            transcript: text.into(),
+            chat_z: None,
+            loudness_z: None,
+            arousal_z: None,
+            start_s,
+        };
+        let req = JudgeRequest {
+            model_path: "x.gguf".into(),
+            language: Language::Id,
+            vod_title: "JADI, COWOK RED FLAG MENURUT ECA SIAPA".into(),
+            vod_creator: "Deddy Corbuzier".into(),
+            // Out of timeline order on purpose; one empty transcript to skip.
+            candidates: vec![mk(125.0, "kedua"), mk(3.0, "pertama"), mk(60.0, "   ")],
+        };
+        let p = build_digest_prompt(&req);
+        assert!(p.contains("Deddy Corbuzier"));
+        assert!(p.contains("JADI, COWOK RED FLAG MENURUT ECA SIAPA"));
+        assert!(p.contains("Bahasa Indonesia"));
+        // Timeline order with m:ss labels, empty candidate skipped.
+        assert!(p.contains("[at 0m03s] pertama"));
+        assert!(p.contains("[at 2m05s] kedua"));
+        assert!(p.find("pertama").unwrap() < p.find("kedua").unwrap());
+        assert!(p.contains("the 2 most notable moments"));
+
+        // A long transcript is excerpted, not pasted whole — and the cut is on a
+        // char boundary even mid-multibyte.
+        let long = "é".repeat(DIGEST_EXCERPT_MAX_CHARS + 50);
+        let req2 = JudgeRequest {
+            model_path: "x.gguf".into(),
+            language: Language::Id,
+            vod_title: String::new(),
+            vod_creator: String::new(),
+            candidates: vec![mk(0.0, &long)],
+        };
+        let p2 = build_digest_prompt(&req2);
+        assert!(p2.matches('é').count() == DIGEST_EXCERPT_MAX_CHARS);
+        assert!(p2.contains("(unknown)")); // blank metadata reads as unknown
+
+        // Many candidates shrink the per-candidate cap so the total stays
+        // bounded ('q' never appears in the template text, so the count is
+        // exactly the excerpts' payload).
+        let many: Vec<_> = (0..100).map(|i| mk(i as f64, &"q".repeat(1000))).collect();
+        let req3 = JudgeRequest {
+            model_path: "x.gguf".into(),
+            language: Language::En,
+            vod_title: String::new(),
+            vod_creator: String::new(),
+            candidates: many,
+        };
+        let p3 = build_digest_prompt(&req3);
+        assert!(p3.matches('q').count() <= DIGEST_TOTAL_MAX_CHARS);
     }
 
     #[test]
@@ -430,16 +642,47 @@ mod tests {
         let req = JudgeRequest {
             model_path: "models/x.gguf".into(),
             language: Language::Id,
+            vod_title: "JADI, COWOK RED FLAG".into(),
+            vod_creator: "Deddy Corbuzier".into(),
             candidates: vec![JudgeCandidate {
                 transcript: "Gila".into(),
                 chat_z: Some(1.0),
                 loudness_z: None,
                 arousal_z: Some(0.5),
+                start_s: 42.0,
             }],
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: JudgeRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.candidates[0].transcript, "Gila");
         assert_eq!(back.candidates[0].context().arousal_z, Some(0.5));
+        assert_eq!(back.candidates[0].start_s, 42.0);
+        assert_eq!(back.vod_title, "JADI, COWOK RED FLAG");
+        // A pre-0071 request (no metadata, no start_s) still parses — the judge
+        // must never reject an older app's payload.
+        let old = r#"{"model_path":"m.gguf","language":"id",
+            "candidates":[{"transcript":"Gila","chat_z":null,"loudness_z":null,"arousal_z":null}]}"#;
+        let back: JudgeRequest = serde_json::from_str(old).unwrap();
+        assert_eq!(back.vod_title, "");
+        assert_eq!(back.candidates[0].start_s, 0.0);
+    }
+
+    #[test]
+    fn parse_response_reads_object_and_stale_bare_array() {
+        // The current shape: digest + verdicts.
+        let obj = r#"{"digest":"Podcast tentang red flag.","verdicts":
+            [{"score":7.0,"reason":"laugh","title":"Judul"}]}"#;
+        let r = parse_response(obj).unwrap();
+        assert_eq!(r.digest, "Podcast tentang red flag.");
+        assert_eq!(r.verdicts.len(), 1);
+        assert_eq!(r.verdicts[0].title, "Judul");
+        // A stale pre-0071 judge exe replies with a bare array — same detect,
+        // just no digest context (ADR 0071's version-skew degrade).
+        let arr = r#"[{"score":3.0,"reason":"menu","title":""}]"#;
+        let r = parse_response(arr).unwrap();
+        assert!(r.digest.is_empty());
+        assert_eq!(r.verdicts[0].score, 3.0);
+        // Garbage is still an error (the llm signal is then omitted upstream).
+        assert!(parse_response("not json").is_err());
     }
 }

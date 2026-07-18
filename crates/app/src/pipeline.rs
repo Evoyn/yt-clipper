@@ -1113,11 +1113,15 @@ fn do_detect(
     // each rendered Short when the Moment is promoted; carried through the rank
     // reorder below onto `Moment.title`.
     let mut llm_titles_vec: Vec<String> = Vec::new();
+    // The judge's whole-video digest brief (ADR 0071), persisted on the Project.
+    let mut llm_digest: Option<String> = None;
     if paths.llm_judge.is_file() && paths.llm_model.is_file() {
         let _ = tx.send(Progress::Stage("Refining moments (LLM judgment, GPU)"));
         let request = yc_detect::llm::JudgeRequest {
             model_path: paths.llm_model.to_string_lossy().into_owned(),
             language: session.vod.language,
+            vod_title: session.vod.title.clone(),
+            vod_creator: session.vod.creator.clone(),
             candidates: moments
                 .iter()
                 .enumerate()
@@ -1126,19 +1130,25 @@ fn do_detect(
                     chat_z: m.signals.chat_rate,
                     loudness_z: m.signals.loudness,
                     arousal_z: m.signals.arousal,
+                    start_s: m.range.start_s,
                 })
                 .collect(),
         };
         match run_llm_judge(&paths.llm_judge, &request, cancel) {
-            Ok(verdicts) if verdicts.len() == moments.len() => {
+            Ok(response) if response.verdicts.len() == moments.len() => {
+                let verdicts = response.verdicts;
+                if !response.digest.trim().is_empty() {
+                    tracing::info!("whole-video digest: {}", response.digest.trim());
+                    llm_digest = Some(response.digest.trim().to_string());
+                }
                 let scores: Vec<f32> = verdicts.iter().map(|v| v.score).collect();
                 llm_titles_vec = verdicts.iter().map(|v| v.title.clone()).collect();
                 llm_reasons_vec = verdicts.into_iter().map(|v| v.reason).collect();
                 yc_detect::llm::apply(&mut moments, &scores, &params.weights);
             }
-            Ok(v) => tracing::warn!(
+            Ok(r) => tracing::warn!(
                 "llm-judge returned {} verdicts for {} moments; omitting llm signal",
-                v.len(),
+                r.verdicts.len(),
                 moments.len()
             ),
             Err(e) if cancel.is_cancelled() => return Err(e),
@@ -1170,6 +1180,11 @@ fn do_detect(
 
     let mut project = load_or_new_project(&session.vod, &session.data_dir);
     project.moments = ranked.clone();
+    // A fresh digest replaces the old one; an llm-less detect keeps whatever
+    // brief the last judged detect wrote (ADR 0071).
+    if llm_digest.is_some() {
+        project.digest = llm_digest;
+    }
     project
         .save(&session.data_dir.join("project.json"))
         .with_context(|| format!("writing project.json in {}", session.data_dir.display()))?;
@@ -1208,16 +1223,18 @@ fn arousal_refine(
 }
 
 /// Run the out-of-process LLM judge over the whole candidate batch (ADR 0010):
-/// write the [`yc_detect::llm::JudgeRequest`] to its stdin, read the verdicts from
-/// its stdout. stderr is inherited so llama.cpp's load logs reach the operator's
-/// terminal. The child is killed if the detect is cancelled mid-run (releasing its
-/// VRAM). The payload is a few KB (well under the pipe buffer) and the response is
-/// small, so writing the request fully before reading the reply can't deadlock.
+/// write the [`yc_detect::llm::JudgeRequest`] to its stdin, read the
+/// [`yc_detect::llm::JudgeResponse`] (digest + verdicts — ADR 0071; a stale
+/// judge exe's bare verdict array still parses) from its stdout. stderr is
+/// inherited so llama.cpp's load logs reach the operator's terminal. The child
+/// is killed if the detect is cancelled mid-run (releasing its VRAM). The
+/// payload is a few KB (well under the pipe buffer) and the response is small,
+/// so writing the request fully before reading the reply can't deadlock.
 fn run_llm_judge(
     bin: &Path,
     request: &yc_detect::llm::JudgeRequest,
     cancel: &CancelToken,
-) -> Result<Vec<yc_detect::llm::JudgeVerdict>> {
+) -> Result<yc_detect::llm::JudgeResponse> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
@@ -1259,7 +1276,7 @@ fn run_llm_judge(
         .context("llm-judge stdout unavailable")?
         .read_to_string(&mut out)
         .context("reading llm-judge output")?;
-    serde_json::from_str(&out).context("parsing llm-judge verdicts")
+    yc_detect::llm::parse_response(&out).context("parsing llm-judge response")
 }
 
 /// LLM caption-correction pass (ADR 0030): hand whisper's caption units + the
