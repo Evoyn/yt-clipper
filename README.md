@@ -19,7 +19,7 @@
 Windows-first desktop app that turns long VODs — gaming streams and podcasts — into vertical (9:16) short-form clips: transcription, moment detection, framing, speaker tracking, animated captions, and NVENC export, with zero cloud calls. Pure Rust (egui), no web stack.
 
 <p align="center">
-  <img src="img/app.png" width="820" alt="yt-clipper — import a VOD, detect Moments, open the Studio editor">
+  <img src="assets/img/app.png" width="820" alt="yt-clipper — import a VOD, detect Moments, open the Studio editor">
 </p>
 
 ## What it does
@@ -110,8 +110,6 @@ The default build needs no ONNX Runtime binary; each feature compiles one option
 - **[User Guide](USER-GUIDE.md)** — install, first Short, the Studio editor, caption engines, CLI + env reference, troubleshooting.
 - **[Architecture](ARCHITECTURE.md)** — crate map, process model, GPU staging, data layout, design principles.
 - **[CONTEXT.md](CONTEXT.md)** — the domain language. Code mirrors these terms exactly.
-- **[docs/adr/](docs/adr/)** — 71 architecture decision records: why everything is the way it is (read 0001 first).
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — how it was built, milestone by milestone.
 
 ## Built with
 
