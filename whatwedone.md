@@ -4,6 +4,34 @@ A running, readable log of completed features — **newest first**. Each session
 
 ---
 
+## 2026-07-20 — The launch flash is gone (window opened, vanished, re-opened)
+
+Your report: opening yt-clipper.exe flashed the window for a second (open →
+close), then it opened for real. Reproduced, traced, fixed.
+
+- **What was wrong**: you run the app maximized, and that's exactly the
+  trigger. eframe keeps the new window **hidden until the first frame is
+  painted** (so you never see an unpainted white window) — but restoring
+  your saved "maximized" state during window creation goes through
+  Windows' `ShowWindow(SW_MAXIMIZE)`, which force-shows the still-hidden,
+  unpainted window. eframe then re-hides it until the first paint. On the
+  event trace: appear 308 ms → vanish 339 ms → reappear 1345 ms. An
+  upstream winit/eframe interaction bug, worked around app-side.
+- **What ships**: maximize is stripped out of window *creation* and
+  re-applied one frame later — right after the first painted frame is
+  shown. The window now appears **once, already painted, maximized**, and
+  your maximized preference still saves back on close (verified in
+  app.ron after a full open/close round trip).
+- **Proof**: `scripts/diag-launch-flash.ps1` (new) launches the exe and
+  logs every window appear/vanish with timestamps — the before-trace
+  shows the flash, the after-trace shows a single appear at 627 ms. No
+  Rust-test seam exists for this (it spans winit's Win32 calls and
+  eframe's paint loop), so that watcher is the regression check.
+
+Release exe rebuilt with your shipping features (align, face, ser — CUDA
+whisper confirmed ON in the build cache). Suites green both ways (463
+each), clippy gate exit 0.
+
 ## 2026-07-18 — Titles now know what the video is (your title-generation plan, shipped; your eye gates it)
 
 Your `feature-implementation-plan.md` title item, run in automatic mode: the

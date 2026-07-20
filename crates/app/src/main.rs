@@ -308,11 +308,32 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Launch-flash fix: eframe creates the window hidden and first shows it
+    // after the first painted frame — but restoring a persisted `maximized`
+    // makes winit call ShowWindow(SW_MAXIMIZE) during creation, which
+    // force-SHOWS the still-unpainted window for an instant (the operator's
+    // open→close→open flash). Strip `maximized` from the creation builder
+    // (the hook runs AFTER eframe merges the persisted window settings) and
+    // note it; the first `ui` frame re-applies it as a ViewportCommand,
+    // which eframe processes after that frame's paint + show — the window
+    // appears once, painted, and immediately maximized.
+    let restore_maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])
             .with_title("yt-clipper")
             .with_icon(window_icon()),
+        window_builder: Some(Box::new({
+            let restore_maximize = restore_maximize.clone();
+            move |builder: egui::ViewportBuilder| {
+                if builder.maximized == Some(true) {
+                    restore_maximize.store(true, std::sync::atomic::Ordering::Relaxed);
+                    builder.with_maximized(false)
+                } else {
+                    builder
+                }
+            }
+        })),
         ..Default::default()
     };
 
@@ -328,6 +349,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App {
                 paths,
                 deno_dir,
+                restore_maximize: restore_maximize.load(std::sync::atomic::Ordering::Relaxed),
                 url: String::new(),
                 video_path: String::new(),
                 start_s: 0.0,
@@ -596,6 +618,11 @@ enum Status {
 struct App {
     paths: AppPaths,
     deno_dir: Option<PathBuf>,
+    /// One-shot: re-maximize on the first frame. `main`'s launch-flash fix
+    /// strips a session-restored `maximized` from window creation (winit's
+    /// SW_MAXIMIZE would show the still-hidden, unpainted window); the first
+    /// `ui` frame sends it back as a ViewportCommand, processed post-paint.
+    restore_maximize: bool,
     url: String,
     video_path: String,
     start_s: f64,
@@ -874,6 +901,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Deferred maximize-restore (the launch-flash fix in `main`): sent on
+        // the first frame, processed after that frame's paint + show, so the
+        // operator's maximized window returns without the pre-paint flash.
+        if std::mem::take(&mut self.restore_maximize) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         // Drain worker messages.
         while let Ok(msg) = self.from_worker.try_recv() {
             match msg {
