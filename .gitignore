@@ -18,5 +18,5 @@
 /handoffs/
 /notes/
 
-# Claude Code local (machine-specific) settings; shared .claude/ files are committed
-/.claude/settings.local.json
+# Claude Code project config (skills, settings) — local tooling, not published
+/.claude/
