@@ -53,6 +53,10 @@ Prerequisites (Windows, MSVC):
 - **LLVM**, for `libclang` — whisper-rs runs `bindgen` at build time, and its bundled bindings are Linux-only, so a Windows build must generate its own. Install with `winget install LLVM.LLVM`; the build looks for `libclang.dll` (set `LIBCLANG_PATH` if it lands somewhere non-standard). Do **not** set `WHISPER_DONT_GENERATE_BINDINGS` on Windows — the bundled bindings won't compile here.
 - An NVIDIA GPU.
 
+Developed and tested on a **Lenovo Legion 5i Pro 16IAH7H** — Intel Core i7-12700H, NVIDIA RTX 3070 Ti 8 GB, 16 GB RAM, 1 TB NVMe M.2 SSD.
+
+> **Known limitation:** everything shares that one GPU — whisper, the LLM judge, NVENC, and the UI. Opening other GPU-heavy software while yt-clipper is working can crash the app (VRAM exhaustion); ordinary browser use is fine. Keep the GPU to yt-clipper during long detects and renders.
+
 Build through the env wrapper, which discovers VS, CUDA, and LLVM for you:
 
 ```powershell

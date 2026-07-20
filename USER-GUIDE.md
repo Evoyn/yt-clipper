@@ -17,7 +17,7 @@ Everything from a fresh checkout to an exported Short. The [README](README.md) h
 
 ## Requirements
 
-- **Windows** with an **NVIDIA GPU** (transcription is whisper.cpp CUDA; export is NVENC). Developed and tuned on a single 8 GB RTX 3070 Ti — GPU stages run strictly sequentially, so 8 GB is enough.
+- **Windows** with an **NVIDIA GPU** (transcription is whisper.cpp CUDA; export is NVENC). Reference machine — everything was developed and tested on it: **Lenovo Legion 5i Pro 16IAH7H** (Intel Core i7-12700H, NVIDIA RTX 3070 Ti 8 GB, 16 GB RAM, 1 TB NVMe M.2 SSD). GPU stages run strictly sequentially, so 8 GB of VRAM is enough — but see the GPU-sharing note in [Troubleshooting](#troubleshooting).
 - **Rust** (MSVC toolchain), **CMake**, the **CUDA Toolkit** (verified: 13.3, compute 8.6), and **LLVM** (`winget install LLVM.LLVM`) for `libclang` — whisper-rs generates its bindings at build time on Windows.
 - Disk: the required whisper model is ~3.1 GB; the optional LLM judge is ~5.4 GB; everything else is small-to-moderate. Per-VOD working data (audio, segments, exports) lives under `workspace/`.
 
@@ -140,7 +140,7 @@ Advanced caption-tuning knobs (diagnostic; defaults are the shipped behavior): `
 
 - **YouTube import fails / 403.** yt-dlp needs a JS runtime for YouTube's signature challenges: make sure `deno.exe` is present (`scripts/fetch-sidecars.ps1`, the in-app Download row, or `winget install DenoLand.Deno`).
 - **"Diagnostics — something is missing."** Open the section; every red row has a pinned Download. Only ffmpeg/ffprobe/yt-dlp/whisper are hard requirements — the rest degrade gracefully.
-- **Detection or renders crawl while gaming.** All GPU stages share your one GPU by design (strictly sequential, never concurrent) — run detects when the GPU is idle.
+- **GPU sharing: slowdowns and crashes.** All GPU stages share your one card by design (strictly sequential, never concurrent). Running a game alongside makes detects and renders crawl — and opening other GPU-heavy software while the app is working can crash it outright: the pipeline holds multi-gigabyte models resident, and another app exhausting the 8 GB of VRAM takes yt-clipper down with it. Ordinary browser use is fine. Run heavy jobs with the GPU otherwise idle.
 - **Captions mishear slang or names.** That's what the review queue is for — fill corrections once per Creator, they stick. For per-clip experiments, prefer the Studio's transcript editor (verbatim burn).
 - **The build fails in whisper-rs.** Check CMake + CUDA Toolkit + LLVM are installed and use `scripts\cargo-cuda.bat`; don't set `WHISPER_DONT_GENERATE_BINDINGS`.
 - **Window/launch oddities.** `scripts/diag-launch-flash.ps1` logs every window appear/vanish on a launch with timestamps.
