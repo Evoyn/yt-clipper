@@ -15,10 +15,10 @@ serde_json.workspace = true
 # session behind the `align` feature. Same runtime the face/voice/ser models
 # share; the Viterbi + tokenization in `align` are pure and always compiled.
 ort = { workspace = true, optional = true }
-# `tracing_backend` routes whisper.cpp/ggml's own logging through `tracing`, so
-# its verbose per-token DEBUG dump is dropped by the app's `info` filter instead
-# of flooding stderr (install via `install_logging_hooks`).
-whisper-rs = { version = "0.16.0", features = ["cuda", "tracing_backend"] }
+# NO whisper-rs here (ADR 0072): the whisper.cpp link lives ONLY in the
+# `yc-whisper` sidecar crate. This crate is caption policy + the wire client;
+# it carries no ggml, so the app it links into cannot be killed by a CUDA
+# abort — and its tests run without a GPU.
 
 [features]
 # wav2vec2-CTC forced alignment (ADR 0053/0054): pulls the `ort` ONNX runtime.

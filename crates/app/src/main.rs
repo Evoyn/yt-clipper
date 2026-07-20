@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod editor;
+mod forensics;
 mod pipeline;
 mod player;
 mod presets;
@@ -27,13 +28,14 @@ use yc_core::{
 use yc_ingest::CancelToken;
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
+    // Forensics before anything else (ADR 0072 Slice 0): panic hook, SIGABRT
+    // catcher, headless-stderr redirect, and the tracing stack (stdout + the
+    // workspace/logs/yc.log file layer) all arm here, so even an
+    // init-adjacent crash is captured. The injection check right after lets
+    // the bars run without a real crash (the GUI never opens on one).
     let paths = AppPaths::resolve();
+    forensics::init(&paths.workspace);
+    forensics::run_test_injections();
     let deno_dir = paths.deno_dir();
     let (to_worker, from_worker, cancel, worker) = pipeline::spawn(pipeline::PipelinePaths {
         ffmpeg: paths.ffmpeg(),
@@ -472,6 +474,15 @@ impl AppPaths {
     /// llama (the app does not), so the app shells out to it for the llm Signal.
     fn llm_judge(&self) -> PathBuf {
         self.exe_dir.join("yc-llm-judge.exe")
+    }
+
+    /// The `yc-whisper` sidecar binary, beside the app exe (ADR 0072): the only
+    /// binary that links whisper/ggml. Every transcription — captions AND the
+    /// detect refine — runs in it, so a CUDA abort under GPU contention fails
+    /// a job instead of the app. The wire client resolves this same path
+    /// itself (current-exe dir); this accessor exists for the Diagnostics row.
+    fn yc_whisper(&self) -> PathBuf {
+        self.exe_dir.join("yc-whisper.exe")
     }
 
     /// Ultraface RFB-320 face model for M6 auto-framing (ADR 0011). Absent unless
@@ -1439,6 +1450,14 @@ impl App {
                 &["whisper-model"],
             ),
             dep(true, "caption font", p.font(), "the burned caption face (Anton)", &["caption-font"]),
+            dep(
+                true,
+                "whisper engine",
+                p.yc_whisper(),
+                "the out-of-process whisper decode child (ADR 0072) - every caption + detect \
+                 refine runs in it (built with the app - reinstall to restore)",
+                &[],
+            ),
             dep(
                 false,
                 "LLM judge",

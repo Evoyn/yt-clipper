@@ -1,0 +1,25 @@
+[package]
+name = "yc-whisper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yc-whisper"
+path = "src/main.rs"
+
+[dependencies]
+# Wire types + the shared special-token filter (yc-transcribe carries NO
+# whisper link after ADR 0072 — the dependency points this way only).
+yc-transcribe.workspace = true
+yc-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+# whisper.cpp (CUDA). This is the ONLY crate in the workspace that links
+# whisper/ggml (ADR 0072): a CUDA OOM abort() in ggml now kills THIS process,
+# and the app reports a failed job instead of vanishing. `tracing_backend`
+# routes ggml's own logging through `tracing` (to stderr, which the app
+# captures into its log tail).
+whisper-rs = { version = "0.16.0", features = ["cuda", "tracing_backend"] }

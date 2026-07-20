@@ -1,14 +1,17 @@
 @echo off
 REM Build the production RELEASE binaries (M8 packaging) -- the app + the
-REM yc-llm-judge sidecar, optimized (thin-LTO; see the workspace Cargo.toml).
+REM yc-whisper + yc-llm-judge sidecars, optimized (thin-LTO; see the
+REM workspace Cargo.toml).
 REM The operator otherwise runs debug builds; release materially speeds the
 REM whisper + llama GPU work at runtime.
 REM
 REM Usage (from the repo root):  scripts\build-release.bat
 REM
-REM Output:  target\release\yt-clipper.exe  +  target\release\yc-llm-judge.exe
-REM The judge sidecar must sit beside the app exe at runtime (both land in
-REM target\release, so that holds). AppPaths walks up from target\release to the
+REM Output:  target\release\yt-clipper.exe + yc-whisper.exe + yc-llm-judge.exe
+REM Both sidecars must sit beside the app exe at runtime (all land in
+REM target\release, so that holds). yc-whisper is the out-of-process whisper
+REM decode engine (ADR 0072): the app links no ggml, so a CUDA OOM abort
+REM under GPU contention fails the job, never the app. AppPaths walks up from target\release to the
 REM repo root for sidecars\ models\ assets\ workspace\ (ADR 0005), so run with:
 REM     scripts\cargo-cuda.bat run --release -p yt-clipper --features face,align
 REM
@@ -27,5 +30,5 @@ REM Without it the 0.15 arousal weight renormalizes away and Moments rank
 REM loud-vs-flat blind. Fail-soft at runtime: a missing/unloadable model just
 REM omits the Signal (Diagnostics > Downloads heals the install).
 
-call "%~dp0cargo-cuda.bat" build --release -p yt-clipper -p yc-llm-judge --features face,align,ser
+call "%~dp0cargo-cuda.bat" build --release -p yt-clipper -p yc-whisper -p yc-llm-judge --features face,align,ser
 exit /b %ERRORLEVEL%

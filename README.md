@@ -55,7 +55,7 @@ Prerequisites (Windows, MSVC):
 
 Developed and tested on a **Lenovo Legion 5i Pro 16IAH7H** — Intel Core i7-12700H, NVIDIA RTX 3070 Ti 8 GB, 16 GB RAM, 1 TB NVMe M.2 SSD.
 
-> **Known limitation:** everything shares that one GPU — whisper, the LLM judge, NVENC, and the UI. Opening other GPU-heavy software while yt-clipper is working can crash the app (VRAM exhaustion); ordinary browser use is fine. Keep the GPU to yt-clipper during long detects and renders.
+> **Known limitation:** everything shares that one GPU — whisper, the LLM judge, NVENC, and the UI. Whisper (like the judge before it) runs **out-of-process** (`yc-whisper`), so another app exhausting VRAM mid-job fails that **job** with a "GPU busy — retry when free" error instead of killing the app; a warning fires before GPU stages when video memory is already scarce. Ordinary browser use is fine, and detects/renders still crawl while a game hogs the card. A **driver-level reset** (TDR) from a heavy 3D app can still take down the UI itself — if that happens, `workspace/crash.log` and `workspace/logs/` record it; just relaunch.
 
 Build through the env wrapper, which discovers VS, CUDA, and LLVM for you:
 

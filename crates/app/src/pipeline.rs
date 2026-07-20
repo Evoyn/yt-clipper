@@ -471,6 +471,10 @@ pub fn spawn(
                 Ok(job) => job,
                 Err(mpsc::TryRecvError::Empty) => {
                     yc_transcribe::ensemble::release_resident_models();
+                    // Forensics journal (ADR 0072): a crash while parked here
+                    // is the idle class (the wgpu/driver-reset candidate),
+                    // not a job killer.
+                    crate::forensics::set_current_job("idle (worker parked, queue dry)");
                     match rx_job.recv() {
                         Ok(job) => job,
                         Err(_) => break, // the UI hung up (app exit)
@@ -490,6 +494,12 @@ pub fn spawn(
                 continue;
             }
             worker_cancel.reset();
+            // Forensics journal (ADR 0072): the crash writers report this
+            // label, and the yc.log start/done pair brackets every job — an
+            // abort-vanish with no marker is still attributable from the tail.
+            let job_label = job_label(&job);
+            crate::forensics::set_current_job(&job_label);
+            tracing::info!("job start: {job_label}");
             match job {
                 Job::Import { source, language } => {
                     match do_import(&paths, source, language, &worker_cancel, &tx_prog) {
@@ -653,6 +663,8 @@ pub fn spawn(
                     }
                 }
             }
+            tracing::info!("job done: {job_label}");
+            crate::forensics::set_current_job("idle (between jobs)");
             // A cancel aims at everything the operator had in flight — the job
             // it interrupted AND whatever was already queued behind it. The
             // measured case (2026-07-03): a Render clicked during a crawling
@@ -669,6 +681,35 @@ pub fn spawn(
         }
     });
     (tx_job, rx_prog, cancel, worker)
+}
+
+/// One-line label for the forensics journal (ADR 0072): which job the worker
+/// is inside, with enough parameters to identify the killer class in
+/// `crash.log` without dumping operator data.
+fn job_label(job: &Job) -> String {
+    match job {
+        Job::Import { source, .. } => match source {
+            ImportSource::YouTube(_) => "Import (YouTube VOD)".into(),
+            ImportSource::Local(_) => "Import (local file)".into(),
+        },
+        Job::Detect { max_dur_s } => {
+            format!("Detect (max {max_dur_s:.0}s; whisper refine + judge on the GPU)")
+        }
+        Job::Prepare { range, .. } => {
+            format!("Prepare ({:.1}-{:.1}s Segment fetch)", range.start_s, range.end_s)
+        }
+        Job::Transcribe { .. } => "Transcribe (editor caption pre-pass, whisper on the GPU)".into(),
+        Job::AnalyzeSpeakers => "AnalyzeSpeakers (CPU speaker analysis)".into(),
+        Job::Render { caption_engine, .. } => format!(
+            "Render (held clip, engine={})",
+            match caption_engine {
+                None => "creator-saved",
+                Some(CaptionEngine::Whisper) => "whisper",
+                Some(CaptionEngine::QwenEnsemble) => "ensemble",
+            }
+        ),
+        Job::Download { specs } => format!("Download ({} spec(s))", specs.len()),
+    }
 }
 
 /// A job that ended in error reports as `Cancelled` if the token was flipped
@@ -1008,6 +1049,7 @@ fn do_detect(
     // Manual Moments never reach this loop (they are not detect candidates),
     // so their verbatim ranges stay untouched by construction.
     let _ = tx.send(Progress::Stage("Refining moments (whisper, GPU)"));
+    warn_if_gpu_busy(tx);
     // Text-only (no DTW): the lexicon needs words, not word timing, and DTW
     // aborts on sparse music/SFX windows (see Transcriber::load_text_only).
     let lexicon = yc_transcribe::DialectLexicon::load(&paths.dialect_dir, session.vod.language);
@@ -1220,6 +1262,42 @@ fn arousal_refine(
         arousals.push(ser.arousal_max(&samples, win, hop)?);
     }
     Ok(arousals)
+}
+
+/// Slice C (ADR 0072): free-VRAM floor below which a whisper stage gets a
+/// visible warning first. The caption load wants ~4 GB (f16 large-v3 weights
+/// + CUDA context + compute buffers); with less free than this on the shared
+/// 8 GB card, the difference is usually ANOTHER app — the decode may abort.
+const GPU_FREE_WARN_MIB: u64 = 4600;
+
+/// Warn — never block — when free VRAM looks too small for the whisper stage
+/// about to run (ADR 0072 Slice C). Fail-soft by design: no nvidia-smi on
+/// PATH, a query error, or unparseable output = no warning. The decode itself
+/// stays the authority; this is advance notice with a name for the failure
+/// the operator might see next.
+fn warn_if_gpu_busy(tx: &Sender<Progress>) {
+    let out = match std::process::Command::new("nvidia-smi")
+        .no_console()
+        .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = text.lines().next() else { return };
+    let mut parts = line.split(',').map(|p| p.trim().parse::<u64>());
+    let (Some(Ok(used)), Some(Ok(total))) = (parts.next(), parts.next()) else { return };
+    let free = total.saturating_sub(used);
+    if free < GPU_FREE_WARN_MIB {
+        tracing::warn!(
+            "low free VRAM before a whisper stage: {free} MiB free of {total} MiB \
+             (warn floor {GPU_FREE_WARN_MIB} MiB)"
+        );
+        let _ = tx.send(Progress::Stage(
+            "Low free VRAM - another app is on the GPU; transcription may fail (close it and retry if this job errors)",
+        ));
+    }
 }
 
 /// Run the out-of-process LLM judge over the whole candidate batch (ADR 0010):
@@ -1956,6 +2034,7 @@ fn ensure_transcript(
                 &[creator_store.clone(), clip_store.clone()],
                 language,
             );
+            warn_if_gpu_busy(tx);
             let (mut transcript, harvest) = yc_transcribe::transcribe_range_harvesting(
                 &paths.model,
                 &samples,

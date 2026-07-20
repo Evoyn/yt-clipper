@@ -1,26 +1,32 @@
-//! Transcription: whisper.cpp via whisper-rs (CUDA build), model `large-v3`
-//! (ADR 0003; M1 uses the f16 weights, the ADR's quantized ship-default is
-//! revisited at M6). Whisper emits token-level timestamps; the language-aware
-//! grouping layer in this crate converts tokens into animatable caption
-//! units — space-delimited words for EN/ID, fixed-size character chunks for JA
-//! (which whisper emits without inter-word spaces).
+//! Transcription: caption POLICY + the whisper wire client, model `large-v3`
+//! (ADR 0003; f16 weights). Whisper emits token-level timestamps; the
+//! language-aware grouping layer in this crate converts tokens into animatable
+//! caption units — space-delimited words for EN/ID, fixed-size character
+//! chunks for JA (which whisper emits without inter-word spaces).
+//!
+//! Since ADR 0072 the whisper.cpp decode itself runs in the **`yc-whisper`
+//! sidecar child** ([`wire`]): this crate links NO whisper/ggml, so a CUDA
+//! abort under GPU contention kills a child and fails one job instead of the
+//! app. [`Transcriber`] keeps its exact pre-move API — it now spawns and owns
+//! the child (residency = the child's lifetime), sends raw f32 samples, and
+//! runs the unchanged grouping/correction policy over the raw tokens that
+//! come back. The raw token is the seam; the fixture identity bar (A3) pins
+//! it.
 //!
 //! M1 transcribes only the manually-picked range's samples (transcribe-range-
 //! only), so timestamps are already 0-based to the clip and line up with the
-//! render timeline. whisper-rs needs libclang at build time on Windows (its
-//! bundled bindings are Linux-only).
+//! render timeline.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::Path;
-use whisper_rs::{
-    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
-    WhisperContextParameters,
-};
 use yc_core::{CaptionUnit, Language, Transcript};
 
 pub mod align;
 pub mod ensemble;
+pub mod wire;
+
+pub use wire::is_special;
 
 mod correct;
 pub use correct::{
@@ -34,12 +40,6 @@ fn lang_code(l: Language) -> &'static str {
         Language::Id => "id",
         Language::Ja => "ja",
     }
-}
-
-/// whisper's non-text special tokens ([_BEG_], `<|...|>` markers, timestamp
-/// tokens) carry no caption text and must be dropped before grouping.
-fn is_special(text: &str) -> bool {
-    text.starts_with("[_") || text.starts_with("<|")
 }
 
 /// Group raw whisper tokens into animatable caption units for the given
@@ -935,13 +935,23 @@ fn harvest_candidates(
 /// A whisper model kept resident on the GPU so a *batch* of ranges transcribes
 /// with one model load instead of reloading per range (ADR 0002/0007: detection
 /// refine transcribes ~N candidate Moments). Loading the model is the expensive
-/// step; each [`Transcriber::transcribe`] creates a fresh, cheap state.
+/// step; each [`Transcriber::transcribe`] runs against the resident model.
+///
+/// Since ADR 0072 "resident" means a live **`yc-whisper` child** holding the
+/// CUDA context: this struct owns the child, and dropping it kills the child —
+/// the same synchronous VRAM release the in-process drop gave, so the staging
+/// discipline below is unchanged. A CUDA abort under GPU contention (another
+/// app exhausting VRAM) now kills the child and fails the JOB with a
+/// "GPU busy — retry when free" error; the app and UI stay alive.
 ///
 /// GPU discipline: hold one of these only while transcription owns the VRAM -
-/// drop it before the LLM stage loads (M4), since the 8 GB card stages stages
+/// drop it before the LLM stage loads (M4), since the 8 GB card stages
 /// strictly sequentially.
 pub struct Transcriber {
-    ctx: WhisperContext,
+    /// The live `yc-whisper` child (the resident model). Mutex only for
+    /// interior mutability — the API stays `&self` so no caller changes; the
+    /// pipeline worker is the single production caller and calls serially.
+    conn: std::sync::Mutex<wire::SidecarConn>,
     /// Beam-search decoding (ADR 0027) for accuracy on the caption path; greedy
     /// for the bulk text-only detect refine (speed). Tied to the DTW load.
     beam: bool,
@@ -963,32 +973,20 @@ impl Transcriber {
     /// Load without DTW alignment — for bulk *text-only* passes (detection
     /// refine reads the excitement lexicon, not word timing). Besides being
     /// faster, this avoids whisper's DTW median-filter assertion
-    /// (`filter_width < a->ne[2]`), which aborts the process on a sparse,
-    /// few-token window — common when scanning many arbitrary candidate ranges,
-    /// some of which are music/SFX with almost no speech.
+    /// (`filter_width < a->ne[2]`) on a sparse, few-token window — common when
+    /// scanning many arbitrary candidate ranges, some of which are music/SFX
+    /// with almost no speech. (Since ADR 0072 that assert would abort the
+    /// yc-whisper CHILD, not the app — still a failed detect, so the DTW-less
+    /// load remains the right call here.)
     pub fn load_text_only(model: &Path) -> Result<Self> {
         Self::load_inner(model, false)
     }
 
     fn load_inner(model: &Path, dtw: bool) -> Result<Self> {
-        // Route whisper.cpp/ggml logging through `tracing` so its verbose
-        // per-token DEBUG dump is dropped by the app's `info` filter rather than
-        // flooding stderr (that flood also slowed transcription badly). Once-
-        // guarded inside whisper-rs, so calling it on every load is free.
-        whisper_rs::install_logging_hooks();
-        let mut cparams = WhisperContextParameters::default();
-        cparams.use_gpu(true);
-        if dtw {
-            cparams.dtw_parameters(DtwParameters {
-                mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 },
-                ..Default::default()
-            });
-        }
-        let ctx = WhisperContext::new_with_params(model, cparams)
-            .with_context(|| format!("loading whisper model {}", model.display()))?;
         // Opt-in VAD (caption load only): resolve the Silero model beside the
         // whisper model. Requested-but-missing warns and runs without, so a
-        // stray YC_VAD=1 never sinks a render.
+        // stray YC_VAD=1 never sinks a render. Resolved HERE (app-side), like
+        // every env-driven knob — the sidecar reads no env (ADR 0072).
         let vad_model = if dtw && parse_vad_requested(env_opt("YC_VAD").as_deref()) {
             let path = model.with_file_name(VAD_MODEL_FILE);
             if path.is_file() {
@@ -1003,18 +1001,25 @@ impl Transcriber {
         } else {
             None
         };
+        // Spawn the yc-whisper child: it loads the CUDA context (DTW heads on
+        // the caption load) before answering its ready line, so a load failure
+        // — missing model, or the GPU already saturated by another app —
+        // surfaces right here, exactly where the in-process load used to fail.
+        let conn = wire::SidecarConn::spawn(model, dtw)
+            .with_context(|| format!("loading whisper model {} via yc-whisper", model.display()))?;
         // The DTW (caption) load decodes with beam search for accuracy; the
         // text-only detect load stays greedy for speed (ADR 0027).
-        Ok(Self { ctx, beam: dtw, vad_model })
+        Ok(Self { conn: std::sync::Mutex::new(conn), beam: dtw, vad_model })
     }
 
     /// Transcribe one range's 16 kHz mono f32 samples into animatable caption
     /// units, reusing the resident model. Timestamps are 0-based to the range.
     ///
-    /// `should_abort` is currently **inert**: whisper's abort hook collapses GPU
-    /// throughput (see the note in the body), so it is not installed. It is kept
-    /// in the signature so a graph-safe cancel can be re-wired without touching
-    /// callers; for now cancellation happens between candidates in the detect loop.
+    /// `should_abort` is **live** (ADR 0072 — the signature waited for exactly
+    /// this): polled ~every 50 ms while the decode runs in the yc-whisper
+    /// child; returning `true` kills the child mid-decode (VRAM freed by
+    /// process death) and fails with "cancelled". The detect loop's
+    /// between-candidate check still stands on top.
     pub fn transcribe(
         &self,
         samples: &[f32],
@@ -1067,39 +1072,19 @@ impl Transcriber {
         lexicon: &DialectLexicon,
         should_abort: impl FnMut() -> bool + 'static,
     ) -> Result<(Transcript, Vec<f32>)> {
-        let mut state = self.ctx.create_state().context("creating whisper state")?;
-
         // Opt-in decoder priming (#1): only when the store sets `prime`, since
         // it biases the whole transcription (drift risk). The dict (#2, applied
-        // after grouping) is the always-on, risk-free fix. Declared before
-        // `params` so the prompt outlives the borrow.
+        // after grouping) is the always-on, risk-free fix.
         let prompt = if lexicon.prime { lexicon.initial_prompt() } else { String::new() };
 
-        // Caption path: beam search (whisper.cpp's quality decoder) — render time is
-        // no object and accuracy is the goal (ADR 0027). Detect refine: greedy, to
-        // keep the many-candidate scan fast (it reads the excitement lexicon, not
-        // exact words).
-        let strategy = if self.beam {
-            SamplingStrategy::BeamSearch { beam_size: BEAM_SIZE, patience: -1.0 }
-        } else {
-            SamplingStrategy::Greedy { best_of: 1 }
-        };
-        let mut params = FullParams::new(strategy);
-        params.set_language(Some(lang_code(language)));
-        if !prompt.is_empty() {
-            params.set_initial_prompt(&prompt);
-        }
-        params.set_token_timestamps(true); // populate per-token t0/t1 for word timing
-        params.set_translate(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        params.set_print_special(false);
         // Caption-path decode trial knobs (2026-07-02, ADR 0033; see the parse_*
         // docs). ALL OFF by default — a decode change re-garbles the words the
         // operator's curated corrections are keyed to, so each is an explicit
         // per-render opt-in. The detect load keeps whisper defaults regardless.
-        if self.beam {
+        // Resolved HERE from env — the request carries them resolved, so the
+        // render path's scoped YC_SUPPRESS_NST write keeps working even though
+        // the child inherited its env at spawn (ADR 0072).
+        let (no_context, suppress_nst) = if self.beam {
             // Fresh slate per 30 s window, UNLESS the store primes: whisper.cpp
             // feeds `initial_prompt` through the same cross-window context
             // (`prompt_past`) that `no_context` disables, so forcing no_context
@@ -1107,81 +1092,40 @@ impl Transcriber {
             let no_context =
                 prompt.is_empty() && parse_caption_noctx(env_opt("YC_CAPTION_NOCTX").as_deref());
             let suppress_nst = parse_suppress_nst(env_opt("YC_SUPPRESS_NST").as_deref());
-            if no_context {
-                params.set_no_context(true);
-            }
-            if suppress_nst {
-                params.set_suppress_nst(true);
-            }
-            if let Some(vad) = self.vad_model.as_deref() {
-                params.set_vad_model_path(Some(vad));
-                params.set_vad_params(whisper_rs::WhisperVadParams::default());
-                params.enable_vad(true);
-            }
             tracing::info!(
                 "caption decode: beam={BEAM_SIZE} no_context={no_context} \
                  suppress_nst={suppress_nst} vad={}",
                 if self.vad_model.is_some() { "on" } else { "off" },
             );
-        }
-        // NOTE: we deliberately do NOT install whisper's abort callback here.
-        // Installing it collapsed whisper's GPU throughput to a crawl (a
-        // hung-looking ~5% util detect) under concurrent desktop GPU load -
-        // almost certainly because the abort hook forces per-op synchronization /
-        // disables ggml-cuda graph batching. The LLM judge (no abort hook, keeps
-        // CUDA graphs) stays fast under the same load, which isolates the hook as
-        // the cause. Cancellation therefore falls back to the detect loop's
-        // per-candidate `cancel.is_cancelled()` check (between candidates, not
-        // mid-transcription). `should_abort` stays in the signature so a
-        // graph-safe abort can be re-wired later without touching callers.
-        let _ = should_abort;
+            (no_context, suppress_nst)
+        } else {
+            (false, false)
+        };
 
-        state
-            .full(params, samples)
-            .context("whisper transcription failed")?;
-
-        // Collect (text, t0_s, t1_s, prob) for every real token, then group.
-        let mut raw_tokens: Vec<(String, f64, f64, f32)> = Vec::new();
-        for s in 0..state.full_n_segments() {
-            let segment = state
-                .get_segment(s)
-                .ok_or_else(|| anyhow!("segment {s} out of bounds mid-read"))?;
-            // A segment boundary always starts a new word. whisper emits most
-            // word-initial tokens space-led, but a segment's FIRST token can lack
-            // the space (after punctuation, or a mid-word window split) — the
-            // grouping would then fuse it onto the *previous segment's* last word,
-            // stretching that word's span across the 30 s seam. Mark the first
-            // real token space-led so `group_into_words` starts a fresh unit
-            // (JA chunking trims the space; EN/ID display trims it too).
-            let mut first_real_token = true;
-            for t in 0..segment.n_tokens() {
-                let Some(token) = segment.get_token(t) else {
-                    continue;
-                };
-                let mut text = token.to_str_lossy().context("reading token text")?.into_owned();
-                if is_special(&text) {
-                    continue;
-                }
-                if first_real_token {
-                    first_real_token = false;
-                    if s > 0 && !(text.starts_with(' ') || text.starts_with('\u{2581}')) {
-                        text.insert(0, ' ');
-                    }
-                }
-                let data = token.token_data();
-                // Prefer the DTW-aligned time; fall back to the heuristic t0/t1
-                // when DTW produced no value for this token (t_dtw == -1). DTW
-                // gives a single aligned point per token, so a word's span runs
-                // from its first token's time to its last — the caption builders
-                // handle the (zero-width) single-token case.
-                let (t0, t1) = if data.t_dtw >= 0 {
-                    (data.t_dtw, data.t_dtw)
-                } else {
-                    (data.t0, data.t1)
-                };
-                raw_tokens.push((text, t0 as f64 / 100.0, t1 as f64 / 100.0, data.p));
-            }
-        }
+        // Caption path: beam search (whisper.cpp's quality decoder) — render
+        // time is no object and accuracy is the goal (ADR 0027). Detect refine:
+        // greedy, to keep the many-candidate scan fast. The old in-process
+        // abort-callback story (it collapsed CUDA-graph batching; see
+        // yc-whisper's main.rs) is moot here: `should_abort` is REAL now — the
+        // client polls it while awaiting the response and kills the child on
+        // cancel, freeing the VRAM by process death (ADR 0072).
+        let req = wire::DecodeRequest {
+            op: "decode".into(),
+            language: lang_code(language).into(),
+            prompt,
+            beam_size: if self.beam { Some(BEAM_SIZE) } else { None },
+            no_context,
+            suppress_nst,
+            vad_model: self.vad_model.clone(),
+            n_samples: samples.len(),
+        };
+        let raw = self
+            .conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .decode(&req, samples, should_abort)?;
+        let raw_tokens: Vec<(String, f64, f64, f32)> =
+            raw.into_iter().map(|wire::WireToken(text, t0, t1, p)| (text, t0, t1, p)).collect();
 
         let (mut units, mut conf) = group_tokens(raw_tokens, language);
         // Multi-word phrase corrections first (they collapse units + shrink conf in

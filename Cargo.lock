@@ -5640,8 +5640,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "yc-core",
+]
+
+[[package]]
+name = "yc-whisper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "whisper-rs",
  "yc-core",
+ "yc-transcribe",
 ]
 
 [[package]]

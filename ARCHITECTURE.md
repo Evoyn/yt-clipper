@@ -4,22 +4,23 @@ How yt-clipper is put together and why. The vocabulary here ([Moment](CONTEXT.md
 
 ## Workspace
 
-Seven crates, one binary plus one sidecar:
+Eight crates, one binary plus two built sidecars:
 
 | Crate | Role |
 | --- | --- |
 | `crates/app` (`yt-clipper.exe`) | egui/eframe desktop shell, the serial pipeline worker, the Studio editor, headless CLI modes |
 | `crates/core` | Domain model — type names mirror CONTEXT.md; the 1080×1920 canvas constants; `creators.json` store |
 | `crates/ingest` | VOD ingestion: yt-dlp/ffmpeg audio extraction, chat replay, per-clip Segment fetch (HLS + native DASH section fetch), cancel-safe child processes |
-| `crates/transcribe` | whisper.cpp (CUDA, large-v3) via whisper-rs; language-aware caption-unit grouping (EN/ID words, JA character chunks); the Qwen3-ASR ensemble vote; wav2vec2-CTC forced alignment (`align`) |
+| `crates/transcribe` | Caption policy + the whisper wire client (no GPU link): language-aware caption-unit grouping (EN/ID words, JA character chunks); the Qwen3-ASR ensemble vote; wav2vec2-CTC forced alignment (`align`) |
 | `crates/detect` | Moment detection: cheap whole-VOD discovery (chat-rate + loudness), per-candidate refine (lexicon, arousal via `ser`), LLM-judge IPC structs; signals stored unblended |
 | `crates/render` | ffmpeg filtergraph + generated ASS + NVENC export; the ASS generator is the single home of caption animation |
 | `crates/frame` | Framing: Ultraface facecam detection (`face`), pure layout geometry (always compiled), podcast speaker tracking, voice diarization, occupant map, reaction tagging |
+| `crates/whisper` (`yc-whisper.exe`) | Out-of-process whisper.cpp (CUDA, large-v3) decode engine (ADR 0072): raw-token server over stdio, one child per resident model hold |
 | `crates/llm-judge` (`yc-llm-judge.exe`) | Out-of-process llama.cpp worker: whole-video digest, per-Moment clip-worthiness verdicts + titles, the caption-correction pass |
 
 ## Process model
 
-The app links whisper.cpp; llama.cpp lives in the **`yc-llm-judge` sidecar** because both vendor their own `ggml` and cannot co-link (duplicate symbols). The app shells out once per detect run — the candidate batch goes in as JSON on stdin, verdicts come back on stdout, and the sidecar frees its VRAM by exiting.
+The app itself links **no ggml at all**. llama.cpp lives in the **`yc-llm-judge` sidecar** (one-shot per detect run: candidate batch in as JSON on stdin, verdicts back on stdout, VRAM freed by exit). whisper.cpp lives in the **`yc-whisper` sidecar** (ADR 0072): a served child holding the model resident across a batch of decode requests — raw f32 samples in, normalized raw tokens out — so a CUDA out-of-memory `abort()` under GPU contention kills the child and fails the *job* with a "GPU busy — retry when free" error instead of the app, and Cancel can kill a decode mid-flight. All caption **policy** (grouping, dialect corrections, harvest, the ensemble vote, alignment) stays in-process in `yc-transcribe`; the seam is the raw token.
 
 Everything else external is a **pinned sidecar child process**: `ffmpeg`/`ffprobe` (extract, probe, render), `yt-dlp` (+ `deno` for YouTube signature solving), `deep-filter` (caption-input denoise), `llama-mtmd-cli` (ensemble decodes). Child consoles are hidden (ADR 0025); Cancel and window-close kill the whole child tree.
 
