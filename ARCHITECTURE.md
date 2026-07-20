@@ -1,6 +1,6 @@
 # Architecture
 
-How yt-clipper is put together and why. The vocabulary here ([Moment](../CONTEXT.md), Clip, Creator, Layout, Signal, …) is defined in [CONTEXT.md](../CONTEXT.md) — code type names mirror it exactly, and when they drift, the glossary wins. Every non-obvious decision has an ADR under [docs/adr/](adr/) (read [0001](adr/0001-audio-first-two-phase-ingest.md) first); [ROADMAP.md](ROADMAP.md) records the milestone-by-milestone build.
+How yt-clipper is put together and why. The vocabulary here ([Moment](CONTEXT.md), Clip, Creator, Layout, Signal, …) is defined in [CONTEXT.md](CONTEXT.md) — code type names mirror it exactly, and when they drift, the glossary wins. Every non-obvious decision has an ADR under [docs/adr/](docs/adr/) (read [0001](docs/adr/0001-audio-first-two-phase-ingest.md) first); [docs/ROADMAP.md](docs/ROADMAP.md) records the milestone-by-milestone build.
 
 ## Workspace
 

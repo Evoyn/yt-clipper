@@ -19,7 +19,7 @@
 Windows-first desktop app that turns long VODs — gaming streams and podcasts — into vertical (9:16) short-form clips: transcription, moment detection, framing, speaker tracking, animated captions, and NVENC export, with zero cloud calls. Pure Rust (egui), no web stack.
 
 <p align="center">
-  <img src="docs/img/app.png" width="820" alt="yt-clipper — import a VOD, detect Moments, open the Studio editor">
+  <img src="img/app.png" width="820" alt="yt-clipper — import a VOD, detect Moments, open the Studio editor">
 </p>
 
 ## What it does
@@ -73,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-llama-sidecar.ps1 # pinne
 
 Model files live in `/models`, sidecar binaries in `/sidecars`, bundled fonts + the brand set in `/assets`, per-VOD working data in `/workspace` (all gitignored except `/assets`).
 
-Then: paste a YouTube URL (or open a local file) → **Detect Moments** → review the ranked list by ear → **Open in editor** → Export. The full workflow, editor tour, and dependency table are in the **[User Guide](docs/USER-GUIDE.md)**.
+Then: paste a YouTube URL (or open a local file) → **Detect Moments** → review the ranked list by ear → **Open in editor** → Export. The full workflow, editor tour, and dependency table are in the **[User Guide](USER-GUIDE.md)**.
 
 ## Headless CLI
 
@@ -90,7 +90,7 @@ yt-clipper --detect <url-or-file> [en|id|ja]
 yt-clipper --batch <url-or-file> [en|id|ja] [huge|rolling|karaoke] [k] [auto|stacked|cam|gameplay]
 ```
 
-Configuration knobs (`YC_MAX_CLIP_S`, `YC_QWEN_ENS`, `YC_FORCED_ALIGN`, …) are documented in the [User Guide](docs/USER-GUIDE.md#environment-variables).
+Configuration knobs (`YC_MAX_CLIP_S`, `YC_QWEN_ENS`, `YC_FORCED_ALIGN`, …) are documented in the [User Guide](USER-GUIDE.md#environment-variables).
 
 ## Build features
 
@@ -107,8 +107,8 @@ The default build needs no ONNX Runtime binary; each feature compiles one option
 
 ## Documentation
 
-- **[User Guide](docs/USER-GUIDE.md)** — install, first Short, the Studio editor, caption engines, CLI + env reference, troubleshooting.
-- **[Architecture](docs/ARCHITECTURE.md)** — crate map, process model, GPU staging, data layout, design principles.
+- **[User Guide](USER-GUIDE.md)** — install, first Short, the Studio editor, caption engines, CLI + env reference, troubleshooting.
+- **[Architecture](ARCHITECTURE.md)** — crate map, process model, GPU staging, data layout, design principles.
 - **[CONTEXT.md](CONTEXT.md)** — the domain language. Code mirrors these terms exactly.
 - **[docs/adr/](docs/adr/)** — 71 architecture decision records: why everything is the way it is (read 0001 first).
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — how it was built, milestone by milestone.

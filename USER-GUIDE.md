@@ -1,6 +1,6 @@
 # User Guide
 
-Everything from a fresh checkout to an exported Short. The [README](../README.md) has the elevator pitch; [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit; [CONTEXT.md](../CONTEXT.md) defines every capitalized term used here (Moment, Clip, Creator, Layout, …).
+Everything from a fresh checkout to an exported Short. The [README](README.md) has the elevator pitch; [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit; [CONTEXT.md](CONTEXT.md) defines every capitalized term used here (Moment, Clip, Creator, Layout, …).
 
 ## Contents
 
@@ -33,7 +33,7 @@ scripts\build-release.bat
 
 The release binaries land in `target\release\` (`yt-clipper.exe` + `yc-llm-judge.exe` — the judge sidecar must sit beside the app exe, which it does there). The app resolves `sidecars/`, `models/`, `assets/`, and `workspace/` by walking up from the exe to the repo root, so you can launch `target\release\yt-clipper.exe` directly.
 
-Build features (see the [README table](../README.md#build-features)): the default build compiles without any ONNX Runtime; `face`, `ser`, and `align` are what `build-release.bat` ships, and each degrades gracefully at runtime if its model file is missing.
+Build features (see the [README table](README.md#build-features)): the default build compiles without any ONNX Runtime; `face`, `ser`, and `align` are what `build-release.bat` ships, and each degrades gracefully at runtime if its model file is missing.
 
 ## Tools and models
 
