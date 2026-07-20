@@ -18,9 +18,9 @@
 !/workspace/*/en.json
 !/workspace/*/ja.json
 
-# Session-bridge artifacts (ephemeral, not project history)
+# Session-bridge artifacts + work-queue/log notes (ephemeral, not project history)
 /handoffs/
-/nextprompt.md
+/notes/
 
 # Claude Code local (machine-specific) settings; shared .claude/ files are committed
 /.claude/settings.local.json
