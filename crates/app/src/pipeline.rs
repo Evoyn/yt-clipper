@@ -500,6 +500,25 @@ pub fn spawn(
             let job_label = job_label(&job);
             crate::forensics::set_current_job(&job_label);
             tracing::info!("job start: {job_label}");
+            // A panicking job must not take the WORKER with it. Before this
+            // guard, a panic anywhere in a job (measured 2026-07-20: the
+            // speaker tracker's out-of-bounds on a duplicate detection) killed
+            // this thread silently — the UI kept showing the stage forever
+            // because no Failed/JobDone ever arrived, Cancel did nothing (the
+            // token has no reader left), and every later job was dropped on
+            // the floor: an open window attached to nothing. The panic hook
+            // still writes crash.log first (ADR 0072), so we lose no forensics
+            // by recovering here; we report the job as failed and keep
+            // serving. `session`/`prepared` are only assigned at the end of a
+            // successful arm, so a mid-job panic leaves the previous state
+            // intact rather than half-updated.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Test-only injection (no production code path): lets the suite
+            // prove a panicking job leaves the worker serving.
+            #[cfg(test)]
+            if std::env::var("YC_TEST_JOB_PANIC").is_ok_and(|v| v == "1") {
+                panic!("YC_TEST_JOB_PANIC: injected job panic");
+            }
             match job {
                 Job::Import { source, language } => {
                     match do_import(&paths, source, language, &worker_cancel, &tx_prog) {
@@ -662,6 +681,22 @@ pub fn spawn(
                         }
                     }
                 }
+            }
+            }));
+            if let Err(payload) = outcome {
+                // The panic hook already logged the payload + backtrace; turn
+                // it into an honest, actionable job failure for the operator.
+                let what = payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                tracing::error!("job panicked: {job_label}: {what}");
+                let _ = tx_prog.send(Progress::Failed(format!(
+                    "internal error during {job_label}: {what} \
+                     (details in workspace/crash.log). The app is still usable - \
+                     the rest of your session is unaffected."
+                )));
             }
             tracing::info!("job done: {job_label}");
             crate::forensics::set_current_job("idle (between jobs)");
@@ -3662,6 +3697,71 @@ mod tests {
         // The load's context names the model, so the warn+omit log says what broke.
         assert!(format!("{err:#}").contains("SER model"), "unexpected error: {err:#}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panicking_job_fails_that_job_and_leaves_the_worker_serving() {
+        // The 2026-07-20 zombie-app class: a panic inside a job killed the
+        // worker THREAD, so the UI waited forever on a stage message that
+        // could never come, Cancel had no reader, and every later job was
+        // silently dropped. The worker must now report the failure and keep
+        // serving.
+        let paths = PipelinePaths {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            ytdlp: PathBuf::from("yt-dlp"),
+            deno_dir: None,
+            model: PathBuf::from("model"),
+            ser_model: PathBuf::from("ser"),
+            llm_model: PathBuf::from("llm"),
+            llm_judge: PathBuf::from("judge"),
+            face_model: PathBuf::from("face"),
+            voice_model: PathBuf::from("voice"),
+            yunet_model: PathBuf::from("yunet"),
+            sface_model: PathBuf::from("sface"),
+            tag_model: PathBuf::from("tag"),
+            tag_labels: PathBuf::from("labels"),
+            sep_model: PathBuf::from("sep"),
+            deep_filter: PathBuf::from("df"),
+            mtmd_cli: PathBuf::from("mtmd"),
+            qwen_model: PathBuf::from("qwen"),
+            qwen_mmproj: PathBuf::from("mmproj"),
+            align_model: PathBuf::from("align"),
+            dialect_dir: PathBuf::from("dialect"),
+            font: PathBuf::from("font"),
+            workspace: std::env::temp_dir().join("yc_panic_guard_test"),
+        };
+        let (tx_job, rx_prog, _cancel, worker) = spawn(paths);
+
+        // Job 1 panics (injected).
+        std::env::set_var("YC_TEST_JOB_PANIC", "1");
+        tx_job.send(Job::Detect { max_dur_s: 90.0 }).expect("worker alive");
+        let first = rx_prog
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a panicking job must report, not hang forever");
+        match first {
+            Progress::Failed(msg) => {
+                assert!(msg.contains("internal error"), "must name it an internal error: {msg}");
+                assert!(msg.contains("crash.log"), "must point at the forensics: {msg}");
+            }
+            _ => panic!("expected Failed for the panicking job, got another Progress"),
+        }
+
+        // Job 2 must still be served — the worker survived.
+        std::env::remove_var("YC_TEST_JOB_PANIC");
+        tx_job.send(Job::Detect { max_dur_s: 90.0 }).expect("worker still alive after the panic");
+        let second = rx_prog
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker must keep serving after a panicking job");
+        match second {
+            Progress::Failed(msg) => {
+                assert!(msg.contains("import a VOD"), "expected the normal no-session refusal: {msg}");
+            }
+            _ => panic!("expected the normal Failed refusal, got another Progress"),
+        }
+
+        drop(tx_job);
+        let _ = worker.join();
     }
 
     #[test]

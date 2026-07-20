@@ -338,8 +338,20 @@ impl TrackBuilder {
     pub fn observe(&mut self, faces: &[FaceBox], rgb: &[u8]) {
         let frame_idx = self.n_frames;
         self.n_frames += 1;
+        // A track is one SEAT, so it holds at most one detection per frame.
+        // Without this claim guard two detections whose centers both land
+        // within the match radius of the same track — faces drifting together,
+        // or the detector emitting overlapping boxes for one face — each
+        // pushed a per-frame entry onto it, growing that track's `motion` /
+        // `path` past `n_frames`; `finish` then indexed its frame-sized buffer
+        // out of bounds and panicked the whole worker thread (measured
+        // 2026-07-20: "len is 1122 but the index is 1122", crash.log). A
+        // second detection is a second thing on screen, so it starts its own
+        // track; a duplicate box of one face makes a short track that the
+        // persistence gate below drops.
+        let mut claimed: Vec<usize> = Vec::with_capacity(faces.len());
         for f in faces {
-            let ti = self.match_track(f);
+            let ti = self.match_track(f, &claimed);
             let ti = match ti {
                 Some(ti) => {
                     let t = &mut self.tracks[ti];
@@ -363,6 +375,7 @@ impl TrackBuilder {
                     self.tracks.len() - 1
                 }
             };
+            claimed.push(ti);
             let patch = self.sample_mouth_patch(f, rgb);
             let t = &mut self.tracks[ti];
             // Pad any frames this track missed with None, then record this one.
@@ -388,10 +401,15 @@ impl TrackBuilder {
 
     /// Match a detection to the track whose **last seen** position is nearest
     /// (within the radius): a slow-moving face drags its track along frame by
-    /// frame instead of falling off an all-time-mean anchor.
-    fn match_track(&self, f: &FaceBox) -> Option<usize> {
+    /// frame instead of falling off an all-time-mean anchor. Tracks already
+    /// `claimed` by an earlier detection in THIS frame are skipped — one seat
+    /// cannot be in two places at once (see [`Self::observe`]).
+    fn match_track(&self, f: &FaceBox, claimed: &[usize]) -> Option<usize> {
         let mut best: Option<(usize, f32)> = None;
         for (i, t) in self.tracks.iter().enumerate() {
+            if claimed.contains(&i) {
+                continue;
+            }
             let dx = f.cx() - t.last_cx;
             let dy = f.cy() - t.last_cy;
             let d = (dx * dx + dy * dy).sqrt();
@@ -447,7 +465,12 @@ impl TrackBuilder {
             }
             let presence = t.frames_seen as f32 / n as f32;
             let mut raw = vec![0f32; n];
-            for (i, m) in t.motion.iter().enumerate() {
+            // `take(n)` is structural, not defensive dressing: this buffer is
+            // frame-sized, so nothing a track recorded may index past it. The
+            // observe-side claim guard keeps the lengths equal; this makes a
+            // future mismatch degrade (drop the overflow) instead of panicking
+            // the worker thread, which used to freeze the whole app.
+            for (i, m) in t.motion.iter().take(n).enumerate() {
                 if let Some(v) = *m {
                     raw[i] = v;
                 }
@@ -2241,6 +2264,41 @@ mod tests {
         let a0: f32 = tracks[0].activity.iter().sum();
         let a1: f32 = tracks[1].activity.iter().sum();
         assert!(a0 > a1 * 5.0, "talking mouth must out-move listening one: {a0} vs {a1}");
+    }
+
+    #[test]
+    fn two_detections_near_one_seat_never_outgrow_the_frame_count() {
+        // The 2026-07-20 production crash (AnalyzeSpeakers, crash.log: "len is
+        // 1122 but the index is 1122"): two boxes in the SAME frame both fell
+        // inside one track's match radius, so both pushed a per-frame entry
+        // onto it and its motion/path outgrew n_frames — `finish` then indexed
+        // its frame-sized buffer out of bounds and killed the worker thread.
+        // A near-duplicate box (the detector double-reporting one face) is the
+        // honest trigger: 4 px apart, far inside the radius.
+        let (w, h) = (640usize, 360usize);
+        let rgb = frame_with_patch(w, h, None);
+        let mut b = TrackBuilder::new(w as f32, h as f32, w, h);
+        let face = fb(300.0, 100.0, 90.0, 90.0);
+        let dup = fb(304.0, 100.0, 90.0, 90.0);
+        let frames = nbins(4.0);
+        for _ in 0..frames {
+            b.observe(&[face, dup], &rgb);
+        }
+        // No track may carry more per-frame samples than there were frames.
+        for t in &b.tracks {
+            assert!(
+                t.motion.len() <= b.n_frames,
+                "track recorded {} samples over {} frames",
+                t.motion.len(),
+                b.n_frames
+            );
+        }
+        // finish() must not panic, and every activity series stays frame-sized.
+        let tracks = b.finish();
+        for t in &tracks {
+            assert_eq!(t.activity.len(), frames, "activity must be frame-sized");
+            assert_eq!(t.path.len(), frames, "path must be frame-sized");
+        }
     }
 
     #[test]
