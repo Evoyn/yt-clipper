@@ -858,12 +858,25 @@ fn open_in_shell(path: &Path) {
     let _ = std::process::Command::new("explorer").no_console().arg(path).spawn();
 }
 
-/// Reveal a file in Explorer with the file pre-selected. `/select,` and the
-/// path travel as ONE argument (Explorer's own parsing).
+/// Reveal a file in Explorer with the file pre-selected. Explorer's non-argv
+/// command-line parsing wants `/select,"C:\path"` — the switch outside the
+/// quotes, only the path inside. `.arg()` cannot produce that shape: once the
+/// path contains a space (Short titles nearly always do), std quotes the whole
+/// token (`"/select,C:\a b.mp4"`) and Explorer, no longer seeing the switch,
+/// opens Documents instead of revealing. `raw_arg` passes the token verbatim;
+/// Windows filenames can never contain `"`, so the embedded quotes stay
+/// unambiguous.
 fn reveal_in_explorer(path: &Path) {
-    let mut select = std::ffi::OsString::from("/select,");
-    select.push(path);
-    let _ = std::process::Command::new("explorer").no_console().arg(select).spawn();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let mut select = std::ffi::OsString::from("/select,\"");
+        select.push(path);
+        select.push("\"");
+        let _ = std::process::Command::new("explorer").no_console().raw_arg(select).spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = path;
 }
 
 /// The max Moment length (seconds) for headless/batch detection: `YC_MAX_CLIP_S`
