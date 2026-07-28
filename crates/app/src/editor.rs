@@ -5578,6 +5578,11 @@ impl EditorState {
 
         // --- Camera ---
         theme::section(ui, "Camera");
+        // Without `face` the analysis job is a stub that can only fail, so the
+        // modes that would start it are disabled up front (2026-07-28: a
+        // release rebuilt without the feature turned Retry into a µs-fail
+        // loop that read as a dead button).
+        let face_build = cfg!(feature = "face");
         theme::card().show(ui, |ui| {
             for mode in [
                 CameraMode::Manual,
@@ -5587,6 +5592,7 @@ impl EditorState {
                 CameraMode::Group,
             ] {
                 let selected = self.camera_mode == mode;
+                let ai_mode = matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group);
                 let label = match mode {
                     CameraMode::ActiveSpeaker => {
                         format!("{}  ·  best for podcasts", camera_mode_label(mode))
@@ -5594,13 +5600,22 @@ impl EditorState {
                     _ => camera_mode_label(mode).to_string(),
                 };
                 // Full-width rows: every mode the same size, nothing shifts.
-                let mut resp = theme::wide_button(ui, theme::chip(selected, &label));
-                if matches!(mode, CameraMode::ActiveSpeaker | CameraMode::Group) {
+                let mut resp = ui
+                    .add_enabled_ui(face_build || !ai_mode, |ui| {
+                        theme::wide_button(ui, theme::chip(selected, &label))
+                    })
+                    .inner;
+                if ai_mode {
                     // One control, not two: picking an AI mode IS the speaker
                     // detection (the old separate "Detect speakers" button ran
                     // the identical job and read as a different feature).
-                    resp = resp
-                        .on_hover_text("First use runs the speaker analysis (CPU, ~10-30 s)");
+                    resp = if face_build {
+                        resp.on_hover_text("First use runs the speaker analysis (CPU, ~10-30 s)")
+                    } else {
+                        resp.on_disabled_hover_text(
+                            "This build has no face detection - rebuild with scripts\\build-release.bat",
+                        )
+                    };
                 }
                 if resp.clicked() {
                     if self.camera_mode != mode {
@@ -5619,7 +5634,14 @@ impl EditorState {
             ui.add_space(4.0);
             match &self.speaker_job {
                 SpeakerJob::NotRun => {
-                    ui.weak("Active Speaker / Group analyze speakers on first use.");
+                    if face_build {
+                        ui.weak("Active Speaker / Group analyze speakers on first use.");
+                    } else {
+                        ui.weak(
+                            "AI camera is off: this build was compiled without face \
+                             detection (scripts\\build-release.bat restores it).",
+                        );
+                    }
                 }
                 SpeakerJob::Running => {
                     ui.weak("Analyzing speakers…");
@@ -5675,7 +5697,12 @@ impl EditorState {
                     }
                 }
                 SpeakerJob::Failed(e) => {
-                    ui.colored_label(theme::ERR, "Speaker analysis failed").on_hover_text(e);
+                    ui.colored_label(theme::ERR, "Speaker analysis failed");
+                    // The reason inline, not tooltip-only: an instant failure
+                    // (the face-less build, a missing model) re-fails within
+                    // one frame of Retry, and with the cause hidden in a hover
+                    // the button reads as dead.
+                    ui.label(egui::RichText::new(e.as_str()).color(theme::ERR).size(12.0));
                     if ui.add_enabled(!busy, egui::Button::new("Retry")).clicked() {
                         self.speaker_job = SpeakerJob::Running;
                         action = Some(EditorAction::AnalyzeSpeakers);

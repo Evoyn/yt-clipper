@@ -36,6 +36,19 @@ fn main() -> eframe::Result<()> {
     let paths = AppPaths::resolve();
     forensics::init(&paths.workspace);
     forensics::run_test_injections();
+    // A feature-starved exe must self-identify at the top of every log: a
+    // release rebuilt without `--features face,align,ser` (2026-07-28) shipped
+    // stub speaker analysis, DTW-only ensemble timing, and arousal-blind
+    // Moment ranking — and nothing anywhere said so.
+    tracing::info!(
+        "build features: face={} align={} ser={} sep={} enh={} correct={}",
+        cfg!(feature = "face"),
+        cfg!(feature = "align"),
+        cfg!(feature = "ser"),
+        cfg!(feature = "sep"),
+        cfg!(feature = "enh"),
+        cfg!(feature = "correct"),
+    );
     let deno_dir = paths.deno_dir();
     let (to_worker, from_worker, cancel, worker) = pipeline::spawn(pipeline::PipelinePaths {
         ffmpeg: paths.ffmpeg(),

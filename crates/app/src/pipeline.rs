@@ -751,8 +751,13 @@ fn job_label(job: &Job) -> String {
 /// (the child was tree-killed), else as a genuine `Failed`.
 fn fail_or_cancel(e: anyhow::Error, cancel: &CancelToken) -> Progress {
     if cancel.is_cancelled() {
+        tracing::info!("job cancelled ({e:#})");
         Progress::Cancelled
     } else {
+        // yc.log must carry the WHY, not just the start/done bracket: the
+        // face-less-build incident (2026-07-28) logged twenty µs-long
+        // AnalyzeSpeakers pairs with the actual error visible nowhere.
+        tracing::warn!("job failed: {e:#}");
         Progress::Failed(format!("{e:#}"))
     }
 }
