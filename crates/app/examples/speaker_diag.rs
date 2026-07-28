@@ -159,7 +159,10 @@ fn main() -> anyhow::Result<()> {
     let mut builder = speaker::TrackBuilder::new(src_w, src_h, tw as usize, th as usize);
     let mut det_buf = vec![0u8; yc_frame::infer::DET_W * yc_frame::infer::DET_H * 3];
     let mut detect_err: Option<anyhow::Error> = None;
+    // Per-bin frame-look signatures for the rescue's b-roll gate (ADR 0074).
+    let mut look_hists: Vec<[f32; speaker::LOOK_BINS]> = Vec::new();
     yc_ingest::stream_frames_rgb(ffmpeg, &segment, seek_s, dur, tw, th, fps, max_frames, &mut |rgb| {
+        look_hists.push(speaker::frame_luma_hist(rgb, 4));
         speaker::downscale_rgb(
             rgb,
             tw as usize,
@@ -182,17 +185,14 @@ fn main() -> anyhow::Result<()> {
     if let Some(e) = detect_err {
         return Err(e.context("face detection"));
     }
-    let tracks = builder.finish();
+    let mut tracks = builder.finish();
 
-    let samples = yc_ingest::read_range_samples(&analysis_wav, range)?;
     let bin_s = 1.0 / fps;
     let n_bins = (dur * fps).ceil().max(1.0) as usize;
-    let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
-    let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
-    let mut analysis =
-        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
 
     // --- scene cuts: detect_scene_cuts replica (same command, same parse) ----
+    // Before attribution, as in production: the wide-shot rescue below
+    // reshapes the tracks attribution and the plan consume.
     let out = std::process::Command::new(ffmpeg)
         .args([
             "-v",
@@ -220,6 +220,137 @@ fn main() -> anyhow::Result<()> {
         .collect();
     cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     cuts.dedup_by(|a, b| (*a - *b).abs() < 0.1);
+
+    // --- wide-shot rescue (ADR 0074): `rescue_wide_shot_faces` replica — a
+    // follow-visible clip's faceless inter-cut segments re-detect at full res
+    // (YuNet, two overlapping half-frames) so the plan can see the wide's
+    // people instead of parking the previous camera's crop on empty seats.
+    if speaker::follow_visible_regime(&tracks, n_bins) {
+        let segs = speaker::faceless_segments(&tracks, n_bins, bin_s, &cuts, dur);
+        if !segs.is_empty() {
+            let yunet = Path::new(YUNET_MODEL);
+            let sface = Path::new(SFACE_MODEL);
+            if yunet.is_file() && sface.is_file() {
+                let mut ident = yc_frame::face_id::FaceIdentifier::load(yunet, sface)?;
+                let (fw, fh) = (even(probe.width as f32), even(probe.height as f32));
+                let mut candidate = tracks.clone();
+                let mut absorbed = 0usize;
+                println!("== wide-shot rescue: {} faceless segment(s)", segs.len());
+                for &(t0, t1, b0, b1) in &segs {
+                    let seg_dur = t1 - t0;
+                    let max_frames = (seg_dur * fps).ceil() as usize + 2;
+                    let mut per_bin: Vec<(usize, Vec<(yc_frame::FaceBox, speaker::MouthPatch)>)> =
+                        Vec::new();
+                    let mut frame_idx = 0usize;
+                    let mut det_err: Option<anyhow::Error> = None;
+                    yc_ingest::stream_frames_rgb(
+                        ffmpeg,
+                        &segment,
+                        seek_s + t0,
+                        seg_dur,
+                        fw,
+                        fh,
+                        fps,
+                        max_frames,
+                        &mut |rgb| {
+                            let bin = b0 + frame_idx;
+                            frame_idx += 1;
+                            if bin >= b1 {
+                                return false;
+                            }
+                            match ident.detect_frame_tiled(
+                                rgb,
+                                fw as usize,
+                                fh as usize,
+                                speaker::RESCUE_MIN_SCORE,
+                            ) {
+                                Ok(dets) => {
+                                    per_bin.push((
+                                        bin,
+                                        dets.into_iter()
+                                            .map(|d| {
+                                                let patch = speaker::rescue_mouth_patch(
+                                                    rgb,
+                                                    fw as usize,
+                                                    fh as usize,
+                                                    &d.bbox,
+                                                );
+                                                (d.bbox, patch)
+                                            })
+                                            .collect(),
+                                    ));
+                                    true
+                                }
+                                Err(e) => {
+                                    det_err = Some(e);
+                                    false
+                                }
+                            }
+                        },
+                    )?;
+                    if let Some(e) = det_err {
+                        return Err(e.context("wide-shot rescue detection"));
+                    }
+                    let dets: usize = per_bin.iter().map(|(_, f)| f.len()).sum();
+                    // Look reference against the PRE-rescue tracks: an earlier
+                    // rescued segment must never vouch for a later one.
+                    let look = speaker::segment_look_distance(&look_hists, &tracks, (b0, b1));
+                    let seats = speaker::absorb_rescue(
+                        &mut candidate,
+                        n_bins,
+                        (b0, b1),
+                        &per_bin,
+                        look,
+                        src_w,
+                        src_h,
+                    );
+                    let n = seats.iter().filter(|s| s.absorbed).count();
+                    absorbed += n;
+                    println!(
+                        "  {t0:>5.1}-{t1:>5.1}s: {dets} detections over {} bins, look {} -> {n} seat(s)",
+                        b1 - b0,
+                        look.map(|d| format!("{d:.3}")).unwrap_or_else(|| "-".into())
+                    );
+                    for s in &seats {
+                        println!(
+                            "    seat ({:>4.0},{:>4.0}) {:>3.0}x{:>3.0} bins {:>3} | peak mouth {:.4} | {} | {}",
+                            s.bbox.x,
+                            s.bbox.y,
+                            s.bbox.w,
+                            s.bbox.h,
+                            s.bins,
+                            s.peak_activity,
+                            if s.known_seat { "KNOWN seat" } else { "new seat" },
+                            if s.absorbed { "absorbed" } else { "REJECTED" }
+                        );
+                    }
+                }
+                if absorbed > 0 && speaker::follow_visible_regime(&candidate, n_bins) {
+                    speaker::relabel_left_to_right(&mut candidate);
+                    tracks = candidate;
+                    println!(
+                        "  absorbed {absorbed} seat(s) -> {} tracks (relabelled left-to-right)\n",
+                        tracks.len()
+                    );
+                } else if absorbed > 0 {
+                    println!("  DROPPED: absorbing would flip the regime\n");
+                } else {
+                    println!("  nothing above the persistence/size bars — tracks unchanged\n");
+                }
+            } else {
+                println!(
+                    "== wide-shot rescue: {} faceless segment(s) but face-id models missing — skipped\n",
+                    segs.len()
+                );
+            }
+        }
+    }
+
+    let samples = yc_ingest::read_range_samples(&analysis_wav, range)?;
+    let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
+    let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
+    let mut analysis =
+        SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
 
     // The MOUTH-ONLY plan — the pre-integration camera, kept as the printed
     // baseline the integrated plan is diffed against below.

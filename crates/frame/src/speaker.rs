@@ -156,6 +156,57 @@ const MULTICAM_MIN_SHOT_S: f64 = 0.7;
 /// tracker-lagged shadow (the detector re-acquires the new face a few bins
 /// late), never a second camera change — half the flicker floor (ADR 0073).
 const FLIP_SPLIT_GUARD_S: f64 = 0.35;
+/// Wide-shot rescue (ADR 0074): an inter-cut segment at least this long whose
+/// bins the tracker left (almost) empty gets a second, high-resolution
+/// detection pass — a wide angle's distant faces sit below Ultraface's fixed
+/// 320x240 input, and a "faceless" span then holds the PREVIOUS camera's
+/// framing over people who are actually on screen (the 2026-07-28 TKP
+/// "Confidence vs Fear" wide parked B's close-up crop on empty black for
+/// 3.1 s). Shorter spans stay held framing: a transition wobble, not a shot.
+pub const RESCUE_MIN_SEGMENT_S: f64 = 1.0;
+/// A segment counts as faceless while the tracker sees a face in fewer than
+/// this fraction of its bins (a stray near-cut detection must not veto the
+/// rescue of an otherwise empty wide).
+const RESCUE_MAX_SEEN_FRAC: f64 = 0.1;
+/// Open-frame rescue detections keep only YuNet scores at or above this —
+/// stricter than the region path's [`crate::face_id::YUNET_MIN_SCORE`]
+/// because no prior track vouches for the area (a phantom seat would become
+/// a crop target, the very defect the rescue exists to end).
+pub const RESCUE_MIN_SCORE: f32 = 0.7;
+/// A rescued seat must be detected in at least this fraction of its
+/// segment's bins: codec-noise phantoms flicker, people persist.
+const RESCUE_PRESENCE_FRAC: f64 = 0.5;
+/// ...and its median face must be at least this tall in source pixels — a
+/// distant real speaker in a 1080p wide still spans ~100 px; sub-speck
+/// detections are set dressing.
+const RESCUE_MIN_FACE_H: f32 = 24.0;
+/// A rescued segment absorbs unknown seats only when some seat's peak mouth
+/// motion (the tracker's own activity scale, [`MIN_ACTIVITY`] = the smallest
+/// motion attribution treats as speech evidence) shows a live person on this
+/// camera. A sanity floor, not the b-roll discriminator: measured 2026-07-28,
+/// film grain + a Ken Burns pan give a PAINTED face 0.0255 peak — the same
+/// scale as live people (TKP wide listener 0.0123, talker 0.0282) — so only
+/// a synthetically still overlay fails this.
+pub const RESCUE_MIN_LIVENESS: f32 = MIN_ACTIVITY;
+/// Luma-histogram bins for the per-frame LOOK signature the rescue's b-roll
+/// gate compares on.
+pub const LOOK_BINS: usize = 16;
+/// Reference bins per side (≈1 s) when comparing a rescued segment's look
+/// against the nearest tracked bins.
+const LOOK_REF_BINS: usize = 24;
+/// Unknown seats absorb only when the rescued segment LOOKS like the show
+/// around it: normalized L1 histogram distance (0..1) to the nearest tracked
+/// bins at or below this. A wide angle shares its studio's palette with the
+/// close-ups; a produced insert (guru gembul's archival footage inside a TV
+/// graphic) replaces the whole frame. Measured 2026-07-28 on the live
+/// corpus: the TKP studio wide scores 0.052; foreign inserts score 0.179
+/// (refugee b-roll), 0.266 (the painted miniature), 0.30-0.93 (churn, outro
+/// cards). Real studio segments can reach 0.166 (Risyad), so the
+/// distributions nearly touch — the bar sits LOW because the costs are
+/// asymmetric: a missed rescue degrades to the held framing the operator
+/// already accepts, while a false absorb re-frames b-roll (a new defect
+/// class). A known seat re-appearing bypasses this gate entirely.
+pub const RESCUE_MAX_LOOK_DIST: f32 = 0.15;
 /// Solo framing: crop height as a multiple of the face-box height (the zoom),
 /// and where the face center sits vertically in the crop (headroom bias).
 const SOLO_ZOOM: f32 = 3.6;
@@ -429,27 +480,7 @@ impl TrackBuilder {
     fn sample_mouth_patch(&self, f: &FaceBox, rgb: &[u8]) -> [f32; PATCH_W * PATCH_H] {
         let sx = self.frame_w as f32 / self.src_w.max(1.0);
         let sy = self.frame_h as f32 / self.src_h.max(1.0);
-        let mx = (f.x + f.w * MOUTH_X_FRAC) * sx;
-        let my = (f.y + f.h * MOUTH_Y_FRAC) * sy;
-        let mw = (f.w * MOUTH_W_FRAC * sx).max(1.0);
-        let mh = (f.h * MOUTH_H_FRAC * sy).max(1.0);
-        let mut patch = [0f32; PATCH_W * PATCH_H];
-        for py in 0..PATCH_H {
-            for px in 0..PATCH_W {
-                let x = (mx + (px as f32 + 0.5) / PATCH_W as f32 * mw) as usize;
-                let y = (my + (py as f32 + 0.5) / PATCH_H as f32 * mh) as usize;
-                let x = x.min(self.frame_w.saturating_sub(1));
-                let y = y.min(self.frame_h.saturating_sub(1));
-                let o = (y * self.frame_w + x) * 3;
-                if o + 2 < rgb.len() {
-                    // ITU-R BT.601 luma.
-                    patch[py * PATCH_W + px] = 0.299 * rgb[o] as f32
-                        + 0.587 * rgb[o + 1] as f32
-                        + 0.114 * rgb[o + 2] as f32;
-                }
-            }
-        }
-        patch
+        mouth_patch_scaled(rgb, self.frame_w, self.frame_h, f, sx, sy)
     }
 
     /// Close the builder: merge same-seat fragments, keep persistent tracks,
@@ -671,6 +702,394 @@ fn smooth(series: &[f32], win: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The luma grid of one face's mouth region: the tracker's per-frame motion
+/// evidence, exported so the wide-shot rescue can measure liveness through
+/// the SAME pipeline (ADR 0074).
+pub type MouthPatch = [f32; PATCH_W * PATCH_H];
+
+/// Sample a face's mouth region (source-pixel box, `sx`/`sy` mapping onto
+/// the given rgb frame) as a fixed luma grid — the shared core of
+/// [`TrackBuilder`] tracking (scaled frames) and the rescue (full-res).
+fn mouth_patch_scaled(
+    rgb: &[u8],
+    frame_w: usize,
+    frame_h: usize,
+    f: &FaceBox,
+    sx: f32,
+    sy: f32,
+) -> MouthPatch {
+    let mx = (f.x + f.w * MOUTH_X_FRAC) * sx;
+    let my = (f.y + f.h * MOUTH_Y_FRAC) * sy;
+    let mw = (f.w * MOUTH_W_FRAC * sx).max(1.0);
+    let mh = (f.h * MOUTH_H_FRAC * sy).max(1.0);
+    let mut patch = [0f32; PATCH_W * PATCH_H];
+    for py in 0..PATCH_H {
+        for px in 0..PATCH_W {
+            let x = (mx + (px as f32 + 0.5) / PATCH_W as f32 * mw) as usize;
+            let y = (my + (py as f32 + 0.5) / PATCH_H as f32 * mh) as usize;
+            let x = x.min(frame_w.saturating_sub(1));
+            let y = y.min(frame_h.saturating_sub(1));
+            let o = (y * frame_w + x) * 3;
+            if o + 2 < rgb.len() {
+                // ITU-R BT.601 luma.
+                patch[py * PATCH_W + px] =
+                    0.299 * rgb[o] as f32 + 0.587 * rgb[o + 1] as f32 + 0.114 * rgb[o + 2] as f32;
+            }
+        }
+    }
+    patch
+}
+
+/// [`mouth_patch_scaled`] for the rescue's full-resolution frames (detection
+/// coordinates ARE frame coordinates).
+pub fn rescue_mouth_patch(rgb: &[u8], w: usize, h: usize, f: &FaceBox) -> MouthPatch {
+    mouth_patch_scaled(rgb, w, h, f, 1.0, 1.0)
+}
+
+/// Normalized luma histogram of one rgb24 frame, sampling every `step`-th
+/// pixel — the per-bin LOOK signature the wide-shot rescue's b-roll gate
+/// compares (ADR 0074). Collected during the main tracking stream, so the
+/// gate costs no extra decode.
+pub fn frame_luma_hist(rgb: &[u8], step: usize) -> [f32; LOOK_BINS] {
+    let mut hist = [0f32; LOOK_BINS];
+    let step = step.max(1);
+    let mut count = 0f32;
+    let mut i = 0usize;
+    while i + 2 < rgb.len() {
+        let luma = 0.299 * rgb[i] as f32 + 0.587 * rgb[i + 1] as f32 + 0.114 * rgb[i + 2] as f32;
+        let b = ((luma / 256.0) * LOOK_BINS as f32) as usize;
+        hist[b.min(LOOK_BINS - 1)] += 1.0;
+        count += 1.0;
+        i += 3 * step;
+    }
+    if count > 0.0 {
+        for v in hist.iter_mut() {
+            *v /= count;
+        }
+    }
+    hist
+}
+
+/// How different a rescued segment LOOKS from the show around it: normalized
+/// L1 distance (0 = identical palette, 1 = disjoint) between the segment's
+/// mean luma histogram and that of the nearest tracked bins on either side
+/// (up to [`LOOK_REF_BINS`] each). `None` when the clip has no tracked bins
+/// to compare against — callers treat that as "cannot vouch".
+pub fn segment_look_distance(
+    hists: &[[f32; LOOK_BINS]],
+    tracks: &[SpeakerTrack],
+    seg: (usize, usize),
+) -> Option<f32> {
+    let (b0, b1) = seg;
+    let n = hists.len();
+    if b0 >= b1 || b0 >= n {
+        return None;
+    }
+    let tracked =
+        |b: usize| tracks.iter().any(|t| t.path.get(b).map(|p| p.is_some()).unwrap_or(false));
+    let mut refs: Vec<usize> = Vec::new();
+    let mut got = 0usize;
+    for b in (0..b0.min(n)).rev() {
+        if tracked(b) {
+            refs.push(b);
+            got += 1;
+            if got >= LOOK_REF_BINS {
+                break;
+            }
+        }
+    }
+    got = 0;
+    for b in b1..n {
+        if tracked(b) {
+            refs.push(b);
+            got += 1;
+            if got >= LOOK_REF_BINS {
+                break;
+            }
+        }
+    }
+    if refs.is_empty() {
+        return None;
+    }
+    let mean = |idx: &mut dyn Iterator<Item = usize>| -> [f32; LOOK_BINS] {
+        let mut acc = [0f32; LOOK_BINS];
+        let mut k = 0f32;
+        for b in idx {
+            for (a, v) in acc.iter_mut().zip(hists[b].iter()) {
+                *a += v;
+            }
+            k += 1.0;
+        }
+        if k > 0.0 {
+            for a in acc.iter_mut() {
+                *a /= k;
+            }
+        }
+        acc
+    };
+    let seg_mean = mean(&mut (b0..b1.min(n)));
+    let ref_mean = mean(&mut refs.iter().copied());
+    Some(seg_mean.iter().zip(ref_mean.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>() * 0.5)
+}
+
+// --- wide-shot rescue (ADR 0074) ---------------------------------------------
+
+/// Segment boundary times over `0..duration_s`: 0, the in-range `cuts`,
+/// `duration_s` — sorted, de-duplicated. The one segmentation both
+/// [`plan_by_scene_cuts`] and the wide-shot rescue read, so the spans the
+/// rescue fills are exactly the spans the planner frames.
+fn cut_bounds(cuts: &[f64], duration_s: f64) -> Vec<f64> {
+    let mut bounds: Vec<f64> = vec![0.0];
+    for &c in cuts {
+        if c > 0.03 && c < duration_s - 0.03 {
+            bounds.push(c);
+        }
+    }
+    bounds.push(duration_s);
+    bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    bounds.dedup_by(|a, b| (*a - *b).abs() < 0.04);
+    bounds
+}
+
+/// The wide-shot rescue's work list: inter-cut segments of at least
+/// [`RESCUE_MIN_SEGMENT_S`] whose bins the tracker left (almost) empty —
+/// `(t0, t1, b0, b1)` in clip seconds / analysis bins. On a multicam source
+/// such a span is usually a camera the fixed-input detector could not see
+/// into (a wide with distant faces), and holding the previous camera's
+/// framing across it parks the crop on an empty seat.
+pub fn faceless_segments(
+    tracks: &[SpeakerTrack],
+    n_bins: usize,
+    bin_s: f64,
+    cuts: &[f64],
+    duration_s: f64,
+) -> Vec<(f64, f64, usize, usize)> {
+    if bin_s <= 0.0 || n_bins == 0 {
+        return Vec::new();
+    }
+    let bounds = cut_bounds(cuts, duration_s);
+    let mut out = Vec::new();
+    for w in bounds.windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        if t1 - t0 < RESCUE_MIN_SEGMENT_S {
+            continue;
+        }
+        let b0 = ((t0 / bin_s).round() as usize).min(n_bins);
+        let b1 = ((t1 / bin_s).round() as usize).clamp(b0, n_bins);
+        if b1 == b0 {
+            continue;
+        }
+        let seen = (b0..b1)
+            .filter(|&b| {
+                tracks.iter().any(|t| t.path.get(b).map(|p| p.is_some()).unwrap_or(false))
+            })
+            .count();
+        if (seen as f64) < RESCUE_MAX_SEEN_FRAC * (b1 - b0) as f64 {
+            out.push((t0, t1, b0, b1));
+        }
+    }
+    out
+}
+
+/// One surviving rescued seat's evidence and verdict — returned so the
+/// pipeline can log, and the harness can print, the numbers the gate ran on.
+#[derive(Debug, Clone, Copy)]
+pub struct RescueSeat {
+    /// Median detection box over the segment (source pixels).
+    pub bbox: FaceBox,
+    /// Detected bins inside the segment.
+    pub bins: usize,
+    /// Peak smoothed mouth motion, on the tracker's activity scale.
+    pub peak_activity: f32,
+    /// Sits within the match radius of a track the tracker already knows.
+    pub known_seat: bool,
+    pub absorbed: bool,
+}
+
+/// Fold one rescued segment's per-bin detections (source pixels + mouth
+/// patches, already score-filtered by the caller) into `tracks`. Detections
+/// chain into seats by position continuity (the [`TRACK_MATCH_FRAC`] radius,
+/// one detection per seat per bin); a seat survives only if it persists for
+/// [`RESCUE_PRESENCE_FRAC`] of the segment's bins with a median face at
+/// least [`RESCUE_MIN_FACE_H`] tall.
+///
+/// Surviving seats absorb only if the segment shows **life**: some seat's
+/// mouth moves ([`RESCUE_MIN_LIVENESS`], measured through the tracker's own
+/// patch pipeline) — or the seat re-occupies a KNOWN track's position (a
+/// camera the tracker saw in other segments, re-appearing). A produced
+/// insert of printed faces (guru gembul's miniature paintings sat above
+/// every persistence and size bar for 6.9 s) is rigid under its Ken Burns
+/// pan and fails liveness; people filmed live cannot hold a mouth region
+/// pixel-still. An absorbed seat near an existing track fills that track's
+/// empty bins; otherwise it becomes a new zero-`activity` track
+/// (attribution can never pick it — it exists so the PLAN can see who is on
+/// screen) under the [`MAX_TRACKS`] cap.
+///
+/// Contract: call before [`attribute_speakers`] and any consumer of track
+/// ids, then [`relabel_left_to_right`] once after the last segment — ids
+/// shift.
+pub fn absorb_rescue(
+    tracks: &mut Vec<SpeakerTrack>,
+    n_bins: usize,
+    seg: (usize, usize),
+    per_bin: &[(usize, Vec<(FaceBox, MouthPatch)>)],
+    look_distance: Option<f32>,
+    src_w: f32,
+    src_h: f32,
+) -> Vec<RescueSeat> {
+    let (b0, b1) = seg;
+    let seg_bins = b1.saturating_sub(b0);
+    if seg_bins == 0 {
+        return Vec::new();
+    }
+    let match_dist = TRACK_MATCH_FRAC * (src_w * src_w + src_h * src_h).sqrt();
+    struct MiniSeat {
+        last: (f32, f32),
+        bins: Vec<(usize, FaceBox)>,
+        patches: Vec<MouthPatch>,
+    }
+    let mut seats: Vec<MiniSeat> = Vec::new();
+    for (bin, faces) in per_bin {
+        let mut claimed: Vec<usize> = Vec::with_capacity(faces.len());
+        for (f, patch) in faces {
+            let best = seats
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !claimed.contains(i))
+                .map(|(i, s)| {
+                    let (dx, dy) = (f.cx() - s.last.0, f.cy() - s.last.1);
+                    (i, (dx * dx + dy * dy).sqrt())
+                })
+                .filter(|(_, d)| *d <= match_dist)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let i = match best {
+                Some((i, _)) => i,
+                None => {
+                    seats.push(MiniSeat {
+                        last: (f.cx(), f.cy()),
+                        bins: Vec::new(),
+                        patches: Vec::new(),
+                    });
+                    seats.len() - 1
+                }
+            };
+            claimed.push(i);
+            seats[i].last = (f.cx(), f.cy());
+            seats[i].bins.push((*bin, *f));
+            seats[i].patches.push(*patch);
+        }
+    }
+    // Most-persistent seats first, so the MAX_TRACKS cap keeps real people.
+    seats.sort_by_key(|s| std::cmp::Reverse(s.bins.len()));
+    let win = (ACTIVITY_SMOOTH_S * SPEAKER_FPS).round().max(1.0) as usize;
+    let mut report: Vec<RescueSeat> = Vec::new();
+    let mut survivors: Vec<(&MiniSeat, FaceBox)> = Vec::new();
+    for s in &seats {
+        if (s.bins.len() as f64) < RESCUE_PRESENCE_FRAC * seg_bins as f64 {
+            continue;
+        }
+        let boxes: Vec<FaceBox> = s.bins.iter().map(|(_, f)| *f).collect();
+        let med = median_box(&boxes);
+        if med.h < RESCUE_MIN_FACE_H {
+            continue;
+        }
+        // The seat's mouth-motion series over its own consecutive
+        // detections, smoothed exactly as the tracker smooths activity.
+        let raw: Vec<f32> = s
+            .patches
+            .windows(2)
+            .map(|w| {
+                let sum: f32 = w[1].iter().zip(w[0].iter()).map(|(a, b)| (a - b).abs()).sum();
+                sum / (w[0].len() as f32) / 255.0
+            })
+            .collect();
+        let peak = smooth(&raw, win).into_iter().fold(0.0f32, f32::max);
+        let known = tracks.iter().any(|t| {
+            let (dx, dy) = (med.cx() - t.bbox.cx(), med.cy() - t.bbox.cy());
+            (dx * dx + dy * dy).sqrt() <= match_dist
+        });
+        report.push(RescueSeat {
+            bbox: med,
+            bins: s.bins.len(),
+            peak_activity: peak,
+            known_seat: known,
+            absorbed: false,
+        });
+        survivors.push((s, med));
+    }
+    // Unknown seats need the segment to (a) LOOK like the show around it —
+    // [`RESCUE_MAX_LOOK_DIST`], the b-roll gate: a produced insert replaces
+    // the whole frame's palette, a wide shares its studio's — and (b) show
+    // some life (one live mouth vouches for the camera's cast; a silent
+    // listener legitimately shares the wide with the talker). A known seat
+    // re-appearing fills regardless: that camera vouches for itself.
+    let looks_like_show = look_distance.map(|d| d <= RESCUE_MAX_LOOK_DIST).unwrap_or(false);
+    let live = report.iter().any(|r| r.peak_activity >= RESCUE_MIN_LIVENESS);
+    for (i, &(seat, med)) in survivors.iter().enumerate() {
+        if !((looks_like_show && live) || report[i].known_seat) {
+            continue;
+        }
+        // An existing track already seated here (e.g. a person the tracker
+        // sees in OTHER segments of the same camera) absorbs the bins;
+        // anyone genuinely new gets their own track.
+        let existing = tracks
+            .iter_mut()
+            .map(|t| {
+                let (dx, dy) = (med.cx() - t.bbox.cx(), med.cy() - t.bbox.cy());
+                (t, (dx * dx + dy * dy).sqrt())
+            })
+            .filter(|(_, d)| *d <= match_dist)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        match existing {
+            Some((t, _)) => {
+                for &(b, f) in &seat.bins {
+                    if let Some(p) = t.path.get_mut(b) {
+                        if p.is_none() {
+                            *p = Some(f);
+                        }
+                    }
+                }
+                let n = t.path.len().max(1);
+                t.presence = t.path.iter().filter(|p| p.is_some()).count() as f32 / n as f32;
+            }
+            None => {
+                if tracks.len() >= MAX_TRACKS {
+                    continue;
+                }
+                let mut path: Vec<Option<FaceBox>> = vec![None; n_bins];
+                for &(b, f) in &seat.bins {
+                    if let Some(p) = path.get_mut(b) {
+                        *p = Some(f);
+                    }
+                }
+                let presence = seat.bins.len() as f32 / n_bins.max(1) as f32;
+                tracks.push(SpeakerTrack {
+                    id: tracks.len(),
+                    bbox: med,
+                    presence,
+                    activity: vec![0.0; n_bins],
+                    path,
+                });
+            }
+        }
+        report[i].absorbed = true;
+    }
+    report
+}
+
+/// Re-assign track ids in left-to-right reading order (the labelling
+/// [`TrackBuilder::finish`] establishes), after rescue inserts. Only valid
+/// BEFORE attribution / voice / plan run — everything downstream references
+/// tracks by id.
+pub fn relabel_left_to_right(tracks: &mut [SpeakerTrack]) {
+    tracks.sort_by(|a, b| {
+        a.bbox.cx().partial_cmp(&b.bbox.cx()).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (i, t) in tracks.iter_mut().enumerate() {
+        t.id = i;
+    }
+}
+
 // --- audio gate ---------------------------------------------------------------
 
 /// Per-bin voice-activity gate over the clip's 16 kHz mono samples: RMS above
@@ -816,7 +1235,15 @@ fn mean_visible_faces(tracks: &[SpeakerTrack], n: usize) -> f32 {
 /// join is regime-scoped (ADR 0042: the whole-clip join is banned where a
 /// seat is a screen position shared across angles).
 pub fn attribution_regime(analysis: &SpeakerAnalysis) -> bool {
-    mean_visible_faces(&analysis.tracks, analysis.speaking.len()) >= MULTICAM_MAX_MEAN_FACES
+    !follow_visible_regime(&analysis.tracks, analysis.speaking.len())
+}
+
+/// The complement of [`attribution_regime`], testable before the analysis
+/// struct exists (the wide-shot rescue must decide from bare tracks, ahead of
+/// attribution): ≈1 face at a time means the source is an edit that already
+/// chose its subject.
+pub fn follow_visible_regime(tracks: &[SpeakerTrack], n: usize) -> bool {
+    mean_visible_faces(tracks, n) < MULTICAM_MAX_MEAN_FACES
 }
 
 /// Turn the speaker analysis into a **cut-based** [`CameraPlan`]. Two regimes,
@@ -1178,15 +1605,7 @@ fn plan_by_scene_cuts(
     let tracks = &analysis.tracks;
     let n = analysis.speaking.len();
     // Boundary times: 0, the in-range cuts, duration — sorted and de-duplicated.
-    let mut bounds: Vec<f64> = vec![0.0];
-    for &c in cuts {
-        if c > 0.03 && c < duration_s - 0.03 {
-            bounds.push(c);
-        }
-    }
-    bounds.push(duration_s);
-    bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    bounds.dedup_by(|a, b| (*a - *b).abs() < 0.04);
+    let mut bounds = cut_bounds(cuts, duration_s);
 
     // Missed-cut healing (ADR 0073): the pixel threshold proves the cuts it
     // can see, but a near-black studio's cut can score arbitrarily low (the
@@ -2259,6 +2678,220 @@ mod tests {
     /// changing [`SPEAKER_FPS`] never silently invalidates a bin-count constant.
     fn nbins(secs: f64) -> usize {
         (secs * SPEAKER_FPS).round() as usize
+    }
+
+    /// A minimal track visible over `bins` with box `b` (rescue-test scaffold).
+    fn seat_track(id: usize, b: FaceBox, bins: std::ops::Range<usize>, n: usize) -> SpeakerTrack {
+        let mut path: Vec<Option<FaceBox>> = vec![None; n];
+        for k in bins {
+            path[k] = Some(b);
+        }
+        let presence = path.iter().filter(|p| p.is_some()).count() as f32 / n.max(1) as f32;
+        SpeakerTrack { id, bbox: b, presence, activity: vec![0.0; n], path }
+    }
+
+    #[test]
+    fn faceless_segments_finds_the_untracked_wide() {
+        // A 10 s clip cut at 4 s and 7 s; the tracker sees someone everywhere
+        // except 4-7 s (the wide the detector couldn't see into).
+        let n = nbins(10.0);
+        let bin_s = 1.0 / SPEAKER_FPS;
+        let a = seat_track(0, fb(100.0, 100.0, 80.0, 80.0), 0..nbins(4.0), n);
+        let b = seat_track(1, fb(400.0, 100.0, 80.0, 80.0), nbins(7.0)..n, n);
+        let segs = faceless_segments(&[a, b], n, bin_s, &[4.0, 7.0], 10.0);
+        assert_eq!(segs.len(), 1, "exactly the untracked span rescues");
+        let (t0, t1, b0, b1) = segs[0];
+        assert!((t0 - 4.0).abs() < 0.05 && (t1 - 7.0).abs() < 0.05);
+        assert_eq!((b0, b1), (nbins(4.0), nbins(7.0)));
+    }
+
+    #[test]
+    fn faceless_segments_ignores_short_wobbles_and_stray_bins() {
+        let n = nbins(10.0);
+        let bin_s = 1.0 / SPEAKER_FPS;
+        // Tracked everywhere except a 0.5 s transition wobble at 4.0-4.5 s...
+        let mut a = seat_track(0, fb(100.0, 100.0, 80.0, 80.0), 0..n, n);
+        for k in nbins(4.0)..nbins(4.5) {
+            a.path[k] = None;
+        }
+        assert!(
+            faceless_segments(&[a], n, bin_s, &[4.0, 4.5], 10.0).is_empty(),
+            "a sub-second span holds framing instead of rescuing"
+        );
+        // ...and a 3 s faceless span still rescues around one stray detection.
+        let mut b = seat_track(0, fb(100.0, 100.0, 80.0, 80.0), 0..nbins(4.0), n);
+        for k in nbins(7.0)..n {
+            b.path[k] = Some(fb(100.0, 100.0, 80.0, 80.0));
+        }
+        b.path[nbins(5.0)] = Some(fb(100.0, 100.0, 80.0, 80.0));
+        assert_eq!(
+            faceless_segments(&[b], n, bin_s, &[4.0, 7.0], 10.0).len(),
+            1,
+            "one stray bin must not veto the rescue"
+        );
+    }
+
+    /// A rigid mouth patch (printed face, or a phantom on set dressing).
+    fn still(v: f32) -> MouthPatch {
+        [v; PATCH_W * PATCH_H]
+    }
+
+    /// A live mouth: the patch luma flips per frame, far above the floor.
+    fn live(k: usize) -> MouthPatch {
+        still(if k % 2 == 0 { 40.0 } else { 80.0 })
+    }
+
+    fn absorbed_count(seats: &[RescueSeat]) -> usize {
+        seats.iter().filter(|s| s.absorbed).count()
+    }
+
+    #[test]
+    fn absorb_rescue_mints_persistent_seats_and_drops_phantoms() {
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let mut tracks =
+            vec![seat_track(0, fb(900.0, 200.0, 260.0, 400.0), 0..nbins(4.0), n)];
+        // Two people persist across the wide (one of them talking); a
+        // phantom fires in 2 bins.
+        let left = fb(150.0, 300.0, 70.0, 90.0);
+        let right = fb(1500.0, 320.0, 70.0, 90.0);
+        let phantom = fb(700.0, 500.0, 40.0, 40.0);
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> = (b0..b1)
+            .map(|k| {
+                let mut faces = vec![(left, still(60.0)), (right, live(k))];
+                if k < b0 + 2 {
+                    faces.push((phantom, still(20.0)));
+                }
+                (k, faces)
+            })
+            .collect();
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.05), 1920.0, 1080.0);
+        assert_eq!(
+            absorbed_count(&seats),
+            2,
+            "the two persistent people absorb; the phantom does not"
+        );
+        assert_eq!(tracks.len(), 3);
+        relabel_left_to_right(&mut tracks);
+        assert!(
+            (tracks[0].bbox.cx() - left.cx()).abs() < 1.0,
+            "leftmost seat is Person A after relabel"
+        );
+        let wide_bin = b0 + nbins(1.0);
+        let visible: Vec<usize> =
+            tracks.iter().filter(|t| t.path[wide_bin].is_some()).map(|t| t.id).collect();
+        assert_eq!(visible.len(), 2, "the wide's bins now show its two people");
+    }
+
+    #[test]
+    fn a_foreign_looking_insert_does_not_absorb_even_with_live_people() {
+        // A produced insert (guru gembul's archival b-roll) can show real,
+        // moving people — but its palette is foreign to the show around it,
+        // and the look gate holds the framing instead of re-cutting to it.
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let left = fb(150.0, 300.0, 70.0, 90.0);
+        let right = fb(1500.0, 320.0, 70.0, 90.0);
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> =
+            (b0..b1).map(|k| (k, vec![(left, live(k)), (right, still(55.0))])).collect();
+        let mut tracks =
+            vec![seat_track(0, fb(900.0, 200.0, 260.0, 400.0), 0..nbins(4.0), n)];
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.55), 1920.0, 1080.0);
+        assert_eq!(absorbed_count(&seats), 0, "a foreign-looking segment must not absorb");
+        // No look reference at all = cannot vouch: same refusal.
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, None, 1920.0, 1080.0);
+        assert_eq!(absorbed_count(&seats), 0, "no reference, no absorb");
+        assert_eq!(tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_lifeless_same_look_insert_does_not_absorb_but_a_known_seat_fills() {
+        // Same palette as the show but every mouth synthetically rigid (a
+        // static overlay): the liveness floor refuses it. The SAME lifeless
+        // lone seat at a known track's position is that camera re-appearing,
+        // and fills it.
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let painted_a = fb(1100.0, 340.0, 110.0, 140.0);
+        let painted_b = fb(700.0, 300.0, 100.0, 130.0);
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> = (b0..b1)
+            .map(|k| (k, vec![(painted_a, still(90.0)), (painted_b, still(50.0))]))
+            .collect();
+        let mut tracks =
+            vec![seat_track(0, fb(400.0, 200.0, 260.0, 400.0), 0..nbins(4.0), n)];
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.05), 1920.0, 1080.0);
+        assert_eq!(absorbed_count(&seats), 0, "a lifeless pair must not absorb");
+        assert_eq!(tracks.len(), 1);
+        let known = fb(390.0, 210.0, 250.0, 390.0);
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> =
+            (b0..b1).map(|k| (k, vec![(known, still(70.0))])).collect();
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.9), 1920.0, 1080.0);
+        assert_eq!(
+            absorbed_count(&seats),
+            1,
+            "a known seat fills regardless of look or liveness"
+        );
+        assert!(tracks[0].path[b0 + 2].is_some());
+    }
+
+    #[test]
+    fn one_live_mouth_vouches_for_the_whole_wide() {
+        // The talker's mouth moves; the listener sits still. Both absorb —
+        // a silent listener legitimately shares the wide with the talker.
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let talker = fb(1500.0, 320.0, 70.0, 90.0);
+        let listener = fb(150.0, 300.0, 70.0, 90.0);
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> = (b0..b1)
+            .map(|k| (k, vec![(talker, live(k)), (listener, still(55.0))]))
+            .collect();
+        let mut tracks =
+            vec![seat_track(0, fb(900.0, 200.0, 260.0, 400.0), 0..nbins(4.0), n)];
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.05), 1920.0, 1080.0);
+        assert_eq!(absorbed_count(&seats), 2, "the live talker vouches for the listener");
+    }
+
+    #[test]
+    fn absorb_rescue_fills_an_existing_seat_instead_of_minting_a_twin() {
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let seat = fb(900.0, 200.0, 260.0, 400.0);
+        let mut tracks = vec![seat_track(0, seat, 0..nbins(4.0), n)];
+        // The rescue re-detects the SAME position the tracker already seats.
+        let per_bin: Vec<(usize, Vec<(FaceBox, MouthPatch)>)> =
+            (b0..b1).map(|k| (k, vec![(seat, live(k))])).collect();
+        let seats = absorb_rescue(&mut tracks, n, (b0, b1), &per_bin, Some(0.05), 1920.0, 1080.0);
+        assert_eq!(absorbed_count(&seats), 1);
+        assert_eq!(tracks.len(), 1, "no twin track for an already-known seat");
+        assert!(tracks[0].path[b0 + 2].is_some(), "the seat's empty bins filled");
+    }
+
+    #[test]
+    fn look_distance_separates_a_studio_wide_from_a_foreign_insert() {
+        // Synthetic per-bin histograms: the show lives in dark bins, the
+        // insert in bright ones; a same-palette wide reads near zero.
+        let n = nbins(10.0);
+        let (b0, b1) = (nbins(4.0), nbins(7.0));
+        let mut dark = [0f32; LOOK_BINS];
+        dark[1] = 0.8;
+        dark[2] = 0.2;
+        let mut bright = [0f32; LOOK_BINS];
+        bright[12] = 1.0;
+        let tracks =
+            vec![seat_track(0, fb(400.0, 200.0, 260.0, 400.0), 0..nbins(4.0), n)];
+        let mut hists = vec![dark; n];
+        for h in hists.iter_mut().take(b1).skip(b0) {
+            *h = bright;
+        }
+        let far = segment_look_distance(&hists, &tracks, (b0, b1)).unwrap();
+        assert!(far > 0.9, "foreign palette reads far ({far})");
+        let hists = vec![dark; n];
+        let near = segment_look_distance(&hists, &tracks, (b0, b1)).unwrap();
+        assert!(near < 0.01, "same palette reads near ({near})");
+        assert!(
+            segment_look_distance(&hists, &[], (b0, b1)).is_none(),
+            "no tracked bins, no reference"
+        );
     }
 
     /// A synthetic rgb frame with a bright rectangle where a mouth would be.

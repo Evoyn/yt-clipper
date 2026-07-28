@@ -2582,10 +2582,20 @@ impl EditorState {
         let boxes: Vec<(usize, yc_frame::FaceBox, String)> = match &self.speakers {
             Some(a) => {
                 let t = self.display_time();
+                // The gap smoothing must not reach across a camera change (a
+                // close-up's box would float over the wide's empty black), so
+                // clamp it to the plan shot the displayed frame belongs to.
+                let window = self.plan.as_ref().and_then(|p| {
+                    p.shots
+                        .iter()
+                        .find(|s| s.start_s <= t && t < s.end_s)
+                        .map(|s| (s.start_s, s.end_s))
+                });
                 a.tracks
                     .iter()
                     .filter_map(|tr| {
-                        path_box_near(&tr.path, a.bin_s, t).map(|b| (tr.id, b, track_label(tr.id)))
+                        path_box_near(&tr.path, a.bin_s, t, window)
+                            .map(|b| (tr.id, b, track_label(tr.id)))
                     })
                     .collect()
             }
@@ -6932,19 +6942,33 @@ fn draw_safe_area(painter: &egui::Painter, canvas: Rect) {
 /// nearest detected bin within ±0.25 s (a short detector gap must not blink
 /// the box). `None` = the track is genuinely not on screen there (ADR 0073),
 /// so the Original view draws no box and offers no click target for it.
+/// `window` clamps the search to the current plan shot's span (clip seconds):
+/// the smoothing must never pull a box across a camera change — right after a
+/// cut to the wide, the previous close-up's box floated over empty black
+/// (ADR 0074).
 fn path_box_near(
     path: &[Option<yc_frame::FaceBox>],
     bin_s: f64,
     t: f64,
+    window: Option<(f64, f64)>,
 ) -> Option<yc_frame::FaceBox> {
     if path.is_empty() || bin_s <= 0.0 {
         return None;
     }
-    let bin = ((t / bin_s) as isize).clamp(0, path.len() as isize - 1) as usize;
+    let (mut lo, mut hi) = (0usize, path.len() - 1);
+    if let Some((w0, w1)) = window {
+        lo = ((w0 / bin_s).round() as isize).clamp(0, path.len() as isize - 1) as usize;
+        hi = ((w1 / bin_s).round() as isize - 1).clamp(lo as isize, path.len() as isize - 1)
+            as usize;
+    }
+    let bin = ((t / bin_s) as isize).clamp(lo as isize, hi as isize) as usize;
     let radius = (0.25 / bin_s).round().max(0.0) as usize;
     (0..=radius)
         .flat_map(|d| {
-            [bin.checked_sub(d), bin.checked_add(d).filter(|&b| b < path.len())]
+            [
+                bin.checked_sub(d).filter(|&b| b >= lo),
+                bin.checked_add(d).filter(|&b| b <= hi),
+            ]
         })
         .flatten()
         .find_map(|b| path[b])
@@ -7186,10 +7210,21 @@ mod tests {
         let bin_s = 1.0 / 24.0;
         let mut path: Vec<Option<yc_frame::FaceBox>> = vec![Some(b); 24];
         path.extend(vec![None; 72]);
-        assert!(path_box_near(&path, bin_s, 0.5).is_some(), "a present bin draws");
-        assert!(path_box_near(&path, bin_s, 1.1).is_some(), "a short gap smooths");
-        assert!(path_box_near(&path, bin_s, 2.0).is_none(), "an off-screen seat draws no box");
-        assert!(path_box_near(&[], bin_s, 0.0).is_none(), "no path, no box");
+        assert!(path_box_near(&path, bin_s, 0.5, None).is_some(), "a present bin draws");
+        assert!(path_box_near(&path, bin_s, 1.1, None).is_some(), "a short gap smooths");
+        assert!(path_box_near(&path, bin_s, 2.0, None).is_none(), "an off-screen seat draws no box");
+        assert!(path_box_near(&[], bin_s, 0.0, None).is_none(), "no path, no box");
+        // A camera change bounds the smoothing: the same 1.1 s probe finds
+        // nothing once the displayed frame's shot starts at the 1.0 s cut —
+        // the close-up's box must not float onto the wide (ADR 0074).
+        assert!(
+            path_box_near(&path, bin_s, 1.1, Some((1.0, 4.0))).is_none(),
+            "no smoothing across a cut"
+        );
+        assert!(
+            path_box_near(&path, bin_s, 0.5, Some((0.0, 1.0))).is_some(),
+            "a windowed present bin still draws"
+        );
     }
 
     #[test]

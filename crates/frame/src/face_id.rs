@@ -54,6 +54,10 @@ const YUNET_STRIDES: [usize; 3] = [8, 16, 32];
 /// already vouched for by an Ultraface track — the score only breaks ties.
 pub const YUNET_MIN_SCORE: f32 = 0.6;
 const YUNET_NMS_IOU: f32 = 0.3;
+/// Tile width as a fraction of the frame for [`FaceIdentifier::detect_frame_tiled`]:
+/// two tiles of 0.6 overlap by 0.2 of the frame, so any face narrower than
+/// that overlap sits whole in at least one tile.
+const TILE_FRAC: f32 = 0.6;
 
 /// One YuNet detection inside the probed region: box + the 5 landmarks the
 /// SFace alignment consumes, all in region pixel coordinates.
@@ -374,6 +378,50 @@ impl FaceIdentifier {
             }
         }
         Ok(dets)
+    }
+
+    /// [`Self::detect`] over a whole frame at rescue resolution (ADR 0074): a
+    /// landscape frame letterboxed whole into the fixed 640 input leaves a
+    /// distant face a third of its source pixels, so probe two overlapping
+    /// half-frames instead ([`TILE_FRAC`] of the width each) and merge under
+    /// one NMS — a face straddling the seam detects in both tiles and
+    /// de-duplicates there. Portrait or already-small frames probe as one
+    /// region. `min_score` filters on top of [`YUNET_MIN_SCORE`]: an open
+    /// frame has no prior track vouching for the region, so callers pass a
+    /// stricter bar than the region path's.
+    pub fn detect_frame_tiled(
+        &mut self,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+        min_score: f32,
+    ) -> Result<Vec<FaceDet>> {
+        anyhow::ensure!(w > 0 && h > 0 && rgb.len() >= w * h * 3, "bad frame");
+        let mut scored: Vec<(f32, FaceDet)> = Vec::new();
+        if w > h && w > YUNET_SIZE {
+            let tile_w = ((w as f32 * TILE_FRAC) as usize).clamp(1, w);
+            for x0 in [0usize, w - tile_w] {
+                let mut tile = vec![0u8; tile_w * h * 3];
+                for y in 0..h {
+                    let s = (y * w + x0) * 3;
+                    let d = y * tile_w * 3;
+                    tile[d..d + tile_w * 3].copy_from_slice(&rgb[s..s + tile_w * 3]);
+                }
+                for mut det in self.detect(&tile, tile_w, h)? {
+                    det.bbox.x += x0 as f32;
+                    for k in det.kps.iter_mut() {
+                        k[0] += x0 as f32;
+                    }
+                    scored.push((det.bbox.score, det));
+                }
+            }
+        } else {
+            for det in self.detect(rgb, w, h)? {
+                scored.push((det.bbox.score, det));
+            }
+        }
+        let dets = nms_dets(scored, YUNET_NMS_IOU);
+        Ok(dets.into_iter().filter(|d| d.bbox.score >= min_score).collect())
     }
 
     /// Embed one face from an rgb24 region given its 5 landmarks: similarity

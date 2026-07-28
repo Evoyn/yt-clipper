@@ -2837,6 +2837,162 @@ fn tracking_dims(src_w: f32, src_h: f32) -> (u32, u32) {
 /// in roughly the time of its face inference (the voice lane adds ~2 s).
 /// Returns the analysis, the plan, and a note for the Camera panel when the
 /// voice lane is off.
+/// Wide-shot rescue (ADR 0074): re-detect the faceless inter-cut segments of
+/// a follow-visible clip at high resolution and fold what it finds back into
+/// the tracks, so the planner frames the people a wide angle actually shows
+/// instead of holding a close-up's crop over their empty seats. YuNet over
+/// two overlapping half-frames of the FULL-RES segment frames (the tracking
+/// pass sees only Ultraface's fixed 320x240 input — a distant face vanishes
+/// there). Runs only when the pre-rescue regime is follow-visible (in the
+/// attribution regime a faceless span is a b-roll cutaway, and holding is
+/// correct), and is dropped whole if absorbing would flip the clip INTO the
+/// attribution regime (the regime must never be decided by the rescue).
+/// Degrades to a warn on any model/decode failure — never fails the job.
+/// Returns the number of seats absorbed.
+#[cfg(feature = "face")]
+#[allow(clippy::too_many_arguments)]
+fn rescue_wide_shot_faces(
+    paths: &PipelinePaths,
+    prepared: &PreparedClip,
+    tracks: &mut Vec<yc_frame::speaker::SpeakerTrack>,
+    look_hists: &[[f32; yc_frame::speaker::LOOK_BINS]],
+    cuts: &[f64],
+    dur: f64,
+    n_bins: usize,
+    bin_s: f64,
+    cancel: &CancelToken,
+) -> usize {
+    use yc_frame::speaker;
+    if !speaker::follow_visible_regime(tracks, n_bins) {
+        return 0;
+    }
+    let segs = speaker::faceless_segments(tracks, n_bins, bin_s, cuts, dur);
+    if segs.is_empty() {
+        return 0;
+    }
+    if !(paths.yunet_model.is_file() && paths.sface_model.is_file()) {
+        tracing::info!("wide-shot rescue skipped: face-id models missing");
+        return 0;
+    }
+    let mut ident =
+        match yc_frame::face_id::FaceIdentifier::load(&paths.yunet_model, &paths.sface_model) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("wide-shot rescue: face-id load failed: {e:#}");
+                return 0;
+            }
+        };
+    let (src_w, src_h) = (prepared.src_w, prepared.src_h);
+    let even = |v: f32| (((v.round().max(2.0)) as u32) / 2) * 2;
+    let (fw, fh) = (even(src_w), even(src_h));
+    let mut candidate = tracks.clone();
+    let mut absorbed = 0usize;
+    for &(t0, t1, b0, b1) in &segs {
+        if cancel.is_cancelled() {
+            return 0;
+        }
+        let seg_dur = t1 - t0;
+        let max_frames = (seg_dur * speaker::SPEAKER_FPS).ceil() as usize + 2;
+        let mut per_bin: Vec<(usize, Vec<(yc_frame::FaceBox, speaker::MouthPatch)>)> = Vec::new();
+        let mut frame_idx = 0usize;
+        let mut det_err: Option<anyhow::Error> = None;
+        let res = yc_ingest::stream_frames_rgb(
+            &paths.ffmpeg,
+            &prepared.render_src,
+            prepared.seek_s + t0,
+            seg_dur,
+            fw,
+            fh,
+            speaker::SPEAKER_FPS,
+            max_frames,
+            &mut |rgb| {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                let bin = b0 + frame_idx;
+                frame_idx += 1;
+                if bin >= b1 {
+                    return false;
+                }
+                match ident.detect_frame_tiled(
+                    rgb,
+                    fw as usize,
+                    fh as usize,
+                    speaker::RESCUE_MIN_SCORE,
+                ) {
+                    Ok(dets) => {
+                        per_bin.push((
+                            bin,
+                            dets.into_iter()
+                                .map(|d| {
+                                    let patch = speaker::rescue_mouth_patch(
+                                        rgb,
+                                        fw as usize,
+                                        fh as usize,
+                                        &d.bbox,
+                                    );
+                                    (d.bbox, patch)
+                                })
+                                .collect(),
+                        ));
+                        true
+                    }
+                    Err(e) => {
+                        det_err = Some(e);
+                        false
+                    }
+                }
+            },
+        );
+        if let Err(e) = res {
+            tracing::warn!("wide-shot rescue: decode failed at {t0:.1}s: {e:#}");
+            continue;
+        }
+        if let Some(e) = det_err {
+            tracing::warn!("wide-shot rescue: detection failed at {t0:.1}s: {e:#}");
+            continue;
+        }
+        // Look reference against the PRE-rescue tracks: an earlier rescued
+        // segment must never vouch for a later one.
+        let look = speaker::segment_look_distance(look_hists, tracks, (b0, b1));
+        let seats = speaker::absorb_rescue(
+            &mut candidate,
+            n_bins,
+            (b0, b1),
+            &per_bin,
+            look,
+            src_w,
+            src_h,
+        );
+        for s in &seats {
+            tracing::info!(
+                "wide-shot rescue seat {t0:.1}-{t1:.1}s (look {}): ({:.0},{:.0}) {:.0}x{:.0} bins={} \
+                 peak_activity={:.4} known={} absorbed={}",
+                look.map(|d| format!("{d:.3}")).unwrap_or_else(|| "-".into()),
+                s.bbox.x,
+                s.bbox.y,
+                s.bbox.w,
+                s.bbox.h,
+                s.bins,
+                s.peak_activity,
+                s.known_seat,
+                s.absorbed
+            );
+        }
+        absorbed += seats.iter().filter(|s| s.absorbed).count();
+    }
+    if absorbed == 0 {
+        return 0;
+    }
+    if !speaker::follow_visible_regime(&candidate, n_bins) {
+        tracing::info!("wide-shot rescue dropped: absorbing would flip the regime");
+        return 0;
+    }
+    speaker::relabel_left_to_right(&mut candidate);
+    *tracks = candidate;
+    absorbed
+}
+
 #[cfg(feature = "face")]
 fn do_analyze_speakers(
     paths: &PipelinePaths,
@@ -2861,6 +3017,9 @@ fn do_analyze_speakers(
     let mut det_buf = vec![0u8; yc_frame::infer::DET_W * yc_frame::infer::DET_H * 3];
     let mut detect_err: Option<anyhow::Error> = None;
     let (src_w, src_h) = (prepared.src_w, prepared.src_h);
+    // Per-bin frame-look signatures for the wide-shot rescue's b-roll gate
+    // (ADR 0074) — collected here so the gate costs no extra decode.
+    let mut look_hists: Vec<[f32; speaker::LOOK_BINS]> = Vec::new();
     yc_ingest::stream_frames_rgb(
         &paths.ffmpeg,
         &prepared.render_src,
@@ -2874,6 +3033,7 @@ fn do_analyze_speakers(
             if cancel.is_cancelled() {
                 return false;
             }
+            look_hists.push(speaker::frame_luma_hist(rgb, 4));
             speaker::downscale_rgb(
                 rgb,
                 tw as usize,
@@ -2900,22 +3060,38 @@ fn do_analyze_speakers(
     if cancel.is_cancelled() {
         anyhow::bail!("cancelled");
     }
-    let tracks = builder.finish();
+    let mut tracks = builder.finish();
     tracing::info!(tracks = tracks.len(), "speaker analysis: tracks built");
 
-    let samples = yc_ingest::read_range_samples(&session.analysis_wav, prepared.range)?;
     let bin_s = 1.0 / fps;
     let n_bins = (dur * fps).ceil().max(1.0) as usize;
+    // The source's own cut frames (pixel-level scene detection), so a multicam
+    // plan cuts exactly where the source does — no sampling grid to lag it.
+    // Detected BEFORE the voice lane (its per-angle joins group the segments
+    // between these cuts by seat geometry) and before attribution: the
+    // wide-shot rescue below reshapes the tracks these consume.
+    let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
+    tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
+    // Wide-shot rescue (ADR 0074): a faceless inter-cut segment on a multicam
+    // source is usually a wide whose distant faces sit below Ultraface's fixed
+    // 320x240 input — without this pass the planner holds the previous
+    // camera's framing across it and parks the crop on an empty seat.
+    let rescued = rescue_wide_shot_faces(
+        paths, prepared, &mut tracks, &look_hists, &cuts, dur, n_bins, bin_s, cancel,
+    );
+    if rescued > 0 {
+        tracing::info!(
+            seats = rescued,
+            tracks = tracks.len(),
+            "speaker analysis: wide-shot rescue"
+        );
+    }
+
+    let samples = yc_ingest::read_range_samples(&session.analysis_wav, prepared.range)?;
     let voiced = speaker::voiced_bins(&samples, yc_ingest::WHISPER_SR, bin_s, n_bins);
     let (speaking, confidence) = speaker::attribute_speakers(&tracks, &voiced);
     let mut analysis =
         SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
-    // The source's own cut frames (pixel-level scene detection), so a multicam
-    // plan cuts exactly where the source does — no sampling grid to lag it.
-    // Detected BEFORE the voice lane: its per-angle joins group the segments
-    // between these cuts by seat geometry.
-    let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
-    tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
 
     // --- occupant map (ADR 0044): who occupies each seat, per camera — the
     // person evidence the voice join is scoped by. Computed only where it
