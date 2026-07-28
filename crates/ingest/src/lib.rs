@@ -163,6 +163,77 @@ pub fn extract_frames_args(
     ]
 }
 
+/// [`extract_frames_args`] for the Studio FILMSTRIP (ADR 0075): the FIRST
+/// frame of each `1/fps` slot via `select`, not the `fps` filter — that
+/// filter's nearest-slot rounding hands a slot content from up to HALF a
+/// slot LATER than the label consumers compute as `idx/fps`. At a ~2.6 fps
+/// strip a camera cut showed 0.16 s before it existed, and the Studio
+/// painted the outgoing shot's crop + face boxes over the incoming shot's
+/// pixels (the operator's "cut is late / flicker" report, 2026-07-29).
+/// First-in-slot bounds content to `[idx/fps, idx/fps + one source frame)`
+/// — the label is honest, so overlays always match the shown pixels and a
+/// cut never appears before its marker.
+///
+/// STRIP ONLY: the analysis stream keeps the `fps` filter — its
+/// duplicate-to-fill behavior is what maps a sub-rate source onto the
+/// fixed bin grid, which `select` (no duplication) would silently break.
+pub fn extract_strip_args(
+    video: &Path,
+    seek_s: f64,
+    w: u32,
+    h: u32,
+    fps: f64,
+    max_frames: usize,
+) -> Vec<String> {
+    let sel = format!("isnan(prev_t)+gt(floor(t*{fps}),floor(prev_t*{fps}))");
+    vec![
+        "-ss".into(),
+        format!("{seek_s:.3}"),
+        "-i".into(),
+        video.display().to_string(),
+        "-vf".into(),
+        format!("select='{sel}',scale={w}:{h}"),
+        "-fps_mode".into(),
+        "passthrough".into(),
+        "-frames:v".into(),
+        max_frames.to_string(),
+        "-pix_fmt".into(),
+        "rgb24".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-".into(),
+    ]
+}
+
+/// [`extract_frames_rgb`] with [`extract_strip_args`]'s first-in-slot
+/// sampling — the Studio filmstrip's extraction (ADR 0075).
+pub fn extract_strip_frames_rgb(
+    ffmpeg: &Path,
+    video: &Path,
+    seek_s: f64,
+    w: u32,
+    h: u32,
+    fps: f64,
+    max_frames: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let args = extract_strip_args(video, seek_s, w, h, fps, max_frames);
+    let child = std::process::Command::new(ffmpeg)
+        .no_console()
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning ffmpeg at {}", ffmpeg.display()))?;
+    let output = child.wait_with_output().context("waiting on ffmpeg strip extract")?;
+    anyhow::ensure!(output.status.success(), "ffmpeg strip extract failed ({})", output.status);
+    let frame_bytes = (w as usize) * (h as usize) * 3;
+    anyhow::ensure!(frame_bytes > 0, "zero frame size");
+    let frames: Vec<Vec<u8>> =
+        output.stdout.chunks_exact(frame_bytes).map(|c| c.to_vec()).collect();
+    anyhow::ensure!(!frames.is_empty(), "ffmpeg produced no frames for {}", video.display());
+    Ok(frames)
+}
+
 /// Sample frames from `video` as raw rgb24 (`w` x `h`), returning one
 /// `w*h*3`-byte buffer per frame. stderr is inherited so ffmpeg's diagnostics
 /// reach the log; stdout is drained via `wait_with_output` so a large rawvideo
@@ -377,6 +448,27 @@ mod tests {
         assert!(args.contains(&"rawvideo".to_string()));
         let pf = args.iter().position(|a| a == "-pix_fmt").unwrap();
         assert_eq!(args[pf + 1], "rgb24");
+        assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn strip_args_take_the_first_frame_of_each_slot() {
+        // The filmstrip samples the FIRST source frame of each 1/fps slot
+        // (ADR 0075): content pts >= the idx/fps label, so a camera cut can
+        // never show before its marker and overlays match the shown pixels.
+        // No fps filter (its nearest-slot rounding is the bug), passthrough
+        // so nothing re-times the selected frames.
+        let args = extract_strip_args(Path::new("F:/seg.mp4"), 2.423, 320, 180, 2.5, 120);
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(
+            args[vf + 1],
+            "select='isnan(prev_t)+gt(floor(t*2.5),floor(prev_t*2.5))',scale=320:180"
+        );
+        assert!(!args[vf + 1].contains("fps="), "the fps filter is the bug, never the strip");
+        let fm = args.iter().position(|a| a == "-fps_mode").unwrap();
+        assert_eq!(args[fm + 1], "passthrough");
+        let ss = args.iter().position(|a| a == "-ss").unwrap();
+        assert_eq!(args[ss + 1], "2.423");
         assert_eq!(args.last().unwrap(), "-");
     }
 

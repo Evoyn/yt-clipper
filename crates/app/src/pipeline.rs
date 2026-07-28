@@ -1609,7 +1609,10 @@ fn do_prepare(
     let fps = STRIP_FPS.min(STRIP_MAX_FRAMES as f64 / range.duration_s().max(0.1)).max(0.1);
     let frames = if preview {
         let _ = tx.send(Progress::Stage("Extracting preview frames"));
-        yc_ingest::extract_frames_rgb(
+        // First-in-slot sampling (ADR 0075): strip frame i's content really
+        // is at `i / fps` — the fps filter's nearest-slot rounding showed a
+        // camera cut before it existed and mismatched every overlay there.
+        yc_ingest::extract_strip_frames_rgb(
             &paths.ffmpeg,
             &render_src,
             seek_s,
