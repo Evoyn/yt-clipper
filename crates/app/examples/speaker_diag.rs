@@ -1,6 +1,6 @@
-//! Speaker-analysis inspector: replicate `do_analyze_speakers` 1:1 on a clip's
+﻿//! Speaker-analysis inspector: replicate `do_analyze_speakers` 1:1 on a clip's
 //! workspace data and dump everything the Active-Speaker camera plan is built
-//! from — tracks (with split/adjacency forensics), the attribution timeline,
+//! from â€” tracks (with split/adjacency forensics), the attribution timeline,
 //! and the plan (with per-shot subject-motion forensics explaining any
 //! `pan_to`). The production-path twin of `caption_diag`: same segment, same
 //! measured seek (audio anchor), same constants, same pure functions, so what
@@ -14,21 +14,21 @@
 //! project.json. Without `--features face` this prints a hint and exits.
 //!
 //! The **voice lane** (ADR 0042/0044, integrated) runs the PRODUCTION
-//! functions — `yc_frame::voice::{embed_windows, build_lane,
-//! fuse_attribution}` over the occupant map — per candidate CAM++ model,
+//! functions â€” `yc_frame::voice::{embed_windows, build_lane,
+//! fuse_attribution}` over the occupant map â€” per candidate CAM++ model,
 //! prints the evidence trail (CV-scored sweep, person-join edges with purity
 //! verdicts, positive-absence off-screen runs, disagreements), fuses the
 //! first model into the analysis exactly as `Job::AnalyzeSpeakers` does, and
 //! diffs the integrated plan against the mouth-only baseline. Lanes append
 //! to the CSV; `YC_INTEG_RENDER=1` renders the integrated plan to
-//! `../diar_integration.mp4` (the ADR 0042 gate artifact — do not clobber);
+//! `../diar_integration.mp4` (the ADR 0042 gate artifact â€” do not clobber);
 //! `YC_PERSON_RENDER=1` renders to `../diar_person.mp4` (the ADR 0044
 //! person-join gate artifact); `YC_REACTION_RENDER=1` renders to
 //! `../diar_reaction.mp4` (the ADR 0046 shared-reaction gate artifact). Also:
 //!
-//!   … speaker_diag --features face -- selftest <wav> <wav> [<wav>…]
+//!   â€¦ speaker_diag --features face -- selftest <wav> <wav> [<wav>â€¦]
 //!
-//! embeds whole 16 kHz wavs and prints their pairwise cosine similarity —
+//! embeds whole 16 kHz wavs and prints their pairwise cosine similarity â€”
 //! run it on known same/different-speaker recordings to validate the fbank +
 //! embedding path end-to-end before trusting fixture numbers.
 //!
@@ -37,31 +37,31 @@
 //! (`yc_frame::reaction`), extends the per-segment evidence table with a
 //! laugh column, judges the pre-declared discrimination bars when the
 //! operator supplies the ear-truth spans (`YC_LAUGH_TARGET="25.5-30.25"`,
-//! optional `YC_LAUGH_EXSPLIT="14.2-22.1"`), and — attribution regime only,
-//! exactly as `Job::AnalyzeSpeakers` — feeds the integrated plan's
+//! optional `YC_LAUGH_EXSPLIT="14.2-22.1"`), and â€” attribution regime only,
+//! exactly as `Job::AnalyzeSpeakers` â€” feeds the integrated plan's
 //! shared-reaction splits below. Its Bar 0:
 //!
-//!   … speaker_diag --features face -- tagselftest <wav> [<wav>…]
+//!   â€¦ speaker_diag --features face -- tagselftest <wav> [<wav>â€¦]
 //!
 //! scores whole 16 kHz wavs under both sample-scale conventions and prints
-//! top-5 AudioSet classes + raw logit ranges — the model must rank known
+//! top-5 AudioSet classes + raw logit ranges â€” the model must rank known
 //! content correctly (and the right scale shows itself) before any fixture
 //! number means anything.
 //!
 //! The **face lane** (ADR 0043/0044, production path) builds the OCCUPANT
 //! MAP with `yc_frame::occupant::build_occupant_map`: full-res face crops
 //! per (segment, seat), YuNet landmarks, SFace embeddings, person clusters
-//! cut at the largest dendrogram gap — printed as (segment × seat → person),
+//! cut at the largest dendrogram gap â€” printed as (segment Ã— seat â†’ person),
 //! segments merged into CAMERAS by identical fully-known occupants, and a
 //! contact sheet written for the operator's eyes. Computed exactly when
 //! production computes it (attribution regime + models present); the voice
 //! join above consumes it. And:
 //!
-//!   … speaker_diag --features face -- faceselftest <img> [<img>…]
+//!   â€¦ speaker_diag --features face -- faceselftest <img> [<img>â€¦]
 //!
 //! detects faces in full frames (1920x1080 assumed if ffprobe can't read the
-//! image) and prints pairwise cosines for BOTH pipelines — YuNet-aligned and
-//! box-pseudo-landmarks — on known same/different faces: the model must
+//! image) and prints pairwise cosines for BOTH pipelines â€” YuNet-aligned and
+//! box-pseudo-landmarks â€” on known same/different faces: the model must
 //! order them correctly before any fixture number means anything.
 //!
 //! The **solo-presence table** (the 2026-07-07 worst-defect instrument)
@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     use yc_ingest::CancelToken;
 
     let mut args = std::env::args().skip(1);
-    let first = args.next().expect("data dir (…/<stream>/data), or: selftest <wav> <wav>…");
+    let first = args.next().expect("data dir (â€¦/<stream>/data), or: selftest <wav> <wav>â€¦");
     if first == "selftest" {
         let wavs: Vec<String> = args.collect();
         return voice_selftest(&wavs);
@@ -192,7 +192,9 @@ fn main() -> anyhow::Result<()> {
 
     // --- scene cuts: detect_scene_cuts replica (same command, same parse) ----
     // Before attribution, as in production: the wide-shot rescue below
-    // reshapes the tracks attribution and the plan consume.
+    // reshapes the tracks attribution and the plan consume. The select
+    // floor is SCENE_SNAP_FLOOR (ADR 0076): scores above 0.13 are cuts,
+    // the sub-threshold band feeds the healed-boundary snap.
     let out = std::process::Command::new(ffmpeg)
         .args([
             "-v",
@@ -204,7 +206,7 @@ fn main() -> anyhow::Result<()> {
             "-i",
             &segment.display().to_string(),
             "-vf",
-            "select='gt(scene,0.13)',metadata=print",
+            &format!("select='gt(scene,{})',metadata=print", speaker::SCENE_SNAP_FLOOR),
             "-an",
             "-f",
             "null",
@@ -212,16 +214,35 @@ fn main() -> anyhow::Result<()> {
         ])
         .output()?;
     let text = String::from_utf8_lossy(&out.stderr);
-    let mut cuts: Vec<f64> = text
-        .lines()
-        .filter_map(|l| l.split("pts_time:").nth(1))
-        .filter_map(|s| s.split_whitespace().next())
-        .filter_map(|s| s.parse::<f64>().ok())
-        .collect();
-    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut scored: Vec<(f64, f64)> = Vec::new();
+    let mut pending_t: Option<f64> = None;
+    for l in text.lines() {
+        if let Some(t) = l
+            .split("pts_time:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            pending_t = Some(t);
+        } else if let Some(sc) = l
+            .split("lavfi.scene_score=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            if let Some(t) = pending_t.take() {
+                scored.push((t, sc));
+            }
+        }
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cuts: Vec<f64> =
+        scored.iter().filter(|(_, sc)| *sc > 0.13).map(|&(t, _)| t).collect();
     cuts.dedup_by(|a, b| (*a - *b).abs() < 0.1);
+    let subcuts: Vec<(f64, f64)> =
+        scored.into_iter().filter(|(_, sc)| *sc <= 0.13).collect();
 
-    // --- wide-shot rescue (ADR 0074): `rescue_wide_shot_faces` replica — a
+    // --- wide-shot rescue (ADR 0074): `rescue_wide_shot_faces` replica â€” a
     // follow-visible clip's faceless inter-cut segments re-detect at full res
     // (YuNet, two overlapping half-frames) so the plan can see the wide's
     // people instead of parking the previous camera's crop on empty seats.
@@ -335,11 +356,11 @@ fn main() -> anyhow::Result<()> {
                 } else if absorbed > 0 {
                     println!("  DROPPED: absorbing would flip the regime\n");
                 } else {
-                    println!("  nothing above the persistence/size bars — tracks unchanged\n");
+                    println!("  nothing above the persistence/size bars â€” tracks unchanged\n");
                 }
             } else {
                 println!(
-                    "== wide-shot rescue: {} faceless segment(s) but face-id models missing — skipped\n",
+                    "== wide-shot rescue: {} faceless segment(s) but face-id models missing â€” skipped\n",
                     segs.len()
                 );
             }
@@ -352,9 +373,9 @@ fn main() -> anyhow::Result<()> {
     let mut analysis =
         SpeakerAnalysis { bin_s, tracks, voiced, speaking, confidence, voice: None, reaction: None };
 
-    // The MOUTH-ONLY plan — the pre-integration camera, kept as the printed
+    // The MOUTH-ONLY plan â€” the pre-integration camera, kept as the printed
     // baseline the integrated plan is diffed against below.
-    let baseline_plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
+    let baseline_plan = speaker::plan_shots_snapped(&analysis, src_w, src_h, dur, &cuts, &subcuts);
 
     // --- forensics ------------------------------------------------------------
     let center = |t: &SpeakerTrack, b: usize| t.path.get(b).and_then(|p| p.as_ref()).map(|f| (f.cx(), f.cy()));
@@ -465,7 +486,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // --- face lane (ADR 0044, production path): the occupant map the person
-    // join runs over. Computed exactly when production computes it — the
+    // join runs over. Computed exactly when production computes it â€” the
     // attribution regime with both face-id models present; otherwise the
     // voice join runs the seat-scoped ADR 0042 fallback.
     let attribution = speaker::attribution_regime(&analysis);
@@ -474,12 +495,12 @@ fn main() -> anyhow::Result<()> {
         let sface = Path::new(SFACE_MODEL);
         if !attribution {
             println!(
-                "\n== face lane: follow-visible regime — occupant map not computed (the whole-clip join is the identity)"
+                "\n== face lane: follow-visible regime â€” occupant map not computed (the whole-clip join is the identity)"
             );
             (None, Vec::new())
         } else if !yunet.is_file() || !sface.is_file() {
             println!(
-                "\n== face lane: missing {} or {} — occupant map off, seat-scoped join (ADR 0042 fallback)",
+                "\n== face lane: missing {} or {} â€” occupant map off, seat-scoped join (ADR 0042 fallback)",
                 yunet.display(),
                 sface.display()
             );
@@ -509,8 +530,8 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // --- voice lanes (ADR 0042/0044, INTEGRATED): the PRODUCTION functions —
-    // yc_frame::voice::{embed_windows, build_lane, fuse_attribution} — run
+    // --- voice lanes (ADR 0042/0044, INTEGRATED): the PRODUCTION functions â€”
+    // yc_frame::voice::{embed_windows, build_lane, fuse_attribution} â€” run
     // here on the same inputs (occupant map included), so what this harness
     // measures IS the analysis Job::AnalyzeSpeakers ships. Candidate models
     // A/B beside the production one; a missing file skips its lane so the
@@ -520,7 +541,7 @@ fn main() -> anyhow::Result<()> {
     for (i, &(tag, path, scale, cmn)) in VOICE_MODELS.iter().enumerate() {
         let model = Path::new(path);
         if !model.is_file() {
-            println!("  [{tag}] missing {} — lane skipped", model.display());
+            println!("  [{tag}] missing {} â€” lane skipped", model.display());
             continue;
         }
         let t0 = std::time::Instant::now();
@@ -554,7 +575,7 @@ fn main() -> anyhow::Result<()> {
             attribution,
             occupant_map.as_ref(),
         ) else {
-            println!("  [{tag}] only {} embeddable windows — lane skipped", embs.len());
+            println!("  [{tag}] only {} embeddable windows â€” lane skipped", embs.len());
             continue;
         };
         for l in &diag.lines {
@@ -571,7 +592,7 @@ fn main() -> anyhow::Result<()> {
             println!("  [{tag}] window dump: {p}");
         }
         // The FIRST present model is the production lane: fuse it into the
-        // analysis exactly as Job::AnalyzeSpeakers does — the plan below is
+        // analysis exactly as Job::AnalyzeSpeakers does â€” the plan below is
         // then the integrated production camera.
         if i == 0 {
             let (fspeak, fconf, overridden) =
@@ -612,7 +633,7 @@ fn main() -> anyhow::Result<()> {
         let labels_p = Path::new(TAG_LABELS);
         if !model.is_file() || !labels_p.is_file() {
             println!(
-                "\n== laughter lane: missing {} or {} — skipped",
+                "\n== laughter lane: missing {} or {} â€” skipped",
                 model.display(),
                 labels_p.display()
             );
@@ -650,7 +671,7 @@ fn main() -> anyhow::Result<()> {
         .map(|(steps, _, _)| yc_frame::reaction::project_to_bins(steps, n_bins, bin_s));
 
     // Per-segment evidence table (ADR 0044 grammar forensics): what each
-    // inter-cut segment's voiced time is made of — the printed gaps any
+    // inter-cut segment's voiced time is made of â€” the printed gaps any
     // shared-class plan rule must derive its thresholds from.
     {
         let bounds = yc_frame::voice::segment_bounds(&cuts, dur);
@@ -713,7 +734,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|(c, n)| format!("V{c} {:.0}%", 100.0 * *n as f64 / nv as f64))
                 .collect();
             // Mean laughter score over ALL of the segment's bins (the lane is
-            // VAD-independent — breathy laughter has no voiced bins to count).
+            // VAD-independent â€” breathy laughter has no voiced bins to count).
             let laugh_s = laugh_bins
                 .as_ref()
                 .map(|lb| {
@@ -737,7 +758,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --- laughter bars (ADR 0045): the pre-declared discrimination gates —
+    // --- laughter bars (ADR 0045): the pre-declared discrimination gates â€”
     // at ONE tau from the declared grid: target mass >= 50%, every monologue
     // segment <= 10%, gap >= 5x vs the worst monologue. Judged only when the
     // operator supplies the fixture's ear-truth spans:
@@ -755,7 +776,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_default();
         let taus = [0.1f32, 0.2, 0.3, 0.4, 0.5];
         let bounds = yc_frame::voice::segment_bounds(&cuts, dur);
-        // Top-5 classes the model hears over a span — the "is it actually
+        // Top-5 classes the model hears over a span â€” the "is it actually
         // laughter" forensic (one aggregate window per span).
         let mut top5 = |span: (f64, f64)| -> String {
             let sr = yc_frame::voice::VOICE_SR as f64;
@@ -840,7 +861,7 @@ fn main() -> anyhow::Result<()> {
             match selected {
                 Some(tau) => println!("  BARS: PASS at tau {tau:.1}"),
                 None => println!(
-                    "  BARS: FAIL — no tau on the declared grid meets A(>=50%) B(<=10% every monologue) C(gap >=5x)"
+                    "  BARS: FAIL â€” no tau on the declared grid meets A(>=50%) B(<=10% every monologue) C(gap >=5x)"
                 ),
             }
             // Findings (not bars): the ex-split pieces' masses, the mask, and
@@ -882,7 +903,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // The shared-reaction mask joins the integrated analysis EXACTLY as
-    // production does (ADR 0046): attribution regime only — a follow-visible
+    // production does (ADR 0046): attribution regime only â€” a follow-visible
     // plan never consults it, so the ANTITESA byte-pin holds by construction
     // (and the pipeline never even computes the mask there).
     if speaker::attribution_regime(&analysis) {
@@ -891,10 +912,10 @@ fn main() -> anyhow::Result<()> {
 
     // The INTEGRATED production plan: plan_shots itself applies the
     // off-screen splits, the shared-reaction splits, and interjection rescues
-    // from analysis.voice/analysis.reaction. Every forensic below — the shot
-    // list, the camera audit, the crop-stability blocks, camera_diag.fg —
+    // from analysis.voice/analysis.reaction. Every forensic below â€” the shot
+    // list, the camera audit, the crop-stability blocks, camera_diag.fg â€”
     // runs on THIS plan.
-    let plan = speaker::plan_shots(&analysis, src_w, src_h, dur, &cuts);
+    let plan = speaker::plan_shots_snapped(&analysis, src_w, src_h, dur, &cuts, &subcuts);
     let changed = plan
         .shots
         .iter()
@@ -964,17 +985,17 @@ fn main() -> anyhow::Result<()> {
     if audit.is_empty() {
         println!("\n== camera audit: clean (0 findings)");
     } else {
-        println!("\n== camera audit: {} FINDING(S) — this plan renders with visible camera defects:", audit.len());
+        println!("\n== camera audit: {} FINDING(S) â€” this plan renders with visible camera defects:", audit.len());
         for f in &audit {
             println!("  ! {f}");
         }
     }
 
     // --- same-subject piece pairs (crop stability forensics): each solo shot
-    // vs the PREVIOUS solo shot of the same track (adjacent or across runs) —
-    // exactly the pairs a framing memory would act on. Δsubj is the span-median
-    // face center/height; Δcrop is the planner's current output; sig compares
-    // the spans' 60px seat-geometry signatures (reference only — leans are
+    // vs the PREVIOUS solo shot of the same track (adjacent or across runs) â€”
+    // exactly the pairs a framing memory would act on. Î”subj is the span-median
+    // face center/height; Î”crop is the planner's current output; sig compares
+    // the spans' 60px seat-geometry signatures (reference only â€” leans are
     // known to split angles, ADR 0042). PAN pairs carry real motion and are
     // excluded from the summary distributions.
     println!("\n== same-subject piece pairs (crop stability forensics):");
@@ -1026,7 +1047,7 @@ fn main() -> anyhow::Result<()> {
         }
         sig
     };
-    // (Δcenter px, |Δface h| %, Δcrop pos px, |Δcrop h| %) per pair, grouped
+    // (Î”center px, |Î”face h| %, Î”crop pos px, |Î”crop h| %) per pair, grouped
     // by the signature verdict.
     let mut same_sig: Vec<(f32, f32, f32, f32)> = Vec::new();
     let mut diff_sig: Vec<(f32, f32, f32, f32)> = Vec::new();
@@ -1095,7 +1116,7 @@ fn main() -> anyhow::Result<()> {
 
     // --- best prior anchor per solo piece: what the framing memory would
     // actually find. For each solo shot, the prior same-track solo shot whose
-    // subject geometry is closest (center px + 4x |dh| px) — small deltas mark
+    // subject geometry is closest (center px + 4x |dh| px) â€” small deltas mark
     // a RETURN to an already-framed camera (the reuse candidates), large ones
     // a first visit to a new angle. Fractions are of the anchor's face height
     // (fh) and crop width, the scale-free units a dead-zone would use.
@@ -1143,7 +1164,7 @@ fn main() -> anyhow::Result<()> {
 
     // --- solo presence (the 2026-07-07 worst-defect instrument): per solo
     // shot, does the plan verifiably frame its subject's real face? Additive
-    // only — bars are placed on this table after it exists (ADR 0045 pattern).
+    // only â€” bars are placed on this table after it exists (ADR 0045 pattern).
     let presence_plan = solo_presence(
         ffmpeg,
         &segment,
@@ -1171,7 +1192,7 @@ fn main() -> anyhow::Result<()> {
     // output names, because past gate artifacts must never be clobbered
     // (their gates PASSED; the files are the record):
     //  - YC_SMOOTH_RENDER  -> ../camera_smoothing.mp4  (the camera-smoothing
-    //    gate's name — NOTE: the plan now includes the voice behaviors, so
+    //    gate's name â€” NOTE: the plan now includes the voice behaviors, so
     //    re-rendering under this name overwrites the signed-off artifact;
     //    prefer YC_INTEG_RENDER unless reproducing that old gate on purpose)
     //  - YC_INTEG_RENDER   -> ../diar_integration.mp4  (the ADR 0042
@@ -1266,7 +1287,7 @@ fn main() -> anyhow::Result<()> {
                 yc_render::run_export(&ffabs, &data_dir, &args, &|| false)?;
             }
             None => println!(
-                "YC_PRESENCE_RENDER: no rewritten plan (follow-visible or models absent) — nothing to render"
+                "YC_PRESENCE_RENDER: no rewritten plan (follow-visible or models absent) â€” nothing to render"
             ),
         }
     }
@@ -1317,19 +1338,19 @@ fn main() -> anyhow::Result<()> {
 /// The speaker-embedding models this harness runs (first = the PRODUCTION
 /// lane, fused into the analysis; the rest are A/B candidates). Production
 /// today: 3D-Speaker CAM++ zh_en
-/// "advanced" — CAM++ is the fastest surveyed architecture on CPU — from the
+/// "advanced" â€” CAM++ is the fastest surveyed architecture on CPU â€” from the
 /// sherpa-onnx `speaker-recongition-models` release (that typo is real),
 /// SHA-256-verified against the release's published checksum.txt, Apache-2.0.
 /// On the known-speaker selftest it separates cleanly (same speaker +0.60,
 /// different +0.05). The other candidate, `wespeaker_en_voxceleb_CAM++_LM`,
 /// FAILED that selftest under every documented convention (int16/unit scale,
-/// CMN on/off — best case: same speaker +0.26 vs different +0.66) with the
+/// CMN on/off â€” best case: same speaker +0.26 vs different +0.66) with the
 /// identical fbank code, so it is rejected rather than A/B'd; if this lane
 /// ever underwhelms, retry it with WeSpeaker's exact torchaudio frontend
 /// (snip_edges=true, high_freq=nyquist) before blaming the weights.
 #[cfg(feature = "face")]
 const VOICE_MODELS: [(&str, &str, yc_frame::voice::SampleScale, bool); 1] = [
-    // (tag, path, sample scale, apply per-window CMN) — the model's
+    // (tag, path, sample scale, apply per-window CMN) â€” the model's
     // reference convention, validated on the known-speaker selftest.
     (
         "3ds",
@@ -1341,16 +1362,16 @@ const VOICE_MODELS: [(&str, &str, yc_frame::voice::SampleScale, bool); 1] = [
 
 /// The audio-event tagging model (ADR 0045 spike): icefall Zipformer-M
 /// audio tagger trained on AudioSet (527 classes, laughter family included),
-/// from the sherpa-onnx `audio-tagging-models` release — the CAM++ sourcing
+/// from the sherpa-onnx `audio-tagging-models` release â€” the CAM++ sourcing
 /// pattern, Apache-2.0. Asset
 /// `sherpa-onnx-zipformer-audio-tagging-2024-04-09.tar.bz2`, SHA-256
 /// `6c89b86c3d4812520e6937316d9aff944458871ec037dd47cf33ae2034b5eb54` (the
 /// live asset, matching the GitHub API digest; the release's checksum.txt
-/// still lists a stale pre-re-upload hash `8d786db8…`). The installed
+/// still lists a stale pre-re-upload hash `8d786db8â€¦`). The installed
 /// `model.onnx` hashes `a8f11014905fbaab81644514b79e719f3fcfa3ad45d29a25b46e34eb03c48ed8`.
-/// Input `(x [N,T,80] fbank, x_lens [N])` — the existing byte-validated
+/// Input `(x [N,T,80] fbank, x_lens [N])` â€” the existing byte-validated
 /// Kaldi frontend feeds it directly; picked over the CED exports for exactly
-/// that reason (CED wants a 64-mel torchaudio-style frontend — new matching
+/// that reason (CED wants a 64-mel torchaudio-style frontend â€” new matching
 /// work the spike doesn't pay for speculatively).
 #[cfg(feature = "face")]
 const TAG_MODEL: &str = "models/sherpa-onnx-zipformer-audio-tagging-2024-04-09.onnx";
@@ -1358,26 +1379,26 @@ const TAG_MODEL: &str = "models/sherpa-onnx-zipformer-audio-tagging-2024-04-09.o
 /// beside the model; SHA-256 `cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429`.
 #[cfg(feature = "face")]
 const TAG_LABELS: &str = "models/audioset_class_labels_indices.csv";
-/// Fbank sample scale for the tagger — PINNED by `tagselftest` on the
+/// Fbank sample scale for the tagger â€” PINNED by `tagselftest` on the
 /// release's own 13 test wavs (no CMN here, so scale genuinely changes the
 /// features): `Unit` reproduces the published reference outputs rank-perfect
 /// on all 13 (4.wav: Laughter top with the family beneath; Stream, Oink,
 /// Meow, Siren all correct), while `Int16` audibly breaks them (the laughter
-/// wav tags as Music/Singing, the stream as Engine) — the icefall/lhotse
+/// wav tags as Music/Singing, the stream as Engine) â€” the icefall/lhotse
 /// [-1,1] training convention, seen not assumed.
 #[cfg(feature = "face")]
 const TAG_SCALE: yc_frame::voice::SampleScale = yc_frame::voice::SampleScale::Unit;
-/// Output convention — PINNED by the same selftest: raw outputs live in
+/// Output convention â€” PINNED by the same selftest: raw outputs live in
 /// exactly [0, 1] with hard zeros on absent classes, and match the published
 /// reference probabilities nearly digit-for-digit (Cat raw 0.944 vs 0.939
-/// published, Oink 0.895 vs 0.888) — the export ends in a sigmoid, so
+/// published, Oink 0.895 vs 0.888) â€” the export ends in a sigmoid, so
 /// `tag()` must NOT apply another one.
 #[cfg(feature = "face")]
 const TAG_OUTPUT: yc_frame::reaction::TagOutput = yc_frame::reaction::TagOutput::Probs;
 
-/// `tagselftest <wav> [<wav>…]`: score whole 16 kHz mono wavs with the
+/// `tagselftest <wav> [<wav>â€¦]`: score whole 16 kHz mono wavs with the
 /// audio-event tagger under BOTH sample-scale conventions and print top-5
-/// AudioSet classes + the raw logit range per wav — Bar 0 of the ADR 0045
+/// AudioSet classes + the raw logit range per wav â€” Bar 0 of the ADR 0045
 /// spike: the model must rank known content correctly (and the right scale
 /// show itself) before any fixture number means anything.
 #[cfg(feature = "face")]
@@ -1423,8 +1444,8 @@ fn tag_selftest(wavs: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `selftest <wav> <wav> [<wav>…]`: embed whole 16 kHz mono wavs with every
-/// present candidate model and print pairwise cosine similarity — ground
+/// `selftest <wav> <wav> [<wav>â€¦]`: embed whole 16 kHz mono wavs with every
+/// present candidate model and print pairwise cosine similarity â€” ground
 /// truth for the fbank + embedding path on known same/different speakers.
 #[cfg(feature = "face")]
 fn voice_selftest(wavs: &[String]) -> anyhow::Result<()> {
@@ -1437,7 +1458,7 @@ fn voice_selftest(wavs: &[String]) -> anyhow::Result<()> {
     for (tag, model, scale, cmn) in VOICE_MODELS {
         let model = Path::new(model);
         if !model.is_file() {
-            println!("[{tag}] missing {} — skipped", model.display());
+            println!("[{tag}] missing {} â€” skipped", model.display());
             continue;
         }
         let mut emb = VoiceEmbedder::load(model, scale, cmn)?;
@@ -1461,7 +1482,7 @@ fn voice_selftest(wavs: &[String]) -> anyhow::Result<()> {
 }
 
 /// The face-identity models (ADR 0043 spike): the OpenCV zoo pair designed to
-/// work together — YuNet for the 5 landmarks the alignment needs (MIT,
+/// work together â€” YuNet for the 5 landmarks the alignment needs (MIT,
 /// 232,589 bytes, SHA-256 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`),
 /// SFace for the embedding (Apache-2.0, 38,696,353 bytes, SHA-256
 /// `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`), both
@@ -1542,7 +1563,7 @@ fn write_png_rgb(
 /// The face lane (ADR 0043/0044, production path): sample full-res crops per
 /// (segment, seat), embed through YuNet landmarks + SFace, and build the
 /// OCCUPANT MAP with the production `yc_frame::occupant::build_occupant_map`
-/// (person cut at the largest dendrogram gap — printed, not trusted
+/// (person cut at the largest dendrogram gap â€” printed, not trusted
 /// silently). Prints the map + camera merge, writes the operator's contact
 /// sheet. Returns the map the voice join runs over plus each person's
 /// centroid unit embedding (the solo-presence table's identity reference)
@@ -1570,10 +1591,10 @@ fn face_lane(
     let n_segs = bounds.len() - 1;
     let t0 = std::time::Instant::now();
     let mut ident = FaceIdentifier::load(yunet, sface)?;
-    println!("\n== face lane (production path): occupant map — who occupies each seat, per segment");
+    println!("\n== face lane (production path): occupant map â€” who occupies each seat, per segment");
 
     // Sample times per segment (production plan: most-present bins at spread
-    // quantiles, inset from the cut edges) — one seek per time, every present
+    // quantiles, inset from the cut edges) â€” one seek per time, every present
     // seat cropped from the same frame.
     let samples =
         yc_frame::occupant::plan_samples(analysis, &bounds, yc_frame::occupant::SAMPLES_PER_SEG);
@@ -1637,7 +1658,7 @@ fn face_lane(
         t0.elapsed().as_secs_f32()
     );
     if entries.len() < 2 {
-        println!("  too few entries — occupant map skipped");
+        println!("  too few entries â€” occupant map skipped");
         return Ok(None);
     }
 
@@ -1649,7 +1670,7 @@ fn face_lane(
         .map(|e| yc_frame::occupant::FaceEntry { seg: e.seg, track: e.track, emb: e.emb.clone() })
         .collect();
     let Some(map) = yc_frame::occupant::build_occupant_map(&face_entries, n_segs) else {
-        println!("  too few entries — occupant map skipped");
+        println!("  too few entries â€” occupant map skipped");
         return Ok(None);
     };
     let trail: Vec<String> = map.merges.iter().map(|d| format!("{d:.2}")).collect();
@@ -1666,7 +1687,7 @@ fn face_lane(
         if p < map.n_persons {
             format!("P{p}")
         } else {
-            format!("?{p}") // a singleton sighting — unknown occupant, not an identity
+            format!("?{p}") // a singleton sighting â€” unknown occupant, not an identity
         }
     };
     for p in 0..n_clusters {
@@ -1703,7 +1724,7 @@ fn face_lane(
     );
 
     // Contact sheet: one row per cluster (persons first, then singleton
-    // sightings), tiles time-ordered — the operator's eyes-gate ("every row
+    // sightings), tiles time-ordered â€” the operator's eyes-gate ("every row
     // is one human") without a render.
     let tile = face_id::ALIGN_SIZE;
     let pad = 4usize;
@@ -1734,7 +1755,7 @@ fn face_lane(
         write_png_rgb(ffmpeg, &sheet_path, &sheet, sw, sh)?;
         println!("  contact sheet: {} (row = person, columns time-ordered)", sheet_path.display());
     }
-    // Per-person centroid unit embeddings (persons only — singletons carry no
+    // Per-person centroid unit embeddings (persons only â€” singletons carry no
     // identity), the reference the solo-presence table's track-match cosines
     // are read against.
     let centroids: Vec<Vec<f32>> = (0..map.n_persons)
@@ -1753,7 +1774,7 @@ fn face_lane(
 
 /// The SOLO-PRESENCE instrument (the 2026-07-07 worst-defect spike, measure
 /// first): per solo shot of the integrated plan, measure whether the shot
-/// actually frames its attributed subject's real, currently-visible face —
+/// actually frames its attributed subject's real, currently-visible face â€”
 /// the verification the planner and audit never had. Sub-class A (no
 /// measurement in the shot): the stale crop persists and the audit is blind.
 /// Sub-class B (the track matched a face-like blob on set dressing in this
@@ -1763,15 +1784,15 @@ fn face_lane(
 /// - `in-crop`: share of measured centers inside the crop's safe region
 ///   (the audit's own [`speaker::REUSE_GUARD_X_FH`] insets, pan-aware);
 /// - seeks (span quantiles + the max-gap midpoint), per sampled frame:
-///   `crop` = YuNet over the PLANNED crop region — is a real face (landmarks)
+///   `crop` = YuNet over the PLANNED crop region â€” is a real face (landmarks)
 ///   visible in what renders?; `track` = YuNet + SFace on the region around
-///   the track's own measurement — is what the track matched a real face,
+///   the track's own measurement â€” is what the track matched a real face,
 ///   and which occupant-map person does it embed as (vs the map's expected
 ///   occupant of the attributed seat)?;
 /// - `occ`: the occupant map's verdict for the attributed seat in this
 ///   shot's segment (P# / ?=unknown singleton / -=no entry or no map);
-/// - `fb`: the fallback ladder's structural pick IF this shot failed a bar —
-///   split(tracks ≥40% present in the span) / hold(#prev; no source cut at
+/// - `fb`: the fallback ladder's structural pick IF this shot failed a bar â€”
+///   split(tracks â‰¥40% present in the span) / hold(#prev; no source cut at
 ///   the boundary) / wide (cut crossed, nobody measured).
 ///
 /// Purely additive diagnostics: bars are placed on this table AFTER it
@@ -1810,12 +1831,12 @@ fn solo_presence(
         "\n== solo presence (per solo shot; crop= face in planned crop, track= what the track matched):"
     );
     if ident.is_none() {
-        println!("  (face-id models missing — seek lanes off)");
+        println!("  (face-id models missing â€” seek lanes off)");
     }
     let cos = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
     let mut n_seeks = 0usize;
     // Per solo shot: the tallest crop-face over all seeks (0.0 = MISS), fed to
-    // the PRODUCTION Bar P + rewrite below — this harness is the production
+    // the PRODUCTION Bar P + rewrite below â€” this harness is the production
     // twin for the wiring (ADR 0048), not just a table.
     let mut heights: Vec<(usize, f32)> = Vec::new();
     for (i, s) in plan.shots.iter().enumerate() {
@@ -1828,7 +1849,7 @@ fn solo_presence(
         let nb = (b1 - b0).max(1);
         let at = |b: usize| tr.path.get(b).and_then(|p| p.as_ref());
 
-        // meas + largest unmeasured run (edges count — the shipped A-class
+        // meas + largest unmeasured run (edges count â€” the shipped A-class
         // windows sit at piece starts).
         let meas_n = (b0..b1).filter(|&b| at(b).is_some()).count();
         let (mut gs, mut gl, mut cl) = (0usize, 0usize, 0usize);
@@ -1963,7 +1984,7 @@ fn solo_presence(
             n_seeks += 1;
             shot_got += 1;
             // crop scan: any real face visible in what renders? Center in
-            // frame coords — a det hugging the crop's edge is a sliced face.
+            // frame coords â€” a det hugging the crop's edge is a sliced face.
             let c = crop_at(t);
             let (region, rw, rh, rx, ry) = yc_frame::occupant::crop_rgb(
                 &frame,
@@ -2058,7 +2079,7 @@ fn solo_presence(
             };
             println!("    {t:>6.1}s  crop {crop_cell:<18} track {track_cell}");
         }
-        // Omit a shot with no decoded frame — measured absence flags,
+        // Omit a shot with no decoded frame â€” measured absence flags,
         // ignorance does not (matches the production pass's `got > 0` gate).
         if shot_got > 0 {
             heights.push((i, shot_max_h));
@@ -2070,7 +2091,7 @@ fn solo_presence(
     // through the PRODUCTION Bar P + fallback rewrite (the exact yc_frame
     // functions `pipeline.rs` calls) so the fixtures and VIOR clips are
     // verified against production here, not a re-implementation. Attribution
-    // regime + models present only — mirrors the pipeline's own gate exactly,
+    // regime + models present only â€” mirrors the pipeline's own gate exactly,
     // so a follow-visible clip's plan is proven byte-identical (never touched).
     if ident.is_some() && speaker::attribution_regime(analysis) {
         let mut verdicts = speaker::evaluate_solo_presence(analysis, plan, &heights);
@@ -2079,7 +2100,7 @@ fn solo_presence(
         let flagged = verdicts.iter().filter(|v| v.flagged).count();
         println!("\n== solo presence (production twin: Bar P + fallback rewrite):");
         if flagged == 0 {
-            println!("  0 flagged — plan unchanged (fixture-clean)");
+            println!("  0 flagged â€” plan unchanged (fixture-clean)");
         }
         for v in verdicts.iter().filter(|v| v.flagged) {
             println!(
@@ -2102,17 +2123,17 @@ fn solo_presence(
         return Ok(Some(rewritten));
     }
     println!(
-        "\n== solo presence (production twin): follow-visible or models absent — production skips the pass, plan byte-identical (ADR 0048)"
+        "\n== solo presence (production twin): follow-visible or models absent â€” production skips the pass, plan byte-identical (ADR 0048)"
     );
     Ok(None)
 }
 
-/// `faceselftest <img> [<img>…]`: detect every face in each full frame and
-/// print pairwise cosines for BOTH pipelines — YuNet-aligned and
-/// box-pseudo-landmark — labeled by frame and left-to-right position. The
+/// `faceselftest <img> [<img>â€¦]`: detect every face in each full frame and
+/// print pairwise cosines for BOTH pipelines â€” YuNet-aligned and
+/// box-pseudo-landmark â€” labeled by frame and left-to-right position. The
 /// model must order known same/different faces correctly here BEFORE any
 /// fixture number means anything (the WeSpeaker rejection discipline).
-/// OpenCV's own same-identity floor for SFace is cosine 0.363 — the
+/// OpenCV's own same-identity floor for SFace is cosine 0.363 â€” the
 /// calibration line to read the matrix against.
 #[cfg(feature = "face")]
 fn face_selftest(imgs: &[String]) -> anyhow::Result<()> {
@@ -2136,12 +2157,12 @@ fn face_selftest(imgs: &[String]) -> anyhow::Result<()> {
         let (w, h) = match yc_ingest::probe_segment(ffprobe, p, &cancel) {
             Ok(pr) => (pr.width as usize, pr.height as usize),
             Err(_) => {
-                println!("[{stem}] ffprobe failed — assuming 1920x1080");
+                println!("[{stem}] ffprobe failed â€” assuming 1920x1080");
                 (1920, 1080)
             }
         };
         let Some(frame) = fetch_frame(ffmpeg, p, 0.0, w, h, 25.0)? else {
-            println!("[{stem}] no frame decoded — skipped");
+            println!("[{stem}] no frame decoded â€” skipped");
             continue;
         };
         let mut dets = ident.detect(&frame, w, h)?;
@@ -2179,3 +2200,4 @@ fn face_selftest(imgs: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+

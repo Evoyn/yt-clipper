@@ -156,6 +156,20 @@ const MULTICAM_MIN_SHOT_S: f64 = 0.7;
 /// tracker-lagged shadow (the detector re-acquires the new face a few bins
 /// late), never a second camera change — half the flicker floor (ADR 0073).
 const FLIP_SPLIT_GUARD_S: f64 = 0.35;
+/// Healed-boundary snapping (ADR 0076): a subject flip proves a camera
+/// change nearby, so pixel evidence DOWN TO this scene score marks its
+/// exact frame — well above the corpus hand-motion noise ceiling (0.039,
+/// ADR 0073's eye-labeled sweep), well below the 0.099+ the TKP fixture's
+/// sub-threshold cuts actually score. Only ever consulted where a flip
+/// already demands a boundary; never mints cuts on its own.
+pub const SCENE_SNAP_FLOOR: f64 = 0.05;
+/// How far BEFORE a flip boundary the true cut can hide: detection can
+/// only lag the cut (the face isn't there earlier), and the measured lag
+/// is a bin or two — 0.5 s covers a slow re-acquire with margin.
+const SNAP_BACK_S: f64 = 0.5;
+/// ...and how far after: the bin grid can round a flip past the cut frame
+/// by at most one bin.
+const SNAP_FWD_S: f64 = 0.06;
 /// Wide-shot rescue (ADR 0074): an inter-cut segment at least this long whose
 /// bins the tracker left (almost) empty gets a second, high-resolution
 /// detection pass — a wide angle's distant faces sit below Ultraface's fixed
@@ -1275,6 +1289,23 @@ pub fn plan_shots(
     duration_s: f64,
     cuts: &[f64],
 ) -> CameraPlan {
+    plan_shots_snapped(analysis, src_w, src_h, duration_s, cuts, &[])
+}
+
+/// [`plan_shots`] with the scene detector's SUB-THRESHOLD candidates
+/// (`(clip_time, score)`, scores in `[SCENE_SNAP_FLOOR, the cut
+/// threshold)`): a healed subject-flip boundary snaps to the strongest
+/// candidate in its lag window, making healed cuts frame-exact like
+/// detected ones (ADR 0076). Empty candidates = today's healing (the flip
+/// bin, up to a frame late).
+pub fn plan_shots_snapped(
+    analysis: &SpeakerAnalysis,
+    src_w: f32,
+    src_h: f32,
+    duration_s: f64,
+    cuts: &[f64],
+    subcuts: &[(f64, f64)],
+) -> CameraPlan {
     let n = analysis.speaking.len();
     let bin_s = if analysis.bin_s > 0.0 { analysis.bin_s } else { 1.0 / SPEAKER_FPS };
     if n == 0 || analysis.tracks.is_empty() {
@@ -1293,7 +1324,7 @@ pub fn plan_shots(
     // source's real cut frames, cut exactly there; else approximate per-bin.
     if mean_visible_faces(&analysis.tracks, n) < MULTICAM_MAX_MEAN_FACES {
         if !cuts.is_empty() {
-            return plan_by_scene_cuts(analysis, src_w, src_h, duration_s, bin_s, cuts);
+            return plan_by_scene_cuts(analysis, src_w, src_h, duration_s, bin_s, cuts, subcuts);
         }
         return plan_follow_visible(analysis, src_w, src_h, duration_s, bin_s);
     }
@@ -1601,6 +1632,7 @@ fn plan_by_scene_cuts(
     duration_s: f64,
     bin_s: f64,
     cuts: &[f64],
+    subcuts: &[(f64, f64)],
 ) -> CameraPlan {
     let tracks = &analysis.tracks;
     let n = analysis.speaking.len();
@@ -1625,7 +1657,7 @@ fn plan_by_scene_cuts(
                 && t < duration_s - 0.03
                 && bounds.iter().all(|&p| (p - t).abs() > FLIP_SPLIT_GUARD_S)
             {
-                bounds.push(t);
+                bounds.push(snap_flip_boundary(t, subcuts));
             }
         }
         bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1678,6 +1710,24 @@ fn plan_by_scene_cuts(
         i = j + 1;
     }
     CameraPlan { shots }
+}
+
+/// Where a healed flip boundary REALLY cuts (ADR 0076): the flip bin is the
+/// tracker's FIRST SIGHT of the new face — detection can only lag the cut,
+/// and the bin grid quantizes up to a bin later still — so the true cut
+/// frame renders one frame under the OUTGOING shot's crop (the operator's
+/// single-frame wrong-crop flash at healed cuts, 2026-07-29: healed
+/// 1.125 / 7.167 / 43.208 vs true 1.112 / 7.153 / 43.195 on the
+/// "Confidence vs Fear" fixture). The cut's pixel evidence exists BELOW the
+/// detection threshold (measured 0.099-0.109 there): snap to the strongest
+/// sub-threshold candidate within the lag window; none → keep the flip bin.
+fn snap_flip_boundary(t: f64, subcuts: &[(f64, f64)]) -> f64 {
+    subcuts
+        .iter()
+        .filter(|(c, _)| *c >= t - SNAP_BACK_S && *c <= t + SNAP_FWD_S)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|&(c, _)| c)
+        .unwrap_or(t)
 }
 
 /// Plan for a **multicam edit or solo source** (≈1 face visible at a time): the
@@ -4031,6 +4081,43 @@ mod tests {
         );
         assert_eq!(plan.shots[0].track, Some(1));
         assert_eq!(plan.shots[1].track, Some(0));
+    }
+
+    #[test]
+    fn a_healed_boundary_snaps_to_the_subthreshold_pixel_cut() {
+        // ADR 0076: same setup as the missed-cut heal above, but the scene
+        // detector's sub-threshold candidates carry the true cut frame a
+        // hair before the flip bin (detection lags the cut). The boundary
+        // must land on the CANDIDATE's exact pts — the cut frame renders in
+        // the incoming shot, not one frame under the outgoing crop.
+        let n = nbins(40.0);
+        let k = nbins(30.0);
+        let b_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i < k).then(|| fb(1200.0, 300.0, 90.0, 90.0))).collect();
+        let a_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i >= k).then(|| fb(400.0, 300.0, 90.0, 90.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(400.0, 300.0, 90.0, 90.0), presence: 0.25, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1200.0, 300.0, 90.0, 90.0), presence: 0.75, activity: vec![0.0; n], path: b_path };
+        let a = analysis(vec![None; n], vec![ta, tb]);
+        // The true cut frame at 29.987 (score 0.11), plus noise below the
+        // floor's purpose: a weaker candidate nearer the flip must lose to
+        // the strongest one in the window.
+        let subcuts = [(29.987, 0.11), (29.996, 0.06)];
+        let plan = plan_shots_snapped(&a, 1920.0, 1080.0, 40.0, &[10.0], &subcuts);
+        assert_eq!(plan.shots.len(), 2, "{plan:?}");
+        assert!(
+            (plan.shots[0].end_s - 29.987).abs() < 1e-9,
+            "boundary snaps to the strongest candidate's exact pts, got {}",
+            plan.shots[0].end_s
+        );
+        // A candidate OUTSIDE the lag window never captures the boundary.
+        let far = [(28.0, 0.12)];
+        let plan = plan_shots_snapped(&a, 1920.0, 1080.0, 40.0, &[10.0], &far);
+        assert!(
+            (plan.shots[0].end_s - 30.0).abs() < 0.1,
+            "no in-window candidate keeps the flip bin, got {}",
+            plan.shots[0].end_s
+        );
     }
 
     #[test]

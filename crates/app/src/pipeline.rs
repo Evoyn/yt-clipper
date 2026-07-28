@@ -3073,8 +3073,13 @@ fn do_analyze_speakers(
     // Detected BEFORE the voice lane (its per-angle joins group the segments
     // between these cuts by seat geometry) and before attribution: the
     // wide-shot rescue below reshapes the tracks these consume.
-    let cuts = detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
-    tracing::info!(cuts = cuts.len(), "speaker analysis: source cuts");
+    let (cuts, subcuts) =
+        detect_scene_cuts(&paths.ffmpeg, &prepared.render_src, prepared.seek_s, dur);
+    tracing::info!(
+        cuts = cuts.len(),
+        subcuts = subcuts.len(),
+        "speaker analysis: source cuts"
+    );
     // Wide-shot rescue (ADR 0074): a faceless inter-cut segment on a multicam
     // source is usually a wide whose distant faces sit below Ultraface's fixed
     // 320x240 input — without this pass the planner holds the previous
@@ -3261,7 +3266,14 @@ fn do_analyze_speakers(
         anyhow::bail!("cancelled");
     }
 
-    let mut plan = speaker::plan_shots(&analysis, prepared.src_w, prepared.src_h, dur, &cuts);
+    let mut plan = speaker::plan_shots_snapped(
+        &analysis,
+        prepared.src_w,
+        prepared.src_h,
+        dur,
+        &cuts,
+        &subcuts,
+    );
     tracing::info!(shots = plan.shots.len(), "speaker analysis: camera plan");
 
     // --- solo presence (ADR 0048): verify each solo shot frames a real,
@@ -3539,13 +3551,24 @@ fn presence_seeks(
 const SCENE_CUT_THRESHOLD: f64 = 0.13;
 
 /// Detect the source's cut frames over the clip (`[seek_s, seek_s+dur]`) with
-/// ffmpeg's scene-change filter, returning clip-relative cut times (seconds).
-/// Best-effort: any failure yields an empty list, and the plan falls back to
-/// approximating cuts from the per-bin subject. One extra full-rate decode of
-/// the clip (cheap — pixel diff, no model), so the cuts are frame-exact even
-/// when the source frame rate differs from the analysis grid.
+/// ffmpeg's scene-change filter. Returns `(cuts, subcuts)`: clip-relative cut
+/// times scoring above [`SCENE_CUT_THRESHOLD`], plus the SUB-THRESHOLD scored
+/// candidates in `[SCENE_SNAP_FLOOR, threshold)` — the pixel evidence a
+/// healed subject-flip boundary snaps to (ADR 0076; a near-black studio's
+/// real cut can score under any workable threshold, but where a flip proves
+/// a camera change, even weak evidence marks its exact frame). Best-effort:
+/// any failure yields empty lists, and the plan falls back to approximating
+/// cuts from the per-bin subject. One extra full-rate decode of the clip
+/// (cheap — pixel diff, no model), so the cuts are frame-exact even when the
+/// source frame rate differs from the analysis grid.
 #[cfg(feature = "face")]
-fn detect_scene_cuts(ffmpeg: &Path, src: &Path, seek_s: f64, dur_s: f64) -> Vec<f64> {
+fn detect_scene_cuts(
+    ffmpeg: &Path,
+    src: &Path,
+    seek_s: f64,
+    dur_s: f64,
+) -> (Vec<f64>, Vec<(f64, f64)>) {
+    let floor = yc_frame::speaker::SCENE_SNAP_FLOOR;
     let args: Vec<String> = vec![
         "-v".into(),
         "info".into(),
@@ -3556,7 +3579,7 @@ fn detect_scene_cuts(ffmpeg: &Path, src: &Path, seek_s: f64, dur_s: f64) -> Vec<
         "-i".into(),
         src.display().to_string(),
         "-vf".into(),
-        format!("select='gt(scene,{SCENE_CUT_THRESHOLD})',metadata=print"),
+        format!("select='gt(scene,{floor})',metadata=print"),
         "-an".into(),
         "-f".into(),
         "null".into(),
@@ -3570,22 +3593,42 @@ fn detect_scene_cuts(ffmpeg: &Path, src: &Path, seek_s: f64, dur_s: f64) -> Vec<
         .output();
     let Ok(output) = output else {
         tracing::warn!("scene-cut detection failed to spawn; plan will approximate cuts");
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    // metadata=print logs `... pts_time:<clip-relative seconds> ...` to stderr.
+    // metadata=print logs a `... pts_time:<clip-relative seconds>` line, then
+    // a `lavfi.scene_score=<score>` line, per selected frame.
     let text = String::from_utf8_lossy(&output.stderr);
-    let mut cuts: Vec<f64> = text
-        .lines()
-        .filter_map(|l| l.split("pts_time:").nth(1))
-        .filter_map(|s| s.split_whitespace().next())
-        .filter_map(|s| s.parse::<f64>().ok())
-        .collect();
-    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut scored: Vec<(f64, f64)> = Vec::new();
+    let mut pending_t: Option<f64> = None;
+    for l in text.lines() {
+        if let Some(t) = l
+            .split("pts_time:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            pending_t = Some(t);
+        } else if let Some(sc) = l
+            .split("lavfi.scene_score=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            if let Some(t) = pending_t.take() {
+                scored.push((t, sc));
+            }
+        }
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut cuts: Vec<f64> =
+        scored.iter().filter(|(_, sc)| *sc > SCENE_CUT_THRESHOLD).map(|&(t, _)| t).collect();
     // One transition event = one cut: a dissolve or animated-overlay churn
     // scores several consecutive frames (ADR 0073) and no real source holds a
     // 2-frame shot — detections within 0.1 s collapse to the first.
     cuts.dedup_by(|a, b| (*a - *b).abs() < 0.1);
-    cuts
+    let subcuts: Vec<(f64, f64)> =
+        scored.into_iter().filter(|(_, sc)| *sc <= SCENE_CUT_THRESHOLD).collect();
+    (cuts, subcuts)
 }
 
 /// Without the `face` feature there is no detector: speaker analysis cannot run.
