@@ -10,10 +10,11 @@
 //! decoder. The player is spawned on Play / seek-while-playing and killed on
 //! Pause / end / drop.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 
 use yc_core::NoConsole;
 
@@ -50,15 +51,25 @@ pub struct PreviewPlayer {
     /// cut": a wall-clock playhead outpaces a decoder that isn't perfectly
     /// real-time, switching the crop before the new shot is visible).
     frames_seen: u64,
+    /// The FIRST delivered frame's pts on the decode's own slot grid
+    /// (`showinfo` after the fps filter, seconds from the seek point) — the
+    /// phase `frames_seen` alone cannot know: `-ss` discards up to a frame
+    /// and the fps filter can slot the first frame late, so counting from
+    /// zero under-reads content by up to ~1.5 frames and the crop switched a
+    /// beat AFTER the picture at every cut while playing (ADR 0076 follow-up,
+    /// 2026-07-29). `None` until the decoder's first stderr line parses;
+    /// consumers fall back to the zero-phase estimate.
+    first_pts: Arc<OnceLock<f64>>,
 }
 
-/// Content time (seconds) of the MIDDLE of the newest delivered frame —
-/// frames `0..n` delivered, so the one on screen spans `[(n-1)/fps, n/fps)`.
-/// The midpoint is the robust instant to pick the camera shot with: a cut
-/// boundary is an exact frame pts, so comparing at mid-frame tolerates up to
-/// half a frame of seek/grid phase in either direction.
-pub(crate) fn frame_mid_s(frames_seen: u64, fps: f64) -> f64 {
-    (frames_seen as f64 - 0.5) / fps.max(1e-6)
+/// Content time (seconds) of the MIDDLE of the newest delivered frame:
+/// `phase` is the first frame's measured pts on the decode grid (0 until it
+/// parses), frames `0..n` delivered, so the one on screen spans
+/// `[phase + (n-1)/fps, phase + n/fps)`. The midpoint is the robust instant
+/// to pick the camera shot with: a cut boundary is an exact frame pts, so
+/// comparing at mid-frame tolerates the remaining sub-frame wobble.
+pub(crate) fn frame_mid_s(phase: f64, frames_seen: u64, fps: f64) -> f64 {
+    phase + (frames_seen as f64 - 0.5) / fps.max(1e-6)
 }
 
 /// Aspect-preserving even dimensions with the longest edge capped.
@@ -102,7 +113,10 @@ impl PreviewPlayer {
                 &format!("{:.3}", dur_s.max(0.05)),
                 "-an",
                 "-vf",
-                &format!("fps={fps},scale={w}:{h}:flags=fast_bilinear"),
+                // showinfo AFTER the fps filter: its first line reports the
+                // first OUTPUT frame's slotted pts — the decode phase that
+                // binds delivered-frame counts to true content time.
+                &format!("fps={fps},showinfo,scale={w}:{h}:flags=fast_bilinear"),
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -110,9 +124,33 @@ impl PreviewPlayer {
                 "-",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         let mut stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        // Parse the FIRST showinfo pts, then keep draining to EOF — showinfo
+        // prints per frame, and an undrained stderr pipe would block ffmpeg.
+        let first_pts: Arc<OnceLock<f64>> = Arc::new(OnceLock::new());
+        {
+            let first_pts = Arc::clone(&first_pts);
+            std::thread::spawn(move || {
+                let mut r = std::io::BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if first_pts.get().is_none() {
+                                if let Some(p) = parse_showinfo_pts(&line) {
+                                    let _ = first_pts.set(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
         // A shallow channel: the UI drains to newest, so anything deeper is
         // just latency between the decoder and the screen.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
@@ -133,21 +171,29 @@ impl PreviewPlayer {
                 }
             }
         });
-        Ok(Self { child, rx, w, h, fps, texture: None, got_frame: false, frames_seen: 0 })
+        Ok(Self { child, rx, w, h, fps, texture: None, got_frame: false, frames_seen: 0, first_pts })
     }
 
-    /// The video's elapsed **content** time (seconds) — frames delivered so far
-    /// over the decode grid — or `None` before the first frame. The caller adds
-    /// it to the play offset for the playhead (the audio/caption clock).
+    /// The measured decode phase: the first delivered frame's slotted pts,
+    /// or 0 until the decoder reports it.
+    fn phase(&self) -> f64 {
+        self.first_pts.get().copied().unwrap_or(0.0)
+    }
+
+    /// The video's elapsed **content** time (seconds) — the measured phase
+    /// plus frames delivered so far over the decode grid — or `None` before
+    /// the first frame. The caller adds it to the play offset for the
+    /// playhead (the audio/caption clock).
     pub fn video_secs(&self) -> Option<f64> {
-        (self.frames_seen > 0).then(|| self.frames_seen as f64 / self.fps.max(1e-6))
+        (self.frames_seen > 0)
+            .then(|| self.phase() + self.frames_seen as f64 / self.fps.max(1e-6))
     }
 
     /// Content time of the midpoint of the frame currently ON SCREEN, or
     /// `None` before the first frame — what the camera crop must be picked
     /// with (see [`frame_mid_s`]).
     pub fn shown_frame_mid_s(&self) -> Option<f64> {
-        (self.frames_seen > 0).then(|| frame_mid_s(self.frames_seen, self.fps))
+        (self.frames_seen > 0).then(|| frame_mid_s(self.phase(), self.frames_seen, self.fps))
     }
 
     /// Drain to the newest decoded frame and return the live texture to draw,

@@ -8354,15 +8354,27 @@ mod tests {
         // in both states: tick 318 still shows the outgoing scene, tick 319
         // shows the incoming one.
         let fps = 24000.0 / 1001.0;
-        let showing_outgoing = crate::player::frame_mid_s(319, fps); // ticks 0..=318
+        let showing_outgoing = crate::player::frame_mid_s(0.0, 319, fps); // ticks 0..=318
         assert!(
             showing_outgoing < 13.302833,
             "old scene on screen keeps the old crop: {showing_outgoing}"
         );
-        let showing_cut = crate::player::frame_mid_s(320, fps); // ticks 0..=319
+        let showing_cut = crate::player::frame_mid_s(0.0, 320, fps); // ticks 0..=319
         assert!(
             showing_cut > 13.302833,
             "the tick that shows the cut frame selects the incoming shot: {showing_cut}"
+        );
+        // The measured decode phase (ADR 0076 follow-up): when the fps
+        // filter slots the first delivered frame one tick late (seek phase
+        // past the half-frame), counting from zero under-reads content by a
+        // frame and the crop switches AFTER the picture. The reported first
+        // pts shifts the whole binding so the same delivery count lands on
+        // the incoming side.
+        let phase = 1.0 / fps;
+        let with_phase = crate::player::frame_mid_s(phase, 319, fps);
+        assert!(
+            with_phase > 13.302833,
+            "a one-tick-late first frame means tick 318 already shows the cut: {with_phase}"
         );
     }
 }
