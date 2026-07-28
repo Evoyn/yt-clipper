@@ -2569,15 +2569,26 @@ impl EditorState {
     // crop share one direct-manipulation implementation.)
 
     /// Face boxes + labels over the Source view; click to retarget the camera.
+    /// Post-analysis a box draws only for a track VISIBLE in the displayed
+    /// frame, at its tracked position there (ADR 0073): the seats a multicam
+    /// source is not currently showing get no box (they floated over empty
+    /// black) and no click target (retargeting a shot to an off-screen seat
+    /// would park the crop on nothing — the defect class the follow-visible
+    /// plan exists to prevent). Attribution-regime clips (everyone always on
+    /// screen) keep a box per person, now at per-bin positions.
     fn face_overlays(&mut self, ui: &mut egui::Ui, painter: &egui::Painter, frame_rect: Rect) {
         let sx = frame_rect.width() / self.src_w;
         let sy = frame_rect.height() / self.src_h;
         let boxes: Vec<(usize, yc_frame::FaceBox, String)> = match &self.speakers {
-            Some(a) => a
-                .tracks
-                .iter()
-                .map(|t| (t.id, t.bbox, track_label(t.id)))
-                .collect(),
+            Some(a) => {
+                let t = self.display_time();
+                a.tracks
+                    .iter()
+                    .filter_map(|tr| {
+                        path_box_near(&tr.path, a.bin_s, t).map(|b| (tr.id, b, track_label(tr.id)))
+                    })
+                    .collect()
+            }
             None => self
                 .faces
                 .iter()
@@ -6917,6 +6928,28 @@ fn draw_safe_area(painter: &egui::Painter, canvas: Rect) {
 }
 
 /// A small filled label chip painted directly on a canvas.
+/// The track's face box at the displayed frame: the frame's own bin, or the
+/// nearest detected bin within ±0.25 s (a short detector gap must not blink
+/// the box). `None` = the track is genuinely not on screen there (ADR 0073),
+/// so the Original view draws no box and offers no click target for it.
+fn path_box_near(
+    path: &[Option<yc_frame::FaceBox>],
+    bin_s: f64,
+    t: f64,
+) -> Option<yc_frame::FaceBox> {
+    if path.is_empty() || bin_s <= 0.0 {
+        return None;
+    }
+    let bin = ((t / bin_s) as isize).clamp(0, path.len() as isize - 1) as usize;
+    let radius = (0.25 / bin_s).round().max(0.0) as usize;
+    (0..=radius)
+        .flat_map(|d| {
+            [bin.checked_sub(d), bin.checked_add(d).filter(|&b| b < path.len())]
+        })
+        .flatten()
+        .find_map(|b| path[b])
+}
+
 fn chip(painter: &egui::Painter, pos: egui::Pos2, text: &str, color: Color32) {
     let font = FontId::proportional(11.0);
     let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
@@ -7143,6 +7176,21 @@ fn ellipsize(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use yc_core::CaptionUnit;
+
+    #[test]
+    fn overlay_boxes_gate_on_per_bin_visibility() {
+        // ADR 0073: a box only where the track is detected near the displayed
+        // frame — a present bin hits, a short detector gap smooths to the
+        // neighbour, and a long absence (an off-screen seat) draws nothing.
+        let b = yc_frame::FaceBox { x: 10.0, y: 20.0, w: 30.0, h: 40.0, score: 0.9 };
+        let bin_s = 1.0 / 24.0;
+        let mut path: Vec<Option<yc_frame::FaceBox>> = vec![Some(b); 24];
+        path.extend(vec![None; 72]);
+        assert!(path_box_near(&path, bin_s, 0.5).is_some(), "a present bin draws");
+        assert!(path_box_near(&path, bin_s, 1.1).is_some(), "a short gap smooths");
+        assert!(path_box_near(&path, bin_s, 2.0).is_none(), "an off-screen seat draws no box");
+        assert!(path_box_near(&[], bin_s, 0.0).is_none(), "no path, no box");
+    }
 
     #[test]
     fn ass_to_egui_font_factor_matches_the_shipped_caption_face() {

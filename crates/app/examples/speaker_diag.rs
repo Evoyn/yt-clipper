@@ -204,7 +204,7 @@ fn main() -> anyhow::Result<()> {
             "-i",
             &segment.display().to_string(),
             "-vf",
-            "select='gt(scene,0.2)',metadata=print",
+            "select='gt(scene,0.13)',metadata=print",
             "-an",
             "-f",
             "null",
@@ -219,7 +219,7 @@ fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.parse::<f64>().ok())
         .collect();
     cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.02);
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.1);
 
     // The MOUTH-ONLY plan — the pre-integration camera, kept as the printed
     // baseline the integrated plan is diffed against below.

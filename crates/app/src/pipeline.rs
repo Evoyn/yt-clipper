@@ -3347,12 +3347,17 @@ fn presence_seeks(
 }
 
 /// The `scene` value above which an inter-frame change is a source **cut**, not
-/// motion. Measured on a real multicam VOD: hard cuts score ~0.3-0.5, the
-/// busiest in-shot motion stays under ~0.1 — 0.2 separates them with margin. A
-/// stray trigger costs nothing (it merges into its neighbour when the subject
-/// is unchanged); a miss would leave two shots fused, so err low.
+/// motion. Re-measured 2026-07-28 over the live corpus with eye-labeled truth
+/// (ADR 0073): near-black studio cuts bottom out at 0.155 — the Knowledge
+/// Project fixture's four missed cuts scored 0.155-0.203 against the old 0.2,
+/// fusing 0-47.8 s onto an empty seat — while non-cut churn outside
+/// produced-overlay content ceils at 0.112; 0.13 is the corpus gap's midpoint.
+/// Produced overlays (animated B-roll) overlap ANY threshold; their strays
+/// collapse to one event in the dedup below and merge away in the planner,
+/// and a cut the pixels still miss is healed by the planner's subject-flip
+/// split (ADR 0073) — the threshold's job is only frame-exactness.
 #[cfg(feature = "face")]
-const SCENE_CUT_THRESHOLD: f64 = 0.2;
+const SCENE_CUT_THRESHOLD: f64 = 0.13;
 
 /// Detect the source's cut frames over the clip (`[seek_s, seek_s+dur]`) with
 /// ffmpeg's scene-change filter, returning clip-relative cut times (seconds).
@@ -3397,7 +3402,10 @@ fn detect_scene_cuts(ffmpeg: &Path, src: &Path, seek_s: f64, dur_s: f64) -> Vec<
         .filter_map(|s| s.parse::<f64>().ok())
         .collect();
     cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.02);
+    // One transition event = one cut: a dissolve or animated-overlay churn
+    // scores several consecutive frames (ADR 0073) and no real source holds a
+    // 2-frame shot — detections within 0.1 s collapse to the first.
+    cuts.dedup_by(|a, b| (*a - *b).abs() < 0.1);
     cuts
 }
 

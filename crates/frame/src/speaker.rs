@@ -152,6 +152,10 @@ const MULTICAM_MAX_MEAN_FACES: f32 = 1.5;
 /// one- or two-bin detection wobble never becomes a cut, and a momentary
 /// two-face overlap at a cut never flashes a split screen.
 const MULTICAM_MIN_SHOT_S: f64 = 0.7;
+/// A subject-flip boundary within this of a pixel-detected cut is that cut's
+/// tracker-lagged shadow (the detector re-acquires the new face a few bins
+/// late), never a second camera change — half the flicker floor (ADR 0073).
+const FLIP_SPLIT_GUARD_S: f64 = 0.35;
 /// Solo framing: crop height as a multiple of the face-box height (the zoom),
 /// and where the face center sits vertically in the crop (headroom bias).
 const SOLO_ZOOM: f32 = 3.6;
@@ -1184,6 +1188,30 @@ fn plan_by_scene_cuts(
     bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     bounds.dedup_by(|a, b| (*a - *b).abs() < 0.04);
 
+    // Missed-cut healing (ADR 0073): the pixel threshold proves the cuts it
+    // can see, but a near-black studio's cut can score arbitrarily low (the
+    // Knowledge Project fixture's B->A cut scored 0.1993 against a 0.2
+    // threshold, and the fused 0-47.8 s span parked the crop on an empty
+    // seat). The per-bin visible subject is this regime's own cut evidence:
+    // a flip that outlasts the flicker floor is a camera change the pixels
+    // missed — split there, at bin resolution. A boundary near a pixel cut
+    // is that cut's tracker-lagged shadow ([`FLIP_SPLIT_GUARD_S`]), skipped.
+    let runs = stable_subject_runs(tracks, n, bin_s);
+    if runs.len() >= 2 {
+        let mut b = 0usize;
+        for (_, len) in &runs[..runs.len() - 1] {
+            b += len;
+            let t = b as f64 * bin_s;
+            if t > 0.03
+                && t < duration_s - 0.03
+                && bounds.iter().all(|&p| (p - t).abs() > FLIP_SPLIT_GUARD_S)
+            {
+                bounds.push(t);
+            }
+        }
+        bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     // One (subject, time span, bin span) per inter-cut segment.
     let mut subs: Vec<Option<Subject>> = Vec::new();
     let mut ranges: Vec<(f64, f64, usize, usize)> = Vec::new();
@@ -1237,7 +1265,7 @@ fn plan_by_scene_cuts(
 /// source already cut to its subject, so follow the **visible** face and mirror
 /// those cuts instead of choosing a speaker from audio. Per bin the subject is
 /// the largest visible face (the one the source is showing); a cutaway with no
-/// face holds the previous subject; sub-[`MULTICAM_FLICKER_S`] runs are absorbed
+/// face holds the previous subject; sub-[`MULTICAM_MIN_SHOT_S`] runs are absorbed
 /// as detection noise but every real cut is kept — so the crop is only ever on a
 /// face that is actually on screen (no empty-position parking). No group shots:
 /// with one person on screen there is nothing to combine.
@@ -1262,30 +1290,7 @@ fn plan_follow_visible(
             }],
         };
     }
-    let subject = subject_series(tracks, n);
-    // Runs of the same subject = the source's own shots. Fold sub-minimum blips
-    // (a transition wobble, or a momentary two-face overlap at a cut) into the
-    // neighbour; a real source camera holds longer.
-    let mut runs: Vec<(Subject, usize)> = Vec::new();
-    for s in &subject {
-        match runs.last_mut() {
-            Some((r, len)) if r == s => *len += 1,
-            _ => runs.push((*s, 1)),
-        }
-    }
-    let min_bins = (MULTICAM_MIN_SHOT_S / bin_s).round().max(1.0) as usize;
-    let mut merged: Vec<(Subject, usize)> = Vec::new();
-    for (subj, len) in runs {
-        match merged.last_mut() {
-            Some((prev, plen)) if *prev == subj => *plen += len,
-            Some((_, plen)) if len < min_bins => *plen += len,
-            _ => merged.push((subj, len)),
-        }
-    }
-    if merged.len() >= 2 && merged[0].1 < min_bins {
-        let (_, len) = merged.remove(0);
-        merged[0].1 += len;
-    }
+    let merged = stable_subject_runs(tracks, n, bin_s);
     // Frame each source shot STATICALLY on its subject's median position — no
     // leading-edge pan (which lagged the cut for ~1 s) and no per-bin follow
     // (which jittered): a static source camera wants a static crop, correct
@@ -1313,6 +1318,38 @@ fn plan_follow_visible(
         shots.push(Shot { start_s, end_s, track, layout, pan_to: None });
     }
     CameraPlan { shots }
+}
+
+/// The stable per-bin subject runs of a multicam/solo source, `(subject,
+/// len_bins)` covering `0..n`: [`subject_series`] with sub-flicker blips (a
+/// transition wobble, or a momentary two-face overlap at a cut) folded into
+/// their neighbour under [`MULTICAM_MIN_SHOT_S`] — a real source camera holds
+/// longer, so every surviving run boundary is a camera change as the per-bin
+/// evidence sees it. The shot grammar of [`plan_follow_visible`], shared with
+/// [`plan_by_scene_cuts`]'s missed-cut healing (ADR 0073).
+fn stable_subject_runs(tracks: &[SpeakerTrack], n: usize, bin_s: f64) -> Vec<(Subject, usize)> {
+    let subject = subject_series(tracks, n);
+    let mut runs: Vec<(Subject, usize)> = Vec::new();
+    for s in &subject {
+        match runs.last_mut() {
+            Some((r, len)) if r == s => *len += 1,
+            _ => runs.push((*s, 1)),
+        }
+    }
+    let min_bins = (MULTICAM_MIN_SHOT_S / bin_s).round().max(1.0) as usize;
+    let mut merged: Vec<(Subject, usize)> = Vec::new();
+    for (subj, len) in runs {
+        match merged.last_mut() {
+            Some((prev, plen)) if *prev == subj => *plen += len,
+            Some((_, plen)) if len < min_bins => *plen += len,
+            _ => merged.push((subj, len)),
+        }
+    }
+    if merged.len() >= 2 && merged[0].1 < min_bins {
+        let (_, len) = merged.remove(0);
+        merged[0].1 += len;
+    }
+    merged
 }
 
 /// Per-bin on-screen subject for a multicam/solo source, mirroring what the
@@ -3335,6 +3372,70 @@ mod tests {
         let ta = SpeakerTrack { id: 0, bbox: fb(300.0, 300.0, 90.0, 90.0), presence: 1.0, activity: vec![0.0; n], path };
         let plan = plan_shots(&analysis(vec![None; n], vec![ta]), 1920.0, 1080.0, 10.0, &[5.0]);
         assert_eq!(plan.shots.len(), 1, "same subject across a cut = one shot: {plan:?}");
+    }
+
+    #[test]
+    fn a_missed_scene_cut_splits_on_the_subject_flip() {
+        // The TKP failure (ADR 0073): the source cuts B -> A at 30 s but the
+        // pixel detector missed it (a near-black studio scores such cuts
+        // arbitrarily low); the only detected cut is elsewhere. The per-bin
+        // subject flip must mint the boundary, so A's footage is never framed
+        // on B's empty seat.
+        let n = nbins(40.0);
+        let k = nbins(30.0);
+        let b_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i < k).then(|| fb(1200.0, 300.0, 90.0, 90.0))).collect();
+        let a_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i >= k).then(|| fb(400.0, 300.0, 90.0, 90.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(400.0, 300.0, 90.0, 90.0), presence: 0.25, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1200.0, 300.0, 90.0, 90.0), presence: 0.75, activity: vec![0.0; n], path: b_path };
+        let plan = plan_shots(&analysis(vec![None; n], vec![ta, tb]), 1920.0, 1080.0, 40.0, &[10.0]);
+        assert_eq!(plan.shots.len(), 2, "{plan:?}");
+        assert!(
+            (plan.shots[0].end_s - 30.0).abs() < 0.1,
+            "split at the flip (bin resolution), got {}",
+            plan.shots[0].end_s
+        );
+        assert_eq!(plan.shots[0].track, Some(1));
+        assert_eq!(plan.shots[1].track, Some(0));
+    }
+
+    #[test]
+    fn a_sub_flicker_flip_does_not_mint_a_cut() {
+        // A 0.3 s detector wobble (B drops, A pops) inside B's shot is noise
+        // under the flicker floor — the healing pass must not split there.
+        let n = nbins(20.0);
+        let j = nbins(9.0);
+        let f = nbins(0.3);
+        let b_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i < j || i >= j + f).then(|| fb(1200.0, 300.0, 90.0, 90.0))).collect();
+        let a_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i >= j && i < j + f).then(|| fb(400.0, 300.0, 90.0, 90.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(400.0, 300.0, 90.0, 90.0), presence: 0.02, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1200.0, 300.0, 90.0, 90.0), presence: 0.98, activity: vec![0.0; n], path: b_path };
+        let plan = plan_shots(&analysis(vec![None; n], vec![ta, tb]), 1920.0, 1080.0, 20.0, &[5.0]);
+        assert_eq!(plan.shots.len(), 1, "a flicker must not cut: {plan:?}");
+        assert_eq!(plan.shots[0].track, Some(1));
+    }
+
+    #[test]
+    fn a_missed_cut_to_the_wide_splits_to_a_group() {
+        // The source cuts from B's close-up to the wide two-shot and the
+        // pixels miss it: the sustained two-face stretch must still become
+        // its own group shot instead of riding inside B's solo crop.
+        let n = nbins(38.0);
+        let k = nbins(30.0);
+        let b_path: Vec<Option<FaceBox>> =
+            (0..n).map(|_| Some(fb(1200.0, 300.0, 90.0, 90.0))).collect();
+        let a_path: Vec<Option<FaceBox>> =
+            (0..n).map(|i| (i >= k).then(|| fb(400.0, 300.0, 90.0, 90.0))).collect();
+        let ta = SpeakerTrack { id: 0, bbox: fb(400.0, 300.0, 90.0, 90.0), presence: 0.2, activity: vec![0.0; n], path: a_path };
+        let tb = SpeakerTrack { id: 1, bbox: fb(1200.0, 300.0, 90.0, 90.0), presence: 1.0, activity: vec![0.0; n], path: b_path };
+        let plan = plan_shots(&analysis(vec![None; n], vec![ta, tb]), 1920.0, 1080.0, 38.0, &[10.0]);
+        assert_eq!(plan.shots.len(), 2, "{plan:?}");
+        assert!((plan.shots[0].end_s - 30.0).abs() < 0.1, "got {}", plan.shots[0].end_s);
+        assert_eq!(plan.shots[0].track, Some(1), "B's solo before the wide");
+        assert_eq!(plan.shots[1].track, None, "the wide is a group shot: {plan:?}");
     }
 
     #[test]
