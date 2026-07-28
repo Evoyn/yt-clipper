@@ -190,3 +190,162 @@ impl Drop for PreviewPlayer {
         let _ = self.child.wait();
     }
 }
+
+/// A **marker-exact paused frame** (ADR 0075): while the Studio is paused,
+/// one background ffmpeg decode fetches the TRUE source frame at the
+/// playhead and replaces the ~2-4 fps filmstrip thumbnail (whose slot
+/// granularity makes a camera cut appear only at the next strip frame, up
+/// to ~0.4 s after its marker). `showinfo` reports the delivered frame's
+/// actual pts, so `display_time` can bind overlays to the exact frame shown
+/// — never to the requested time, which may fall a sub-frame on the other
+/// side of a cut boundary.
+///
+/// The decode discards frames before the seek target, so the delivered
+/// frame is the FIRST one with pts at or after the playhead — parking
+/// exactly on a cut marker shows the cut frame, the same side the render's
+/// trim keeps.
+pub struct PausedExact {
+    child: Child,
+    rx: Receiver<(f64, Vec<u8>)>,
+    /// The clip-relative source time this fetch is FOR (the caller matches
+    /// it against the current playhead before trusting the result).
+    pub src_t: f64,
+    w: usize,
+    h: usize,
+    texture: Option<egui::TextureHandle>,
+    /// Clip-relative pts of the delivered frame, once it arrived.
+    shown_pts: Option<f64>,
+}
+
+/// The `pts_time:` of the LAST `showinfo` line in an ffmpeg stderr dump —
+/// the delivered frame's pts on the seek-rebased timeline (0 = the seek
+/// point, so the frame's clip time is `src_t + this`).
+pub(crate) fn parse_showinfo_pts(stderr: &str) -> Option<f64> {
+    stderr
+        .lines()
+        .filter(|l| l.contains("Parsed_showinfo"))
+        .filter_map(|l| l.split("pts_time:").nth(1))
+        .filter_map(|s| {
+            s.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .last()
+}
+
+impl PausedExact {
+    /// Fetch the frame at clip-relative `src_t` (in-source seek =
+    /// `seek_s + src_t`), at the live player's preview dimensions. Returns
+    /// immediately; the decode (~0.1-0.2 s) lands via [`Self::poll`].
+    pub fn spawn(
+        ffmpeg: &Path,
+        src: &PathBuf,
+        seek_s: f64,
+        src_t: f64,
+        src_w: f32,
+        src_h: f32,
+    ) -> std::io::Result<Self> {
+        let (w, h) = play_dims(src_w, src_h);
+        let mut child = Command::new(ffmpeg)
+            .no_console()
+            .args([
+                "-ss",
+                &format!("{:.3}", seek_s + src_t),
+                "-i",
+                &src.display().to_string(),
+                "-frames:v",
+                "1",
+                "-an",
+                "-vf",
+                &format!("showinfo,scale={w}:{h}:flags=fast_bilinear"),
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(f64, Vec<u8>)>(1);
+        let frame_bytes = w * h * 3;
+        // Drain both pipes concurrently (a one-frame decode, but stderr must
+        // not be left to fill while stdout blocks, or vice versa).
+        let err_h = std::thread::spawn(move || {
+            let mut s = String::new();
+            let mut r = stderr;
+            let _ = std::io::Read::read_to_string(&mut r, &mut s);
+            s
+        });
+        std::thread::spawn(move || {
+            let mut frame = Vec::with_capacity(frame_bytes);
+            let mut r = stdout;
+            let _ = std::io::Read::read_to_end(&mut r, &mut frame);
+            let text = err_h.join().unwrap_or_default();
+            let delta = parse_showinfo_pts(&text).unwrap_or(0.0);
+            if frame.len() >= frame_bytes {
+                frame.truncate(frame_bytes);
+                let _ = tx.send((src_t + delta, frame));
+            }
+        });
+        Ok(Self { child, rx, src_t, w, h, texture: None, shown_pts: None })
+    }
+
+    /// The delivered frame's clip-relative pts, without polling — for
+    /// `display_time`, which reads immutably after `poll` ran this paint.
+    pub fn ready_pts(&self) -> Option<f64> {
+        self.shown_pts
+    }
+
+    /// The exact frame's texture and its clip-relative pts, once the decode
+    /// lands (`None` until then — the caller keeps showing the filmstrip).
+    pub fn poll(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, f64)> {
+        if self.shown_pts.is_none() {
+            if let Ok((pts, frame)) = self.rx.try_recv() {
+                if frame.len() == self.w * self.h * 3 {
+                    let img = egui::ColorImage::from_rgb([self.w, self.h], &frame);
+                    match &mut self.texture {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => {
+                            self.texture = Some(ctx.load_texture(
+                                "paused-exact",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
+                    self.shown_pts = Some(pts);
+                }
+            }
+        }
+        match (&self.texture, self.shown_pts) {
+            (Some(t), Some(pts)) => Some((t.id(), pts)),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for PausedExact {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod paused_exact_tests {
+    use super::parse_showinfo_pts;
+
+    #[test]
+    fn showinfo_pts_parses_the_delivered_frames_line() {
+        let stderr = "\
+[Parsed_showinfo_0 @ 0x1] config in time_base: 1/24000, frame_rate: 24000/1001\n\
+[Parsed_showinfo_0 @ 0x1] n:   0 pts:    501 pts_time:0.020875 duration:1001 fmt:yuv420p\n\
+frame=    1 fps=0.0 q=-0.0 size=  1350kB time=00:00:00.02\n";
+        let pts = parse_showinfo_pts(stderr).unwrap();
+        assert!((pts - 0.020875).abs() < 1e-9);
+        assert!(parse_showinfo_pts("no such line").is_none(), "absent showinfo parses to None");
+    }
+}

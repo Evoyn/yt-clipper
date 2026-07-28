@@ -45,7 +45,7 @@ use yc_render::{
     WordState,
 };
 
-use crate::player::PreviewPlayer;
+use crate::player::{PausedExact, PreviewPlayer};
 use crate::presets::caption_presets;
 use crate::theme;
 
@@ -681,6 +681,15 @@ pub struct EditorState {
     /// Live playback decode (streaming ffmpeg → one texture, ~24 fps): the
     /// motion upgrade over the 4 fps filmstrip, alive only while playing.
     live: Option<PreviewPlayer>,
+    /// Marker-exact paused frame (ADR 0075): the in-flight/landed true-frame
+    /// decode replacing the strip thumbnail while paused. Dropped whenever
+    /// the playhead moves past half a source frame or playback starts.
+    paused_exact: Option<PausedExact>,
+    /// The paused playhead the exact fetch targets and when it settled there
+    /// (the fetch spawns only after a short settle, so drag-scrubbing never
+    /// churns decoder processes), plus whether a spawn already failed for
+    /// this target (no retry storms — a missing ffmpeg is permanent).
+    exact_want: Option<(f64, std::time::Instant, bool)>,
     /// What the live player needs to spawn: the pinned ffmpeg, the resolved
     /// render source, and the clip's in-source seek offset.
     ffmpeg: std::path::PathBuf,
@@ -875,6 +884,8 @@ impl EditorState {
             playing: None,
             video_aligned: false,
             live: None,
+            paused_exact: None,
+            exact_want: None,
             ffmpeg,
             render_src,
             seek_s,
@@ -1291,6 +1302,10 @@ impl EditorState {
     /// music boundary can never double-start a clip.
     fn restart_playback(&mut self, out_t: f64) -> EditorAction {
         self.playing = Some((Instant::now(), out_t));
+        // The paused-exact fetch belongs to the paused world (ADR 0075):
+        // playback shows the live stream, and pausing re-fetches fresh.
+        self.paused_exact = None;
+        self.exact_want = None;
         self.start_video();
         let voice = (out_t >= self.intro_d()).then(|| self.play_range_from(out_t));
         let music = self.music_cues(out_t);
@@ -2176,8 +2191,9 @@ impl EditorState {
     }
 
     /// The frame texture to draw at the playhead: the LIVE stream while
-    /// playing (full-rate motion), else the filmstrip frame nearest the
-    /// playhead (paused / scrubbing / before the first live frame lands).
+    /// playing (full-rate motion), the marker-exact paused frame once its
+    /// decode lands (ADR 0075), else the filmstrip frame nearest the
+    /// playhead (scrubbing / the settle window / before a decode lands).
     fn frame_tex(&mut self, ctx: &egui::Context) -> egui::TextureId {
         if self.playing.is_some() {
             if let Some(live) = &mut self.live {
@@ -2185,8 +2201,70 @@ impl EditorState {
                     return id;
                 }
             }
+        } else if let Some((id, _)) = self.poll_paused_exact(ctx) {
+            return id;
         }
         self.frames[self.strip_idx()].id()
+    }
+
+    /// Half a source frame — the tolerance under which two playhead values
+    /// mean the SAME frame (fetch reuse, display-time binding).
+    fn half_frame_s(&self) -> f64 {
+        0.5 / if self.src_fps > 0.0 { self.src_fps } else { crate::player::PLAY_FPS }
+    }
+
+    /// Drive the marker-exact paused fetch (ADR 0075): while paused, one
+    /// background ffmpeg decode fetches the TRUE frame at the playhead and
+    /// replaces the strip thumbnail — so parking on a cut marker shows the
+    /// cut frame, not the strip's nearest slot up to ~0.4 s away. The fetch
+    /// spawns only after the playhead SETTLES (a drag emits dozens of
+    /// positions a second; killing/spawning a decoder for each is churn),
+    /// and a moved playhead drops the stale fetch immediately.
+    fn poll_paused_exact(&mut self, ctx: &egui::Context) -> Option<(egui::TextureId, f64)> {
+        const SETTLE_S: f64 = 0.15;
+        let t = self.src_t();
+        let eps = self.half_frame_s();
+        match self.exact_want {
+            Some((want, _, _)) if (want - t).abs() <= eps => {}
+            _ => {
+                self.exact_want = Some((t, std::time::Instant::now(), false));
+                self.paused_exact = None; // kills a stale in-flight decode
+            }
+        }
+        if self.paused_exact.is_none() {
+            let (want, since, failed) = self.exact_want.expect("set above");
+            if failed {
+                return None;
+            }
+            if since.elapsed().as_secs_f64() >= SETTLE_S {
+                match PausedExact::spawn(
+                    &self.ffmpeg,
+                    &self.render_src,
+                    self.seek_s,
+                    want,
+                    self.src_w,
+                    self.src_h,
+                ) {
+                    Ok(pe) => self.paused_exact = Some(pe),
+                    Err(e) => {
+                        tracing::warn!("paused-exact frame unavailable ({e}); strip carries");
+                        self.exact_want = Some((want, since, true));
+                        return None;
+                    }
+                }
+            } else {
+                // Wake up when the settle window closes, even with no input.
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+        }
+        if let Some(pe) = &mut self.paused_exact {
+            match pe.poll(ctx) {
+                Some(r) => return Some(r),
+                // Decode in flight: poll again shortly.
+                None => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            }
+        }
+        None
     }
 
     /// The filmstrip frame [`Self::frame_tex`] shows for the current playhead
@@ -2214,6 +2292,15 @@ impl EditorState {
                 // The play anchor is OUTPUT time; the decode started at its
                 // source twin — the shown frame's SOURCE time re-bases it.
                 return (offset - self.intro_d()).max(0.0) + mid;
+            }
+        } else if let Some(pe) = &self.paused_exact {
+            // The marker-exact paused frame (ADR 0075): bind to the shown
+            // frame's TRUE pts midpoint, not the requested playhead — the
+            // decode may land a sub-frame across a cut boundary.
+            if let Some(pts) = pe.ready_pts() {
+                if (pe.src_t - self.src_t()).abs() <= self.half_frame_s() {
+                    return pts + self.half_frame_s();
+                }
             }
         }
         strip_frame_time_s(self.strip_idx(), self.frame_fps)
