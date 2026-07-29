@@ -445,7 +445,20 @@ impl PausedExact {
             let mut r = stdout;
             let _ = std::io::Read::read_to_end(&mut r, &mut frame);
             let text = err_h.join().unwrap_or_default();
-            let delta = parse_showinfo_pts(&text).unwrap_or(0.0);
+            // The DELIVERED frame is output n:0 — ffmpeg's read-ahead can
+            // push the NEXT frame through showinfo before the one-frame
+            // stop propagates, and taking the last line labeled the shown
+            // frame with its successor's pts: picture and label one frame
+            // apart, forever (caught by the operator's HUD screenshot,
+            // 2026-07-29: want 18.064 showing the 18.083 close-up labeled
+            // 18.125 — the next frame).
+            let delta = text
+                .lines()
+                .filter_map(parse_showinfo_frame)
+                .find(|(n, _)| *n == 0)
+                .map(|(_, p)| p)
+                .or_else(|| parse_showinfo_pts(&text))
+                .unwrap_or(0.0);
             if frame.len() >= frame_bytes {
                 frame.truncate(frame_bytes);
                 let _ = tx.send((origin + delta, frame));
