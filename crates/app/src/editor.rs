@@ -2537,7 +2537,14 @@ impl EditorState {
         };
 
         // Dim everything outside the effective crop(s), so the kept region pops.
-        let layout = self.effective_layout(self.src_t());
+        // The FRAME ON SCREEN picks the layout, never the playhead clock
+        // (the Output view's rule since ADR 0038, finally applied to the
+        // Source view's visible rect too — ADR 0076): around a cut the clock
+        // and the shown frame skew by a frame or two, and this rect flipped
+        // shots at a different instant than the picture behind it — the
+        // operator's 1-3 frame wrong-crop flicker, hiding in plain sight
+        // while every other surface got its clock measured (2026-07-29).
+        let layout = self.effective_layout(self.display_time());
         let crops: Vec<(Crop, &str, Color32)> = match &layout {
             Layout::Stacked { gameplay, facecam, .. } => vec![
                 (*gameplay, "Top panel", theme::INFO),
