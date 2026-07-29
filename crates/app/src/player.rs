@@ -228,6 +228,22 @@ impl PreviewPlayer {
         Some(self.shown_frame_start()? + 1.0 / self.fps.max(1e-6))
     }
 
+    /// One-line debug state for the Studio's time HUD (ADR 0076): delivered
+    /// frame count, the shown frame's start time, and whether it is the
+    /// frame's REPORTED pts or the nearest-anchor estimate.
+    pub fn hud(&self) -> String {
+        let idx = self.frames_seen.saturating_sub(1) as usize;
+        let measured = self.pts_seen.get(idx).copied().flatten().is_some();
+        match self.shown_frame_start() {
+            Some(s) => format!(
+                "live n={} start={s:.3} {}",
+                self.frames_seen,
+                if measured { "meas" } else { "est" }
+            ),
+            None => format!("live n={} (no frame yet)", self.frames_seen),
+        }
+    }
+
     /// Content time of the midpoint of the frame currently ON SCREEN, or
     /// `None` before the first frame — what the camera crop must be picked
     /// with (see [`frame_mid_s`]).
@@ -409,6 +425,14 @@ impl PausedExact {
     /// `display_time`, which reads immutably after `poll` ran this paint.
     pub fn ready_pts(&self) -> Option<f64> {
         self.shown_pts
+    }
+
+    /// One-line debug state for the Studio's time HUD (ADR 0076).
+    pub fn hud(&self) -> String {
+        match self.shown_pts {
+            Some(p) => format!("exact want={:.3} pts={p:.3}", self.src_t),
+            None => format!("exact want={:.3} decoding…", self.src_t),
+        }
     }
 
     /// The exact frame's texture and its clip-relative pts, once the decode

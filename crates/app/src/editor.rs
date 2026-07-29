@@ -2656,6 +2656,55 @@ impl EditorState {
         // Face overlays: tracks (post-analysis) or Prepare's clusters, with
         // labels; clicking one retargets the camera.
         self.face_overlays(ui, &painter, frame_rect);
+
+        // Time HUD (ADR 0076 diagnostics): the numbers every element above
+        // was picked with, live — so a clock/picture disagreement shows as
+        // data, not a chase. Small, top-left, Source view only.
+        self.time_hud(&painter, frame_rect);
+    }
+
+    /// The Source view's live time readout: the playhead clock, the shown
+    /// frame's bound time and its SOURCE (live decode / paused-exact /
+    /// filmstrip), and the plan shot each would pick. One glance answers
+    /// "which clock moved this element".
+    fn time_hud(&self, painter: &egui::Painter, frame_rect: Rect) {
+        let clock = self.src_t();
+        let shown = self.display_time();
+        let source = if self.playing.is_some() {
+            match &self.live {
+                Some(l) => l.hud(),
+                None => "live (spawning)".into(),
+            }
+        } else if let Some(pe) = &self.paused_exact {
+            pe.hud()
+        } else {
+            format!("strip idx={} t={:.3}", self.strip_idx(), strip_frame_time_s(self.strip_idx(), self.frame_fps))
+        };
+        let shot_of = |t: f64| -> String {
+            self.plan
+                .as_ref()
+                .and_then(|p| {
+                    p.shots.iter().position(|s| s.start_s <= t && t < s.end_s).map(|i| {
+                        let s = &p.shots[i];
+                        format!("#{i} [{:.3}..{:.3}) {}", s.start_s, s.end_s,
+                            s.track.map(track_label).unwrap_or_else(|| "group".into()))
+                    })
+                })
+                .unwrap_or_else(|| "-".into())
+        };
+        let fps = if self.src_fps > 0.0 { self.src_fps } else { crate::player::PLAY_FPS };
+        let text = format!(
+            "clock {clock:.3} | shown {shown:.3} ({:+.1}f)\n{source}\nshot@shown {}\nshot@clock {}",
+            (shown - clock) * fps,
+            shot_of(shown),
+            shot_of(clock),
+        );
+        let font = FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+        let pos = frame_rect.min + egui::vec2(8.0, 28.0);
+        let bg = Rect::from_min_size(pos, galley.size() + egui::vec2(10.0, 6.0));
+        painter.rect_filled(bg, CornerRadius::same(4), Color32::from_rgba_unmultiplied(10, 12, 16, 200));
+        painter.galley(pos + egui::vec2(5.0, 3.0), galley, Color32::WHITE);
     }
 
     // (Crop-box interaction is the free `crop_box_interaction` below — it
