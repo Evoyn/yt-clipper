@@ -14,7 +14,6 @@ use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, OnceLock};
 
 use yc_core::NoConsole;
 
@@ -51,15 +50,18 @@ pub struct PreviewPlayer {
     /// cut": a wall-clock playhead outpaces a decoder that isn't perfectly
     /// real-time, switching the crop before the new shot is visible).
     frames_seen: u64,
-    /// The FIRST delivered frame's pts on the decode's own slot grid
-    /// (`showinfo` after the fps filter, seconds from the seek point) — the
-    /// phase `frames_seen` alone cannot know: `-ss` discards up to a frame
-    /// and the fps filter can slot the first frame late, so counting from
-    /// zero under-reads content by up to ~1.5 frames and the crop switched a
-    /// beat AFTER the picture at every cut while playing (ADR 0076 follow-up,
-    /// 2026-07-29). `None` until the decoder's first stderr line parses;
-    /// consumers fall back to the zero-phase estimate.
-    first_pts: Arc<OnceLock<f64>>,
+    /// Every delivered frame's pts on the decode's own grid (`showinfo`
+    /// after the fps filter, seconds from the seek point), keyed by the
+    /// REPORTED output frame number — the shown frame binds to its reported
+    /// pts, never an inferred one: `-ss` discards up to a frame, the fps
+    /// filter can slot the first frame late, and mid-stream drop/duplicate
+    /// wobble moves a count off the grid by another frame — each error put
+    /// the crop 1-3 frames on the wrong side of a cut while playing
+    /// (ADR 0076 follow-up, 2026-07-29). Consumers fall back to a count
+    /// estimate for the few ms a frame can outrun its stderr line.
+    pts_rx: Receiver<(usize, f64)>,
+    /// Drained [`Self::pts_rx`] — slot k = delivered frame k's pts.
+    pts_seen: Vec<Option<f64>>,
 }
 
 /// Content time (seconds) of the MIDDLE of the newest delivered frame:
@@ -128,29 +130,28 @@ impl PreviewPlayer {
             .spawn()?;
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        // Parse the FIRST showinfo pts, then keep draining to EOF — showinfo
-        // prints per frame, and an undrained stderr pipe would block ffmpeg.
-        let first_pts: Arc<OnceLock<f64>> = Arc::new(OnceLock::new());
-        {
-            let first_pts = Arc::clone(&first_pts);
-            std::thread::spawn(move || {
-                let mut r = std::io::BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match r.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if first_pts.get().is_none() {
-                                if let Some(p) = parse_showinfo_pts(&line) {
-                                    let _ = first_pts.set(p);
-                                }
+        // Parse EVERY showinfo pts in order (one line per output frame) and
+        // keep draining to EOF — an undrained stderr pipe would block ffmpeg.
+        // The channel is effectively unbounded: a preview clip is minutes,
+        // thousands of f64s at most.
+        let (tx_pts, pts_rx) = std::sync::mpsc::channel::<(usize, f64)>();
+        std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Some(np) = parse_showinfo_frame(&line) {
+                            if tx_pts.send(np).is_err() {
+                                break; // player dropped (child killed with it)
                             }
                         }
                     }
                 }
-            });
-        }
+            }
+        });
         // A shallow channel: the UI drains to newest, so anything deeper is
         // just latency between the decoder and the screen.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
@@ -171,34 +172,76 @@ impl PreviewPlayer {
                 }
             }
         });
-        Ok(Self { child, rx, w, h, fps, texture: None, got_frame: false, frames_seen: 0, first_pts })
+        Ok(Self {
+            child,
+            rx,
+            w,
+            h,
+            fps,
+            texture: None,
+            got_frame: false,
+            frames_seen: 0,
+            pts_rx,
+            pts_seen: Vec::new(),
+        })
     }
 
-    /// The measured decode phase: the first delivered frame's slotted pts,
-    /// or 0 until the decoder reports it.
+    /// Drain newly reported frame timestamps into their slots (slot k =
+    /// frame k's pts, keyed by showinfo's own frame number).
+    fn drain_pts(&mut self) {
+        while let Ok((n, p)) = self.pts_rx.try_recv() {
+            if n >= self.pts_seen.len() {
+                self.pts_seen.resize(n + 1, None);
+            }
+            self.pts_seen[n] = Some(p);
+        }
+    }
+
+    /// The SHOWN frame's reported pts (decode-grid seconds), when its
+    /// stderr line has arrived.
+    fn shown_pts(&self) -> Option<f64> {
+        self.pts_seen.get(self.frames_seen.saturating_sub(1) as usize).copied().flatten()
+    }
+
+    /// The decode phase: the first frame's reported pts, 0 until it arrives.
     fn phase(&self) -> f64 {
-        self.first_pts.get().copied().unwrap_or(0.0)
+        self.pts_seen.first().copied().flatten().unwrap_or(0.0)
     }
 
-    /// The video's elapsed **content** time (seconds) — the measured phase
-    /// plus frames delivered so far over the decode grid — or `None` before
-    /// the first frame. The caller adds it to the play offset for the
-    /// playhead (the audio/caption clock).
+    /// The video's elapsed **content** time (seconds) — the shown frame's
+    /// REPORTED end when available, else the count estimate over the first
+    /// frame's phase — or `None` before the first frame. The caller adds it
+    /// to the play offset for the playhead (the audio/caption clock).
     pub fn video_secs(&self) -> Option<f64> {
-        (self.frames_seen > 0)
-            .then(|| self.phase() + self.frames_seen as f64 / self.fps.max(1e-6))
+        if self.frames_seen == 0 {
+            return None;
+        }
+        let step = 1.0 / self.fps.max(1e-6);
+        Some(match self.shown_pts() {
+            Some(p) => p + step,
+            None => self.phase() + self.frames_seen as f64 * step,
+        })
     }
 
     /// Content time of the midpoint of the frame currently ON SCREEN, or
     /// `None` before the first frame — what the camera crop must be picked
-    /// with (see [`frame_mid_s`]).
+    /// with (see [`frame_mid_s`]). Binds to the frame's REPORTED pts; the
+    /// count estimate carries only for the few ms a frame can outrun its
+    /// stderr line.
     pub fn shown_frame_mid_s(&self) -> Option<f64> {
-        (self.frames_seen > 0).then(|| frame_mid_s(self.phase(), self.frames_seen, self.fps))
+        if self.frames_seen == 0 {
+            return None;
+        }
+        Some(match self.shown_pts() {
+            Some(p) => p + 0.5 / self.fps.max(1e-6),
+            None => frame_mid_s(self.phase(), self.frames_seen, self.fps),
+        })
     }
 
     /// Drain to the newest decoded frame and return the live texture to draw,
     /// or `None` until the first frame lands (caller shows the filmstrip).
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<egui::TextureId> {
+        self.drain_pts();
         let mut newest: Option<Vec<u8>> = None;
         loop {
             match self.rx.try_recv() {
@@ -277,6 +320,32 @@ pub(crate) fn parse_showinfo_pts(stderr: &str) -> Option<f64> {
                 .and_then(|v| v.parse::<f64>().ok())
         })
         .last()
+}
+
+/// One `showinfo` frame line → `(n, pts_time)`: the OUTPUT frame number and
+/// its pts on the seek-rebased timeline. Pairing by the REPORTED `n` (not
+/// arrival order) survives any extra showinfo/log lines interleaved in the
+/// stream.
+pub(crate) fn parse_showinfo_frame(line: &str) -> Option<(usize, f64)> {
+    if !line.contains("Parsed_showinfo") {
+        return None;
+    }
+    let n = line
+        .split(" n:")
+        .nth(1)?
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let pts = line
+        .split("pts_time:")
+        .nth(1)?
+        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .next()?
+        .parse::<f64>()
+        .ok()?;
+    Some((n, pts))
 }
 
 impl PausedExact {
@@ -393,5 +462,24 @@ frame=    1 fps=0.0 q=-0.0 size=  1350kB time=00:00:00.02\n";
         let pts = parse_showinfo_pts(stderr).unwrap();
         assert!((pts - 0.020875).abs() < 1e-9);
         assert!(parse_showinfo_pts("no such line").is_none(), "absent showinfo parses to None");
+    }
+
+    #[test]
+    fn showinfo_frame_lines_pair_by_reported_number() {
+        // The live binding pairs pts to frames by showinfo's OWN `n:` field —
+        // arrival order can carry extra lines (a config header, side-data
+        // rows) that index-pairing would drift on.
+        let l = "[Parsed_showinfo_1 @ 0x2] n:  17 pts: 17017 pts_time:0.709042 duration:1001";
+        let (n, pts) = super::parse_showinfo_frame(l).unwrap();
+        assert_eq!(n, 17);
+        assert!((pts - 0.709042).abs() < 1e-9);
+        assert!(
+            super::parse_showinfo_frame(
+                "[Parsed_showinfo_1 @ 0x2] config in time_base: 1/24000"
+            )
+            .is_none(),
+            "a non-frame showinfo line pairs to nothing"
+        );
+        assert!(super::parse_showinfo_frame("frame=  1 fps=0.0").is_none());
     }
 }
