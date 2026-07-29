@@ -197,45 +197,42 @@ impl PreviewPlayer {
         }
     }
 
-    /// The SHOWN frame's reported pts (decode-grid seconds), when its
-    /// stderr line has arrived.
-    fn shown_pts(&self) -> Option<f64> {
-        self.pts_seen.get(self.frames_seen.saturating_sub(1) as usize).copied().flatten()
-    }
-
-    /// The decode phase: the first frame's reported pts, 0 until it arrives.
-    fn phase(&self) -> f64 {
-        self.pts_seen.first().copied().flatten().unwrap_or(0.0)
-    }
-
-    /// The video's elapsed **content** time (seconds) — the shown frame's
-    /// REPORTED end when available, else the count estimate over the first
-    /// frame's phase — or `None` before the first frame. The caller adds it
-    /// to the play offset for the playhead (the audio/caption clock).
-    pub fn video_secs(&self) -> Option<f64> {
+    /// START time of the frame currently ON SCREEN, on the decode grid:
+    /// its REPORTED pts when the stderr line has arrived, else the nearest
+    /// earlier measured frame plus the grid steps since — an estimate that
+    /// can only be off by the frames since the last measurement (≈0), never
+    /// by drift accumulated from the stream start (which re-exposed a
+    /// 1-frame early box/crop flip on exactly the fallback paints near a
+    /// cut — the operator's "green box before the picture switches",
+    /// 2026-07-29). `None` before any frame.
+    fn shown_frame_start(&self) -> Option<f64> {
         if self.frames_seen == 0 {
             return None;
         }
+        let idx = (self.frames_seen - 1) as usize;
         let step = 1.0 / self.fps.max(1e-6);
-        Some(match self.shown_pts() {
-            Some(p) => p + step,
-            None => self.phase() + self.frames_seen as f64 * step,
-        })
+        // The shown frame's own line, or the nearest measured one before it.
+        for k in (0..=idx.min(self.pts_seen.len().saturating_sub(1))).rev() {
+            if let Some(p) = self.pts_seen.get(k).copied().flatten() {
+                return Some(p + (idx - k) as f64 * step);
+            }
+        }
+        // No line has arrived at all yet (first paints after spawn).
+        Some(idx as f64 * step)
+    }
+
+    /// The video's elapsed **content** time (seconds) — the shown frame's
+    /// end — or `None` before the first frame. The caller adds it to the
+    /// play offset for the playhead (the audio/caption clock).
+    pub fn video_secs(&self) -> Option<f64> {
+        Some(self.shown_frame_start()? + 1.0 / self.fps.max(1e-6))
     }
 
     /// Content time of the midpoint of the frame currently ON SCREEN, or
     /// `None` before the first frame — what the camera crop must be picked
-    /// with (see [`frame_mid_s`]). Binds to the frame's REPORTED pts; the
-    /// count estimate carries only for the few ms a frame can outrun its
-    /// stderr line.
+    /// with (see [`frame_mid_s`]).
     pub fn shown_frame_mid_s(&self) -> Option<f64> {
-        if self.frames_seen == 0 {
-            return None;
-        }
-        Some(match self.shown_pts() {
-            Some(p) => p + 0.5 / self.fps.max(1e-6),
-            None => frame_mid_s(self.phase(), self.frames_seen, self.fps),
-        })
+        Some(self.shown_frame_start()? + 0.5 / self.fps.max(1e-6))
     }
 
     /// Drain to the newest decoded frame and return the live texture to draw,
