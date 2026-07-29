@@ -25,6 +25,18 @@ use yc_core::NoConsole;
 /// 23.976 source re-quantizes every cut by up to a frame (a per-cut coin flip
 /// — the preview twin of the render's trim-rounding flash).
 pub const PLAY_FPS: f64 = 24.0;
+/// Seek-target back-off, in frames, for every preview decode (ADR 0076): on
+/// these DASH muxes `ffmpeg -ss` can KEEP the frame before the target and
+/// emit it with its rebased pts CLAMPED TO ZERO — content one frame earlier
+/// than every label derived from it. Measured on the eyegate fixture: the
+/// linear scan puts the cut frame at 18.125, while `-ss <cut>` delivered the
+/// PRE-cut frame labeled `pts_time:0`; the burn and analysis decode linearly
+/// and never see this. Seeking a quarter-frame early makes a genuine
+/// on-target frame rebase to a POSITIVE pts, so a zero-stamped frame is
+/// provably the clamped impostor — and `select=gt(t,0)` drops it. Verified:
+/// with the bias every probed seek lands on the true grid and the cut seek
+/// delivers the actual cut frame.
+const SEEK_BIAS_FRAMES: f64 = 0.25;
 /// Longest edge of the live playback frame — quality is explicitly secondary
 /// to motion here (the render always reads the full-res source).
 const PLAY_LONG_EDGE: f32 = 640.0;
@@ -62,6 +74,10 @@ pub struct PreviewPlayer {
     pts_rx: Receiver<(usize, f64)>,
     /// Drained [`Self::pts_rx`] — slot k = delivered frame k's pts.
     pts_seen: Vec<Option<f64>>,
+    /// The seek back-off applied at spawn ([`SEEK_BIAS_FRAMES`]): delivered
+    /// times are relative to the biased target; subtracting this rebases
+    /// them to the caller's requested origin.
+    bias: f64,
 }
 
 /// Content time (seconds) of the MIDDLE of the newest delivered frame:
@@ -103,22 +119,29 @@ impl PreviewPlayer {
     ) -> std::io::Result<Self> {
         let (w, h) = play_dims(src_w, src_h);
         let fps = if src_fps.is_finite() && src_fps > 0.0 { src_fps } else { PLAY_FPS };
+        // Quarter-frame-early target + drop-zero-pts: the clamped-leader
+        // guard (see SEEK_BIAS_FRAMES). Delivered times are relative to the
+        // BIASED target; `bias` converts them back to the caller's origin.
+        let bias = SEEK_BIAS_FRAMES / fps;
+        let target = (seek_s - bias).max(0.0);
         let mut child = Command::new(ffmpeg)
             .no_console()
             .args([
                 "-ss",
-                &format!("{seek_s:.3}"),
+                &format!("{target:.4}"),
                 "-re",
                 "-i",
                 &src.display().to_string(),
                 "-t",
-                &format!("{:.3}", dur_s.max(0.05)),
+                &format!("{:.3}", dur_s.max(0.05) + bias),
                 "-an",
                 "-vf",
-                // showinfo AFTER the fps filter: its first line reports the
-                // first OUTPUT frame's slotted pts — the decode phase that
-                // binds delivered-frame counts to true content time.
-                &format!("fps={fps},showinfo,scale={w}:{h}:flags=fast_bilinear"),
+                // select drops the clamped leader; showinfo AFTER the fps
+                // filter reports each OUTPUT frame's slotted pts — the times
+                // that bind delivered frames to true content time.
+                &format!(
+                    "select='gt(t,0)',fps={fps},showinfo,scale={w}:{h}:flags=fast_bilinear"
+                ),
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -183,6 +206,7 @@ impl PreviewPlayer {
             frames_seen: 0,
             pts_rx,
             pts_seen: Vec::new(),
+            bias,
         })
     }
 
@@ -211,14 +235,15 @@ impl PreviewPlayer {
         }
         let idx = (self.frames_seen - 1) as usize;
         let step = 1.0 / self.fps.max(1e-6);
-        // The shown frame's own line, or the nearest measured one before it.
+        // The shown frame's own line, or the nearest measured one before it —
+        // rebased from the biased seek target to the caller's origin.
         for k in (0..=idx.min(self.pts_seen.len().saturating_sub(1))).rev() {
             if let Some(p) = self.pts_seen.get(k).copied().flatten() {
-                return Some(p + (idx - k) as f64 * step);
+                return Some(p + (idx - k) as f64 * step - self.bias);
             }
         }
         // No line has arrived at all yet (first paints after spawn).
-        Some(idx as f64 * step)
+        Some(idx as f64 * step - self.bias)
     }
 
     /// The video's elapsed **content** time (seconds) — the shown frame's
@@ -372,20 +397,28 @@ impl PausedExact {
         src_t: f64,
         src_w: f32,
         src_h: f32,
+        src_fps: f64,
     ) -> std::io::Result<Self> {
         let (w, h) = play_dims(src_w, src_h);
+        let fps = if src_fps.is_finite() && src_fps > 0.0 { src_fps } else { PLAY_FPS };
+        // Quarter-frame-early target + drop-zero-pts: the clamped-leader
+        // guard (see SEEK_BIAS_FRAMES) — without it this decode delivered
+        // the frame BEFORE a cut relabeled with the cut's own time.
+        let bias = SEEK_BIAS_FRAMES / fps;
+        let target = (seek_s + src_t - bias).max(0.0);
+        let origin = src_t - bias;
         let mut child = Command::new(ffmpeg)
             .no_console()
             .args([
                 "-ss",
-                &format!("{:.3}", seek_s + src_t),
+                &format!("{target:.4}"),
                 "-i",
                 &src.display().to_string(),
                 "-frames:v",
                 "1",
                 "-an",
                 "-vf",
-                &format!("showinfo,scale={w}:{h}:flags=fast_bilinear"),
+                &format!("select='gt(t,0)',showinfo,scale={w}:{h}:flags=fast_bilinear"),
                 "-pix_fmt",
                 "rgb24",
                 "-f",
@@ -415,7 +448,7 @@ impl PausedExact {
             let delta = parse_showinfo_pts(&text).unwrap_or(0.0);
             if frame.len() >= frame_bytes {
                 frame.truncate(frame_bytes);
-                let _ = tx.send((src_t + delta, frame));
+                let _ = tx.send((origin + delta, frame));
             }
         });
         Ok(Self { child, rx, src_t, w, h, texture: None, shown_pts: None })

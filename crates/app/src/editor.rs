@@ -2244,6 +2244,7 @@ impl EditorState {
                     want,
                     self.src_w,
                     self.src_h,
+                    self.src_fps,
                 ) {
                     Ok(pe) => self.paused_exact = Some(pe),
                     Err(e) => {
